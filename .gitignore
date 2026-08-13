@@ -1,0 +1,38 @@
+# Claude Code - track .claude/CLAUDE.md, settings.json,
+# commands, docs, rules, skills, agents
+.claude/*
+!.claude/CLAUDE.md
+!.claude/settings.json
+!.claude/commands/
+!.claude/docs/
+!.claude/rules/
+!.claude/skills/
+!.claude/agents/
+
+# Codex CLI - track .codex/AGENTS.md, config.toml, skills
+.codex/*
+!.codex/AGENTS.md
+!.codex/config.toml
+!.codex/skills
+
+# Trae CLI - track .trae/AGENTS.md, traecli.toml, skills
+.trae/*
+!.trae/AGENTS.md
+!.trae/traecli.toml
+!.trae/skills
+
+.env
+.env.*
+!.env.example
+
+# macOS / Swift
+.DS_Store
+.build/
+DerivedData/
+dist/
+*.xcuserstate
+xcuserdata/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log

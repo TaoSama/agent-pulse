@@ -1,0 +1,2 @@
+{"timestamp":"2026-08-10T00:00:00.000Z","type":"session_meta","payload":{"session_id":"33333333-3333-7333-8333-333333333333","thread_source":"user","cwd":"/Users/tester/Workspaces/project-c","originator":"codex_exec"}}
+{"timestamp":"2026-08-10T00:02:00.000Z","type":"event_msg","payload":{"type":"task_complete"}}
