@@ -101,6 +101,30 @@ final class IngestClientTests: XCTestCase {
         XCTAssertEqual(supplier.calls, [false, true])
     }
 
+    func testOpaqueTokenRefreshPassesFenceWhenUnchanged() async throws {
+        // A non-JWT opaque token falls back to digest identity; the same opaque
+        // value on refresh keeps the same identity and the retry succeeds.
+        let sender = CapturingSender(responses: [HTTPResponse(statusCode: 401, body: Data()), ok()])
+        let supplier = StubTokenSupplier(tokens: ["opaque-token", "opaque-token"])
+        let client = UsageIngestClient(configuration: configured(), tokenSupplier: supplier, sender: sender)
+        let result = try await client.ingest(request())
+        XCTAssertEqual(result.bucketsUpserted, 1)
+        XCTAssertEqual(supplier.calls, [false, true])
+        XCTAssertEqual(sender.requests.count, 2)
+    }
+
+    func testOpaqueTokenRefreshFencesWhenChanged() async {
+        // A changed opaque token yields a different digest identity, so the
+        // fence aborts before sending the second request.
+        let sender = CapturingSender(responses: [HTTPResponse(statusCode: 401, body: Data()), ok()])
+        let supplier = StubTokenSupplier(tokens: ["opaque-token-a", "opaque-token-b"])
+        let client = UsageIngestClient(configuration: configured(), tokenSupplier: supplier, sender: sender)
+        do { _ = try await client.ingest(request()); XCTFail("expected authIdentityChanged") }
+        catch { XCTAssertEqual(error as? IngestClientError, .authIdentityChanged) }
+        XCTAssertEqual(sender.requests.count, 1)
+        XCTAssertEqual(supplier.calls, [false, true])
+    }
+
     func testPersistent401FailsAfterSingleRefresh() async {
         let sender = CapturingSender(responses: [HTTPResponse(statusCode: 401, body: Data()), HTTPResponse(statusCode: 401, body: Data())])
         let supplier = StubTokenSupplier(tokens: [stableJWT("s"), stableJWT("s")])

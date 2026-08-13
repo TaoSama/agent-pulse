@@ -16,8 +16,82 @@ public struct CommandTokenSupplier: TokenSupplying {
         self.provider = provider
     }
 
+    /// Runs the synchronous, blocking provider off the Swift cooperative
+    /// executor. The provider spawns a subprocess and waits on it, so calling
+    /// it directly would tie up a cooperative thread for the whole helper
+    /// duration; instead we hop to a dedicated background thread.
+    ///
+    /// Cancellation: a detached Thread does not inherit the calling task, so
+    /// Task.isCancelled is meaningless inside the worker. Instead the task
+    /// cancellation handler flips a shared latch that resolves the awaiting
+    /// continuation with CancellationError immediately, so the caller is never
+    /// blocked waiting on a slow helper. The helper itself is still bounded by
+    /// its configured timeout and its result is simply discarded once the
+    /// continuation has already been resolved. The latch guarantees the
+    /// continuation is resumed exactly once, whichever path wins the race.
     public func token(forceRefresh: Bool) async throws -> SecretToken {
-        try provider.token(forceRefresh: forceRefresh)
+        try Task.checkCancellation()
+        let provider = self.provider
+        let latch = ContinuationLatch()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<SecretToken, Error>) in
+                latch.attach(continuation)
+                let thread = Thread {
+                    do {
+                        let token = try provider.token(forceRefresh: forceRefresh)
+                        latch.resolve(.success(token))
+                    } catch {
+                        latch.resolve(.failure(error))
+                    }
+                }
+                thread.name = "command-token-supplier"
+                thread.stackSize = 512 * 1024
+                thread.start()
+            }
+        } onCancel: {
+            latch.resolve(.failure(CancellationError()))
+        }
+    }
+}
+
+/// Bridges a single CheckedContinuation to at-most-one resume, arbitrating
+/// between the background worker finishing and the task being cancelled. The
+/// first resolution wins; later resolutions are dropped. The continuation may
+/// be attached after a resolution has already arrived (the cancellation handler
+/// can fire before the continuation body runs), so a pending result is
+/// replayed on attach.
+private final class ContinuationLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<SecretToken, Error>?
+    private var pendingResult: Result<SecretToken, Error>?
+    private var isResolved = false
+
+    func attach(_ continuation: CheckedContinuation<SecretToken, Error>) {
+        lock.lock()
+        if let pending = pendingResult, !isResolved {
+            isResolved = true
+            pendingResult = nil
+            lock.unlock()
+            continuation.resume(with: pending)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func resolve(_ result: Result<SecretToken, Error>) {
+        lock.lock()
+        guard !isResolved else { lock.unlock(); return }
+        if let continuation = continuation {
+            isResolved = true
+            self.continuation = nil
+            lock.unlock()
+            continuation.resume(with: result)
+        } else {
+            // Continuation not attached yet; stash the first result to replay.
+            if pendingResult == nil { pendingResult = result }
+            lock.unlock()
+        }
     }
 }
 

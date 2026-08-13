@@ -4,6 +4,12 @@ import SwiftUI
 
 private enum WindowInteraction {
     static let outsideClickGraceInterval: TimeInterval = 0.35
+    /// Dashboard and settings are explicit user actions and must stay above an
+    /// open menu-bar surface. Keeping this in one place avoids the two windows
+    /// drifting to different levels.
+    static let foregroundWindowLevel = NSWindow.Level(
+        rawValue: NSWindow.Level.statusBar.rawValue + 1
+    )
 }
 
 final class FloatingPanel: NSPanel {
@@ -259,7 +265,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate {
             defer: false
         )
         window.title = "Agent Pulse · TPS Charts"
-        window.level = .normal
+        window.level = WindowInteraction.foregroundWindowLevel
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: TPSDashboardView(model: model))
         super.init(window: window)
@@ -333,7 +339,7 @@ final class SettingsWindowController: NSWindowController {
             defer: false
         )
         window.title = "Agent Pulse 设置"
-        window.level = .normal
+        window.level = WindowInteraction.foregroundWindowLevel
         window.minSize = NSSize(width: 520, height: 480)
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: AgentPulseSettingsView(model: model))

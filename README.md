@@ -148,7 +148,7 @@ open dist/AgentPulse.app
 - 本地扫描 `~/.codex/sessions/**/*.jsonl` 与 `~/.claude/projects/**/*.jsonl`，事件追加写入独立 SQLite，并聚合为 30 分钟 bucket。
 - 菜单汇总展示总 Tokens、估算费用、缓存/新增、缓存命中率与实时 TPS；无数据时不以 0 冒充。
 - 只保存统计维度、token 计数和 hash 后的 session/source-file 标识，不保存正文、标题、完整 cwd 或凭证。
-- 上报默认关闭，API 地址为空、canonical hostname 缺失或 `reporting.json` 不完整时都无法启用，也不会发起任何网络请求或外部进程。
+- 本地长期采集默认开启（仅写本机 SQLite）；上报默认关闭。API 地址为空、canonical hostname 缺失或 `reporting.json` 不完整时都无法启用上报，也不会发起任何网络请求或外部进程。
 - 开启自动上报后会立即执行一次“扫描 → 上报”，此后每 30 分钟重复；关闭开关会停止后续周期，配置失效时会持久化关闭，不会在配置恢复后自行重新开启。
 - `reporting.json` 中的 path、header 名、静态 header、取 token 命令及 JSON key path 均由用户配置；仓库不提供环境相关默认值，token 仅在请求期间驻留内存。
 
@@ -161,7 +161,15 @@ open dist/AgentPulse.app
 - **严格 ACK**：仅当响应逐维度精确回执（buckets / sessions 数量完全一致）时才标记已同步；`2xx {}`、字段缺失、少计或多计一律保持 pending。
 - **按 revision 精确对账**：每行携带 revision 快照，ack 时按（自然键 + revision 快照）精确匹配；上传期间被重算的行不会被误 ack，保持 dirty。
 - **删除即 fail-closed**：删除已同步的派生数据会置位全局对账门禁，普通上报在对账完成前保持禁用，避免远端与本地静默失配。
-- **全量同步禁用**：full sync 始终 blocked，避免以不完整数据替换远端。
+- **全量同步就绪门禁**：full sync 需要 `reporting.json` 携带完整且合法的 `fullSync` 协议段；缺失或不完整时状态保持 blocked（未就绪），不会发起任何请求。
+
+### 谁开谁报、累计 upsert 与 Full Sync
+
+- **谁开谁报（本机 opt-in）**：本地长期采集与上报是两个相互独立的开关——采集默认开启（仅写本机 SQLite），上报默认关闭；只有在本机显式打开上报、填好 API 地址与 canonical hostname、且 `reporting.json` 校验通过时，这台设备才会以自己的 canonical hostname 作为上报身份上报自身账本。未开启上报的设备只在本地统计，不上报，也不代任何其他设备上报。
+- **普通上报 = 累计值幂等 upsert**：每一轮普通上报发送本地账本中该设备**每个 bucket 的完整累计值**（并非单次增量），服务端据此做幂等 upsert。因此漏报、乱序或重试都能自愈：相同自然键重复提交只会覆盖为同一累计值，不会重复累加。
+- **Full Sync 与普通上报的区别**：普通上报是持续、增量触发（启动一次 + 每 30 分钟）、只推送 dirty 行的累计值，服务端做幂等 upsert；Full Sync 则是一次显式的“把本机全部派生行与远端对齐”的修复动作，不依赖上报开关，可在上报关闭时手动执行。它先读取本地 generation 基线并固定账号身份，再向服务端 `reserve` 围栏；只有围栏持久化成功后，才读取同一 generation 的本地快照并执行 `begin → stage → commit`。分块 kind 为 `buckets`、`sessions`、`autonomy`，其中 autonomy 的行数组字段仍为 `autonomySessions`。远端确认 commit 后，本机才对账本做原子 commit（以 generation 与逐行 revision 快照为围栏）。若 reserve 后、快照前崩溃，会在 generation 未变化时复用原围栏；若远端已 commit 但本地 commit 前崩溃/重启，下次会命中幂等 committed 分支并重跑本地 commit。
+- **历史源删除触发 reconciliation gate、Full Sync 修复后清除**：远端协议暂不支持 tombstone。一旦本地重算删除了曾经 ack 过的 bucket/session 自然键（例如清理或改动历史数据源导致派生行消失），会置位全局对账门禁（reconciliation required）并 fail-closed —— 在对账完成前普通上报持续禁用，界面给出被阻原因，防止远端保留本地已不存在的旧行造成静默失配。该门禁持久化，不会因下一次“无变化”的 finalize 自动解除；只有成功跑完一次 Full Sync（远端 commit 成功后本地账本原子 commit）才会清除对账门禁并恢复上报资格。即使本机已无待同步行，只要门禁已置位，Full Sync 仍会完整走一遍协议、由远端据整份快照删除旧行并回执确认，再清除门禁。
+- **API 地址仅本机配置、不随用量上传**：上报目标（base URL）只保存在本机应用偏好中，仅在发起上报时于内存中拼接请求；它既不写入账本 SQLite，也**不会作为任何字段包含在上传的用量 payload 里**。上传内容仅为聚合后的用量维度、token 计数与 hash 后的标识，不含地址、凭证、路径或会话正文。
 
 默认配置路径（文件由用户自行创建，缺失即保持本地模式）：
 
@@ -194,6 +202,13 @@ open dist/AgentPulse.app
     "errorKey": "error",
     "tokenKeyPath": ["data", "accessToken"]
   },
+  "fullSync": {
+    "path": "/your/full-sync/path",
+    "actionNames": { "reserve": "reserve", "begin": "begin", "stage": "stage", "commit": "commit" },
+    "kindNames": { "buckets": "buckets", "sessions": "sessions", "autonomySessions": "autonomy" },
+    "maxRowsPerChunk": 2000,
+    "maxBytesPerChunk": 8388608
+  },
   "localeEnvironmentVariables": ["LC_ALL", "LANG"],
   "batch": { "maxBucketsPerBatch": 500, "maxSessionsPerBatch": 1000, "maxConcurrentBatches": 2 },
   "retry": { "maxRetries": 3, "retryableStatusCodes": [502, 503, 504], "backoffSeconds": [2, 5, 11] }
@@ -206,7 +221,7 @@ open dist/AgentPulse.app
 chmod 600 ~/Library/Application\ Support/AgentPulse/reporting.json
 ```
 
-base URL 单独在设置中配置（保存到 UserDefaults），并按上述传输安全规则校验。取 token 命令的输出由 `statusKey` / `successStatus` / `errorKey` / `tokenKeyPath` 解析，token 不写入 SQLite、UserDefaults 或日志。
+base URL（API 地址）单独在设置中配置、仅保存在本机应用偏好（UserDefaults），发起上报时于内存中拼接请求，不写入账本 SQLite，也不会作为任何字段包含在上传的用量 payload 里。它按上述传输安全规则校验。取 token 命令的输出由 `statusKey` / `successStatus` / `errorKey` / `tokenKeyPath` 解析，token 不写入 SQLite、UserDefaults 或日志。
 
 ---
 
@@ -253,7 +268,7 @@ R2_SECRET_ACCESS_KEY=your-secret-access-key
 ~/Library/Application Support/AgentPulse/usage.sqlite3
 ```
 
-- schema v2、WAL 模式；分层保存原始 token/session 事件、派生的 30 分钟聚合 bucket 与 session、源文件 checkpoint 与同步状态。
+- schema v4、WAL 模式；分层保存原始 token/session 事件、派生的 30 分钟聚合 bucket 与 session、源文件 checkpoint 与按 hostname 隔离的同步状态。
 - 派生行逐行携带 revision 与 synced_revision：revision 大于 synced_revision 即为 dirty；ack 按（自然键 + revision 快照）精确匹配，避免误 ack 上传期间被重算的行。
 - 删除已同步的派生数据会置位全局对账门禁（reconciliation required），在对账完成前普通上报 fail-closed。
 - 源文件删除后已入库历史仍保留；未变化文件按 size、mtime 与 parser version 跳过。
@@ -295,7 +310,7 @@ swift run AgentPulseCollectorSmoke
 - TPS 为固定 180 秒 output-only 速率，区间线性摊分是缺少逐 token 时间戳时的稳定估计，不能还原微观逐 token 速度。
 - Completed 是可读本地 rollout 的下界，无法证明为非 automation 的记录不计入。
 - 费用采用内置 fallback 单价估算，只用于本地观察，不构成账单数据。
-- 全量同步安全门尚未开放，按钮保持禁用。
+- 全量同步需要 `reporting.json` 中完整合法的 `fullSync` 协议段并与配置权威 hostname 对齐；条件不满足时状态为“未就绪”、按钮禁用。
 
 ---
 

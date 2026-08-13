@@ -84,7 +84,11 @@ let package = Package(
             name: "AgentPulseUsageVerification",
             dependencies: ["AgentPulseUsage"],
             path: "Tests/AgentPulseUsageVerification",
-            sources: ["VerificationMain.swift"]
+            sources: [
+                "VerificationMain.swift",
+                "FullSyncVerification.swift",
+                "CoordinatorVerification.swift",
+            ]
         ),
     ],
     swiftLanguageModes: [.v6]

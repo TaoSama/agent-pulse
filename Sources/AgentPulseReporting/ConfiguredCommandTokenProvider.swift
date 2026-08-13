@@ -28,6 +28,9 @@ public enum TokenProviderError: Error, Equatable, Sendable {
     case launchFailed
     /// The helper exited with a non-zero status.
     case commandFailed(exitCode: Int32)
+    /// The helper did not finish within the configured timeout and was
+    /// terminated. No output is captured or surfaced.
+    case timedOut
     /// The helper output was not valid UTF-8 or not the expected JSON envelope.
     case malformedOutput
     /// The envelope reported a non-success status or carried an error field.
@@ -42,7 +45,19 @@ public protocol ProcessRunning: Sendable {
     /// Runs the executable with the given arguments and returns its exit status
     /// and captured standard output bytes. Implementations must not log the
     /// arguments or output, which may contain secrets.
-    func run(executable: String, arguments: [String]) throws -> ProcessResult
+    ///
+    /// The runner must enforce timeout: if the child does not finish within
+    /// timeout seconds it must be terminated and TokenProviderError.timedOut
+    /// thrown. A non-positive timeout means "no timeout".
+    func run(executable: String, arguments: [String], timeout: TimeInterval) throws -> ProcessResult
+}
+
+public extension ProcessRunning {
+    /// Convenience overload defaulting to no timeout, preserving older call
+    /// sites that do not care about deadlines.
+    func run(executable: String, arguments: [String]) throws -> ProcessResult {
+        try run(executable: executable, arguments: arguments, timeout: 0)
+    }
 }
 
 /// Captured result of a single command invocation.
@@ -62,7 +77,7 @@ public struct ProcessResult: Sendable, Equatable {
 public struct SubprocessRunner: ProcessRunning {
     public init() {}
 
-    public func run(executable: String, arguments: [String]) throws -> ProcessResult {
+    public func run(executable: String, arguments: [String], timeout: TimeInterval) throws -> ProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -71,15 +86,84 @@ public struct SubprocessRunner: ProcessRunning {
         process.standardOutput = stdoutPipe
         process.standardError = FileHandle.nullDevice
 
+        // Drain stdout on a dedicated thread so a helper that writes more than
+        // the OS pipe buffer can never deadlock against our wait. The buffer is
+        // guarded by a lock and never logged.
+        let drainedOutput = LockedData()
+        let readHandle = stdoutPipe.fileHandleForReading
+        let drainThread = Thread {
+            let data = readHandle.readDataToEndOfFile()
+            drainedOutput.set(data)
+        }
+        drainThread.name = "token-helper-stdout-drain"
+
         do {
             try process.run()
         } catch {
             throw TokenProviderError.launchFailed
         }
+        drainThread.start()
 
-        let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        if timeout > 0 {
+            let deadline = Date().addingTimeInterval(timeout)
+            while process.isRunning {
+                if Date() >= deadline {
+                    // Terminate then hard-kill to guarantee the child cannot
+                    // outlive the deadline, then let the drain finish so the
+                    // pipe is closed and the thread exits cleanly.
+                    process.terminate()
+                    if process.isRunning {
+                        kill(process.processIdentifier, SIGKILL)
+                    }
+                    process.waitUntilExit()
+                    _ = drainedOutput.waitForCompletion(timeout: 1.0)
+                    throw TokenProviderError.timedOut
+                }
+                // Poll cheaply; the child usually finishes well before this.
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+
         process.waitUntilExit()
-        return ProcessResult(exitCode: process.terminationStatus, standardOutput: data)
+        // Ensure the drain thread has observed EOF before we read the buffer.
+        _ = drainedOutput.waitForCompletion(timeout: 1.0)
+        return ProcessResult(exitCode: process.terminationStatus, standardOutput: drainedOutput.get())
+    }
+}
+
+/// A tiny thread-safe box for the drained stdout bytes. Isolating the buffer
+/// behind a lock keeps the reader thread and the waiter from racing, and keeps
+/// the captured bytes (which may contain a token) off any log path.
+private final class LockedData: @unchecked Sendable {
+    private let lock = NSCondition()
+    private var data = Data()
+    private var completed = false
+
+    func set(_ value: Data) {
+        lock.lock()
+        data = value
+        completed = true
+        lock.signal()
+        lock.unlock()
+    }
+
+    func get() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+
+    /// Waits up to timeout seconds for set() to be called. Returns true when
+    /// the drain completed, false on timeout.
+    @discardableResult
+    func waitForCompletion(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        lock.lock()
+        defer { lock.unlock() }
+        while !completed {
+            if !lock.wait(until: deadline) { return completed }
+        }
+        return true
     }
 }
 
@@ -104,6 +188,10 @@ public struct CommandTokenProviderConfiguration: Sendable, Equatable {
     /// Ordered keys used to walk into the JSON envelope to reach the token
     /// string (for example ["data", "token"]).
     public var tokenKeyPath: [String]
+    /// Maximum seconds the helper may run before it is terminated and
+    /// TokenProviderError.timedOut is thrown. Defaults to 30 seconds; a
+    /// non-positive value disables the timeout.
+    public var timeoutSeconds: TimeInterval
 
     public init(
         executable: String = "",
@@ -112,7 +200,8 @@ public struct CommandTokenProviderConfiguration: Sendable, Equatable {
         statusKey: String = "",
         successStatus: String = "",
         errorKey: String = "",
-        tokenKeyPath: [String] = []
+        tokenKeyPath: [String] = [],
+        timeoutSeconds: TimeInterval = 30
     ) {
         self.executable = executable
         self.arguments = arguments
@@ -121,6 +210,7 @@ public struct CommandTokenProviderConfiguration: Sendable, Equatable {
         self.successStatus = successStatus
         self.errorKey = errorKey
         self.tokenKeyPath = tokenKeyPath
+        self.timeoutSeconds = timeoutSeconds
     }
 
     /// True when an executable and a token path are configured.
@@ -162,7 +252,11 @@ public struct ConfiguredCommandTokenProvider: Sendable {
             arguments.append(contentsOf: configuration.forceRefreshArguments)
         }
 
-        let result = try runner.run(executable: configuration.executable, arguments: arguments)
+        let result = try runner.run(
+            executable: configuration.executable,
+            arguments: arguments,
+            timeout: configuration.timeoutSeconds
+        )
         guard result.exitCode == 0 else {
             throw TokenProviderError.commandFailed(exitCode: result.exitCode)
         }
@@ -206,4 +300,3 @@ public struct ConfiguredCommandTokenProvider: Sendable {
         return current as? String
     }
 }
-

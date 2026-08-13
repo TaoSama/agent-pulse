@@ -3,6 +3,9 @@ import SQLite3
 
 private let usageSQLiteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+/// full sync 提交核对失败的内部信号：在事务内 throw 触发 ROLLBACK，确保 fail-closed 不落部分状态。
+private struct FullSyncFenced: Error { let reason: String; init(_ reason: String) { self.reason = reason } }
+
 public enum UsageLedgerError: Error, CustomStringConvertible {
     case sqlite(String)
     case invalidCheckpoint
@@ -10,6 +13,12 @@ public enum UsageLedgerError: Error, CustomStringConvertible {
     public var description: String {
         switch self { case let .sqlite(message): message; case .invalidCheckpoint: "invalid checkpoint" }
     }
+}
+
+/// reserve-before-snapshot 的快照失败：generation 已被重算推进，快照整体放弃（不返回半快照）。
+/// 仅携带 generation 数字（expected/actual），不含 hostname、路径或用量等敏感数据。
+public enum UsageFullSyncSnapshotError: Error, Sendable, Equatable {
+    case staleGeneration(expected: Int64, actual: Int64)
 }
 
 /// 待上传的单个 bucket 快照：自然键 + 内容 + 该行当前 revision 快照。
@@ -46,6 +55,76 @@ public struct UsagePendingBatch: Sendable, Equatable {
     }
 
     public var isEmpty: Bool { buckets.isEmpty && sessions.isEmpty }
+}
+
+/// 全量同步快照：单事务读取某 hostname 的**全部**派生行（含已 synced），用于与远端做
+/// 完整对账（reconciliation）。
+///
+/// - generation: 本次快照的单调世代号（读取不推进）。快照之后账本若被 finalize/rebuild 重算并
+///   推进 generation，则本快照过期；commitFullSync 以 generation 作为围栏（fence）整体拒绝陈旧提交。
+/// - buckets / sessions: 每行携带其 revision 快照；commit 时按「自然键 + revision 快照」精确匹配。
+/// - reconciliationReason: 当前 remote_reconciliation_required 的原因（无则 nil）。上层据此判断
+///   是否需要触发一次全量对账；成功 commit 后该门禁被清除。
+/// - payload fingerprint 由上层依据 buckets/sessions 内容计算（本层不做序列化假设）。
+public struct UsageFullSyncSnapshot: Sendable, Equatable {
+    public let hostname: String
+    public let generation: Int64
+    public let buckets: [UsagePendingBucket]
+    public let sessions: [UsagePendingSession]
+    public let reconciliationReason: String?
+
+    public init(hostname: String, generation: Int64, buckets: [UsagePendingBucket], sessions: [UsagePendingSession], reconciliationReason: String?) {
+        self.hostname = hostname
+        self.generation = generation
+        self.buckets = buckets
+        self.sessions = sessions
+        self.reconciliationReason = reconciliationReason
+    }
+
+    public var isEmpty: Bool { buckets.isEmpty && sessions.isEmpty }
+}
+
+/// 全量同步提交凭证：由上层在**远端已确认收妥整份快照**后回传给本层。
+///
+/// 必须携带发起时快照的 generation 与逐行 revision 快照。commitFullSync 会：
+/// 1) 用 generation 围栏确认账本自快照以来未被重算；
+/// 2) 逐行按 (自然键, revision 快照) 精确核对当前库行仍完全一致；
+/// 任一不满足即整体 fail-closed（不部分标记、不清 gate）。全部匹配且远端已确认后，才原子
+/// 地把全部行标记为已同步、清除 remote_reconciliation_required、恢复 reportingEligible。
+public struct UsageFullSyncCommit: Sendable, Equatable {
+    public let hostname: String
+    public let generation: Int64
+    public let buckets: [UsagePendingBucket]
+    public let sessions: [UsagePendingSession]
+
+    public init(hostname: String, generation: Int64, buckets: [UsagePendingBucket], sessions: [UsagePendingSession]) {
+        self.hostname = hostname
+        self.generation = generation
+        self.buckets = buckets
+        self.sessions = sessions
+    }
+
+    /// 从快照直接构造提交凭证（远端已确认整份快照时最常用）。
+    public init(snapshot: UsageFullSyncSnapshot) {
+        self.init(hostname: snapshot.hostname, generation: snapshot.generation, buckets: snapshot.buckets, sessions: snapshot.sessions)
+    }
+}
+
+/// 全量同步提交结果。committed == true 表示整份快照已原子标记同步且门禁清除；
+/// false 表示 fail-closed（附原因），此时库状态未被改动。
+public struct UsageFullSyncCommitResult: Sendable, Equatable {
+    public let committed: Bool
+    public let failureReason: String?
+
+    public init(committed: Bool, failureReason: String?) {
+        self.committed = committed
+        self.failureReason = failureReason
+    }
+
+    public static let success = UsageFullSyncCommitResult(committed: true, failureReason: nil)
+    public static func failed(_ reason: String) -> UsageFullSyncCommitResult {
+        UsageFullSyncCommitResult(committed: false, failureReason: reason)
+    }
 }
 
 /// canonical hostname 门禁状态。
@@ -87,7 +166,7 @@ public struct UsageFinalizeResult: Sendable, Equatable {
 /// - canonical hostname 变化时，从原始事件事务重建目标 hostname 派生聚合并清除旧 hostname。
 /// - 显式 rebuild 时事务性清空派生 + 原始 + checkpoint（仅显式 rebuild）。
 public final class UsageLedgerStore: @unchecked Sendable {
-    public static let schemaVersion: Int32 = 2
+    public static let schemaVersion: Int32 = 4
     public static let bucketMilliseconds: Int64 = 30 * 60 * 1_000
     public static let defaultMaxBucketsPerBatch = 500
     public static let defaultMaxSessionsPerBatch = 1_000
@@ -271,7 +350,19 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
         // 3) 重算 sessions（复用聚合器）。
         let sessionEvents = try readAllSessionEvents()
-        let sessions = UsageSessionAggregator.aggregate(events: sessionEvents, hostname: hostname)
+        // session project 内容策略：以同一 (source, sessionHash) 下**最新有效** UsageEvent.project 为准
+        // （按 timestamp 取最大，非空优先），无则回落空串。project 不参与自然键/分组/去重。
+        // 注意：从**全量 raw**（而非血缘去重后的 deduped）计算 —— 去重可能丢弃携带 project 的行，
+        // 从 deduped 取会漏算 project；project 只是内容字段，用全量取最新非空更稳。
+        var sessionProject: [String: (project: String, timestampMs: Int64)] = [:]
+        for event in raw where !event.project.isEmpty {
+            let key = "\(event.source)\u{1}\(event.sessionHash)"
+            if let current = sessionProject[key], current.timestampMs >= event.timestampMs { continue }
+            sessionProject[key] = (event.project, event.timestampMs)
+        }
+        let sessions = UsageSessionAggregator.aggregate(events: sessionEvents, hostname: hostname) { source, sessionHash in
+            sessionProject["\(source)\u{1}\(sessionHash)"]?.project ?? ""
+        }
 
         // 4) 差异写入：仅对内容变化的行提升 revision（变 dirty），未变行保持原 revision/synced。
         let newRevision = try nextRevisionUnlocked(hostname: hostname)
@@ -312,29 +403,45 @@ public final class UsageLedgerStore: @unchecked Sendable {
             changed = true
         }
 
+        // 非 reconciliation 类阻断（如无法证明的 inherited replay）单独持久到 per-host eligibility flag；
+        // reconciliation gate 用独立键，二者在 reportingEligible() 处正交组合。
+        // 关键：per-host flag 不得混入 reconciliation 原因，否则 full sync 清 gate 后无法区分两类阻断。
+        let nonReconciliationEligible = blockedReasons.isEmpty
+
         // 远端协议尚无 tombstone。若本地重算删除了曾经 ack 的自然键，远端仍会保留旧行；
-        // 持久 fail-closed，避免下一次无变化 finalize 又自动恢复 reportingEligible。
+        // 按 hostname 持久 fail-closed，避免下一次无变化 finalize 又自动恢复 reportingEligible，
+        // 也避免用一个全局键混记多个 host 的对账债务（否则任一 host 的全量同步会误清其它 host 的债务）。
         if removedSyncedBuckets > 0 || removedSyncedSessions > 0 {
             let reason = "removed \(removedSyncedBuckets) previously synced bucket(s) and \(removedSyncedSessions) session(s) without remote tombstone support"
-            try setTextUnlocked(key: Self.remoteReconciliationRequiredKey, value: reason)
+            try setTextUnlocked(key: reconciliationKey(hostname), value: reason)
         }
-        if let reason = try readTextUnlocked(key: Self.remoteReconciliationRequiredKey), !reason.isEmpty {
-            blockedReasons.append(reason)
+        // Reflect GLOBAL reconciliation debt: any hostname with outstanding debt blocks reporting,
+        // so append every pending host reason (deterministic order), not just this host s.
+        for debtHost in try pendingReconciliationHostsUnlocked() {
+            if let reason = try readReconciliationReasonUnlocked(hostname: debtHost) {
+                blockedReasons.append(reason)
+            }
         }
 
         if !changed {
             // 无变化则回退 revision 计数，避免无谓递增。
             try setIntUnlocked(key: revisionKey(hostname), value: newRevision - 1)
+        } else {
+            // 派生数据真实变化：推进全量同步 generation，使早于本次重算的 fullSyncSnapshot 提交被围栏拒绝。
+            try nextGenerationUnlocked()
         }
 
+        // per-host flag 仅记录非 reconciliation 阻断；reconciliation 由独立 gate 在 reportingEligible() 组合。
+        try setTextUnlocked(key: reportingEligibleKey(hostname), value: nonReconciliationEligible ? "1" : "0")
+        // 对外返回的整体资格仍需综合两类阻断（blockedReasons 已含 reconciliation）。
         let eligible = blockedReasons.isEmpty
-        try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
         return UsageFinalizeResult(reportingEligible: eligible, blockedReasons: blockedReasons, collapsedInheritedEvents: collapsed)
     }
 
     public func reportingEligible(hostname: String) throws -> Bool {
         try queue.sync {
-            guard try readTextUnlocked(key: Self.remoteReconciliationRequiredKey) == nil else { return false }
+            // 全局 fail-closed：任一 hostname 仍有未对账的远端残留（对账债务），整体不可上报。
+            guard try pendingReconciliationHostsUnlocked().isEmpty else { return false }
             return (try readTextUnlocked(key: reportingEligibleKey(hostname)) ?? "1") == "1"
         }
     }
@@ -453,7 +560,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     private func readSessionsUnlocked(hostname: String) throws -> [UsageSession] {
         let sql = """
-            SELECT source,session_hash,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram
+            SELECT source,session_hash,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram,project
             FROM usage_sessions WHERE hostname=? ORDER BY source,session_hash;
             """
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
@@ -461,6 +568,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         while sqlite3_step(statement) == SQLITE_ROW {
             result.append(UsageSession(
                 hostname: hostname, source: text(statement, 0), sessionHash: text(statement, 1),
+                project: text(statement, 9),
                 firstActivity: date(sqlite3_column_int64(statement, 2)), lastActivity: date(sqlite3_column_int64(statement, 3)),
                 activeSeconds: sqlite3_column_int64(statement, 4), messageCount: sqlite3_column_int64(statement, 5),
                 userMessageCount: sqlite3_column_int64(statement, 6), assistantEvents: sqlite3_column_int64(statement, 7),
@@ -549,7 +657,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     private func readSessionRowsUnlocked(hostname: String) throws -> [String: SessionRow] {
         let sql = """
-            SELECT source,session_hash,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram,revision,synced_revision
+            SELECT source,session_hash,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram,revision,synced_revision,project
             FROM usage_sessions WHERE hostname=?;
             """
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
@@ -557,6 +665,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         while sqlite3_step(statement) == SQLITE_ROW {
             let session = UsageSession(
                 hostname: hostname, source: text(statement, 0), sessionHash: text(statement, 1),
+                project: text(statement, 11),
                 firstActivity: date(sqlite3_column_int64(statement, 2)), lastActivity: date(sqlite3_column_int64(statement, 3)),
                 activeSeconds: sqlite3_column_int64(statement, 4), messageCount: sqlite3_column_int64(statement, 5),
                 userMessageCount: sqlite3_column_int64(statement, 6), assistantEvents: sqlite3_column_int64(statement, 7),
@@ -573,18 +682,19 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     private func upsertSessionUnlocked(_ session: UsageSession, revision: Int64) throws {
         let sql = """
-            INSERT INTO usage_sessions(hostname,source,session_hash,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram,revision,synced_revision,updated_at_ms)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?)
+            INSERT INTO usage_sessions(hostname,source,session_hash,project,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram,revision,synced_revision,updated_at_ms)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?)
             ON CONFLICT(hostname,source,session_hash) DO UPDATE SET
-              first_activity_ms=excluded.first_activity_ms,last_activity_ms=excluded.last_activity_ms,active_seconds=excluded.active_seconds,
+              project=excluded.project,first_activity_ms=excluded.first_activity_ms,last_activity_ms=excluded.last_activity_ms,active_seconds=excluded.active_seconds,
               message_count=excluded.message_count,user_message_count=excluded.user_message_count,assistant_events=excluded.assistant_events,
               hour_histogram=excluded.hour_histogram,revision=excluded.revision,updated_at_ms=excluded.updated_at_ms;
             """
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
         try bind(statement, 1, session.hostname); try bind(statement, 2, session.source); try bind(statement, 3, session.sessionHash)
-        try bind(statement, 4, millis(session.firstActivity)); try bind(statement, 5, millis(session.lastActivity))
-        try bind(statement, 6, session.activeSeconds); try bind(statement, 7, session.messageCount); try bind(statement, 8, session.userMessageCount); try bind(statement, 9, session.assistantEvents)
-        try bind(statement, 10, encodeHistogram(session.hourHistogramUTC)); try bind(statement, 11, revision); try bind(statement, 12, millis(Date()))
+        try bind(statement, 4, session.project)
+        try bind(statement, 5, millis(session.firstActivity)); try bind(statement, 6, millis(session.lastActivity))
+        try bind(statement, 7, session.activeSeconds); try bind(statement, 8, session.messageCount); try bind(statement, 9, session.userMessageCount); try bind(statement, 10, session.assistantEvents)
+        try bind(statement, 11, encodeHistogram(session.hourHistogramUTC)); try bind(statement, 12, revision); try bind(statement, 13, millis(Date()))
         try done(statement)
     }
 
@@ -624,7 +734,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 pendingBuckets.append(UsagePendingBucket(bucket: bucket, revision: sqlite3_column_int64(bucketStmt, 10)))
             }
 
-            var sessionSQL = "SELECT source,session_hash,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram,revision FROM usage_sessions WHERE hostname=? AND revision>synced_revision ORDER BY revision,source,session_hash"
+            var sessionSQL = "SELECT source,session_hash,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram,revision,project FROM usage_sessions WHERE hostname=? AND revision>synced_revision ORDER BY revision,source,session_hash"
             if let sessionLimit { sessionSQL += " LIMIT \(sessionLimit + 1)" }
             sessionSQL += ";"
             let sessionStmt = try prepare(sessionSQL); defer { sqlite3_finalize(sessionStmt) }; try bind(sessionStmt, 1, hostname)
@@ -634,6 +744,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 if let sessionLimit, pendingSessions.count >= sessionLimit { moreSessions = true; break }
                 let session = UsageSession(
                     hostname: hostname, source: text(sessionStmt, 0), sessionHash: text(sessionStmt, 1),
+                    project: text(sessionStmt, 10),
                     firstActivity: date(sqlite3_column_int64(sessionStmt, 2)), lastActivity: date(sqlite3_column_int64(sessionStmt, 3)),
                     activeSeconds: sqlite3_column_int64(sessionStmt, 4), messageCount: sqlite3_column_int64(sessionStmt, 5),
                     userMessageCount: sqlite3_column_int64(sessionStmt, 6), assistantEvents: sqlite3_column_int64(sessionStmt, 7),
@@ -695,6 +806,202 @@ public final class UsageLedgerStore: @unchecked Sendable {
     }
 
 
+    // MARK: - Full sync (generation-fenced reconciliation over ALL rows)
+
+    /// 读取当前全量同步 generation（只读，不推进）。
+    ///
+    /// reserve-before-snapshot 流程：先取 baseline 并在远端预留，再用
+    /// fullSyncSnapshot(hostname:expectedGeneration:) 取同一 generation 的快照；
+    /// 期间账本若被 finalize/rebuild/reset 重算推进 generation，快照整体失败（不返回半快照）。
+    public func fullSyncGenerationBaseline() throws -> Int64 {
+        try queue.sync {
+            try readIntUnlocked(key: Self.fullSyncGenerationKey) ?? 0
+        }
+    }
+
+    /// 兼容入口：等价于 fullSyncSnapshot(hostname:expectedGeneration: nil)。
+    public func fullSyncSnapshot(hostname: String) throws -> UsageFullSyncSnapshot {
+        try fullSyncSnapshot(hostname: hostname, expectedGeneration: nil)
+    }
+
+    /// 单事务读取某 hostname 的**全部**派生行（含已 synced），并附当前单调 generation 与
+    /// reconciliation 原因，用于与远端做完整对账。
+    ///
+    /// generation 在同一事务内只读取、不推进：无数据变化时连续快照的 generation 必须相同，
+    /// 否则「远端已 committed、本地 crash 未及 commit」的上传在恢复时会因重拍快照 generation
+    /// 变大而永远无法通过 commit 围栏。generation 仅在派生数据真实变化（finalize 差异写入 /
+    /// rebuild / reset）时推进，快照后任何这类重算都会使旧快照的 commit 整体失效。
+    /// 快照与 generation 在同一事务内读取，避免读到半更新状态。
+    ///
+    /// expectedGeneration 非 nil 时，同一事务内先读 generation 并要求与之相等；不相等则抛
+    /// UsageFullSyncSnapshotError.staleGeneration 且不读取/返回任何行（无半快照）。
+    /// 全部行与 reconciliationReason 仍在同一一致性范围内读取。
+    public func fullSyncSnapshot(hostname: String, expectedGeneration: Int64?) throws -> UsageFullSyncSnapshot {
+        try queue.sync {
+            var snapshot = UsageFullSyncSnapshot(hostname: hostname, generation: 0, buckets: [], sessions: [], reconciliationReason: nil)
+            try transaction {
+                let generation = try readIntUnlocked(key: Self.fullSyncGenerationKey) ?? 0
+                if let expectedGeneration, expectedGeneration != generation {
+                    throw UsageFullSyncSnapshotError.staleGeneration(expected: expectedGeneration, actual: generation)
+                }
+                let buckets = try readAllBucketPendingUnlocked(hostname: hostname)
+                let sessions = try readAllSessionPendingUnlocked(hostname: hostname)
+                let reason = try readReconciliationReasonUnlocked(hostname: hostname)
+                snapshot = UsageFullSyncSnapshot(hostname: hostname, generation: generation, buckets: buckets, sessions: sessions, reconciliationReason: reason)
+            }
+            return snapshot
+        }
+    }
+
+    /// 指定 hostname 的 remote reconciliation 原因（无则 nil）。上层据此判断该 host 是否需要一次全量对账。
+    public func reconciliationReason(hostname: String) throws -> String? {
+        try queue.sync { try readReconciliationReasonUnlocked(hostname: hostname) }
+    }
+
+    /// 任一存在对账债务的 hostname 的原因（按 hostname 稳定排序取首个），无则 nil。
+    /// 便于观测「当前是否存在任何未对账残留」而不必先知道具体 host。
+    public func reconciliationReason() throws -> String? {
+        try queue.sync {
+            guard let first = try pendingReconciliationHostsUnlocked().first else { return nil }
+            return try readReconciliationReasonUnlocked(hostname: first)
+        }
+    }
+
+    /// 存在对账债务（远端旧行待删除）的 hostname 列表，按 hostname 升序稳定排序。
+    /// coordinator 据此优先驱动旧 host 的全量同步（即便它不是当前 canonical hostname）。
+    public func pendingReconciliationHosts() throws -> [String] {
+        try queue.sync { try pendingReconciliationHostsUnlocked() }
+    }
+
+    /// 提交一次全量同步：generation 围栏 + 逐行精确 revision 核对，整体成功或整体 fail-closed。
+    ///
+    /// 崩溃安全：全部核对与写入在单个 IMMEDIATE 事务内完成；核对不通过时直接返回失败且不改动任何
+    /// 行（不部分标记、不清 gate）。仅当 generation 未过期、且提交携带的每个 (自然键, revision 快照)
+    /// 与当前库行**精确一致**、且提交的行集与当前库该 hostname 全部行集合完全一致（无缺失/无多余）时，
+    /// 才原子地：把全部行 synced_revision 抬到其 revision、清除 remote_reconciliation_required、
+    /// 恢复 reportingEligible。
+    @discardableResult
+    public func commitFullSync(_ commit: UsageFullSyncCommit) throws -> UsageFullSyncCommitResult {
+        try queue.sync {
+            var result = UsageFullSyncCommitResult.failed("uninitialized")
+            do {
+                try transaction {
+                    // 失败路径统一 throw FullSyncFenced 触发 ROLLBACK，绝不落任何部分状态（即便未来在核对前新增写入）。
+                    // 1) generation 围栏：提交的 generation 必须等于当前 generation（快照后未被重算/推进）。
+                    let currentGeneration = try readIntUnlocked(key: Self.fullSyncGenerationKey) ?? 0
+                    guard commit.generation == currentGeneration else {
+                        throw FullSyncFenced("full sync generation fenced: commit=\(commit.generation) current=\(currentGeneration)")
+                    }
+
+                    // 2) 逐行核对当前库行（含 synced）与提交快照精确一致；同时校验行集合完全一致。
+                    // 自然键在库内因主键约束唯一；行集合计数相等 + 每个提交键精确命中，
+                    // 即可证明「无缺失、无多余、无重复键」。
+                    let liveBuckets = try readBucketRowsUnlocked(hostname: commit.hostname)
+                    let liveSessions = try readSessionRowsUnlocked(hostname: commit.hostname)
+                    guard liveBuckets.count == commit.buckets.count, liveSessions.count == commit.sessions.count else {
+                        throw FullSyncFenced("full sync row set changed since snapshot (buckets \(commit.buckets.count)->\(liveBuckets.count), sessions \(commit.sessions.count)->\(liveSessions.count))")
+                    }
+                    var seenBucketKeys = Set<String>(); seenBucketKeys.reserveCapacity(commit.buckets.count)
+                    for pending in commit.buckets {
+                        let b = pending.bucket
+                        let key = "\(b.source)\u{1}\(b.model)\u{1}\(b.project)\u{1}\(millis(b.bucketStart))"
+                        guard seenBucketKeys.insert(key).inserted else {
+                            throw FullSyncFenced("full sync commit contains duplicate bucket key: \(key)")
+                        }
+                        guard let row = liveBuckets[key] else {
+                            throw FullSyncFenced("full sync bucket missing since snapshot: \(key)")
+                        }
+                        guard row.revision == pending.revision, row.counts == b.counts else {
+                            throw FullSyncFenced("full sync bucket changed since snapshot: \(key)")
+                        }
+                    }
+                    var seenSessionKeys = Set<String>(); seenSessionKeys.reserveCapacity(commit.sessions.count)
+                    for pending in commit.sessions {
+                        let s = pending.session
+                        let key = "\(s.source)\u{1}\(s.sessionHash)"
+                        guard seenSessionKeys.insert(key).inserted else {
+                            throw FullSyncFenced("full sync commit contains duplicate session key: \(key)")
+                        }
+                        guard let row = liveSessions[key] else {
+                            throw FullSyncFenced("full sync session missing since snapshot: \(key)")
+                        }
+                        guard row.revision == pending.revision, row.session == s else {
+                            throw FullSyncFenced("full sync session changed since snapshot: \(key)")
+                        }
+                    }
+
+                    // 3) 全部精确匹配 -> 原子标记全部行 synced、清 gate、恢复上报资格。
+                    let nowMs = millis(Date())
+                    let bucketSQL = "UPDATE usage_buckets SET synced_revision=?, updated_at_ms=? WHERE hostname=? AND source=? AND model=? AND project=? AND bucket_start_ms=? AND revision=?;"
+                    let bucketStmt = try prepare(bucketSQL); defer { sqlite3_finalize(bucketStmt) }
+                    for pending in commit.buckets {
+                        let b = pending.bucket
+                        sqlite3_reset(bucketStmt); sqlite3_clear_bindings(bucketStmt)
+                        try bind(bucketStmt, 1, pending.revision); try bind(bucketStmt, 2, nowMs); try bind(bucketStmt, 3, b.hostname)
+                        try bind(bucketStmt, 4, b.source); try bind(bucketStmt, 5, b.model); try bind(bucketStmt, 6, b.project); try bind(bucketStmt, 7, millis(b.bucketStart)); try bind(bucketStmt, 8, pending.revision)
+                        try done(bucketStmt)
+                    }
+                    let sessionSQL = "UPDATE usage_sessions SET synced_revision=?, updated_at_ms=? WHERE hostname=? AND source=? AND session_hash=? AND revision=?;"
+                    let sessionStmt = try prepare(sessionSQL); defer { sqlite3_finalize(sessionStmt) }
+                    for pending in commit.sessions {
+                        let s = pending.session
+                        sqlite3_reset(sessionStmt); sqlite3_clear_bindings(sessionStmt)
+                        try bind(sessionStmt, 1, pending.revision); try bind(sessionStmt, 2, nowMs); try bind(sessionStmt, 3, s.hostname)
+                        try bind(sessionStmt, 4, s.source); try bind(sessionStmt, 5, s.sessionHash); try bind(sessionStmt, 6, pending.revision)
+                        try done(sessionStmt)
+                    }
+
+                    // 全量对账完成：远端已收妥整份快照，仅清除 reconciliation gate。
+                    // 不得无条件 set reportingEligible=1：per-host flag 记录的是非 reconciliation 阻断
+                    //（如无法证明的 inherited replay），full sync 与其无关，覆盖会造成 fail-open。
+                    // 清 gate 后由 reportingEligible() 正交组合：无 gate 且 flag==1 才恢复上报。
+                    // 只清 commit.hostname 自己的对账债务；其它 host 的债务保持不变，
+                    // 由后续针对各自 host 的全量同步分别清除。
+                    try deleteKeyUnlocked(reconciliationKey(commit.hostname))
+                    try setTextUnlocked(key: lastSyncedKey(commit.hostname), value: String(nowMs))
+                    result = .success
+                }
+            } catch let fenced as FullSyncFenced {
+                // 事务已 ROLLBACK：库状态未改动。返回失败原因，交由上层保持 fail-closed。
+                result = .failed(fenced.reason)
+            }
+            return result
+        }
+    }
+
+    /// 读取某 hostname 全部 bucket 行（含 synced），携带 revision 快照。
+    private func readAllBucketPendingUnlocked(hostname: String) throws -> [UsagePendingBucket] {
+        let sql = "SELECT source,model,project,bucket_start_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,revision FROM usage_buckets WHERE hostname=? ORDER BY revision,bucket_start_ms,source,model,project;"
+        let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
+        var result: [UsagePendingBucket] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let counts = UsageTokenCounts(input: sqlite3_column_int64(statement, 4), output: sqlite3_column_int64(statement, 5), cachedInput: sqlite3_column_int64(statement, 6), cacheCreationInput: sqlite3_column_int64(statement, 7), reasoningOutput: sqlite3_column_int64(statement, 8), reportedTotal: sqlite3_column_int64(statement, 9))
+            let bucket = UsageBucket(hostname: hostname, source: text(statement, 0), model: text(statement, 1), project: text(statement, 2), bucketStart: date(sqlite3_column_int64(statement, 3)), counts: counts)
+            result.append(UsagePendingBucket(bucket: bucket, revision: sqlite3_column_int64(statement, 10)))
+        }
+        return result
+    }
+
+    /// 读取某 hostname 全部 session 行（含 synced），携带 revision 快照。
+    private func readAllSessionPendingUnlocked(hostname: String) throws -> [UsagePendingSession] {
+        let sql = "SELECT source,session_hash,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram,revision,project FROM usage_sessions WHERE hostname=? ORDER BY revision,source,session_hash;"
+        let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
+        var result: [UsagePendingSession] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let session = UsageSession(
+                hostname: hostname, source: text(statement, 0), sessionHash: text(statement, 1),
+                project: text(statement, 10),
+                firstActivity: date(sqlite3_column_int64(statement, 2)), lastActivity: date(sqlite3_column_int64(statement, 3)),
+                activeSeconds: sqlite3_column_int64(statement, 4), messageCount: sqlite3_column_int64(statement, 5),
+                userMessageCount: sqlite3_column_int64(statement, 6), assistantEvents: sqlite3_column_int64(statement, 7),
+                hourHistogramUTC: decodeHistogram(text(statement, 8))
+            )
+            result.append(UsagePendingSession(session: session, revision: sqlite3_column_int64(statement, 9)))
+        }
+        return result
+    }
+
+
     // MARK: - Hostname gate + rebuild
 
     public func hostnameState(current hostname: String) throws -> UsageHostnameState {
@@ -735,7 +1042,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 try exec("DELETE FROM usage_session_events;")
                 try exec("DELETE FROM usage_events;")
                 try exec("DELETE FROM usage_files;")
-                try exec("DELETE FROM sync_state WHERE key NOT LIKE 'revision\u{1}%' AND key!='remote_reconciliation_required';")
+                // full_sync_generation 单调不回退：保留其键，供 generation 围栏在 reset 后仍能拒绝旧在途提交。
+                try exec("DELETE FROM sync_state WHERE key NOT LIKE 'revision\u{1}%' AND key NOT LIKE 'remote_reconciliation_required\u{1}%' AND key!='\(Self.fullSyncGenerationKey)';")
+                // 推进 generation：reset 后新快照从更高 generation 继续。
+                try nextGenerationUnlocked()
             }
         }
     }
@@ -758,6 +1068,35 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 try exec("PRAGMA user_version=2;")
             }
         }
+        let afterV2 = try scalar("PRAGMA user_version;")
+        if afterV2 == 2 {
+            try transaction {
+                // v2 -> v3：会话聚合表加 project 内容列（不进自然键）。
+                // 逐列存在性检测后 ALTER，保证幂等且不丢现有数据（234MB 库安全迁移）。
+                // session project 由原始 usage_events.project 派生，不在 usage_session_events 上冗余列。
+                try addColumnIfMissing(table: "usage_sessions", column: "project", definition: "TEXT NOT NULL DEFAULT ''")
+                try exec("PRAGMA user_version=3;")
+            }
+        }
+        let afterV3 = try scalar("PRAGMA user_version;")
+        if afterV3 == 3 {
+            try transaction {
+                // v3 -> v4: split the single global reconciliation debt key into per-hostname keys.
+                // Move any legacy debt to the canonical hostname when known; otherwise drop it,
+                // since without a hostname it cannot be reconciled per host anyway.
+                try migrateLegacyReconciliationDebtUnlocked()
+                try exec("PRAGMA user_version=4;")
+            }
+        }
+    }
+
+    /// 幂等列新增：仅当目标列不存在时执行 ALTER，兼容已被其它路径升级过的库。
+    private func addColumnIfMissing(table: String, column: String, definition: String) throws {
+        let statement = try prepare("SELECT 1 FROM pragma_table_info(?) WHERE name=? LIMIT 1;")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, table); try bind(statement, 2, column)
+        if sqlite3_step(statement) == SQLITE_ROW { return }
+        try exec("ALTER TABLE \(table) ADD COLUMN \(column) \(definition);")
     }
 
     private static let schemaV1SQL = """
@@ -792,11 +1131,66 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return next
     }
 
+    /// 全量同步 generation：全局单调计数（跨 hostname）。只在派生数据真实变化时推进——
+    /// finalize 差异写入、rebuild、reset；fullSyncSnapshot 读取不推进，保证无数据变化时
+    /// 连续快照 generation 相同，crash 恢复可用同一 generation 完成 commit。
+    /// generation 只增不减，reset/rebuild 后不回退（清库时保留其 sync_state 键）。
+    @discardableResult
+    private func nextGenerationUnlocked() throws -> Int64 {
+        let next = (try readIntUnlocked(key: Self.fullSyncGenerationKey) ?? 0) + 1
+        try setIntUnlocked(key: Self.fullSyncGenerationKey, value: next)
+        return next
+    }
+
     private func revisionKey(_ hostname: String) -> String { "revision\u{1}\(hostname)" }
     private func lastSyncedKey(_ hostname: String) -> String { "last_synced_at_ms\u{1}\(hostname)" }
     private func reportingEligibleKey(_ hostname: String) -> String { "reporting_eligible\u{1}\(hostname)" }
-    private static let remoteReconciliationRequiredKey = "remote_reconciliation_required"
+    /// per-host reconciliation debt key (remote still holds old rows to delete): prefix + hostname.
+    private func reconciliationKey(_ hostname: String) -> String { "\(Self.reconciliationKeyPrefix)\(hostname)" }
+    private static let reconciliationKeyPrefix = "remote_reconciliation_required\u{1}"
+    /// Legacy v1 global reconciliation key (no hostname). Migrated to the per-host key under the canonical hostname.
+    private static let legacyReconciliationKey = "remote_reconciliation_required"
+    private static let fullSyncGenerationKey = "full_sync_generation"
     private static let canonicalHostnameKey = "canonical_hostname"
+
+    /// v3 -> v4 migration: relocate the legacy global reconciliation debt key to a per-host key.
+    private func migrateLegacyReconciliationDebtUnlocked() throws {
+        guard let legacy = try readTextUnlocked(key: Self.legacyReconciliationKey), !legacy.isEmpty else {
+            try deleteKeyUnlocked(Self.legacyReconciliationKey)
+            return
+        }
+        if let host = try readTextUnlocked(key: Self.canonicalHostnameKey), !host.isEmpty {
+            // Preserve an already-migrated per-host debt if one exists; never overwrite it.
+            if try readReconciliationReasonUnlocked(hostname: host) == nil {
+                try setTextUnlocked(key: reconciliationKey(host), value: legacy)
+            }
+        }
+        try deleteKeyUnlocked(Self.legacyReconciliationKey)
+    }
+    /// Reads the reconciliation debt reason for a hostname (nil when absent/empty; unlocked, call inside queue.sync).
+    private func readReconciliationReasonUnlocked(hostname: String) throws -> String? {
+        try readTextUnlocked(key: reconciliationKey(hostname)).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// Hostnames that carry reconciliation debt, sorted ascending for stable ordering (unlocked).
+    private func pendingReconciliationHostsUnlocked() throws -> [String] {
+        let prefix = Self.reconciliationKeyPrefix
+        let statement = try prepare("SELECT key FROM sync_state WHERE key GLOB ? AND value<>'' ORDER BY key;")
+        defer { sqlite3_finalize(statement) }
+        var pat = ""
+        for ch in prefix {
+            if ch == "*" || ch == "?" || ch == "[" || ch == "]" {
+                pat.append("["); pat.append(ch); pat.append("]")
+            } else { pat.append(ch) }
+        }
+        try bind(statement, 1, pat + "*")
+        var hosts: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let key = text(statement, 0)
+            hosts.append(String(key.dropFirst(prefix.count)))
+        }
+        return hosts
+    }
 
     private func preserveRevisionHighWatermarksUnlocked() throws {
         let statement = try prepare("""
@@ -837,16 +1231,20 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 sqlite3_column_int64(statement, 2)
             ))
         }
-        let bucketCount = deletions.reduce(Int64(0)) { $0 + $1.buckets }
-        let sessionCount = deletions.reduce(Int64(0)) { $0 + $1.sessions }
-        if bucketCount > 0 || sessionCount > 0 {
-            let reason = "\(reasonPrefix) removed \(bucketCount) previously synced bucket(s) and \(sessionCount) session(s) without remote tombstone support"
-            try setTextUnlocked(key: Self.remoteReconciliationRequiredKey, value: reason)
+        // per-host reconciliation debt: one key per affected hostname
+        for item in deletions where item.buckets > 0 || item.sessions > 0 {
+            let reason = "\(reasonPrefix) removed \(item.buckets) previously synced bucket(s) and \(item.sessions) session(s) without remote tombstone support"
+            try setTextUnlocked(key: reconciliationKey(item.hostname), value: reason)
         }
     }
 
     private func readIntUnlocked(key: String) throws -> Int64? { try readTextUnlocked(key: key).flatMap { Int64($0) } }
     private func setIntUnlocked(key: String, value: Int64) throws { try setTextUnlocked(key: key, value: String(value)) }
+
+    private func deleteKeyUnlocked(_ key: String) throws {
+        let statement = try prepare("DELETE FROM sync_state WHERE key=?;"); defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, key); try done(statement)
+    }
 
     private func readTextUnlocked(key: String) throws -> String? {
         let statement = try prepare("SELECT value FROM sync_state WHERE key=?;"); defer { sqlite3_finalize(statement) }

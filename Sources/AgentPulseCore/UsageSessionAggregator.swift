@@ -15,7 +15,14 @@ public enum UsageSessionAggregator {
     /// - messageCount: 去重后的全部会话事件数。
     /// - userMessageCount: 非 synthetic 的 user 事件数。
     /// - hourHistogramUTC: 按「非 synthetic user prompt」的 UTC 小时落桶（长度 24）。
-    public static func aggregate(events: [UsageSessionEvent], hostname: String) -> [UsageSession] {
+    /// - projectForSession: 按自然键 (source, sessionHash) 解析该会话的 project 内容字段；
+    ///   project 不参与分组 / 去重 / 排序（自然键仍为 hostname/source/sessionHash），
+    ///   仅作为内容字段写入结果。默认返回空串，调用方（账本）可注入真实来源。
+    public static func aggregate(
+        events: [UsageSessionEvent],
+        hostname: String,
+        projectForSession: (_ source: String, _ sessionHash: String) -> String = { _, _ in "" }
+    ) -> [UsageSession] {
         // 1) 去重：按 (source, eventID)。
         var deduped: [String: UsageSessionEvent] = [:]
         for event in events {
@@ -92,6 +99,7 @@ public enum UsageSessionAggregator {
                 hostname: hostname,
                 source: key.source,
                 sessionHash: key.sessionHash,
+                project: projectForSession(key.source, key.sessionHash),
                 firstActivity: first.timestamp,
                 lastActivity: lastActivity,
                 activeSeconds: Int64(activeSeconds.rounded()),

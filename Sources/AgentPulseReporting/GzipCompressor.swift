@@ -1,9 +1,9 @@
 import Foundation
 import zlib
 
-/// Minimal gzip (RFC 1952) compressor used to match the reference producer's
-/// wire format when a request body reaches the size threshold. Backed by the
-/// system zlib with a gzip-framed deflate stream (windowBits 15 + 16).
+/// Minimal gzip (RFC 1952) compressor used for the wire format when a request
+/// body reaches the size threshold. Backed by the system zlib with a
+/// gzip-framed deflate stream (windowBits 15 + 16).
 public enum GzipCompressor {
     /// Compresses the input into a gzip stream. Returns nil if zlib reports an
     /// initialization or stream error, letting the caller fall back to sending

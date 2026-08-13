@@ -27,17 +27,27 @@ public enum UsageJSONLParser {
     /// 解析器版本。v2：稳健 RFC3339（无 distantPast 回退）、原始 session 活动事件、
     /// 基于原始 session id 的稳定 session hash、血缘证明去重（rollout/parent/inherited +
     /// 完整 total 快照指纹）、unknown model backfill。
-    public static let parserVersion = 2
+    /// v3：新增 Claude subagent transcript 处理（token 计入、不产生 session 事件、
+    /// 不做 thinking 拆分）与「原生 reasoning 缺失时按 thinking/其余输出字符比例
+    /// 拆分 output→reasoning（round-half-up，仅 Anthropic 家族）」。
+    public static let parserVersion = 3
 
     public static func fileID(for identity: String) -> String { hash(identity) }
 
-    public static func parse(data: Data, source: String, fileIdentity: String, modifiedAt: Date = Date()) -> ParsedUsageFile {
+    /// 解析一个来源文件。
+    ///
+    /// - isSubagent: 该文件是否为子代理（subagent / Task）transcript。子代理转录只计入
+    ///   token 用量，不产生任何 session 活动事件（否则会按 fork 数量放大会话计数 /
+    ///   活跃时间），且不做 thinking→reasoning 拆分（拆分只在 output 与 reasoning 之间
+    ///   移动 token，二者同价，总量与成本不变；子代理属次要路径，省略该细分可接受）。
+    ///   目前仅 Claude（claude-code）来源使用此标志。
+    public static func parse(data: Data, source: String, fileIdentity: String, modifiedAt: Date = Date(), isSubagent: Bool = false) -> ParsedUsageFile {
         let fileHash = fileID(for: fileIdentity)
         let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
         var diagnostics: [String] = []
         var sessionEvents: [UsageSessionEvent] = []
         let events = source == "claude-code"
-            ? parseClaude(lines, source: source, fileHash: fileHash, sessionEvents: &sessionEvents, diagnostics: &diagnostics)
+            ? parseClaude(lines, source: source, fileHash: fileHash, isSubagent: isSubagent, sessionEvents: &sessionEvents, diagnostics: &diagnostics)
             : parseCodex(lines, source: source, fileHash: fileHash, sessionEvents: &sessionEvents, diagnostics: &diagnostics)
         return ParsedUsageFile(
             events: events,
@@ -62,6 +72,14 @@ public enum UsageJSONLParser {
     private static func parseCodex(_ lines: [Data.SubSequence], source: String, fileHash: String, sessionEvents: inout [UsageSessionEvent], diagnostics: inout [String]) -> [UsageEvent] {
         let sourceName = "codex"
         let metadata = codexMetadata(lines, fileHash: fileHash)
+        // A Codex rollout file is the session boundary. Session identity must be
+        // stable across archival moves (sessions/ -> archived_sessions/), so it is
+        // keyed by the rollout's own stable id rather than the mutable file path.
+        // The conversation session_id is deliberately not used: it is shared by
+        // many rollout files of the same conversation, so it would merge distinct
+        // rollouts into one session. Rollouts without payload.id have no stable
+        // per-rollout identity and fall back to the file identity (fail-safe).
+        let activitySessionHash = codexActivitySessionHash(metadata: metadata, fileHash: fileHash)
         if metadata.hasParentConflict {
             diagnostics.append("session_meta: conflicting parent references; lineage replay disabled")
         }
@@ -78,38 +96,28 @@ public enum UsageJSONLParser {
             let type = string(object["type"])
             let payload = dictionary(object["payload"])
 
-            if type == "session_meta" {
-                appendSessionEvent(
-                    &sessionEvents, source: sourceName, sessionHash: metadata.sessionHash,
-                    identitySessionScope: metadata.hasSessionIdentity ? metadata.sessionHash : "missing-session",
-                    role: .syntheticUser,
-                    object: object, seenIDs: &seenSessionEventIDs,
-                    diagnostics: &diagnostics, index: index
-                )
-            }
-
             if type == "turn_context" {
                 if let authoritativeModel = nonemptyString(payload["model"]) {
                     turnModel = authoritativeModel
                 }
-                appendSessionEvent(
-                    &sessionEvents, source: sourceName, sessionHash: metadata.sessionHash,
-                    identitySessionScope: metadata.hasSessionIdentity ? metadata.sessionHash : "missing-session",
-                    role: .user,
-                    object: object, seenIDs: &seenSessionEventIDs,
-                    diagnostics: &diagnostics, index: index
-                )
                 // The semantic boundary applies even when this record has no usable timestamp.
                 seenFirstTurnContext = true
             }
 
-            if type == "response_item", string(payload["type"]) == "message", codexMessageRole(payload) == .assistant {
+            // Every timestamped rollout record participates in the session
+            // timeline. session_meta/turn_context anchor user turns; all other
+            // records, including token_count, extend assistant activity.
+            let sessionRole: UsageSessionEvent.Role = (type == "session_meta")
+                ? .syntheticUser
+                : (type == "turn_context" ? .user : .assistant)
+            if UsageTimestamp.parse(object["timestamp"]) != nil {
                 appendSessionEvent(
-                    &sessionEvents, source: sourceName, sessionHash: metadata.sessionHash,
-                    identitySessionScope: metadata.hasSessionIdentity ? metadata.sessionHash : "missing-session",
-                    role: .assistant,
+                    &sessionEvents, source: sourceName, sessionHash: activitySessionHash,
+                    identitySessionScope: activitySessionHash,
+                    role: sessionRole,
                     object: object, seenIDs: &seenSessionEventIDs,
-                    diagnostics: &diagnostics, index: index
+                    diagnostics: &diagnostics, index: index,
+                    occurrence: index
                 )
             }
 
@@ -165,7 +173,7 @@ public enum UsageJSONLParser {
 
             result.append(UsageEvent(
                 id: eventID, source: sourceName, model: modelAtEmission, project: metadata.project,
-                timestamp: timestamp, counts: counts, sessionHash: metadata.sessionHash, sourceFileHash: fileHash,
+                timestamp: timestamp, counts: counts, sessionHash: activitySessionHash, sourceFileHash: fileHash,
                 rolloutKey: metadata.rolloutKey, parentRolloutKey: metadata.parentRolloutKey, inherited: inherited,
                 hasTotalSnapshot: hasTotalSnapshot, lineageFingerprint: lineageFingerprint
             ))
@@ -228,6 +236,16 @@ public enum UsageJSONLParser {
         return metadata
     }
 
+    /// Codex 会话活动身份：rollout 文件在 sessions/ 与 archived_sessions/ 之间移动时路径会变，
+    /// 因此不能用文件路径做 session key。优先 rollout 自带的稳定 ID（payload.id，每个 rollout
+    /// 文件唯一）。会话 ID（session_id）不能用：同一会话的多个 rollout 共享它，会把不同
+    /// rollout 合并成一个 session。缺 payload.id 时没有稳定的 per-rollout 身份，直接以文件
+    /// 身份兜底（保持旧的路径键控行为，是该退化场景下的 fail-safe）。
+    private static func codexActivitySessionHash(metadata: CodexMetadata, fileHash: String) -> String {
+        if !metadata.rolloutKey.isEmpty { return metadata.rolloutKey }
+        return String(fileHash.prefix(16))
+    }
+
     private static func codexMessageRole(_ payload: [String: Any]) -> UsageSessionEvent.Role? {
         let rawRole = string(payload["role"]) ?? string(dictionary(payload["message"])["role"])
         return rawRole == "assistant" ? .assistant : nil
@@ -237,8 +255,30 @@ public enum UsageJSONLParser {
 
     private struct ClaudeCandidate { var model: String; var project: String; var timestamp: Date; var counts: UsageTokenCounts; var index: Int; var sessionHash: String }
 
-    private static func parseClaude(_ lines: [Data.SubSequence], source: String, fileHash: String, sessionEvents: inout [UsageSessionEvent], diagnostics: inout [String]) -> [UsageEvent] {
+    /// 单个 assistant turn 的 thinking 与其余输出（text / tool_use）的字符量累计。
+    ///
+    /// Claude Code 把一个 turn 写成共享同一 msg.id 的多行 jsonl —— 每行携带一个内容块，
+    /// 但重复整 turn 的 usage（output_tokens 在每行相同，非叠加）。因此要在 thinking 与
+    /// 其余输出之间分摊该 turn 的 output_tokens，必须跨该 turn 全部行 union 内容块。
+    /// seen 去重 streaming / fork 重刷造成的逐字节相同块（同一块只计一次）。
+    /// 加密的 signature 字段不计入；redacted_thinking 无明文，thinking 主导的 turn 只会
+    /// 在 thinking 侧低估 —— 是诚实下界，绝不高估。
+    private struct ClaudeTurnSplit {
+        var thinkingChars: Int = 0
+        var otherChars: Int = 0
+        var seen: Set<String> = []
+
+        mutating func mark(_ kind: String, _ payload: String) -> Bool {
+            seen.insert("\(kind)\u{0}\(payload)").inserted
+        }
+    }
+
+    private static func parseClaude(_ lines: [Data.SubSequence], source: String, fileHash: String, isSubagent: Bool, sessionEvents: inout [UsageSessionEvent], diagnostics: inout [String]) -> [UsageEvent] {
         var messages: [String: ClaudeCandidate] = [:]
+        // 记录每个候选 entry 归属的稳定 turn id（msg.id 优先，回退 uuid），
+        // 用于扫描结束后按整 turn 字符比例做 thinking 拆分。空串表示不需要拆分。
+        var candidateStableID: [String: String] = [:]
+        var turnChars: [String: ClaudeTurnSplit] = [:]
         var seenSessionEventIDs = Set<String>()
         for (index, line) in lines.enumerated() {
             guard let object = json(line) else { diagnostics.append("line \(index + 1): invalid json"); continue }
@@ -247,7 +287,8 @@ public enum UsageJSONLParser {
             // 保留真实 sessionHash（每行自带 sessionId）；缺失时才以文件兜底。
             let sessionHash = rawSessionID.map(shortHash) ?? shortHash(fileHash)
 
-            if type == "user" || type == "assistant" {
+            // 子代理转录不产生 session 事件：其会话计数 / 活跃时间只应反映主会话。
+            if !isSubagent, type == "user" || type == "assistant" {
                 let role: UsageSessionEvent.Role
                 if type == "assistant" {
                     role = .assistant
@@ -270,6 +311,10 @@ public enum UsageJSONLParser {
             guard type == "assistant" else { continue }
             let message = dictionary(object["message"]); let usage = dictionary(message["usage"]); guard !usage.isEmpty else { continue }
             let id = string(message["id"]) ?? string(object["uuid"]) ?? "line-\(index)"
+            // 累计该 turn 的 thinking / 其余输出字符（仅主转录需要，子代理不拆分）。
+            if !isSubagent {
+                accumulateClaudeTurnChars(message: message, turnID: id, into: &turnChars)
+            }
             guard let timestamp = UsageTimestamp.parse(object["timestamp"]) else {
                 diagnostics.append("line \(index + 1): invalid timestamp (usage skipped)")
                 continue
@@ -280,13 +325,29 @@ public enum UsageJSONLParser {
                 // 同 msg.id 保留最大累计 usage（Claude 流式增量）。真实 sessionHash 以先出现者为准。
                 messages[id] = ClaudeCandidate(model: candidate.model == "unknown" ? old.model : candidate.model, project: candidate.project == "unknown" ? old.project : candidate.project, timestamp: max(old.timestamp, candidate.timestamp), counts: maximum(old.counts, candidate.counts), index: min(old.index, candidate.index), sessionHash: old.sessionHash.isEmpty ? candidate.sessionHash : old.sessionHash)
             } else { messages[id] = candidate }
+            candidateStableID[id] = id
         }
         return messages.sorted { $0.value.index < $1.value.index }.map { id, value in
+            var counts = value.counts
+            // 原生 reasoning 缺失时，按 thinking / 其余输出字符比例把 output 拆一部分入
+            // reasoning（round-half-up）。仅限 Anthropic 家族（该家族 reasoning 与 output
+            // 同价，拆分不改变总花费），且非子代理路径。有原生 reasoning 时优先，不拆。
+            if !isSubagent, counts.reasoningOutput == 0, counts.output > 0, isAnthropicModel(value.model),
+               let split = turnChars[candidateStableID[id] ?? id] {
+                let est = splitOutputTokens(thinkingChars: split.thinkingChars, otherChars: split.otherChars, outputTokens: counts.output)
+                if est > 0 {
+                    counts = UsageTokenCounts(
+                        input: counts.input, output: counts.output - est,
+                        cachedInput: counts.cachedInput, cacheCreationInput: counts.cacheCreationInput,
+                        reasoningOutput: est, reportedTotal: counts.reportedTotal
+                    )
+                }
+            }
             // Claude 同 msg.id 的累计增长依靠稳定 event id 在账本层 UPSERT 取最大，
             // 因此不生成 lineage 指纹（Claude 无跨文件继承回放问题）。
-            UsageEvent(
+            return UsageEvent(
                 id: hash("\(source)|message:\(id)"),
-                source: source, model: value.model, project: value.project, timestamp: value.timestamp, counts: value.counts,
+                source: source, model: value.model, project: value.project, timestamp: value.timestamp, counts: counts,
                 sessionHash: value.sessionHash, sourceFileHash: fileHash,
                 rolloutKey: value.sessionHash, parentRolloutKey: "", inherited: false,
                 hasTotalSnapshot: true, lineageFingerprint: ""
@@ -294,9 +355,71 @@ public enum UsageJSONLParser {
         }
     }
 
+    /// 跨该 turn 的所有行累计 thinking 与其余输出（text / tool_use）的字符量。
+    private static func accumulateClaudeTurnChars(message: [String: Any], turnID: String, into turnChars: inout [String: ClaudeTurnSplit]) {
+        guard let content = message["content"] as? [Any] else { return }
+        var split = turnChars[turnID] ?? ClaudeTurnSplit()
+        for item in content {
+            guard let part = item as? [String: Any] else { continue }
+            switch string(part["type"]) {
+            case "thinking":
+                if let value = string(part["thinking"]), !value.isEmpty, split.mark("t", value) {
+                    split.thinkingChars += value.utf8.count
+                }
+            case "text":
+                if let value = string(part["text"]), !value.isEmpty, split.mark("x", value) {
+                    split.otherChars += value.utf8.count
+                }
+            case "tool_use":
+                let name = string(part["name"]) ?? ""
+                let inputJSON = canonicalJSONValue(part["input"]) ?? ""
+                if name.utf8.count + inputJSON.utf8.count > 0, split.mark("u", "\(name)\u{0}\(inputJSON)") {
+                    split.otherChars += name.utf8.count + inputJSON.utf8.count
+                }
+            default:
+                break
+            }
+        }
+        turnChars[turnID] = split
+    }
+
+    /// 按 thinking 字符占比把已知 output_tokens 分摊给 reasoning（round-half-up 整数拆分）。
+    ///
+    /// 不估算绝对 token（那需要无法内置且可能与计费不一致的分词器），而是拆分「已知总量」：
+    /// 调用方从 output 中扣除该结果，turn 总量不变，字符→token 的换算偏差在比例里相消。
+    /// 无 thinking 文本或无可拆分量时返回 0。
+    private static func splitOutputTokens(thinkingChars: Int, otherChars: Int, outputTokens: Int64) -> Int64 {
+        guard outputTokens > 0, thinkingChars > 0 else { return 0 }
+        let denom = Int64(thinkingChars + otherChars)
+        guard denom > 0 else { return 0 }
+        // round-half-up 整数拆分，无浮点、无分词器。
+        var est = (outputTokens * Int64(thinkingChars) + denom / 2) / denom
+        if est > outputTokens { est = outputTokens }
+        return est
+    }
+
+    /// 是否为 Anthropic / Claude 家族模型 —— 唯一保证 reasoning 与 output 同价的家族，
+    /// thinking 拆分据此门控：拆分把 token 从 output（计费）移入 reasoning，若非该家族
+    /// 且 reasoning 定价为 0，拆分会静默丢失总花费。
+    private static func isAnthropicModel(_ model: String) -> Bool {
+        let value = model.lowercased()
+        return value.contains("claude") || value.contains("sonnet") || value.contains("haiku") || value.contains("opus")
+    }
+
+    /// 把任意 JSON 值稳定序列化为字符串（sortedKeys），用于 tool_use.input 的字符计量。
+    private static func canonicalJSONValue(_ value: Any?) -> String? {
+        guard let value else { return nil }
+        if let object = value as? [String: Any] { return canonicalJSON(object) }
+        guard JSONSerialization.isValidJSONObject(["v": value]),
+              let data = try? JSONSerialization.data(withJSONObject: ["v": value], options: [.sortedKeys, .withoutEscapingSlashes]),
+              let wrapped = String(data: data, encoding: .utf8)
+        else { return String(describing: value) }
+        return wrapped
+    }
+
     // MARK: - Shared helpers
 
-    private static func appendSessionEvent(_ sink: inout [UsageSessionEvent], source: String, sessionHash: String, identitySessionScope: String, role: UsageSessionEvent.Role, object: [String: Any], seenIDs: inout Set<String>, diagnostics: inout [String], index: Int) {
+    private static func appendSessionEvent(_ sink: inout [UsageSessionEvent], source: String, sessionHash: String, identitySessionScope: String, role: UsageSessionEvent.Role, object: [String: Any], seenIDs: inout Set<String>, diagnostics: inout [String], index: Int, occurrence: Int? = nil) {
         guard let timestamp = UsageTimestamp.parse(object["timestamp"]) else {
             diagnostics.append("line \(index + 1): invalid timestamp (session event skipped)")
             return
@@ -305,7 +428,8 @@ public enum UsageJSONLParser {
             diagnostics.append("line \(index + 1): session event identity serialization failed")
             return
         }
-        let id = hash("\(source)|session-event|\(identitySessionScope)|\(role.rawValue)|\(identity)")
+        let occurrenceIdentity = occurrence.map { "|occurrence:\($0)" } ?? ""
+        let id = hash("\(source)|session-event|\(identitySessionScope)|\(role.rawValue)|\(identity)\(occurrenceIdentity)")
         guard seenIDs.insert(id).inserted else { return }
         sink.append(UsageSessionEvent(id: id, source: source, sessionHash: sessionHash, role: role, timestamp: timestamp))
     }
@@ -328,6 +452,10 @@ public enum UsageJSONLParser {
                let id = nonemptyString(payload["id"]) ?? nonemptyString(dictionary(payload["message"])["id"])
             {
                 return "message:\(id)"
+            }
+        case "event_msg":
+            if let payloadType = nonemptyString(payload["type"]) {
+                return "event:\(payloadType):\(canonicalJSON(payload) ?? "")"
             }
         case "user", "assistant":
             if let id = nonemptyString(message["id"]) ?? nonemptyString(object["uuid"]) {

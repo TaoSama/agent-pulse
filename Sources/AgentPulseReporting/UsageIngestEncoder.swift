@@ -211,9 +211,8 @@ struct JSONObjectBuilder {
         }
     }
 
-    /// Escapes a string using the same rules the reference producer applies
-    /// (including HTML-safe escaping of < > &) so encoded bytes match for
-    /// shared inputs.
+    /// Escapes a string with deterministic JSON rules (including HTML-safe
+    /// escaping of < > &) so encoded bytes are stable for shared inputs.
     static func encodeString(_ value: String) -> String {
         var result = "\""
         for scalar in value.unicodeScalars {

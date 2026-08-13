@@ -74,6 +74,8 @@ enum AgentPulseUsageVerification {
         try await verifyPartialAckAndRecovery()
         try await verifyMalformedAcknowledgementsRemainPending()
         try await verifyCancellationKeepsBatchPending()
+        try await FullSyncVerification.run()
+        try await CoordinatorVerification.run()
         print("AgentPulseUsage verification passed")
     }
 
@@ -140,6 +142,7 @@ enum AgentPulseUsageVerification {
 
         let session = UsageSession(
             hostname: "device", source: "source", sessionHash: "session",
+            project: "demo",
             firstActivity: Date(timeIntervalSince1970: 1_800),
             lastActivity: Date(timeIntervalSince1970: 1_860),
             activeSeconds: 45, messageCount: 5, userMessageCount: 2, assistantEvents: 3,
@@ -150,6 +153,7 @@ enum AgentPulseUsageVerification {
             sessionPayload.durationSeconds == 60
                 && sessionPayload.activeSeconds == 45
                 && sessionPayload.messageCount == 5
+                && sessionPayload.project == "demo"
                 && sessionPayload.userPromptHours.count == 24,
             "session mapping failed"
         )

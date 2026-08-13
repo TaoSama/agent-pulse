@@ -8,11 +8,9 @@ struct TokenSyncSettingsSection: View {
         Section("Token 统计") {
             Toggle("本地长期采集", isOn: localCollectionBinding)
 
-            HStack {
-                Text("Canonical hostname")
-                Spacer()
+            LabeledContent("Canonical hostname") {
                 Text(model.tokenSyncStatus.canonicalHostname ?? "未配置")
-                    .foregroundStyle(model.tokenSyncStatus.canonicalHostname == nil ? .red : .secondary)
+                    .foregroundStyle(model.tokenSyncStatus.canonicalHostname == nil ? .red : .primary)
             }
 
             // 配置就绪时以 reporting.json 的 canonical hostname 为权威，不允许用户自由输入
@@ -20,45 +18,43 @@ struct TokenSyncSettingsSection: View {
             if hostnameIsAuthoritative {
                 Text("hostname 由本地上报配置提供，作为上报权威，不可在此修改。")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
             } else {
                 TextField("设备标识（仅本地采集用）", text: hostnameBinding)
                     .textFieldStyle(.roundedBorder)
             }
 
-            HStack {
-                Text("上次扫描")
-                Spacer()
+            LabeledContent("上次扫描") {
                 Text(Self.dateText(model.tokenSyncStatus.lastScanAt))
-                    .foregroundStyle(.secondary)
             }
 
             Button(model.tokenSyncStatus.scanningInProgress ? "正在扫描…" : "立即扫描") {
                 model.scanTokenUsageNow()
             }
-            .disabled(!model.tokenSyncStatus.localCollectionEnabled || model.tokenSyncStatus.scanningInProgress)
+            .disabled(scanDisabled)
 
             Text("历史会话删除后，已入库的 Token 统计仍会保留。")
                 .font(.caption)
-                .foregroundStyle(.secondary)
         }
 
         Section("用量上报") {
-            Toggle("自动上报", isOn: reportingBinding)
+            Toggle("本机上报（谁开谁报）", isOn: reportingBinding)
                 .disabled(!canEnableReporting)
 
             if !canEnableReporting {
                 Text(reportingDisabledReason)
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.red)
             }
 
             TextField("API 地址（留空则仅本地）", text: ingestURLBinding)
                 .textFieldStyle(.roundedBorder)
 
-            HStack {
-                Text("配置状态")
-                Spacer()
+            Text("仅本机使用，不随用量上报。")
+                .font(.caption)
+
+            Text(localToApiRouteText)
+
+            LabeledContent("配置状态") {
                 Text(configurationStatusText)
                     .foregroundStyle(configurationStatusColor)
             }
@@ -66,14 +62,11 @@ struct TokenSyncSettingsSection: View {
             if let error = model.tokenSyncStatus.configurationError {
                 Text(error)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.red)
             }
 
-            HStack {
-                Text("上次上报")
-                Spacer()
+            LabeledContent("上次上报") {
                 Text(Self.dateText(model.tokenSyncStatus.lastReportAt))
-                    .foregroundStyle(.secondary)
             }
 
             if let error = model.tokenSyncStatus.reportingError {
@@ -85,19 +78,17 @@ struct TokenSyncSettingsSection: View {
             if !model.tokenSyncStatus.reportingEligible {
                 Text("上报门禁：存在无法证明的潜在重复，已阻止上报。")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.red)
                 ForEach(model.tokenSyncStatus.reportingBlockedReasons, id: \.self) { reason in
                     Text("• \(reason)")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
             }
 
-            HStack {
-                Text("待上报")
-                Spacer()
-                Text("buckets \(model.tokenSyncStatus.pendingBuckets) · sessions \(model.tokenSyncStatus.pendingSessions)")
-                    .foregroundStyle(.secondary)
+            if pendingTotal > 0 {
+                LabeledContent("待上报") {
+                    Text("buckets \(model.tokenSyncStatus.pendingBuckets) · sessions \(model.tokenSyncStatus.pendingSessions)")
+                }
             }
 
             Button(model.tokenSyncStatus.reportingInProgress ? "正在上报…" : "立即上报") {
@@ -107,23 +98,18 @@ struct TokenSyncSettingsSection: View {
 
             Text(reportFooterText)
                 .font(.caption)
-                .foregroundStyle(.secondary)
         }
 
         Section("全量同步") {
-            HStack {
-                Text("状态")
-                Spacer()
+            LabeledContent("状态") {
                 Text(fullSyncStateText)
-                    .foregroundStyle(.secondary)
             }
             ForEach(model.tokenSyncStatus.fullSyncBlockReasons, id: \.self) { reason in
                 Text("• \(reason)")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
             }
-            Button("开始全量同步") { model.runTokenFullSync() }
-                .disabled(model.tokenSyncStatus.fullSyncState != .ready)
+            Button(fullSyncButtonTitle) { model.runTokenFullSync() }
+                .disabled(fullSyncDisabled)
         }
     }
 
@@ -160,6 +146,17 @@ struct TokenSyncSettingsSection: View {
         model.tokenSyncStatus.configurationStatus == .ready
     }
 
+    /// scan / report / full sync 任一在途时，互斥动作一律禁用，避免并发写账。
+    private var anySyncInProgress: Bool {
+        model.tokenSyncStatus.scanningInProgress
+        || model.tokenSyncStatus.reportingInProgress
+        || model.tokenSyncStatus.fullSyncState == .running
+    }
+
+    private var scanDisabled: Bool {
+        !model.tokenSyncStatus.localCollectionEnabled || anySyncInProgress
+    }
+
     private var canEnableReporting: Bool {
         !model.tokenSyncStatus.ingestBaseURL.isEmpty
         && model.tokenSyncStatus.canonicalHostname != nil
@@ -181,9 +178,14 @@ struct TokenSyncSettingsSection: View {
 
     private var canReport: Bool {
         model.tokenSyncStatus.reportingEnabled
-        && !model.tokenSyncStatus.reportingInProgress
+        && !anySyncInProgress
         && model.tokenSyncStatus.canonicalHostname != nil
         && model.tokenSyncStatus.reportingEligible
+    }
+
+    /// 待上报总数为 0 时隐藏计数行。
+    private var pendingTotal: Int {
+        model.tokenSyncStatus.pendingBuckets + model.tokenSyncStatus.pendingSessions
     }
 
     private var configurationStatusText: String {
@@ -195,7 +197,26 @@ struct TokenSyncSettingsSection: View {
     }
 
     private var configurationStatusColor: Color {
-        model.tokenSyncStatus.configurationStatus == .ready ? .green : .orange
+        model.tokenSyncStatus.configurationStatus == .ready ? .primary : .red
+    }
+
+    /// 只展示 API host，绝不展示完整 URL（路径/查询参数可能含敏感信息）。
+    private var apiHostText: String {
+        let raw = model.tokenSyncStatus.ingestBaseURL
+        for candidate in [raw, "https://\(raw)"] {
+            if let host = URL(string: candidate)?.host, !host.isEmpty {
+                return host
+            }
+        }
+        return "—"
+    }
+
+    private var localToApiRouteText: String {
+        let hostname = model.tokenSyncStatus.canonicalHostname ?? "未配置"
+        guard !model.tokenSyncStatus.ingestBaseURL.isEmpty else {
+            return "本机（\(hostname)）· 仅本地"
+        }
+        return "本机（\(hostname)）→ \(apiHostText)"
     }
 
     private var reportFooterText: String {
@@ -213,6 +234,23 @@ struct TokenSyncSettingsSection: View {
         case .completed: return "已完成"
         case .failed: return "失败"
         }
+    }
+
+    private var fullSyncButtonTitle: String {
+        switch model.tokenSyncStatus.fullSyncState {
+        case .blocked, .ready:
+            return "开始全量同步"
+        case .running:
+            return "正在全量同步…"
+        case .completed:
+            return "重新全量同步"
+        case .failed:
+            return "重试全量同步"
+        }
+    }
+
+    private var fullSyncDisabled: Bool {
+        model.tokenSyncStatus.fullSyncState != .ready || anySyncInProgress
     }
 
     private static let dateFormatter: DateFormatter = {

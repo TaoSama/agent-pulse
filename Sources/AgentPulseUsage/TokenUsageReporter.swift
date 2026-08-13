@@ -110,7 +110,8 @@ public struct TokenUsageReporter: Sendable {
         let provider = ConfiguredCommandTokenProvider(configuration: reporting.tokenCommand.providerConfiguration)
         let client = UsageIngestClient(
             configuration: configuration,
-            tokenSupplier: CommandTokenSupplier(provider: provider)
+            tokenSupplier: CommandTokenSupplier(provider: provider),
+            identity: TokenAccountIdentity(claimKeys: reporting.tokenAccountClaimKeys)
         )
         return UsageBatchOrchestrator(client: client, configuration: reporting.batch.transportConfiguration)
     }
@@ -302,7 +303,7 @@ public enum UsageSessionPayloadMapper {
         sessions.map { session in
             UsageSessionPayload(
                 source: session.source,
-                project: "",
+                project: session.project,
                 sessionHash: session.sessionHash,
                 hostname: session.hostname,
                 firstMessageAt: UsagePayloadDateFormatter.string(from: session.firstActivity),

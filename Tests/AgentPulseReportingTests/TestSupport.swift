@@ -3,15 +3,15 @@ import Foundation
 
 /// Records command invocations and replays a scripted result.
 final class ClosureProcessRunner: ProcessRunning, @unchecked Sendable {
-    struct Invocation: Equatable { let executable: String; let arguments: [String] }
+    struct Invocation: Equatable { let executable: String; let arguments: [String]; let timeout: TimeInterval }
     private(set) var invocations: [Invocation] = []
-    private let body: (String, [String]) throws -> ProcessResult
+    private let body: (String, [String], TimeInterval) throws -> ProcessResult
 
-    init(_ body: @escaping (String, [String]) throws -> ProcessResult) { self.body = body }
+    init(_ body: @escaping (String, [String], TimeInterval) throws -> ProcessResult) { self.body = body }
 
-    func run(executable: String, arguments: [String]) throws -> ProcessResult {
-        invocations.append(Invocation(executable: executable, arguments: arguments))
-        return try body(executable, arguments)
+    func run(executable: String, arguments: [String], timeout: TimeInterval) throws -> ProcessResult {
+        invocations.append(Invocation(executable: executable, arguments: arguments, timeout: timeout))
+        return try body(executable, arguments, timeout)
     }
 }
 
@@ -55,4 +55,3 @@ func makeTestJWT(_ payloadJSON: String) -> String {
     }
     return b64url("{\"alg\":\"none\"}") + "." + b64url(payloadJSON) + ".sig"
 }
-

@@ -186,6 +186,9 @@ public struct UsageSession: Codable, Sendable, Equatable {
     public let hostname: String
     public let source: String
     public let sessionHash: String
+    /// 内容字段：会话归属的 project（内容字段，不参与自然键）。
+    /// 自然键仍为 hostname/source/sessionHash；project 仅描述内容，缺失时为空串。
+    public let project: String
     public let firstActivity: Date
     public let lastActivity: Date
     public let activeSeconds: Int64
@@ -194,10 +197,11 @@ public struct UsageSession: Codable, Sendable, Equatable {
     public let assistantEvents: Int64
     public let hourHistogramUTC: [Int64]
 
-    public init(hostname: String, source: String, sessionHash: String, firstActivity: Date, lastActivity: Date, activeSeconds: Int64, messageCount: Int64, userMessageCount: Int64, assistantEvents: Int64, hourHistogramUTC: [Int64]) {
+    public init(hostname: String, source: String, sessionHash: String, project: String = "", firstActivity: Date, lastActivity: Date, activeSeconds: Int64, messageCount: Int64, userMessageCount: Int64, assistantEvents: Int64, hourHistogramUTC: [Int64]) {
         self.hostname = hostname
         self.source = source
         self.sessionHash = sessionHash
+        self.project = project
         self.firstActivity = firstActivity
         self.lastActivity = lastActivity
         self.activeSeconds = max(0, activeSeconds)
@@ -210,6 +214,34 @@ public struct UsageSession: Codable, Sendable, Equatable {
             histogram[index] = max(0, value)
         }
         self.hourHistogramUTC = histogram
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case hostname, source, sessionHash, project, firstActivity, lastActivity
+        case activeSeconds, messageCount, userMessageCount, assistantEvents, hourHistogramUTC
+    }
+
+    // project 为后加内容字段：旧数据缺失时解码为空串，保持向后兼容。
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let hostname = try container.decode(String.self, forKey: .hostname)
+        let source = try container.decode(String.self, forKey: .source)
+        let sessionHash = try container.decode(String.self, forKey: .sessionHash)
+        let project = try container.decodeIfPresent(String.self, forKey: .project) ?? ""
+        let firstActivity = try container.decode(Date.self, forKey: .firstActivity)
+        let lastActivity = try container.decode(Date.self, forKey: .lastActivity)
+        let activeSeconds = try container.decode(Int64.self, forKey: .activeSeconds)
+        let messageCount = try container.decode(Int64.self, forKey: .messageCount)
+        let userMessageCount = try container.decode(Int64.self, forKey: .userMessageCount)
+        let assistantEvents = try container.decode(Int64.self, forKey: .assistantEvents)
+        let hourHistogramUTC = try container.decode([Int64].self, forKey: .hourHistogramUTC)
+        self.init(
+            hostname: hostname, source: source, sessionHash: sessionHash, project: project,
+            firstActivity: firstActivity, lastActivity: lastActivity,
+            activeSeconds: activeSeconds, messageCount: messageCount,
+            userMessageCount: userMessageCount, assistantEvents: assistantEvents,
+            hourHistogramUTC: hourHistogramUTC
+        )
     }
 }
 

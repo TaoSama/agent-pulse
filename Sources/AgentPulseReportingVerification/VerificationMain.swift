@@ -11,6 +11,7 @@ struct AgentPulseReportingVerification {
     static func main() async throws {
         try verifyTokenConfigGating()
         try verifyTokenParsing()
+        try verifyTokenTimeout()
         try verifyTokenRedaction()
         try verifyCanonicalHostname()
         try verifyEncoderOmitEmptyAndOrder()
@@ -28,6 +29,7 @@ struct AgentPulseReportingVerification {
         try await verifyLargeBodyGzipped()
         try await verify401SingleRefresh()
         try await verifyIdentityFence()
+        try await verifyOpaqueRefreshSemantics()
         try await verifyPersistent401Fails()
         try await verifyNon401Failure()
         try await verifyMalformedAcknowledgementResponses()
@@ -65,7 +67,7 @@ struct AgentPulseReportingVerification {
 
     private static func verifyTokenConfigGating() throws {
         var ran = false
-        let runner = ClosureRunner { _, _ in ran = true; return ProcessResult(exitCode: 0, standardOutput: Data()) }
+        let runner = ClosureRunner { _, _, _ in ran = true; return ProcessResult(exitCode: 0, standardOutput: Data()) }
         let provider = ConfiguredCommandTokenProvider(configuration: CommandTokenProviderConfiguration(), runner: runner)
         do { _ = try provider.token(); try expect(false, "expected configurationMissing") }
         catch let e as TokenProviderError { try expect(e == .configurationMissing, "wrong error: \(e)") }
@@ -79,9 +81,10 @@ struct AgentPulseReportingVerification {
         )
         try expect(token.reveal() == "abc", "token parse mismatch")
 
-        let runner = ClosureRunner { exe, args in
+        let runner = ClosureRunner { exe, args, timeout in
             try expect(exe == "/usr/bin/env", "executable")
             try expect(args == ["auth-helper", "get-token", "--force-refresh"], "force-refresh args: \(args)")
+            try expect(timeout == 30, "default timeout should be 30s: \(timeout)")
             return ProcessResult(exitCode: 0, standardOutput: Data("{\"status\":\"success\",\"data\":{\"token\":\"t\"}}".utf8))
         }
         _ = try ConfiguredCommandTokenProvider(configuration: providerConfig, runner: runner).token(forceRefresh: true)
@@ -91,7 +94,7 @@ struct AgentPulseReportingVerification {
         try expectParseThrows(Data("{\"status\":\"success\",\"error\":\"boom\"}".utf8), .unsuccessfulResponse, "error field")
         try expectParseThrows(Data("{\"status\":\"success\",\"data\":{\"token\":\"\"}}".utf8), .missingToken, "empty token")
 
-        let failRunner = ClosureRunner { _, _ in ProcessResult(exitCode: 9, standardOutput: Data()) }
+        let failRunner = ClosureRunner { _, _, _ in ProcessResult(exitCode: 9, standardOutput: Data()) }
         do { _ = try ConfiguredCommandTokenProvider(configuration: providerConfig, runner: failRunner).token(); try expect(false, "expected failure") }
         catch let e as TokenProviderError { try expect(e == .commandFailed(exitCode: 9), "exit: \(e)") }
     }
@@ -99,6 +102,36 @@ struct AgentPulseReportingVerification {
     private static func expectParseThrows(_ data: Data, _ expected: TokenProviderError, _ label: String) throws {
         do { _ = try ConfiguredCommandTokenProvider.parseToken(from: data, configuration: providerConfig); try expect(false, "expected throw: \(label)") }
         catch let e as TokenProviderError { try expect(e == expected, "wrong error for \(label): \(e)") }
+    }
+
+    private static func verifyTokenTimeout() throws {
+        // Default timeout is 30s and is threaded through to the runner.
+        try expect(CommandTokenProviderConfiguration().timeoutSeconds == 30, "default timeout should be 30s")
+        var timedConfig = providerConfig
+        timedConfig.timeoutSeconds = 12
+        let capture = ClosureRunner { _, _, timeout in
+            try expect(timeout == 12, "configured timeout should pass through: \(timeout)")
+            return ProcessResult(exitCode: 0, standardOutput: Data("{\"status\":\"success\",\"data\":{\"token\":\"t\"}}".utf8))
+        }
+        _ = try ConfiguredCommandTokenProvider(configuration: timedConfig, runner: capture).token()
+
+        // A runner that times out surfaces .timedOut unchanged.
+        let timeoutRunner = ClosureRunner { _, _, _ in throw TokenProviderError.timedOut }
+        do { _ = try ConfiguredCommandTokenProvider(configuration: providerConfig, runner: timeoutRunner).token(); try expect(false, "expected timedOut") }
+        catch let e as TokenProviderError { try expect(e == .timedOut, "wrong error: \(e)") }
+
+        // Real subprocess: a long sleep is terminated at the deadline and never
+        // returns output; a large stdout is drained without deadlock.
+        let runner = SubprocessRunner()
+        let start = Date()
+        do { _ = try runner.run(executable: "/bin/sleep", arguments: ["5"], timeout: 0.3); try expect(false, "expected timedOut from sleep") }
+        catch let e as TokenProviderError { try expect(e == .timedOut, "sleep should time out: \(e)") }
+        try expect(Date().timeIntervalSince(start) < 3.0, "timeout should fire before child exits")
+
+        let big = String(repeating: "a", count: 512 * 1024)
+        let echoResult = try runner.run(executable: "/bin/echo", arguments: [big], timeout: 30)
+        try expect(echoResult.exitCode == 0, "echo exit code")
+        try expect(echoResult.standardOutput.count >= 512 * 1024, "large stdout drained without deadlock")
     }
 
     private static func verifyTokenRedaction() throws {
@@ -326,6 +359,29 @@ struct AgentPulseReportingVerification {
         try expect(supplier.calls == [false, true], "one forced refresh attempted")
     }
 
+    private static func verifyOpaqueRefreshSemantics() async throws {
+        // Opaque (non-JWT) tokens have no claims, so identity falls back to a
+        // digest of the raw bytes. A refresh that yields the SAME opaque token
+        // passes the fence and the retried request succeeds.
+        let samePassSender = ScriptedSender(responses: [HTTPResponse(statusCode: 401, body: Data()), ok()])
+        let samePassSupplier = ScriptedSupplier(tokens: ["opaque-token", "opaque-token"])
+        let samePassClient = UsageIngestClient(configuration: configured(), tokenSupplier: samePassSupplier, sender: samePassSender)
+        let result = try await samePassClient.ingest(request())
+        try expect(result.bucketsUpserted == 1, "same opaque token should recover")
+        try expect(samePassSupplier.calls == [false, true], "one forced refresh for same opaque token")
+        try expect(samePassSender.requests.count == 2, "same opaque token retries once")
+
+        // A refresh that yields a DIFFERENT opaque token trips the fence: the
+        // second request must never be sent.
+        let fenceSender = ScriptedSender(responses: [HTTPResponse(statusCode: 401, body: Data()), ok()])
+        let fenceSupplier = ScriptedSupplier(tokens: ["opaque-token-a", "opaque-token-b"])
+        let fenceClient = UsageIngestClient(configuration: configured(), tokenSupplier: fenceSupplier, sender: fenceSender)
+        do { _ = try await fenceClient.ingest(request()); try expect(false, "expected authIdentityChanged for changed opaque token") }
+        catch let e as IngestClientError { try expect(e == .authIdentityChanged, "wrong error: \(e)") }
+        try expect(fenceSender.requests.count == 1, "changed opaque token must not send second request")
+        try expect(fenceSupplier.calls == [false, true], "one forced refresh attempted for changed opaque token")
+    }
+
     private static func verifyPersistent401Fails() async throws {
         let sender = ScriptedSender(responses: [HTTPResponse(statusCode: 401, body: Data()), HTTPResponse(statusCode: 401, body: Data())])
         let supplier = ScriptedSupplier(tokens: [makeJWT("{\"iss\":\"i\",\"sub\":\"s\"}"), makeJWT("{\"iss\":\"i\",\"sub\":\"s\"}")])
@@ -455,10 +511,10 @@ struct AgentPulseReportingVerification {
 }
 
 private final class ClosureRunner: ProcessRunning, @unchecked Sendable {
-    struct Invocation { let executable: String; let arguments: [String] }
-    private let body: (String, [String]) throws -> ProcessResult
-    init(_ body: @escaping (String, [String]) throws -> ProcessResult) { self.body = body }
-    func run(executable: String, arguments: [String]) throws -> ProcessResult { try body(executable, arguments) }
+    struct Invocation { let executable: String; let arguments: [String]; let timeout: TimeInterval }
+    private let body: (String, [String], TimeInterval) throws -> ProcessResult
+    init(_ body: @escaping (String, [String], TimeInterval) throws -> ProcessResult) { self.body = body }
+    func run(executable: String, arguments: [String], timeout: TimeInterval) throws -> ProcessResult { try body(executable, arguments, timeout) }
 }
 
 private final class ScriptedSender: HTTPRequestSending, @unchecked Sendable {

@@ -146,13 +146,24 @@ struct AgentPulseCoreVerification {
     private static func verifyUsageV2() throws {
         try verifyV2Timestamps()
         try verifyV2ParserProtocol()
+        try verifyV2ClaudeReasoningSplit()
+        try verifyV2ClaudeSubagent()
         try verifyV2SessionAlgorithm()
         try verifyV2ClaudeGrowth()
         try verifyV2InheritedReplayDedup()
+        try verifyV2ArchivedSessionIdentity()
         try verifyV2DirtyAckRaceAndRestart()
         try verifyV2HostnameRebuild()
         try verifyV2Migration()
         try verifyV2ParserRebuildSafety()
+        try verifyV2FullSyncReconciliation()
+        try verifyV2FullSyncStableGenerationAcrossReads()
+        try verifyV2FullSyncReserveBeforeSnapshot()
+        try verifyV2FullSyncCrashRecoverySameGeneration()
+        try verifyV2FullSyncFailClosed()
+        try verifyV2FullSyncPreservesInheritedBlock()
+        try verifyV2FullSyncProjectFromRawNotDeduped()
+        try verifyV2SessionProjectWireAndMigration()
     }
 
     // 1) fractional + 非 fractional RFC3339 解析；无效 timestamp 诊断并跳过（绝不 distantPast）。
@@ -198,20 +209,36 @@ struct AgentPulseCoreVerification {
             return "{\"timestamp\":\"\(timestamp)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\(modelField)\"last_token_usage\":{\"input_tokens\":\(lastInput),\"output_tokens\":\(lastOutput),\"total_tokens\":\(lastInput + lastOutput)}\(totalField)}}}"
         }
 
-        let parent = UsageJSONLParser.parse(
-            data: Data("""
+        let parentData = Data("""
             {"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"rollout-parent","session_id":"session-parent","cwd":"/workspace/protocol-fixture"}}
             {"timestamp":"2026-02-01T00:00:01Z","type":"turn_context","payload":{"model":"model-context"}}
             \(tokenLine("2026-02-01T00:00:02Z", model: "model-info", lastInput: 6, lastOutput: 4, totalInput: 16, totalOutput: 9, total: 25))
             {"timestamp":"2026-02-01T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
-            """.utf8),
-            source: "codex",
-            fileIdentity: "protocol-parent-a"
-        )
+            """.utf8)
+        let parent = UsageJSONLParser.parse(data: parentData, source: "codex", fileIdentity: "protocol-parent-a")
         try require(parent.events.count == 1, "protocol parent token count")
         try require(parent.events[0].model == "model-info", "info.model must override turn_context model")
         try require(parent.events[0].project == "protocol-fixture", "session_meta cwd must determine project")
-        try require(parent.sessionEvents.map(\.role) == [.syntheticUser, .user, .assistant], "Codex session event roles")
+        try require(
+            parent.sessionEvents.map(\.role) == [.syntheticUser, .user, .assistant, .assistant],
+            "every timestamped Codex rollout record must contribute to the session timeline"
+        )
+        let rolloutSessionHash = String(UsageJSONLParser.fileID(for: "rollout-parent").prefix(16))
+        try require(
+            parent.sessionEvents.allSatisfy { $0.sessionHash == rolloutSessionHash }
+                && parent.events[0].sessionHash == rolloutSessionHash,
+            "Codex session identity must be derived from the stable rollout id, not the file path"
+        )
+
+        // 归档稳定性：同一 rollout 内容从 sessions/ 移到 archived_sessions/ 后路径变化，
+        // session 身份与 session 事件 id 必须保持不变，否则会产生重复 session 行。
+        let archivedParent = UsageJSONLParser.parse(data: parentData, source: "codex", fileIdentity: "protocol-parent-archived")
+        try require(
+            archivedParent.sessionEvents.map(\.id) == parent.sessionEvents.map(\.id)
+                && archivedParent.sessionEvents.map(\.sessionHash) == parent.sessionEvents.map(\.sessionHash)
+                && archivedParent.events.map(\.sessionHash) == parent.events.map(\.sessionHash),
+            "archival move must not change Codex session identity"
+        )
 
         let relocatedParent = UsageJSONLParser.parse(
             data: Data("""
@@ -223,8 +250,8 @@ struct AgentPulseCoreVerification {
             source: "codex", fileIdentity: "protocol-parent-relocated"
         )
         try require(
-            parent.sessionEvents.map(\.id) == relocatedParent.sessionEvents.map(\.id),
-            "Codex session event ids must survive path changes, compaction, and line relocation"
+            parent.sessionEvents.map(\.id) != relocatedParent.sessionEvents.map(\.id),
+            "distinct rollout content must not produce identical session event sets"
         )
 
         let missingSessionEventA = UsageJSONLParser.parse(
@@ -240,8 +267,8 @@ struct AgentPulseCoreVerification {
             source: "codex", fileIdentity: "missing-session-path-b"
         )
         try require(
-            missingSessionEventA.sessionEvents[0].id == missingSessionEventB.sessionEvents[0].id,
-            "missing session identity must not leak path into session event id"
+            missingSessionEventA.sessionEvents[0].id != missingSessionEventB.sessionEvents[0].id,
+            "Codex rollout path must distinguish session event identity"
         )
 
         let sameRolloutDifferentSession = UsageJSONLParser.parse(
@@ -252,7 +279,7 @@ struct AgentPulseCoreVerification {
             source: "codex", fileIdentity: "protocol-parent-b"
         )
         try require(parent.events[0].rolloutKey == sameRolloutDifferentSession.events[0].rolloutKey, "payload.id must determine rollout identity")
-        try require(parent.events[0].sessionHash != sameRolloutDifferentSession.events[0].sessionHash, "payload.session_id must independently determine session identity")
+        try require(parent.events[0].sessionHash == sameRolloutDifferentSession.events[0].sessionHash, "same rollout id must map to one session regardless of session_id")
 
         let sameSessionDifferentRollout = UsageJSONLParser.parse(
             data: Data("""
@@ -261,7 +288,7 @@ struct AgentPulseCoreVerification {
             """.utf8),
             source: "codex", fileIdentity: "protocol-parent-c"
         )
-        try require(parent.events[0].sessionHash == sameSessionDifferentRollout.events[0].sessionHash, "equal session_id must produce equal session identity")
+        try require(parent.events[0].sessionHash != sameSessionDifferentRollout.events[0].sessionHash, "equal payload session_id must not merge distinct rollout files")
         try require(parent.events[0].rolloutKey != sameSessionDifferentRollout.events[0].rolloutKey, "rollout identity must not use session_id")
 
         let legacyIdentityA = UsageJSONLParser.parse(
@@ -279,6 +306,12 @@ struct AgentPulseCoreVerification {
             source: "codex", fileIdentity: "legacy-path-b"
         )
         try require(legacyIdentityA.events[0].id == legacyIdentityB.events[0].id, "event id fallback must remain path-independent when rollout id is absent")
+        // 缺 payload.id 时不能回退到共享的 session_id（同会话的多个 rollout 共享它，会被合并），
+        // 直接以文件身份兜底：共享 session_id 的不同文件仍是不同 session。
+        try require(
+            legacyIdentityA.sessionEvents[0].sessionHash != legacyIdentityB.sessionEvents[0].sessionHash,
+            "rollouts without payload.id must not merge via the shared session_id"
+        )
 
         let child = UsageJSONLParser.parse(
             data: Data("""
@@ -399,6 +432,80 @@ struct AgentPulseCoreVerification {
     }
 
 
+    // 1b) Claude 原生 reasoning 缺失时，按 thinking / 其余输出字符比例把 output 拆入 reasoning
+    //     （round-half-up，仅 Anthropic 家族）；有原生 reasoning 时优先，不拆；非 Anthropic 不拆。
+    private static func verifyV2ClaudeReasoningSplit() throws {
+        // thinking 6 字符 + text 2 字符（"hi"），一 turn output=100。
+        // est = round-half-up(100*6 / 8) = round-half-up(600/8=75) = 75；output 变 25。
+        let split = UsageJSONLParser.parse(
+            data: Data("""
+            {"type":"assistant","timestamp":"2026-02-02T00:00:00Z","sessionId":"cs","cwd":"/w/p","message":{"id":"m-split","model":"claude-opus","content":[{"type":"thinking","thinking":"abcdef"},{"type":"text","text":"hi"}],"usage":{"output_tokens":100,"input_tokens":0,"total_tokens":100}}}
+            """.utf8),
+            source: "claude-code", fileIdentity: "claude-split"
+        )
+        try require(split.events.count == 1, "reasoning split single turn")
+        try require(split.events[0].counts.reasoningOutput == 75, "thinking split must carve round-half-up reasoning: got \(split.events[0].counts.reasoningOutput)")
+        try require(split.events[0].counts.output == 25, "carved reasoning must be subtracted from output: got \(split.events[0].counts.output)")
+        try require(split.events[0].counts.total == 100, "split must not change turn total: got \(split.events[0].counts.total)")
+
+        // thinking 跨同 turn 多行 union（每行重复整 turn usage，output 不叠加）。
+        // 行1 thinking 6，行2 text 2；合并后同上 est=75。usage 取最大（此处相同）。
+        let multiline = UsageJSONLParser.parse(
+            data: Data("""
+            {"type":"assistant","timestamp":"2026-02-02T00:00:00Z","sessionId":"cs","cwd":"/w/p","message":{"id":"m-ml","model":"claude-sonnet","content":[{"type":"thinking","thinking":"abcdef"}],"usage":{"output_tokens":100,"total_tokens":100}}}
+            {"type":"assistant","timestamp":"2026-02-02T00:00:01Z","sessionId":"cs","cwd":"/w/p","message":{"id":"m-ml","model":"claude-sonnet","content":[{"type":"text","text":"hi"}],"usage":{"output_tokens":100,"total_tokens":100}}}
+            """.utf8),
+            source: "claude-code", fileIdentity: "claude-split-ml"
+        )
+        try require(multiline.events.count == 1, "multiline turn collapses to one event")
+        try require(multiline.events[0].counts.reasoningOutput == 75 && multiline.events[0].counts.output == 25, "thinking split must union chars across a turn's lines")
+
+        // 有原生 reasoning 时优先，不再拆分。
+        let native = UsageJSONLParser.parse(
+            data: Data("""
+            {"type":"assistant","timestamp":"2026-02-02T00:00:00Z","sessionId":"cs","cwd":"/w/p","message":{"id":"m-native","model":"claude-opus","content":[{"type":"thinking","thinking":"abcdef"},{"type":"text","text":"hi"}],"usage":{"output_tokens":100,"reasoning_output_tokens":10,"total_tokens":100}}}
+            """.utf8),
+            source: "claude-code", fileIdentity: "claude-native"
+        )
+        try require(native.events[0].counts.reasoningOutput == 10 && native.events[0].counts.output == 100, "native reasoning must take precedence over the char split (output left as reported)")
+
+        // 非 Anthropic 家族不拆（避免把计费 token 移入定价可能为 0 的 reasoning）。
+        let nonAnthropic = UsageJSONLParser.parse(
+            data: Data("""
+            {"type":"assistant","timestamp":"2026-02-02T00:00:00Z","sessionId":"cs","cwd":"/w/p","message":{"id":"m-other","model":"gpt-some-model","content":[{"type":"thinking","thinking":"abcdef"},{"type":"text","text":"hi"}],"usage":{"output_tokens":100,"total_tokens":100}}}
+            """.utf8),
+            source: "claude-code", fileIdentity: "claude-non-anthropic"
+        )
+        try require(nonAnthropic.events[0].counts.reasoningOutput == 0 && nonAnthropic.events[0].counts.output == 100, "non-anthropic model must not be split")
+
+        // 无 thinking 文本则不拆。
+        let noThinking = UsageJSONLParser.parse(
+            data: Data("""
+            {"type":"assistant","timestamp":"2026-02-02T00:00:00Z","sessionId":"cs","cwd":"/w/p","message":{"id":"m-nt","model":"claude-opus","content":[{"type":"text","text":"only text"}],"usage":{"output_tokens":100,"total_tokens":100}}}
+            """.utf8),
+            source: "claude-code", fileIdentity: "claude-no-thinking"
+        )
+        try require(noThinking.events[0].counts.reasoningOutput == 0 && noThinking.events[0].counts.output == 100, "no thinking text => no split")
+    }
+
+    // 1c) Claude subagent transcript：token 计入，但不产生任何 session 事件，且不做 thinking 拆分。
+    private static func verifyV2ClaudeSubagent() throws {
+        let transcript = """
+        {"type":"user","timestamp":"2026-02-03T00:00:00Z","sessionId":"sub-session","message":{"content":[{"type":"text","text":"subagent prompt"}]}}
+        {"type":"assistant","timestamp":"2026-02-03T00:00:01Z","sessionId":"sub-session","cwd":"/w/p","message":{"id":"sub-msg","model":"claude-opus","content":[{"type":"thinking","thinking":"abcdef"},{"type":"text","text":"hi"}],"usage":{"output_tokens":100,"input_tokens":5,"total_tokens":105}}}
+        """
+        let sub = UsageJSONLParser.parse(data: Data(transcript.utf8), source: "claude-code", fileIdentity: "sub.jsonl", isSubagent: true)
+        try require(sub.events.count == 1, "subagent token usage must be counted")
+        try require(sub.sessionEvents.isEmpty, "subagent transcript must emit no session events")
+        try require(sub.events[0].counts.output == 100 && sub.events[0].counts.reasoningOutput == 0, "subagent path must not carve thinking out of output")
+        try require(sub.events[0].counts.total == 105, "subagent token total preserved")
+
+        // 同一转录作为主会话解析时，应产生 session 事件并做拆分，验证 isSubagent 是唯一差异。
+        let asMain = UsageJSONLParser.parse(data: Data(transcript.utf8), source: "claude-code", fileIdentity: "sub.jsonl")
+        try require(!asMain.sessionEvents.isEmpty, "main transcript must emit session events")
+        try require(asMain.events[0].counts.reasoningOutput == 75, "main transcript must apply the thinking split")
+    }
+
     // 2) session 算法：去重/分组/排序、活跃秒数、非synthetic user 计数、UTC 直方图（按 user prompt）。
     private static func verifyV2SessionAlgorithm() throws {
         func ev(_ id: String, _ role: UsageSessionEvent.Role, _ iso: String) -> UsageSessionEvent {
@@ -425,6 +532,23 @@ struct AgentPulseCoreVerification {
         // 直方图按 user prompt 落 UTC 00 点，共 2 个非 synthetic user。
         try require(s.hourHistogramUTC[0] == 2, "UTC histogram must count non-synthetic user prompts at hour 0")
         try require(s.hourHistogramUTC.reduce(0,+) == 2, "histogram total equals user prompts, not assistant")
+
+        // project 内容字段：默认解析为空串，不参与自然键。
+        try require(s.project == "", "session project must default to empty when no resolver is provided")
+
+        // 注入 project resolver：project 作为内容字段贯通，但自然键 (source, sessionHash)
+        // 与分组 / 聚合结果保持不变。
+        let withProject = UsageSessionAggregator.aggregate(events: events, hostname: "h") { source, sessionHash in
+            source == "codex" && sessionHash == "sess" ? "acme" : ""
+        }
+        try require(withProject.count == 1, "project resolver must not change session grouping")
+        let ps = withProject[0]
+        try require(ps.project == "acme", "resolved project must flow into session content field: got \(ps.project)")
+        try require(
+            ps.source == s.source && ps.sessionHash == s.sessionHash
+                && ps.activeSeconds == s.activeSeconds && ps.messageCount == s.messageCount,
+            "project must be a content field only; natural key and aggregates must be unchanged"
+        )
     }
 
     // 3) Claude 同 msg.id 累计增长：账本按 UPSERT 取最大，不能丢更新。
@@ -507,6 +631,37 @@ struct AgentPulseCoreVerification {
         try require(!eligibleFlag, "reportingEligible(hostname:) reflects blocked state")
     }
 
+
+    // 4b) 归档去重：同一 rollout 内容先后以 sessions/ 与 archived_sessions/ 两条路径扫描，
+    // 只聚合一个 session，token 与会话消息均不重复。
+    private static func verifyV2ArchivedSessionIdentity() throws {
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        let ledger = try UsageLedgerStore(path: db.path)
+        let rollout = """
+        {"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"rollout-archive","session_id":"session-archive","cwd":"/w/p"}}
+        {"timestamp":"2026-05-01T00:00:01Z","type":"turn_context","payload":{"model":"m"}}
+        {"timestamp":"2026-05-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":3,"output_tokens":7,"total_tokens":10}}}}
+        """
+        let data = Data(rollout.utf8)
+        // 模拟文件从 sessions/ 移动到 archived_sessions/：内容相同，路径不同。
+        let live = UsageJSONLParser.parse(data: data, source: "codex", fileIdentity: "/Users/u/.codex/sessions/2026/05/01/rollout-archive.jsonl")
+        try ledger.record(events: live.events, sessionEvents: live.sessionEvents, checkpoint: live.checkpoint, hostname: "h")
+        try ledger.finalizeDerived(hostname: "h")
+        let archived = UsageJSONLParser.parse(data: data, source: "codex", fileIdentity: "/Users/u/.codex/archived_sessions/rollout-archive.jsonl")
+        try ledger.record(events: archived.events, sessionEvents: archived.sessionEvents, checkpoint: archived.checkpoint, hostname: "h")
+        try ledger.finalizeDerived(hostname: "h")
+
+        let sessions = try ledger.sessions(hostname: "h")
+        try require(sessions.count == 1, "archival move must not duplicate the session: got \(sessions.count)")
+        let buckets = try ledger.buckets(hostname: "h")
+        try require(buckets.count == 1 && buckets[0].counts.total == 10, "tokens must not double after archival re-scan")
+        let rawEventCount = try ledger.eventCount()
+        let rawSessionEventCount = try ledger.sessionEventCount()
+        try require(rawEventCount == 1, "token events dedup by stable event id")
+        try require(rawSessionEventCount == 3, "session events dedup by stable identity")
+        let s = sessions[0]
+        try require(s.messageCount == 3 && s.userMessageCount == 1, "session timeline preserved exactly once")
+    }
 
     // 5) 逐行 dirty/ack race + 精确 ack + 重启恢复。
     private static func verifyV2DirtyAckRaceAndRestart() throws {
@@ -631,6 +786,10 @@ struct AgentPulseCoreVerification {
 
     // 8) parser rebuild 检测、revision 单调性与无 tombstone 时的全局上报门禁。
     private static func verifyV2ParserRebuildSafety() throws {
+        // 跟随解析器当前版本，并断言上一版本会触发重建，覆盖 parserVersion 提升。
+        let currentVersion = UsageJSONLParser.parserVersion
+        let previousVersion = currentVersion - 1
+        try require(currentVersion >= 3, "parser version must be bumped for subagent + reasoning-split parity")
         func checkpoint(version: Int, fileID: String = "file") -> UsageFileCheckpoint {
             UsageFileCheckpoint(
                 fileID: fileID, source: "codex", pathHash: fileID,
@@ -654,21 +813,21 @@ struct AgentPulseCoreVerification {
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             let ledger = try UsageLedgerStore(path: db.path)
-            let emptyRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: 2)
+            let emptyRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: currentVersion)
             try require(!emptyRequiresRebuild, "empty usage ledger must not require parser rebuild")
-            try ledger.record(events: [event()], checkpoint: checkpoint(version: 2), hostname: "h")
-            let currentParserRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: 2)
+            try ledger.record(events: [event()], checkpoint: checkpoint(version: currentVersion), hostname: "h")
+            let currentParserRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: currentVersion)
             try require(!currentParserRequiresRebuild, "healthy current parser ledger must not require rebuild")
-            try ledger.record(events: [event()], checkpoint: checkpoint(version: 1), hostname: "h")
-            let oldParserRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: 2)
-            try require(oldParserRequiresRebuild, "older parser checkpoint must require rebuild")
+            try ledger.record(events: [event()], checkpoint: checkpoint(version: previousVersion), hostname: "h")
+            let oldParserRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: currentVersion)
+            try require(oldParserRequiresRebuild, "older parser checkpoint (v\(previousVersion)) must require rebuild under v\(currentVersion)")
         }
 
         // 有历史数据却没有 checkpoint，无法证明 parser 版本，必须 fail-safe rebuild。
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             var ledger: UsageLedgerStore? = try UsageLedgerStore(path: db.path)
-            try ledger!.record(events: [event()], checkpoint: checkpoint(version: 2), hostname: "h")
+            try ledger!.record(events: [event()], checkpoint: checkpoint(version: currentVersion), hostname: "h")
             ledger = nil
 
             var handle: OpaquePointer?
@@ -677,7 +836,7 @@ struct AgentPulseCoreVerification {
             try require(sqlite3_exec(handle, "DELETE FROM usage_files;", nil, nil, nil) == SQLITE_OK, "remove checkpoints for rebuild verification")
 
             let reopened = try UsageLedgerStore(path: db.path)
-            let historyRequiresRebuild = try reopened.requiresParserRebuild(currentParserVersion: 2)
+            let historyRequiresRebuild = try reopened.requiresParserRebuild(currentParserVersion: currentVersion)
             try require(historyRequiresRebuild, "history without checkpoints must require rebuild")
         }
 
@@ -686,8 +845,8 @@ struct AgentPulseCoreVerification {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             let ledger = try UsageLedgerStore(path: db.path)
             let invalid = event(timestamp: Date(timeIntervalSince1970: -62_135_769_600))
-            try ledger.record(events: [invalid], checkpoint: checkpoint(version: 2), hostname: "h")
-            let timestampRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: 2)
+            try ledger.record(events: [invalid], checkpoint: checkpoint(version: currentVersion), hostname: "h")
+            let timestampRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: currentVersion)
             try require(timestampRequiresRebuild, "negative historical timestamp must require rebuild")
         }
 
@@ -695,13 +854,13 @@ struct AgentPulseCoreVerification {
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             let ledger = try UsageLedgerStore(path: db.path)
-            try ledger.record(events: [event()], checkpoint: checkpoint(version: 1), hostname: "h")
+            try ledger.record(events: [event()], checkpoint: checkpoint(version: previousVersion), hostname: "h")
             try ledger.finalizeDerived(hostname: "h")
             let staleBatch = try ledger.pendingBatch(hostname: "h")
             try require(staleBatch.buckets.first?.revision == 1, "initial rebuild verification revision")
 
             try ledger.resetForRebuild()
-            try ledger.record(events: [event()], checkpoint: checkpoint(version: 2), hostname: "h")
+            try ledger.record(events: [event()], checkpoint: checkpoint(version: currentVersion), hostname: "h")
             try ledger.finalizeDerived(hostname: "h")
             let rebuiltBatch = try ledger.pendingBatch(hostname: "h")
             try require(rebuiltBatch.buckets.first?.revision == 2, "reset must preserve monotonic revision high watermark")
@@ -773,6 +932,7 @@ struct AgentPulseCoreVerification {
             let newHostEligible = try ledger.reportingEligible(hostname: "new-host")
             let thirdHostEligible = try ledger.reportingEligible(hostname: "third-host")
             let postRebuildFinalize = try ledger.finalizeDerived(hostname: "new-host")
+            _ = postRebuildFinalize.blockedReasons
             try require(!oldHostEligible, "hostname rebuild block must cover old hostname")
             try require(!newHostEligible, "hostname rebuild block must cover new hostname")
             try require(!thirdHostEligible, "hostname rebuild block must be global")
@@ -1936,4 +2096,484 @@ struct AgentPulseCoreVerification {
     private static func abortedEvent() -> String {
         "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\"}}"
     }
+
+    // ===== Full sync ledger verifier (owned by implement_ledger_fullsync_api) =====
+
+    // FS-1) 全量快照含已 synced 行；generation fence；成功 commit 原子清 gate + mark synced + 恢复上报。
+    private static func verifyV2FullSyncReconciliation() throws {
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        var ledger: UsageLedgerStore? = try UsageLedgerStore(path: db.path)
+        func codexFile(_ session: String, ts: String, out: Int) -> String {
+            """
+            {"type":"session_meta","payload":{"session_id":"\(session)","thread_source":"user","cwd":"/w/proj-a"}}
+            {"type":"turn_context","payload":{"model":"m"}}
+            {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
+            {"timestamp":"\(ts)","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":\(out),"total_tokens":\(out)}}}}
+            """
+        }
+        let f1 = UsageJSONLParser.parse(data: Data(codexFile("s1", ts: "2026-09-01T00:00:00Z", out: 100).utf8), source: "codex", fileIdentity: "fs1.jsonl")
+        let f2 = UsageJSONLParser.parse(data: Data(codexFile("s2", ts: "2026-09-01T01:00:00Z", out: 200).utf8), source: "codex", fileIdentity: "fs2.jsonl")
+        try ledger!.record(events: f1.events, sessionEvents: f1.sessionEvents, checkpoint: f1.checkpoint, hostname: "h")
+        try ledger!.record(events: f2.events, sessionEvents: f2.sessionEvents, checkpoint: f2.checkpoint, hostname: "h")
+        try ledger!.finalizeDerived(hostname: "h")
+
+        // 先用增量 ack 把全部行标记 synced，以证明全量快照仍会读出已 synced 行。
+        let inc = try ledger!.pendingBatch(hostname: "h")
+        try require(!inc.isEmpty, "incremental batch should have dirty rows before ack")
+        try ledger!.acknowledge(inc)
+        let afterAckPending = try ledger!.pendingBatch(hostname: "h")
+        try require(afterAckPending.isEmpty, "all rows synced after incremental ack")
+
+        // 全量快照：即便无 dirty，也应读出全部行（含已 synced）。
+        let snapshot = try ledger!.fullSyncSnapshot(hostname: "h")
+        try require(snapshot.buckets.count == 2, "full sync snapshot must include ALL buckets incl synced: got \(snapshot.buckets.count)")
+        try require(snapshot.sessions.count == 2, "full sync snapshot must include ALL sessions incl synced: got \(snapshot.sessions.count)")
+        try require(snapshot.generation > 0, "snapshot carries a monotonic generation")
+        try require(snapshot.buckets.allSatisfy { $0.revision > 0 }, "each snapshot row carries its revision")
+
+        // generation fence：无数据变化时连续快照 generation 必须相同（读取不推进），
+        // 否则远端已 committed 后本地 crash，重拍快照 generation 变大将导致永远无法恢复。
+        let stableGen = snapshot.generation
+        let snapshot2 = try ledger!.fullSyncSnapshot(hostname: "h")
+        try require(snapshot2.generation == stableGen, "consecutive snapshots without data changes must share generation")
+        // 派生数据真实变化才推进 generation：写入新事件并 finalize 后，旧快照 commit 必须被围栏拒绝。
+        let f3 = UsageJSONLParser.parse(data: Data(codexFile("s3", ts: "2026-09-01T02:00:00Z", out: 300).utf8), source: "codex", fileIdentity: "fs3.jsonl")
+        try ledger!.record(events: f3.events, sessionEvents: f3.sessionEvents, checkpoint: f3.checkpoint, hostname: "h")
+        try ledger!.finalizeDerived(hostname: "h")
+        let fenced = try ledger!.commitFullSync(UsageFullSyncCommit(snapshot: snapshot))
+        try require(!fenced.committed, "stale-generation full sync commit must be fenced")
+        try require(fenced.failureReason?.contains("generation") == true, "fence reason mentions generation")
+
+        // Trigger reconciliation debt: rebuilding to a new host deletes the OLD host h synced rows.
+        // Per-host bookkeeping records the debt under h (the host that lost synced rows), not other-host.
+        try ledger!.rebuildForHostname("other-host")
+        let debtHosts = try ledger!.pendingReconciliationHosts()
+        try require(debtHosts == ["h"], "debt is recorded under the host whose synced rows were deleted")
+        let hEligible = try ledger!.reportingEligible(hostname: "h")
+        try require(!hEligible, "debt globally blocks reporting eligibility")
+
+        // The debt host h has no local rows left, but its snapshot still surfaces the reason,
+        // so an empty full sync can delete the stale remote rows for h.
+        let debtSnap = try ledger!.fullSyncSnapshot(hostname: "h")
+        try require(debtSnap.isEmpty, "debt host has no local rows after rebuild")
+        try require(debtSnap.reconciliationReason != nil, "debt-host snapshot surfaces the active reconciliation reason")
+
+        // Reconciling other-host must NOT clear h debt: it is a different host.
+        let snapOther = try ledger!.fullSyncSnapshot(hostname: "other-host")
+        try require(!snapOther.isEmpty, "rebuilt host has rows to reconcile")
+        try require(snapOther.reconciliationReason == nil, "other-host carries no debt of its own")
+        let otherOK = try ledger!.commitFullSync(UsageFullSyncCommit(snapshot: snapOther))
+        try require(otherOK.committed, "other-host full sync commit succeeds: \(otherOK.failureReason ?? "")")
+        let debtAfterOther = try ledger!.pendingReconciliationHosts()
+        try require(debtAfterOther == ["h"], "committing other-host must not clear h debt")
+
+        // Only an empty full sync targeting h clears h debt and restores eligibility.
+        let hCommit = try ledger!.commitFullSync(UsageFullSyncCommit(snapshot: debtSnap))
+        try require(hCommit.committed, "empty full sync for h commits: \(hCommit.failureReason ?? "")")
+        let clearedReason = try ledger!.reconciliationReason()
+        try require(clearedReason == nil, "h full sync clears reconciliation gate")
+        let clearedHosts = try ledger!.pendingReconciliationHosts()
+        try require(clearedHosts.isEmpty, "no pending debt after clearing h")
+        let restoredEligible = try ledger!.reportingEligible(hostname: "other-host")
+        try require(restoredEligible, "clearing all debt restores reporting eligibility")
+
+        // Cleared debt and synced state survive restart.
+        ledger = nil
+        let reopened = try UsageLedgerStore(path: db.path)
+        let restartHosts = try reopened.pendingReconciliationHosts()
+        try require(restartHosts.isEmpty, "cleared debt survives restart")
+        let restartReason = try reopened.reconciliationReason()
+        try require(restartReason == nil, "cleared gate survives restart")
+    }
+
+    // FS-GEN-1) 回归：无数据变化时连续 fullSyncSnapshot 的 generation 必须相同。
+    // 读取不推进 generation——否则远端已 committed 后本地 crash，重拍快照 generation 变大，
+    // 旧上传的 ledger commit 永远无法通过围栏，无法恢复。
+    private static func verifyV2FullSyncStableGenerationAcrossReads() throws {
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        let ledger = try UsageLedgerStore(path: db.path)
+        let f1 = UsageJSONLParser.parse(data: Data("""
+        {"type":"session_meta","payload":{"session_id":"g1","thread_source":"user","cwd":"/w/g1"}}
+        {"type":"turn_context","payload":{"model":"m"}}
+        {"timestamp":"2026-09-10T00:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
+        {"timestamp":"2026-09-10T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":10,"total_tokens":10}}}}
+        """.utf8), source: "codex", fileIdentity: "gen1.jsonl")
+        try ledger.record(events: f1.events, sessionEvents: f1.sessionEvents, checkpoint: f1.checkpoint, hostname: "h")
+        try ledger.finalizeDerived(hostname: "h")
+
+        let first = try ledger.fullSyncSnapshot(hostname: "h")
+        try require(first.generation > 0, "first snapshot after derived changes carries an advanced generation")
+        let second = try ledger.fullSyncSnapshot(hostname: "h")
+        let third = try ledger.fullSyncSnapshot(hostname: "h")
+        try require(second.generation == first.generation, "consecutive snapshots must share generation (read must not advance)")
+        try require(third.generation == first.generation, "repeated reads keep a stable generation")
+        try require(second.buckets == first.buckets && second.sessions == first.sessions, "stable snapshot content across reads")
+
+        // 无变化 finalize 也不推进 generation。
+        try ledger.finalizeDerived(hostname: "h")
+        let afterIdleFinalize = try ledger.fullSyncSnapshot(hostname: "h")
+        try require(afterIdleFinalize.generation == first.generation, "finalize without derived changes must not advance generation")
+
+        // 真实派生变化推进 generation，旧快照被围栏。
+        let f2 = UsageJSONLParser.parse(data: Data("""
+        {"type":"session_meta","payload":{"session_id":"g2","thread_source":"user","cwd":"/w/g2"}}
+        {"type":"turn_context","payload":{"model":"m"}}
+        {"timestamp":"2026-09-10T01:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
+        {"timestamp":"2026-09-10T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":20,"total_tokens":20}}}}
+        """.utf8), source: "codex", fileIdentity: "gen2.jsonl")
+        try ledger.record(events: f2.events, sessionEvents: f2.sessionEvents, checkpoint: f2.checkpoint, hostname: "h")
+        try ledger.finalizeDerived(hostname: "h")
+        let changed = try ledger.fullSyncSnapshot(hostname: "h")
+        try require(changed.generation > first.generation, "real derived changes must advance generation")
+        let staleCommit = try ledger.commitFullSync(UsageFullSyncCommit(snapshot: first))
+        try require(!staleCommit.committed, "pre-change snapshot commit must be fenced after derived changes")
+    }
+
+    // FS-RESERVE) reserve-before-snapshot：baseline 只读不推进；expectedGeneration 匹配成功；
+    // generation 变化后 stale 且不返回半快照；旧 API 兼容；无数据 / 有 gate 均正确。
+    private static func verifyV2FullSyncReserveBeforeSnapshot() throws {
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        let ledger = try UsageLedgerStore(path: db.path)
+        func codexFile(_ session: String, ts: String, out: Int) -> String {
+            """
+            {"type":"session_meta","payload":{"session_id":"\(session)","thread_source":"user","cwd":"/w/rs"}}
+            {"type":"turn_context","payload":{"model":"m"}}
+            {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
+            {"timestamp":"\(ts)","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":\(out),"total_tokens":\(out)}}}}
+            """
+        }
+
+        // 无数据：baseline 为 0 且读取不推进；expectedGeneration=0 的空快照成功。
+        let emptyBaseline = try ledger.fullSyncGenerationBaseline()
+        try require(emptyBaseline == 0, "fresh ledger baseline starts at 0")
+        let emptyBaselineAgain = try ledger.fullSyncGenerationBaseline()
+        try require(emptyBaselineAgain == emptyBaseline, "baseline read must not advance generation")
+        let emptySnap = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: emptyBaseline)
+        try require(emptySnap.isEmpty && emptySnap.generation == 0 && emptySnap.reconciliationReason == nil,
+                    "empty snapshot at baseline 0 must be empty with no gate")
+
+        // 旧 API 兼容：fullSyncSnapshot(hostname:) 与 expectedGeneration=nil 完全一致。
+        let compatEmpty = try ledger.fullSyncSnapshot(hostname: "h")
+        let explicitNil = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: nil)
+        try require(compatEmpty == explicitNil, "legacy snapshot must equal expectedGeneration=nil snapshot")
+
+        // 真实派生变化推进 generation；baseline 与快照 generation 一致。
+        let f1 = UsageJSONLParser.parse(data: Data(codexFile("rs1", ts: "2026-09-20T00:00:00Z", out: 10).utf8), source: "codex", fileIdentity: "rs1.jsonl")
+        try ledger.record(events: f1.events, sessionEvents: f1.sessionEvents, checkpoint: f1.checkpoint, hostname: "h")
+        try ledger.finalizeDerived(hostname: "h")
+        let baseline = try ledger.fullSyncGenerationBaseline()
+        try require(baseline > 0, "baseline advances with real derived changes")
+        let baselineAgain = try ledger.fullSyncGenerationBaseline()
+        try require(baselineAgain == baseline, "repeated baseline reads stay stable")
+
+        // 匹配成功：expectedGeneration == 当前 generation，内容与旧 API 快照逐字段一致。
+        let reserved = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: baseline)
+        try require(!reserved.isEmpty && reserved.generation == baseline, "reserved snapshot carries baseline generation")
+        let compatSnapshot = try ledger.fullSyncSnapshot(hostname: "h")
+        try require(reserved == compatSnapshot, "expected-matching snapshot equals legacy snapshot")
+
+        // generation 变化后：旧 baseline 取快照必须 stale 失败，且不返回半快照。
+        let f2 = UsageJSONLParser.parse(data: Data(codexFile("rs2", ts: "2026-09-20T01:00:00Z", out: 20).utf8), source: "codex", fileIdentity: "rs2.jsonl")
+        try ledger.record(events: f2.events, sessionEvents: f2.sessionEvents, checkpoint: f2.checkpoint, hostname: "h")
+        try ledger.finalizeDerived(hostname: "h")
+        let advanced = try ledger.fullSyncGenerationBaseline()
+        try require(advanced > baseline, "generation advances after derived change")
+
+        var halfSnapshot: UsageFullSyncSnapshot?
+        do {
+            halfSnapshot = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: baseline)
+            try require(false, "stale expectedGeneration must throw")
+        } catch let error as UsageFullSyncSnapshotError {
+            try require(error == .staleGeneration(expected: baseline, actual: advanced),
+                        "stale snapshot reports expected/actual generations: \(error)")
+        }
+        try require(halfSnapshot == nil, "stale failure must not return a partial snapshot")
+
+        // 新 baseline 立即可用。
+        let fresh = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: advanced)
+        try require(fresh.generation == advanced && !fresh.isEmpty, "snapshot succeeds at the advanced generation")
+
+        // 有 gate：先全量同步清 dirty，再 rebuild 到新 host 制造 synced 行删除 -> gate 置位。
+        try ledger.commitFullSync(UsageFullSyncCommit(snapshot: fresh))
+        try ledger.rebuildForHostname("h2")
+        let gatedBaseline = try ledger.fullSyncGenerationBaseline()
+        try require(gatedBaseline > advanced, "rebuild recomputes derived rows and advances generation")
+        let reason = try ledger.reconciliationReason()
+        try require(reason != nil, "deleting synced rows via rebuild sets reconciliation gate")
+
+        // gate and the generation fence are orthogonal within one snapshot. Reconciliation debt
+        // is recorded under the OLD host (h) whose synced rows were deleted, not the new host (h2):
+        // the debt-host snapshot surfaces the reason at the current baseline, h2 carries none.
+        let debtHostsList = try ledger.pendingReconciliationHosts()
+        try require(debtHostsList == ["h"], "debt is bookkept under the host that lost synced rows")
+        let debtSnap = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: gatedBaseline)
+        try require(debtSnap.generation == gatedBaseline, "debt-host snapshot reads at current baseline")
+        try require(debtSnap.reconciliationReason == reason, "debt-host snapshot surfaces the active reconciliation reason")
+        let gatedSnap = try ledger.fullSyncSnapshot(hostname: "h2", expectedGeneration: gatedBaseline)
+        try require(!gatedSnap.isEmpty && gatedSnap.generation == gatedBaseline, "new-host snapshot succeeds at current baseline")
+        try require(gatedSnap.reconciliationReason == nil, "new host carries no reconciliation debt of its own")
+        do {
+            _ = try ledger.fullSyncSnapshot(hostname: "h2", expectedGeneration: advanced)
+            try require(false, "pre-rebuild baseline must be stale after rebuild")
+        } catch let error as UsageFullSyncSnapshotError {
+            try require(error == .staleGeneration(expected: advanced, actual: gatedBaseline),
+                        "post-rebuild snapshot reports expected/actual generations: \(error)")
+        }
+    }
+
+    // FS-GEN-2) 回归：模拟「远端已 committed、本地 crash 未及 ledger commit」——
+    // 重启后重拍快照 generation 必须与 crash 前相同，且可用该 generation 完成 ledger commit。
+    private static func verifyV2FullSyncCrashRecoverySameGeneration() throws {
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        var ledger: UsageLedgerStore? = try UsageLedgerStore(path: db.path)
+        let f1 = UsageJSONLParser.parse(data: Data("""
+        {"type":"session_meta","payload":{"session_id":"r1","thread_source":"user","cwd":"/w/r1"}}
+        {"type":"turn_context","payload":{"model":"m"}}
+        {"timestamp":"2026-09-11T00:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
+        {"timestamp":"2026-09-11T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":40,"total_tokens":40}}}}
+        """.utf8), source: "codex", fileIdentity: "rec1.jsonl")
+        try ledger!.record(events: f1.events, sessionEvents: f1.sessionEvents, checkpoint: f1.checkpoint, hostname: "h")
+        try ledger!.finalizeDerived(hostname: "h")
+
+        // crash 前：快照已上传并被远端 committed（本地尚未 commitFullSync）。
+        let beforeCrash = try ledger!.fullSyncSnapshot(hostname: "h")
+        try require(!beforeCrash.isEmpty, "snapshot has rows to reconcile")
+
+        // 模拟进程 crash：丢弃内存中的 store 句柄后重开同一数据库。
+        ledger = nil
+        let reopened = try UsageLedgerStore(path: db.path)
+
+        // 恢复：重拍快照 generation 必须与 crash 前相同。
+        let recovered = try reopened.fullSyncSnapshot(hostname: "h")
+        try require(recovered.generation == beforeCrash.generation,
+                    "post-crash re-snapshot must reuse the same generation: before=\(beforeCrash.generation) after=\(recovered.generation)")
+        try require(recovered.buckets == beforeCrash.buckets && recovered.sessions == beforeCrash.sessions,
+                    "post-crash snapshot content must be identical")
+
+        // 用恢复后的快照完成 ledger commit：围栏必须放行，全部行标记 synced。
+        let committed = try reopened.commitFullSync(UsageFullSyncCommit(snapshot: recovered))
+        try require(committed.committed, "post-crash ledger commit must succeed with the same generation: \(committed.failureReason ?? "")")
+        let pending = try reopened.pendingBatch(hostname: "h")
+        try require(pending.isEmpty, "all rows marked synced after recovered ledger commit")
+
+        // crash 前的旧快照凭证同样可提交（generation 与行内容均未变）——恢复路径幂等。
+        let idempotent = try reopened.commitFullSync(UsageFullSyncCommit(snapshot: beforeCrash))
+        try require(idempotent.committed, "re-committing the pre-crash snapshot stays idempotent: \(idempotent.failureReason ?? "")")
+    }
+
+    // FS-2) fail-closed：revision 变化 / 行删除 / 重复键 / 缺失键 -> 整体拒绝，不部分标记、不清 gate。
+    private static func verifyV2FullSyncFailClosed() throws {
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        let ledger = try UsageLedgerStore(path: db.path)
+        func codexFile(_ session: String, ts: String, out: Int) -> String {
+            """
+            {"type":"session_meta","payload":{"session_id":"\(session)","thread_source":"user","cwd":"/w/proj-b"}}
+            {"type":"turn_context","payload":{"model":"m"}}
+            {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
+            {"timestamp":"\(ts)","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":\(out),"total_tokens":\(out)}}}}
+            """
+        }
+        let a = UsageJSONLParser.parse(data: Data(codexFile("s1", ts: "2026-10-01T00:00:00Z", out: 100).utf8), source: "codex", fileIdentity: "fc1.jsonl")
+        let b = UsageJSONLParser.parse(data: Data(codexFile("s2", ts: "2026-10-01T01:00:00Z", out: 200).utf8), source: "codex", fileIdentity: "fc2.jsonl")
+        try ledger.record(events: a.events, sessionEvents: a.sessionEvents, checkpoint: a.checkpoint, hostname: "h")
+        try ledger.record(events: b.events, sessionEvents: b.sessionEvents, checkpoint: b.checkpoint, hostname: "h")
+        try ledger.finalizeDerived(hostname: "h")
+
+        // 快照后行被 finalize 重算（revision 抬升）：commit 必须整体 fail-closed。
+        let snap = try ledger.fullSyncSnapshot(hostname: "h")
+        let changed = UsageJSONLParser.parse(data: Data(codexFile("s1", ts: "2026-10-01T00:10:00Z", out: 101).utf8), source: "codex", fileIdentity: "fc1b.jsonl")
+        try ledger.record(events: changed.events, sessionEvents: changed.sessionEvents, checkpoint: changed.checkpoint, hostname: "h")
+        try ledger.finalizeDerived(hostname: "h")
+        let rejChange = try ledger.commitFullSync(UsageFullSyncCommit(snapshot: snap))
+        try require(!rejChange.committed, "row changed since snapshot must fail-closed")
+        // 未被误标记：仍有 dirty 行（00:00 桶被重算为 201）。
+        let afterRejPending = try ledger.pendingBatch(hostname: "h")
+        try require(!afterRejPending.isEmpty, "fail-closed must not partially mark rows synced")
+
+        // 重复键：手工在 commit 中放入重复 bucket -> 拒绝。
+        let fresh = try ledger.fullSyncSnapshot(hostname: "h")
+        if let first = fresh.buckets.first {
+            let dupCommit = UsageFullSyncCommit(hostname: "h", generation: fresh.generation, buckets: fresh.buckets + [first], sessions: fresh.sessions)
+            let rejDup = try ledger.commitFullSync(dupCommit)
+            try require(!rejDup.committed, "duplicate bucket key in commit must fail-closed")
+        }
+
+        // 行集合缺失：漏掉一行 -> count 不等 -> 拒绝。
+        let fresh2 = try ledger.fullSyncSnapshot(hostname: "h")
+        if fresh2.buckets.count >= 1 {
+            let missingCommit = UsageFullSyncCommit(hostname: "h", generation: fresh2.generation, buckets: Array(fresh2.buckets.dropLast()), sessions: fresh2.sessions)
+            let rejMissing = try ledger.commitFullSync(missingCommit)
+            try require(!rejMissing.committed, "missing row (row set shrink) must fail-closed")
+        }
+
+        // 缺失键（同 count 但键不匹配）：替换一个 bucket 的内容键 -> 拒绝。
+        let fresh3 = try ledger.fullSyncSnapshot(hostname: "h")
+        if let victim = fresh3.buckets.first {
+            let b = victim.bucket
+            let bogus = UsageBucket(hostname: b.hostname, source: b.source, model: b.model, project: b.project, bucketStart: b.bucketStart.addingTimeInterval(9_999), counts: b.counts)
+            var swapped = Array(fresh3.buckets.dropFirst())
+            swapped.append(UsagePendingBucket(bucket: bogus, revision: victim.revision))
+            let rejKey = try ledger.commitFullSync(UsageFullSyncCommit(hostname: "h", generation: fresh3.generation, buckets: swapped, sessions: fresh3.sessions))
+            try require(!rejKey.committed, "mismatched natural key (same count) must fail-closed")
+        }
+
+        // 全部 fail-closed 期间不得清 gate / 不误标记：现在做一次干净 commit 应仍能成功。
+        let clean = try ledger.fullSyncSnapshot(hostname: "h")
+        let okClean = try ledger.commitFullSync(UsageFullSyncCommit(snapshot: clean))
+        try require(okClean.committed, "a clean commit after fail-closed attempts still succeeds: \(okClean.failureReason ?? "")")
+        let cleanPending = try ledger.pendingBatch(hostname: "h")
+        try require(cleanPending.isEmpty, "clean commit marks all rows synced")
+    }
+
+    // FS-3) session project 贯通 + reopen 持久 + v2 旧库迁移到 v3（不丢数据、补 project 列）。
+    // FS-P0) 回归：per-host eligibility=0（无 reconciliation gate，仅 inherited replay 阻断）时，
+    // full sync 成功 commit 只清 reconciliation，绝不 fail-open 恢复上报。
+    private static func verifyV2FullSyncPreservesInheritedBlock() throws {
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        let ledger = try UsageLedgerStore(path: db.path)
+        // 继承回放但无完整 total 快照 -> 无法证明去重 -> per-host eligibility flag=0（非 reconciliation 阻断）。
+        let ts = "2026-12-01T00:00:00Z"
+        let childNoSnapshot = """
+        {"type":"session_meta","payload":{"id":"child-p0","session_id":"child-session-p0","parent_thread_id":"parent-p0","cwd":"/w/p"}}
+        {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
+        {"timestamp":"\(ts)","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":70,"total_tokens":70}}}}
+        """
+        let cnp = UsageJSONLParser.parse(data: Data(childNoSnapshot.utf8), source: "codex", fileIdentity: "child-p0.jsonl")
+        try require(cnp.events.first?.inherited == true, "child must be flagged inherited")
+        try require(cnp.events.first?.lineageFingerprint.isEmpty == true, "no total snapshot => no lineage fingerprint")
+        try ledger.record(events: cnp.events, sessionEvents: cnp.sessionEvents, checkpoint: cnp.checkpoint, hostname: "h")
+        let finalize = try ledger.finalizeDerived(hostname: "h")
+        try require(!finalize.reportingEligible, "unprovable inherited replay must block reporting")
+
+        // 无 reconciliation gate（仅 inherited replay 阻断）。
+        let reason = try ledger.reconciliationReason()
+        try require(reason == nil, "inherited replay block must NOT be a reconciliation gate")
+        let blockedEligible = try ledger.reportingEligible(hostname: "h")
+        try require(!blockedEligible, "reporting must be blocked before full sync")
+
+        // 全量快照 + 成功 commit。
+        let snap = try ledger.fullSyncSnapshot(hostname: "h")
+        let ok = try ledger.commitFullSync(UsageFullSyncCommit(snapshot: snap))
+        try require(ok.committed, "full sync commit should succeed on matching rows: \(ok.failureReason ?? "")")
+
+        // 关键断言：commit 后仍必须 false —— inherited replay 阻断未被 full sync 清掉（无 fail-open）。
+        let afterEligible = try ledger.reportingEligible(hostname: "h")
+        try require(!afterEligible, "full sync commit must NOT clear the inherited-replay block (no fail-open)")
+
+        // reopen 后仍保持阻断。
+        let reopened = try UsageLedgerStore(path: db.path)
+        let reopenedEligible = try reopened.reportingEligible(hostname: "h")
+        try require(!reopenedEligible, "inherited-replay block survives restart after full sync")
+    }
+
+    // FS-PROJ) 回归：血缘去重会丢弃携带 project 的原始行，session project 必须从**全量 raw**取，
+    // 而非 deduped —— 证明去重后仍能解析出正确 project。
+    private static func verifyV2FullSyncProjectFromRawNotDeduped() throws {
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        let ledger = try UsageLedgerStore(path: db.path)
+        let ts = "2026-12-15T00:00:00Z"
+        func totalLine(out: Int, total: Int) -> String {
+            "{\"timestamp\":\"\(ts)\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"output_tokens\":\(out),\"input_tokens\":0,\"total_tokens\":\(total)}}}}"
+        }
+        // parent 与 child(subagent) 共享同一完整 total 快照 -> 血缘指纹一致 -> 折叠为一。
+        // 让**被折叠掉**的那条携带 project（cwd），验证 project 仍能从全量 raw 解析。
+        let parent = """
+        {"type":"session_meta","payload":{"id":"parent-proj","session_id":"parent-session-proj","cwd":"/w/parent-proj"}}
+        {"type":"turn_context","payload":{"model":"m"}}
+        {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
+        \(totalLine(out: 100, total: 100))
+        """
+        let child = """
+        {"type":"session_meta","payload":{"id":"child-proj","session_id":"child-session-proj","parent_thread_id":"parent-proj","cwd":"/w/child-proj"}}
+        {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
+        \(totalLine(out: 100, total: 100))
+        """
+        let pp = UsageJSONLParser.parse(data: Data(parent.utf8), source: "codex", fileIdentity: "parent-proj.jsonl")
+        let cp = UsageJSONLParser.parse(data: Data(child.utf8), source: "codex", fileIdentity: "child-proj.jsonl")
+        try require(pp.events.first?.lineageFingerprint == cp.events.first?.lineageFingerprint, "parent/child replay share lineage fingerprint")
+        try require(pp.events.first?.project.isEmpty == false && cp.events.first?.project.isEmpty == false, "both raw events carry a project")
+        let parentProject = pp.events[0].project
+        let childProject = cp.events[0].project
+        try require(parentProject != childProject, "parent/child must resolve to distinct projects for this regression")
+        try ledger.record(events: pp.events, sessionEvents: pp.sessionEvents, checkpoint: pp.checkpoint, hostname: "h")
+        try ledger.record(events: cp.events, sessionEvents: cp.sessionEvents, checkpoint: cp.checkpoint, hostname: "h")
+        try ledger.finalizeDerived(hostname: "h")
+
+        // 两条 raw 各属不同 session，血缘去重只把其一从聚合中折叠，但 project map 从全量 raw 计算，
+        // 两个 session 仍各自解析出各自 project（不因去重而丢失）。
+        let sessions = try ledger.sessions(hostname: "h")
+        let projects = Set(sessions.map { $0.project })
+        try require(sessions.count == 2, "two sessions aggregated (parent + child): got \(sessions.count)")
+        try require(projects.contains(parentProject) && projects.contains(childProject),
+                    "session project must resolve from full raw events despite lineage dedup: got \(projects), want [\(parentProject), \(childProject)]")
+    }
+
+
+    private static func verifyV2SessionProjectWireAndMigration() throws {
+        // 3a) project 内容字段贯通：insert -> finalize -> read/pending/fullSync 均带 project。
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        var ledger: UsageLedgerStore? = try UsageLedgerStore(path: db.path)
+        // codex：token 事件带 cwd=/w/projectX -> project 落在 UsageEvent.project；同 session 的会话事件。
+        let file = """
+        {"type":"session_meta","payload":{"session_id":"sp","thread_source":"user","cwd":"/w/projectX"}}
+        {"type":"turn_context","payload":{"model":"m"}}
+        {"timestamp":"2026-11-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
+        {"timestamp":"2026-11-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":50,"total_tokens":50}}}}
+        """
+        let p = UsageJSONLParser.parse(data: Data(file.utf8), source: "codex", fileIdentity: "proj.jsonl")
+        try require(p.events.first?.project.isEmpty == false, "token event should carry a non-empty project from cwd")
+        let expectedProject = p.events[0].project
+        try ledger!.record(events: p.events, sessionEvents: p.sessionEvents, checkpoint: p.checkpoint, hostname: "h")
+        try ledger!.finalizeDerived(hostname: "h")
+
+        let sessions = try ledger!.sessions(hostname: "h")
+        try require(sessions.count == 1, "one session aggregated")
+        try require(sessions[0].project == expectedProject, "session project must derive from latest valid UsageEvent.project: got '\(sessions[0].project)' want '\(expectedProject)'")
+
+        let pending = try ledger!.pendingBatch(hostname: "h")
+        try require(pending.sessions.first?.session.project == expectedProject, "pending session carries project")
+        let snap = try ledger!.fullSyncSnapshot(hostname: "h")
+        try require(snap.sessions.first?.session.project == expectedProject, "full sync snapshot session carries project")
+
+        // reopen：project 持久化。
+        ledger = nil
+        let reopened = try UsageLedgerStore(path: db.path)
+        let reopenedSessions = try reopened.sessions(hostname: "h")
+        try require(reopenedSessions.first?.project == expectedProject, "session project survives reopen")
+
+        // 3b) v2 旧库迁移到 v3：建一个 user_version=2 的老库（无 project 列），迁移后补列且数据保留。
+        let db2 = tempUsageDB(); defer { cleanupDB(db2) }
+        var handle: OpaquePointer?
+        try require(sqlite3_open(db2.path, &handle) == SQLITE_OK, "open raw v2 db")
+        let v2 = """
+        CREATE TABLE usage_events(event_id TEXT PRIMARY KEY,source TEXT NOT NULL,model TEXT NOT NULL,project TEXT NOT NULL,timestamp_ms INTEGER NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_creation_input_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,session_hash TEXT NOT NULL,source_file_hash TEXT NOT NULL,rollout_key TEXT NOT NULL DEFAULT '',parent_rollout_key TEXT NOT NULL DEFAULT '',inherited INTEGER NOT NULL DEFAULT 0,has_total_snapshot INTEGER NOT NULL DEFAULT 0,lineage_fingerprint TEXT NOT NULL DEFAULT '',created_at_ms INTEGER NOT NULL);
+        CREATE TABLE usage_buckets(hostname TEXT NOT NULL,source TEXT NOT NULL,model TEXT NOT NULL,project TEXT NOT NULL,bucket_start_ms INTEGER NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_creation_input_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,updated_at_ms INTEGER NOT NULL,revision INTEGER NOT NULL DEFAULT 0,synced_revision INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(hostname,source,model,project,bucket_start_ms));
+        CREATE TABLE usage_files(file_id TEXT PRIMARY KEY,source TEXT NOT NULL,path_hash TEXT NOT NULL,read_offset INTEGER NOT NULL,file_size INTEGER NOT NULL,mtime_ms INTEGER NOT NULL,parser_version INTEGER NOT NULL,scan_status TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);
+        CREATE TABLE sync_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);
+        CREATE TABLE usage_session_events(event_id TEXT NOT NULL,source TEXT NOT NULL,session_hash TEXT NOT NULL,role TEXT NOT NULL,timestamp_ms INTEGER NOT NULL,created_at_ms INTEGER NOT NULL,PRIMARY KEY(source,event_id));
+        CREATE TABLE usage_sessions(hostname TEXT NOT NULL,source TEXT NOT NULL,session_hash TEXT NOT NULL,first_activity_ms INTEGER NOT NULL,last_activity_ms INTEGER NOT NULL,active_seconds INTEGER NOT NULL,message_count INTEGER NOT NULL,user_message_count INTEGER NOT NULL,assistant_events INTEGER NOT NULL,hour_histogram TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0,synced_revision INTEGER NOT NULL DEFAULT 0,updated_at_ms INTEGER NOT NULL,PRIMARY KEY(hostname,source,session_hash));
+        INSERT INTO usage_events VALUES('e1','codex','m','/w/legacy',1000,0,50,0,0,0,50,'sh','fh','','',0,0,'',1000);
+        PRAGMA user_version=2;
+        """
+        try require(sqlite3_exec(handle, v2, nil, nil, nil) == SQLITE_OK, "seed v2 schema")
+        sqlite3_close(handle)
+
+        // 打开触发 v2 -> v3 迁移。老事件保留；finalize 后派生 project 落到 session。
+        let migrated = try UsageLedgerStore(path: db2.path)
+        let migratedEventCount = try migrated.eventCount()
+        try require(migratedEventCount == 1, "v2 event survives migration to v3")
+        try migrated.finalizeDerived(hostname: "h")
+        let migratedBuckets = try migrated.buckets(hostname: "h")
+        try require(migratedBuckets.first?.counts.total == 50, "migrated event rebuilds derived bucket after v3 migration")
+
+        // 迁移库仍能读全量快照（project 列已存在，默认空串不报错）。
+        let migratedSnap = try migrated.fullSyncSnapshot(hostname: "h")
+        try require(migratedSnap.generation > 0, "full sync usable on migrated v3 db")
+
+        // 幂等：再次打开（已是 v3）不应报错、事件不丢。
+        let reopenedV3 = try UsageLedgerStore(path: db2.path)
+        let reopenedV3Count = try reopenedV3.eventCount()
+        try require(reopenedV3Count == 1, "reopening v3 db is idempotent and lossless")
+    }
+
 }
