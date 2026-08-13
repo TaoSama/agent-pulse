@@ -266,13 +266,27 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate {
         )
         window.title = "Agent Pulse · TPS Charts"
         window.level = WindowInteraction.foregroundWindowLevel
+        // Elevated windows do not reliably resign key status when another app
+        // is clicked. Let AppKit hide the dashboard on app deactivation, while
+        // the event monitors below continue to handle clicks inside this app.
+        window.hidesOnDeactivate = true
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: TPSDashboardView(model: model))
         super.init(window: window)
         window.delegate = self
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidResignActive),
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
     }
 
     required init?(coder: NSCoder) { nil }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
 
     func show(anchoredTo frame: NSRect? = nil) {
         guard let window else { return }
@@ -294,6 +308,11 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowDidResignKey(_ notification: Notification) {
+        guard window?.isVisible == true else { return }
+        dismiss()
+    }
+
+    @objc private func applicationDidResignActive() {
         guard window?.isVisible == true else { return }
         dismiss()
     }
