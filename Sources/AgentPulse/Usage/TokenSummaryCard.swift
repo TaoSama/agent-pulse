@@ -7,7 +7,13 @@ import SwiftUI
 struct TokenSummaryCard: View {
     let summary: TokenUsageSummary
     let tps: Double?
-    @State private var selectedWindow: TokenUsageWindow = .day
+    @Binding var selectedWindow: TokenUsageWindow
+
+    init(summary: TokenUsageSummary, tps: Double?, selectedWindow: Binding<TokenUsageWindow>) {
+        self.summary = summary
+        self.tps = tps
+        _selectedWindow = selectedWindow
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {

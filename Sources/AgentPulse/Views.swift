@@ -2,7 +2,7 @@ import AppKit
 import AgentPulseCore
 import SwiftUI
 
-private let modelTPSPalette: [Color] = [
+let modelTPSPalette: [Color] = [
     Color(red: 0.00, green: 0.72, blue: 0.86),
     Color(red: 1.00, green: 0.58, blue: 0.10),
     Color(red: 0.64, green: 0.38, blue: 1.00),
@@ -11,12 +11,15 @@ private let modelTPSPalette: [Color] = [
     Color(red: 0.25, green: 0.52, blue: 1.00),
 ]
 
-private func modelTPSColor(for model: String, in series: [ModelTPSHistory]) -> Color {
-    let orderedModels = Set(series.map(\.model)).sorted {
-        $0.localizedStandardCompare($1) == .orderedAscending
-    }
-    let index = orderedModels.firstIndex(of: model) ?? 0
+/// 按模型名在调色板中取稳定颜色：同名跨视图（TPS 图例、Token 明细）取色一致。
+func modelPaletteColor(for model: String, among models: [String]) -> Color {
+    let ordered = Set(models).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    let index = ordered.firstIndex(of: model) ?? 0
     return modelTPSPalette[index % modelTPSPalette.count]
+}
+
+private func modelTPSColor(for model: String, in series: [ModelTPSHistory]) -> Color {
+    modelPaletteColor(for: model, among: series.map(\.model))
 }
 
 extension SparklineTrend {
@@ -134,18 +137,25 @@ struct MenuBarSummaryView: View {
     @ObservedObject var model: ApplicationModel
     @Environment(\.dismiss) private var dismiss
 
+    /// 面板各分区之间的垂直间距。
+    private static let sectionSpacing: CGFloat = 12
+
+    /// Token 汇总卡与分模型明细卡共用同一时间窗口选择。
+    @State private var tokenWindow: TokenUsageWindow = .day
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Agent Pulse").font(.headline)
-                    Text("本机 Agent 活动").font(.caption2).foregroundStyle(.primary)
+        VStack(alignment: .leading, spacing: Self.sectionSpacing) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Agent Pulse").font(.subheadline.weight(.semibold))
+                    Text("本机 Agent 活动").font(.caption2).foregroundStyle(.secondary)
                 }
                 Spacer()
                 Circle()
                     .fill(model.tps == nil ? Color.primary : trendColor)
                     .frame(width: 7, height: 7)
             }
+            .padding(.vertical, 1)
 
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .center, spacing: 16) {
@@ -181,7 +191,9 @@ struct MenuBarSummaryView: View {
             .foregroundStyle(Color.white)
             .background(Color.black, in: RoundedRectangle(cornerRadius: 12))
 
-            TokenSummaryCard(summary: model.tokenSummary, tps: model.tps)
+            TokenSummaryCard(summary: model.tokenSummary, tps: model.tps, selectedWindow: $tokenWindow)
+
+            ModelTokenBreakdownCard(summary: model.tokenSummary, window: tokenWindow)
 
             HStack(spacing: 8) {
                 CompactMetric(title: "Active", value: format(model.activeTasks), symbol: "bolt.fill")
@@ -189,11 +201,6 @@ struct MenuBarSummaryView: View {
                     title: "Total",
                     value: format(model.totalTasks, lowerBound: model.totalTasksIsLowerBound),
                     symbol: "square.stack.3d.up"
-                )
-                CompactMetric(
-                    title: "Completed",
-                    value: format(model.completedTotal, lowerBound: model.completedIsLowerBound),
-                    symbol: "checkmark.circle"
                 )
             }
             RuntimeSourceGrid(breakdown: model.taskBreakdown)
@@ -249,7 +256,7 @@ private struct CompactMetric: View {
     let symbol: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 2) {
             Label(title, systemImage: symbol)
                 .font(.caption2)
                 .foregroundStyle(Color.white)
@@ -259,7 +266,7 @@ private struct CompactMetric: View {
                 .foregroundStyle(Color.white)
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.black, in: RoundedRectangle(cornerRadius: 10))
         .accessibilityElement(children: .combine)

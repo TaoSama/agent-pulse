@@ -16,10 +16,13 @@ struct AgentPulseSettingsView: View {
             }
             .padding(16)
         }
-        .background(Color.black)
+        .background(Self.windowBackground)
         .preferredColorScheme(.dark)
         .frame(minWidth: 580, minHeight: 540)
     }
+
+    /// 窗口底色：比卡片略浅的深灰，使黑底卡片浮起、分区清晰，而非纯黑平铺。
+    private static let windowBackground = Color(red: 0.09, green: 0.09, blue: 0.11)
 
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
@@ -153,11 +156,11 @@ struct SettingsCard<Content: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white.opacity(0.05))
+                .fill(Color.black)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.white.opacity(0.09), lineWidth: 1)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
         )
     }
 }
@@ -209,11 +212,11 @@ struct SettingsField: View {
             .padding(.vertical, 7)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.white.opacity(0.07))
+                    .fill(Color.white.opacity(0.09))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
             )
             .accessibilityLabel(accessibilityLabel ?? title)
         }
@@ -243,8 +246,9 @@ struct SettingsToggleRow: View {
             Toggle("", isOn: $isOn)
                 .toggleStyle(.switch)
                 .labelsHidden()
-                .tint(.white)
+                .tint(SettingsStatusTone.positive.color)
                 .disabled(disabled)
+                .opacity(disabled ? 0.5 : 1)
         }
     }
 }
