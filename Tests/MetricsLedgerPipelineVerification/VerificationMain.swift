@@ -267,7 +267,7 @@ private struct MetricsLedgerPipelineVerifier {
 
         let day = try unwrap(ledger.summary(window: .day, containing: reference, hostname: "host-a", calendar: calendar), "day summary must exist")
         try require(day.counts == inside, "day window must be left-closed and right-open")
-        try require(day.cachedTokens == 5 && day.newTokens == 12, "summary cache/new-token semantics must use input classes")
+        try require(day.cachedTokens == 5 && day.newTokens == 10, "summary cache/new-token semantics: cached=cache-read, new=pure input (excludes cache creation)")
         let expectedCost = UsageCostEstimator.cost(model: "unknown", counts: inside)
         try require(abs(day.estimatedCostUSD - expectedCost) <= 0.000_000_001, "unknown model cost must use estimator fallback")
 
