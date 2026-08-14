@@ -1529,32 +1529,42 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         containing date: Date,
         calendar: Calendar
     ) throws -> TokenUsageSummary {
-        return TokenWindowVirtualBuckets.apply(to: TokenUsageSummary(
-            day: try ledger.summary(
-                window: .day,
-                containing: date,
-                hostname: hostname,
-                calendar: calendar
-            ).map(windowSummary(from:)),
-            week: try ledger.summary(
-                window: .week,
-                containing: date,
-                hostname: hostname,
-                calendar: calendar
-            ).map(windowSummary(from:)),
-            month: try ledger.summary(
-                window: .month,
-                containing: date,
-                hostname: hostname,
-                calendar: calendar
-            ).map(windowSummary(from:)),
-            all: try ledger.summary(
-                window: nil,
-                containing: date,
-                hostname: hostname,
-                calendar: calendar
-            ).map(windowSummary(from:))
-        ))
+        // 四窗口真实按模型 token（原始名）：日为纯真实明细；周/月/全部作为叠加到虚拟基线上的真实增量。
+        let realModels: [TokenUsageWindow: [UsageModelTokenSummary]] = [
+            .day: try ledger.modelSummary(window: .day, containing: date, hostname: hostname, calendar: calendar),
+            .week: try ledger.modelSummary(window: .week, containing: date, hostname: hostname, calendar: calendar),
+            .month: try ledger.modelSummary(window: .month, containing: date, hostname: hostname, calendar: calendar),
+            .all: try ledger.modelSummary(window: nil, containing: date, hostname: hostname, calendar: calendar),
+        ]
+        return TokenWindowVirtualBuckets.apply(
+            to: TokenUsageSummary(
+                day: try ledger.summary(
+                    window: .day,
+                    containing: date,
+                    hostname: hostname,
+                    calendar: calendar
+                ).map(windowSummary(from:)),
+                week: try ledger.summary(
+                    window: .week,
+                    containing: date,
+                    hostname: hostname,
+                    calendar: calendar
+                ).map(windowSummary(from:)),
+                month: try ledger.summary(
+                    window: .month,
+                    containing: date,
+                    hostname: hostname,
+                    calendar: calendar
+                ).map(windowSummary(from:)),
+                all: try ledger.summary(
+                    window: nil,
+                    containing: date,
+                    hostname: hostname,
+                    calendar: calendar
+                ).map(windowSummary(from:))
+            ),
+            realModels: realModels
+        )
     }
 
     nonisolated private static func windowSummary(from summary: UsageSummary) -> TokenUsageWindowSummary {

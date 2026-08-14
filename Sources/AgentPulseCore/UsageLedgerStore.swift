@@ -918,6 +918,57 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
+    /// 指定 canonical hostname 的按模型 token 汇总。window=nil 表示全时段；
+    /// 非 nil 使用调用方 calendar 的窗口区间，边界为 [start,end)。
+    /// 仅聚合 token 计数（不含费用），按 total 降序返回；无数据返回空数组。
+    public func modelSummary(
+        window: UsageSummaryWindow?,
+        containing date: Date,
+        hostname: String,
+        calendar: Calendar = .current
+    ) throws -> [UsageModelTokenSummary] {
+        try queue.sync {
+            var sql = "SELECT model,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens FROM usage_buckets WHERE hostname=?"
+            var interval: DateInterval?
+            if let window {
+                interval = window.interval(containing: date, calendar: calendar)
+                guard interval != nil else { return [] }
+                sql += " AND bucket_start_ms>=? AND bucket_start_ms<?"
+            }
+            sql += ";"
+            let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            if let interval {
+                try bind(statement, 2, millis(interval.start))
+                try bind(statement, 3, millis(interval.end))
+            }
+            var byModel: [String: UsageTokenCounts] = [:]
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let model = text(statement, 0)
+                let counts = UsageTokenCounts(
+                    input: sqlite3_column_int64(statement, 1), output: sqlite3_column_int64(statement, 2),
+                    cachedInput: sqlite3_column_int64(statement, 3), cacheCreationInput: sqlite3_column_int64(statement, 4),
+                    reasoningOutput: sqlite3_column_int64(statement, 5), reportedTotal: sqlite3_column_int64(statement, 6)
+                )
+                let existing = byModel[model] ?? UsageTokenCounts()
+                byModel[model] = UsageTokenCounts(
+                    input: saturatedAdd(existing.input, counts.input), output: saturatedAdd(existing.output, counts.output),
+                    cachedInput: saturatedAdd(existing.cachedInput, counts.cachedInput),
+                    cacheCreationInput: saturatedAdd(existing.cacheCreationInput, counts.cacheCreationInput),
+                    reasoningOutput: saturatedAdd(existing.reasoningOutput, counts.reasoningOutput),
+                    reportedTotal: saturatedAdd(existing.reportedTotal, counts.total)
+                )
+            }
+            if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
+            return byModel
+                .map { UsageModelTokenSummary(model: $0.key, counts: $0.value) }
+                .sorted {
+                    if $0.counts.total == $1.counts.total { return $0.model < $1.model }
+                    return $0.counts.total > $1.counts.total
+                }
+        }
+    }
+
     private func summarizeBucketRows(_ statement: OpaquePointer?, prices: [UsageModelPrice]) throws -> UsageSummary? {
         var total = UsageTokenCounts(); var cost = 0.0; var newest: Int64?
         var found = false
