@@ -1,0 +1,6 @@
+{"timestamp":"2026-08-13T01:00:00.000Z","type":"session_meta","payload":{"id":"rollout-pmts-1","session_id":"conv-pmts-1","cwd":"/workspace/Workspaces/proj-pmts"}}
+{"timestamp":"2026-08-13T01:00:01.000Z","type":"turn_context","payload":{"model":"codex-test-model","turn_id":"turn-1"}}
+{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"pm-skip","input":"const r = await tools.mcp__slack__search({ query: \"x\" });\ntext(r);","status":"completed"}}
+{"timestamp":"2026-08-13T01:00:03.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"pm-keep","input":"const r = await tools.mcp__github__create_issue({ title: \"x\" });\ntext(r);","status":"completed"}}
+{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"pm-keep","output":[{"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},{"type":"input_text","text":"{}"}]}}
+{"timestamp":"2026-08-13T01:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"codex-test-model","last_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150},"total_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}}}

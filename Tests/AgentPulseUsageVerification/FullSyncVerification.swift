@@ -26,6 +26,11 @@ private final class ScriptedFullSyncSender: FullSyncRequestSending, @unchecked S
     var commitBuckets = 0
     var commitSessions = 0
     var commitAutonomy = 0
+    // Wire status tokens emitted per phase. Overridable so a test can prove a
+    // caller-configured status truly transits (or that a mismatch is rejected).
+    var reserveStatus = "reserved"
+    var stageStatus = "staging"
+    var commitStatus = "committed"
     var unauthorizedUntilRefresh = false
     var failAtCallIndex: Int? = nil
     var statusAtCallIndex: [Int: Int] = [:]
@@ -45,9 +50,13 @@ private final class ScriptedFullSyncSender: FullSyncRequestSending, @unchecked S
             }
             if shouldThrow { throw HTTPTransportError.requestNotWritten }
         }
-        if let forced = statusAtCallIndex[index] {
-            return HTTPResponse(statusCode: forced, body: Data("{}".utf8))
-        }
+       if let forced = statusAtCallIndex[index] {
+            // A custom body may be paired with a forced status so a non-2xx
+            // response can still carry a JSON error code for the resolver/
+            // shrink paths.
+            let body = responseAtCallIndex[index] ?? Data("{}".utf8)
+            return HTTPResponse(statusCode: forced, body: body)
+       }
         if let body = responseAtCallIndex[index] {
             return HTTPResponse(statusCode: 200, body: body)
         }
@@ -66,9 +75,9 @@ private final class ScriptedFullSyncSender: FullSyncRequestSending, @unchecked S
 
     private func responseBody(for action: String, gzipped: Bool) -> Data {
         let status: String
-        if action.contains("reserve") { status = "reserved" }
-        else if action.contains("commit") { status = "committed" }
-        else { status = "staging" }
+        if action.contains("reserve") { status = reserveStatus }
+        else if action.contains("commit") { status = commitStatus }
+        else { status = stageStatus }
         var obj: [String: Any] = ["status": status]
         if action.contains("reserve") { obj["fenceRevision"] = reserveFence }
         if action.contains("commit") {
@@ -95,11 +104,28 @@ private struct ScriptedTokens: FullSyncTokenSupplying {
         if forceRefresh { onForceRefresh(); return SecretToken(refreshedToken) }
         return SecretToken(initialToken)
     }
-    func stableAccountIdentity(forToken token: SecretToken) -> String { identityForToken(token.reveal()) }
+    // Identity is resolved asynchronously in production (an authenticated
+    // endpoint lookup). The scripted supplier maps a revealed token straight to
+    // a namespace string, and an empty string models an unresolvable identity
+    // that must fence the upload.
+    func accountNamespace(forToken token: SecretToken) async throws -> String {
+        let namespace = identityForToken(token.reveal())
+        if namespace.isEmpty { throw FullSyncError.authIdentityUnverifiable }
+        return namespace
+    }
 }
 
 private struct ImmediateSleeper: RetrySleeper {
     func sleep(seconds: TimeInterval) async throws {}
+}
+
+// Records the backoff schedule so a test can assert the exact per-retry delays.
+private final class RecordingSleeper: RetrySleeper, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var seconds: [TimeInterval] = []
+    func sleep(seconds: TimeInterval) async throws {
+        lock.withLock { self.seconds.append(seconds) }
+    }
 }
 
 private final class Counter: @unchecked Sendable {
@@ -140,6 +166,30 @@ private func readyConfig(rows: Int = 2, bytes: Int = 8 * 1024 * 1024) -> FullSyn
         maxBytesPerChunk: bytes,
         retryPolicy: RetryPolicy(maxRetries: 2, retryableStatusCodes: [503], backoffSeconds: [0])
     )
+}
+
+/// Ready configuration bound to an explicit hostname. A hostname-change cleanup
+/// must target the OLD host's wire identity even though the current authority
+/// host differs.
+private func readyConfig(hostname: String, rows: Int = 2, bytes: Int = 8 * 1024 * 1024) -> FullSyncConfiguration {
+    FullSyncConfiguration(
+        baseURL: URL(string: "https://example.invalid"),
+        path: "/usage/full-sync",
+        hostname: hostname,
+        headerNames: .init(authToken: "X-Auth", timeZoneOffset: "X-TZ", locale: "X-Locale", contentEncoding: "Content-Encoding", contentType: "Content-Type"),
+        staticHeaders: [StaticHeader(name: "X-Client", value: "verifier")],
+        maxRowsPerChunk: rows,
+        maxBytesPerChunk: bytes,
+        retryPolicy: RetryPolicy(maxRetries: 2, retryableStatusCodes: [503], backoffSeconds: [0])
+    )
+}
+
+/// Deterministic per-host state store, mirroring the coordinator's rule that
+/// each hostname owns a distinct state directory so an old host's recoverable
+/// state never collides with the current host's.
+private func perHostStore(_ hostname: String, root: URL) -> FullSyncStateStore {
+    let component = "host-\(abs(hostname.hashValue))-\(hostname.count)"
+    return FullSyncStateStore(directory: root.appendingPathComponent(component, isDirectory: true))
 }
 
 private func tempStore() -> FullSyncStateStore {
@@ -201,6 +251,7 @@ enum FullSyncVerification {
         try await verifyChunking()
         try await verifyResumeAfterStageCrash()
         try await verifyResumeIdempotentCommit()
+        try await verifyHostnameChangeCrashResumesOldHostState()
         try await verifyStatePermissions()
         try await verifySingleRefreshOn401()
         try await verifyIdentityFenceOnResume()
@@ -209,17 +260,29 @@ enum FullSyncVerification {
         try await verifyFenceConflict()
         try await verifyTransportRetry()
         try await verifyWireVocabularyConfiguration()
+        try await verifyConfiguredSuccessStatuses()
         try await verifyConfigurationGates()
         try await verifyReservationContract()
         try await verifyResponseValidation()
+        try await verifyRecoveredShortUploadIDAccepted()
         try await verifyPerRequestIdentityFence()
         try await verifyCorruptStateRecovery()
         try await verifyUnconfirmedChunkRebuild()
-        try await verifyGzipBoundary()
-        try await verifyPayloadTooLargeSplit()
-        try await verifySingleRowPayloadTooLarge()
-        print("AgentPulseUsage full-sync verification passed")
-    }
+       try await verifyGzipBoundary()
+       try await verifyPayloadTooLargeSplit()
+       try await verifySingleRowPayloadTooLarge()
+        try verifyOriginNormalization()
+        try verifyPositiveUserID()
+        try verifyNamespaceDerivation()
+        try await verifyIdentityEndpointResolution()
+        try await verifyIdentityNamespaceFencing()
+        try await verifyRefreshResolvesIdentityThroughEndpoint()
+        try await verifyPayloadTooLargeJSONCodeSplit()
+        try await verifyUnsupportedStatus()
+        try await verifyRejoinRequiredKeepsCredentials()
+        try await verifyReserveBackoffOnServerErrors()
+       print("AgentPulseUsage full-sync verification passed")
+   }
 
     // A server 413 for a 4-row chunk must halve only the current unconfirmed
     // chunk and complete as 2 + 2 against the same upload/fence, with the commit
@@ -262,9 +325,9 @@ enum FullSyncVerification {
         let firstAccepted = body(3)
         let secondAccepted = body(4)
         try require((firstAccepted["buckets"] as? [[String: Any]])?.count == 2, "first accepted stage should carry 2 rows")
-        try require((secondAccepted["buckets"] as? [[String: Any]])?.count == 2, "second accepted stage should carry 2 rows")
-        try require((firstAccepted["chunkIndex"] as? NSNumber)?.intValue == 0, "retry must reuse chunkIndex 0")
-        try require((secondAccepted["chunkIndex"] as? NSNumber)?.intValue == 1, "remaining rows must go to chunkIndex 1")
+       try require((secondAccepted["buckets"] as? [[String: Any]])?.count == 2, "second accepted stage should carry 2 rows")
+        try require(firstAccepted["chunkIndex"] == nil, "retry must reuse chunkIndex 0 (omitted on the wire)")
+       try require((secondAccepted["chunkIndex"] as? NSNumber)?.intValue == 1, "remaining rows must go to chunkIndex 1")
         for call in [rejected, firstAccepted, secondAccepted] {
             try require(call["uploadId"] as? String == validUploadID, "413-split stage upload id drifted")
             try require((call["fenceRevision"] as? NSNumber)?.intValue == 7, "413-split stage fence drifted")
@@ -359,11 +422,10 @@ enum FullSyncVerification {
         let stage0 = obj(sender.calls[2].body)
         try require(stage0["action"] as? String == "stage", "stage action wrong")
         try require(stage0["uploadId"] as? String == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "stage uploadId wrong")
-        try require(stage0["kind"] as? String == "buckets", "stage kind wrong")
-        try require(
-            stage0.keys.contains("chunkIndex")
-                && (stage0["chunkIndex"] as? NSNumber)?.intValue == 0,
-            "first stage chunkIndex must be explicitly encoded as 0"
+       try require(stage0["kind"] as? String == "buckets", "stage kind wrong")
+       try require(
+            !stage0.keys.contains("chunkIndex"),
+            "first stage chunkIndex 0 must be omitted from the wire"
         )
         try require((stage0["fenceRevision"] as? NSNumber)?.intValue == 7, "stage fence not echoed")
         try require((stage0["expectedBuckets"] as? NSNumber)?.intValue == 3, "stage expectedBuckets wrong")
@@ -380,11 +442,10 @@ enum FullSyncVerification {
 
         // stage[2]: session chunk, kind=sessions with 2 rows.
         let stage2 = obj(sender.calls[4].body)
-        try require(stage2["kind"] as? String == "sessions", "session stage kind wrong")
-        try require(
-            stage2.keys.contains("chunkIndex")
-                && (stage2["chunkIndex"] as? NSNumber)?.intValue == 0,
-            "first chunkIndex for each kind must be explicitly encoded as 0"
+       try require(stage2["kind"] as? String == "sessions", "session stage kind wrong")
+       try require(
+            !stage2.keys.contains("chunkIndex"),
+            "first chunkIndex 0 for each kind must be omitted from the wire"
         )
         try require((stage2["sessions"] as? [[String: Any]])?.count == 2, "session stage rows wrong")
 
@@ -510,6 +571,108 @@ enum FullSyncVerification {
         try require(!store.hasState(), "finalize did not discard committed state")
     }
 
+    // P1: after a hostname change, the OLD host retains reconciliation debt and
+    // (when the crash lands in the remote-ack → ledger-commit window) a persisted
+    // committed state under the OLD host's state directory. Startup recovery must
+    // ENUMERATE the debt hosts rather than only inspecting the current authority
+    // host: otherwise the old host's committed state is orphaned, the global
+    // reconciliation gate stays fail-closed, and incremental reporting is blocked
+    // until a manual full sync. This proves the enumerate → pick old host →
+    // zero-network committed replay → ledger commit → finalize → debt-cleared path.
+    static func verifyHostnameChangeCrashResumesOldHostState() async throws {
+        let databaseURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".sqlite3")
+        let stateRoot = FileManager.default.temporaryDirectory.appendingPathComponent("fullsync-hostchange-" + UUID().uuidString, isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: databaseURL)
+            try? FileManager.default.removeItem(at: stateRoot)
+        }
+        let oldHost = "MacBook-Pro.local"
+        let newHost = "MacBook-Pro-3.local"
+        let ledger = try UsageLedgerStore(path: databaseURL.path)
+
+        // 1) Seed the OLD host and align remote+local via a committed full sync.
+        let timestamp = Date(timeIntervalSince1970: 1_800)
+        try ledger.record(
+            events: [UsageEvent(
+                id: "event", source: "source", model: "model", project: "project",
+                timestamp: timestamp, counts: UsageTokenCounts(input: 1, output: 1),
+                sessionHash: "session", sourceFileHash: "file"
+            )],
+            sessionEvents: [],
+            checkpoint: UsageFileCheckpoint(
+                fileID: "file", source: "source", pathHash: "path", offset: 1,
+                size: 1, modifiedAt: timestamp, parserVersion: UsageJSONLParser.parserVersion, status: "complete"
+            ),
+            hostname: oldHost
+        )
+        _ = try ledger.finalizeDerived(hostname: oldHost)
+        let seededSnapshot = try ledger.fullSyncSnapshot(hostname: oldHost)
+        try require(try ledger.commitFullSync(UsageFullSyncCommit(snapshot: seededSnapshot)).committed, "seed full sync failed")
+
+        // 2) Rename to the NEW host. The OLD host now owns remote rows the local
+        //    ledger no longer has → per-host reconciliation debt.
+        try ledger.rebuildForHostname(newHost)
+        try require(try ledger.pendingReconciliationHosts() == [oldHost], "old host debt not retained after rename")
+        try require(try ledger.reportingEligible(hostname: newHost) == false, "global gate must fail-closed while old host debt is pending")
+
+        // 3) The OLD host's cleanup is an EMPTY, gated full sync. Drive it through a
+        //    remote commit, then simulate a crash BEFORE the local ledger commit by
+        //    dropping the reporter/transport while the committed state persists
+        //    under the OLD host's own state directory.
+        let oldHostStore = perHostStore(oldHost, root: stateRoot)
+        let newHostStore = perHostStore(newHost, root: stateRoot)
+        let cleanupSnapshot = try ledger.fullSyncSnapshot(hostname: oldHost)
+        try require(cleanupSnapshot.isEmpty && cleanupSnapshot.reconciliationReason != nil, "old host cleanup snapshot must be empty and gated")
+        let cleanupPayload = UsageFullSyncSnapshotMapper.payloadSnapshot(from: cleanupSnapshot)
+        let firstSender = ScriptedFullSyncSender()
+        let firstReporter = FullSyncReporter(
+            configuration: readyConfig(hostname: oldHost), sender: firstSender,
+            tokenSupplier: sameAccountTokens(), retrySleeper: ImmediateSleeper()
+        )
+        let firstResult = try await firstReporter.upload(
+            snapshot: cleanupPayload, authIdentity: "ns:account-1", store: oldHostStore
+        )
+        try require(!firstResult.wasAlreadyCommitted, "fresh remote cleanup commit flagged as replay")
+        let cleanupActions = firstSender.calls.map { obj(rawBody($0))["action"] as? String }
+        try require(cleanupActions == ["reserve", "begin", "commit"], "empty cleanup sent unexpected phases: \(cleanupActions)")
+        try require(try ledger.pendingReconciliationHosts() == [oldHost], "ledger debt must persist until local commit")
+        try require(oldHostStore.hasState(), "remote cleanup commit was not retained across the ledger crash window")
+        try require(!newHostStore.hasState(), "new host must have no recoverable state — enumerating only the current host misses the old host")
+
+        // 4) Restart-style recovery. Mirror resumeFullSyncIfPending + performFullSync's
+        //    host selection: ENUMERATE pendingReconciliationHosts, pick the debt host,
+        //    and resume its store. Selecting the current (new) host would find nothing.
+        let debtHosts = try ledger.pendingReconciliationHosts()
+        let recoveryHost = debtHosts.first ?? newHost
+        try require(recoveryHost == oldHost, "recovery must prioritize the old debt host, not the current authority host")
+        let recoveryStore = perHostStore(recoveryHost, root: stateRoot)
+        try require(recoveryStore.hasState(), "recovery could not locate the old host's persisted state")
+        try require(try recoveryStore.load().phase == .committed, "recovered state must be committed (remote already finalized)")
+
+        // Re-read the snapshot under the same host for the resume upload + ledger commit.
+        let resumeSnapshot = try ledger.fullSyncSnapshot(hostname: recoveryHost)
+        let resumePayload = UsageFullSyncSnapshotMapper.payloadSnapshot(from: resumeSnapshot)
+        let reentrySender = ScriptedFullSyncSender()
+        let reentryReporter = FullSyncReporter(
+            configuration: readyConfig(hostname: recoveryHost), sender: reentrySender,
+            tokenSupplier: sameAccountTokens(), retrySleeper: ImmediateSleeper()
+        )
+        let resumeResult = try await reentryReporter.upload(
+            snapshot: resumePayload, authIdentity: "ns:account-1", store: recoveryStore
+        )
+        try require(resumeResult.wasAlreadyCommitted, "committed resume across restart not idempotent")
+        try require(reentrySender.calls.isEmpty, "committed resume across restart performed network calls")
+
+        // 5) Local ledger commit closes the window; finalize discards state; debt cleared;
+        //    the global reconciliation gate reopens so incremental reporting is unblocked.
+        let ledgerCommit = try ledger.commitFullSync(UsageFullSyncCommit(snapshot: resumeSnapshot))
+        try require(ledgerCommit.committed, "ledger commit failed after committed resume")
+        try reentryReporter.finalize(store: recoveryStore)
+        try require(!recoveryStore.hasState(), "finalize did not discard the recovered committed state")
+        try require(try ledger.pendingReconciliationHosts().isEmpty, "old host debt was not cleared after recovery")
+        try require(try ledger.reportingEligible(hostname: newHost), "reporting still blocked after old host debt cleared")
+    }
+
     static func verifyStatePermissions() async throws {
         let snapshot = makeSnapshot(buckets: 2, sessions: 0)
         let store = tempStore()
@@ -589,16 +752,19 @@ enum FullSyncVerification {
         } catch FullSyncError.acknowledgementCountMismatch {}
     }
 
-    static func verifyFenceConflict() async throws {
-        let snapshot = makeSnapshot(buckets: 1, sessions: 0)
-        let store = tempStore()
-        let sender = ScriptedFullSyncSender(); sender.commitBuckets = 1; sender.statusAtCallIndex = [3: 409]
-        let reporter = FullSyncReporter(configuration: readyConfig(), sender: sender, tokenSupplier: sameAccountTokens(), retrySleeper: ImmediateSleeper())
-        do {
-            _ = try await reporter.upload(snapshot: snapshot, authIdentity: "ns:account-1", store: store)
-            throw FullSyncVerificationError.failed("fence conflict not surfaced")
-        } catch FullSyncError.fenceConflict {}
-    }
+   static func verifyFenceConflict() async throws {
+       let snapshot = makeSnapshot(buckets: 1, sessions: 0)
+       let store = tempStore()
+       let sender = ScriptedFullSyncSender(); sender.commitBuckets = 1; sender.statusAtCallIndex = [3: 409]
+       let reporter = FullSyncReporter(configuration: readyConfig(), sender: sender, tokenSupplier: sameAccountTokens(), retrySleeper: ImmediateSleeper())
+       do {
+           _ = try await reporter.upload(snapshot: snapshot, authIdentity: "ns:account-1", store: store)
+            throw FullSyncVerificationError.failed("409 did not invalidate the upload")
+        } catch FullSyncError.rescanRequired {}
+        // A 409 invalidates the local upload state and forces a rescan; the
+        // stale state must be discarded so the next attempt re-reserves.
+        try require(!store.hasState(), "409 did not discard invalidated state")
+   }
 
     static func verifyTransportRetry() async throws {
         let snapshot = makeSnapshot(buckets: 1, sessions: 0)
@@ -680,6 +846,97 @@ enum FullSyncVerification {
         try require(sender.calls.isEmpty, "gated upload performed networking")
     }
 
+    // Success statuses are configuration-driven with an exact default contract.
+    // This proves three things end to end: the default section is exactly
+    // reserved/staging/staging/committed, a caller-configured status truly
+    // transits through TokenReportingConfiguration.fullSyncConfiguration into the
+    // upload core and is accepted, and a response whose status does not match the
+    // configured expectation is rejected (fail-closed), even when it equals the
+    // built-in default.
+    static func verifyConfiguredSuccessStatuses() async throws {
+        // 1) Absent section decodes to the exact default contract.
+        let defaults = try JSONDecoder().decode(
+            TokenReportingConfiguration.FullSync.self,
+            from: Data(#"{"path":"/usage/full-sync"}"#.utf8)
+        )
+        try require(defaults.isValid, "default success statuses did not validate")
+        try require(
+            defaults.successStatuses == .init(reserve: "reserved", begin: "staging", stage: "staging", commit: "committed"),
+            "default success statuses drifted from reserved/staging/staging/committed"
+        )
+
+        // 2) A blank override is trimmed to empty and fails closed.
+        let blank = try JSONDecoder().decode(
+            TokenReportingConfiguration.FullSync.self,
+            from: Data(#"{"path":"/usage/full-sync","successStatuses":{"commit":"   "}}"#.utf8)
+        )
+        try require(!blank.isValid, "blank success status was not rejected")
+
+        // 3) A custom section decodes (trimmed) and maps through into the core.
+        let customFullSync = try JSONDecoder().decode(
+            TokenReportingConfiguration.FullSync.self,
+            from: Data(#"{"path":"/usage/full-sync","successStatuses":{"reserve":" ok-reserve ","begin":"ok-stage","stage":"ok-stage","commit":"ok-commit"}}"#.utf8)
+        )
+        try require(customFullSync.isValid, "custom success statuses did not validate")
+        try require(
+            customFullSync.successStatuses == .init(reserve: "ok-reserve", begin: "ok-stage", stage: "ok-stage", commit: "ok-commit"),
+            "custom success statuses were not trimmed/decoded"
+        )
+       let reporting = TokenReportingConfiguration(
+           canonicalHostname: "device",
+           path: "/usage",
+           headers: .init(authToken: "X-Auth", contentEncoding: "Content-Encoding", contentType: "Content-Type"),
+           staticHeaders: [.init(name: "X-Client", value: "verifier")],
+            fullSync: customFullSync,
+            identityEndpoint: .init(path: "/whoami", method: "GET", responseIDKeyPath: ["id"], successStatusCodes: [200])
+       )
+        guard let mapped = reporting.fullSyncConfiguration(
+            baseURL: URL(string: "https://example.invalid")!, hostname: "device"
+        ) else {
+            throw FullSyncVerificationError.failed("valid full-sync config did not map")
+        }
+        try require(
+            mapped.successStatuses == FullSyncSuccessStatuses(reserve: "ok-reserve", begin: "ok-stage", stage: "ok-stage", commit: "ok-commit"),
+            "configured success statuses were not carried into FullSyncConfiguration"
+        )
+
+        // A sender that answers with exactly the configured tokens uploads clean.
+        let snapshot = makeSnapshot(buckets: 1, sessions: 0)
+        let accepting = ScriptedFullSyncSender()
+        accepting.commitBuckets = 1
+        accepting.reserveStatus = "ok-reserve"
+        accepting.stageStatus = "ok-stage"
+        accepting.commitStatus = "ok-commit"
+        let acceptStore = tempStore()
+        defer { try? acceptStore.discard() }
+        let acceptingReporter = FullSyncReporter(
+            configuration: mapped, sender: accepting,
+            tokenSupplier: sameAccountTokens(), retrySleeper: ImmediateSleeper()
+        )
+        let result = try await acceptingReporter.upload(
+            snapshot: snapshot, authIdentity: "ns:account-1", store: acceptStore
+        )
+        try require(result.bucketsUpserted == 1 && !accepting.calls.isEmpty, "configured status was not accepted end to end")
+
+        // The same custom config must reject the built-in default status, proving
+        // the check honors the configured value rather than any hardcoded one.
+        let rejecting = ScriptedFullSyncSender()
+        rejecting.commitBuckets = 1
+        // reserveStatus stays the built-in "reserved", which no longer matches.
+        let rejectStore = tempStore()
+        defer { try? rejectStore.discard() }
+        let rejectingReporter = FullSyncReporter(
+            configuration: mapped, sender: rejecting,
+            tokenSupplier: sameAccountTokens(), retrySleeper: ImmediateSleeper()
+        )
+        do {
+            _ = try await rejectingReporter.upload(
+                snapshot: snapshot, authIdentity: "ns:account-1", store: rejectStore
+            )
+            throw FullSyncVerificationError.failed("mismatched reserve status was accepted")
+        } catch FullSyncError.malformedResponse {}
+    }
+
     static func verifyReservationContract() async throws {
         let sender = ScriptedFullSyncSender()
         sender.responseAtCallIndex[0] = jsonData([
@@ -702,26 +959,36 @@ enum FullSyncVerification {
         let state = try store.load()
         try require(state.phase == .reserved && !state.payloadBound, "reserve bound payload prematurely")
 
-        for response in [
-            jsonData(["status": "reserved"]),
-            jsonData(["status": "reserved", "fenceRevision": 1, "fence_revision": 2]),
-        ] {
-            let invalidSender = ScriptedFullSyncSender()
-            invalidSender.responseAtCallIndex[0] = response
-            let invalidStore = tempStore()
-            defer { try? invalidStore.discard() }
-            let invalidReporter = FullSyncReporter(
-                configuration: readyConfig(), sender: invalidSender, tokenSupplier: sameAccountTokens(),
+        // A reserve response that omits the fence field defaults to revision 0:
+        // an absent field equals an explicit zero on the wire.
+        let missingFenceSender = ScriptedFullSyncSender()
+        missingFenceSender.responseAtCallIndex[0] = jsonData(["status": "reserved"])
+        let missingFenceStore = tempStore()
+        defer { try? missingFenceStore.discard() }
+        let missingFence = try await FullSyncReporter(
+            configuration: readyConfig(), sender: missingFenceSender, tokenSupplier: sameAccountTokens(),
+            retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }
+        ).reserve(
+            hostname: "device", authIdentity: "ns:account-1", generationBaseline: 1, store: missingFenceStore
+        )
+        try require(missingFence.fenceRevision == 0, "missing reserve fence must default to 0")
+        try require((try missingFenceStore.load()).fenceRevision == 0, "persisted reserve fence must be 0 when omitted")
+
+        // Both camel and snake fence fields present with conflicting values is
+        // still rejected: the decoder cannot pick a single authoritative value.
+        let conflictSender = ScriptedFullSyncSender()
+        conflictSender.responseAtCallIndex[0] = jsonData(["status": "reserved", "fenceRevision": 1, "fence_revision": 2])
+        let conflictStore = tempStore()
+        defer { try? conflictStore.discard() }
+        do {
+            _ = try await FullSyncReporter(
+                configuration: readyConfig(), sender: conflictSender, tokenSupplier: sameAccountTokens(),
                 retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }
+            ).reserve(
+                hostname: "device", authIdentity: "ns:account-1", generationBaseline: 1, store: conflictStore
             )
-            do {
-                _ = try await invalidReporter.reserve(
-                    hostname: "device", authIdentity: "ns:account-1",
-                    generationBaseline: 1, store: invalidStore
-                )
-                throw FullSyncVerificationError.failed("invalid fence response accepted")
-            } catch FullSyncError.malformedResponse {}
-        }
+            throw FullSyncVerificationError.failed("conflicting fence fields accepted")
+        } catch FullSyncError.malformedResponse {}
 
         let generatedStore = tempStore()
         defer { try? generatedStore.discard() }
@@ -764,19 +1031,68 @@ enum FullSyncVerification {
             } catch FullSyncError.malformedResponse {}
         }
 
+        // A committed response that omits a zero count field defaults it to 0.
+        // With an empty snapshot every expected count is 0, so the omitted
+        // autonomy count must default to 0 and the ack check must pass.
         let empty = FullSyncPayloadSnapshot(rawGeneration: 1)
         let sender = ScriptedFullSyncSender()
         sender.responseAtCallIndex[2] = jsonData([
             "status": "committed", "buckets_upserted": 0, "sessions_upserted": 0,
         ])
         let store = tempStore(); defer { try? store.discard() }
-        do {
-            _ = try await FullSyncReporter(
-                configuration: readyConfig(), sender: sender, tokenSupplier: sameAccountTokens(),
-                retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }
-            ).upload(snapshot: empty, authIdentity: "ns:account-1", store: store)
-            throw FullSyncVerificationError.failed("missing zero commit count accepted")
-        } catch FullSyncError.malformedResponse {}
+        let committed = try await FullSyncReporter(
+            configuration: readyConfig(), sender: sender, tokenSupplier: sameAccountTokens(),
+            retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }
+        ).upload(snapshot: empty, authIdentity: "ns:account-1", store: store)
+        try require(
+            committed.bucketsUpserted == 0
+                && committed.sessionsUpserted == 0
+                && committed.autonomySessionsUpserted == 0,
+            "omitted zero commit counts must default to 0"
+        )
+    }
+
+    // A recovered upload state whose server-issued upload ID is shorter than the
+    // 64-hex generation width (as short as 32 lowercase hex) must still load and
+    // resume to a clean commit. Freshly generated IDs remain 64 hex; only the
+    // recovery gate accepts the 32-64 hex range.
+    static func verifyRecoveredShortUploadIDAccepted() async throws {
+        let shortUploadID = String(repeating: "a", count: 32)
+        try require(
+            shortUploadID.utf8.count == 32
+                && shortUploadID.utf8.allSatisfy {
+                    (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0)
+                        || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains($0)
+                },
+            "test fixture must be 32-hex"
+        )
+        let snapshot = makeSnapshot(buckets: 1, sessions: 0)
+        let store = tempStore(); defer { try? store.discard() }
+        try store.save(FullSyncState(
+            uploadID: shortUploadID, hostname: "device", phase: .begun, fenceRevision: 7,
+            authIdentity: "ns:account-1",
+            payloadFingerprint: FullSyncDigest.fingerprint(for: snapshot, hostname: "device"),
+            rawGeneration: 1, expectedBuckets: 1, expectedSessions: 0, expectedAutonomySessions: 0,
+            autonomySources: [], autonomyWindowStart: "", autonomyWindowEnd: ""
+        ))
+        // Reloading proves validate() accepts the 32-hex recovered ID; a strict
+        // 64-only gate would surface corruptState here.
+        try require((try store.load()).uploadID == shortUploadID, "32-hex recovered upload ID rejected on load")
+
+        let sender = ScriptedFullSyncSender(); sender.commitBuckets = 1
+        let reporter = FullSyncReporter(
+            configuration: readyConfig(), sender: sender, tokenSupplier: sameAccountTokens(),
+            retrySleeper: ImmediateSleeper()
+        )
+        let result = try await reporter.upload(snapshot: snapshot, authIdentity: "ns:account-1", store: store)
+        try require(result.uploadID == shortUploadID, "resume changed the recovered upload ID")
+        try require(result.bucketsUpserted == 1, "resume of 32-hex upload did not commit")
+        let actions = sender.calls.map { obj($0.body)["action"] as? String }
+        try require(!actions.contains("reserve") && !actions.contains("begin"), "recovered upload must not re-reserve or re-begin")
+        for call in sender.calls {
+            try require(obj(call.body)["uploadId"] as? String == shortUploadID, "resume sent a drifted upload ID")
+        }
+        try reporter.finalize(store: store)
     }
 
     static func verifyPerRequestIdentityFence() async throws {
@@ -905,5 +1221,254 @@ enum FullSyncVerification {
                 == String(repeating: "x", count: 1_024 - base),
             "gzip body did not decompress to the original JSON"
         )
+    }
+
+    // MARK: - Identity endpoint (origin + positive user id -> namespace)
+
+    // A scripted transport for the identity endpoint. It records the requests
+    // it received (method, headers, whether a body was attached) and answers
+    // each call from a queued script so a 401-then-200 refresh flow can be
+    // modeled deterministically without a live server.
+    private final class ScriptedIdentitySender: HTTPRequestSending, @unchecked Sendable {
+        struct Recorded { let method: String; let headers: [String: String]; let hasBody: Bool; let url: URL }
+        private let lock = NSLock()
+        private var responses: [HTTPResponse]
+        private var index = 0
+        private(set) var calls: [Recorded] = []
+        init(_ responses: [HTTPResponse]) { self.responses = responses }
+        func send(_ request: URLRequest) async throws -> HTTPResponse {
+            lock.withLock {
+                calls.append(Recorded(
+                    method: request.httpMethod ?? "",
+                    headers: request.allHTTPHeaderFields ?? [:],
+                    hasBody: request.httpBody != nil,
+                    url: request.url!
+                ))
+            }
+            let response: HTTPResponse = lock.withLock {
+                let r = responses[min(index, responses.count - 1)]
+                index += 1
+                return r
+            }
+            return response
+        }
+    }
+
+    private static func idResponse(_ status: Int, _ json: [String: Any]) -> HTTPResponse {
+        HTTPResponse(statusCode: status, body: jsonData(json))
+    }
+
+    // A token supplier whose namespace is resolved through a real
+    // OriginUserIdentityResolver against a scripted identity endpoint, so the
+    // reporter's fence exercises the production identity path end to end.
+    private struct EndpointTokens: FullSyncTokenSupplying {
+        let initialToken: String
+        let refreshedToken: String
+        let resolver: OriginUserIdentityResolver
+        let onForceRefresh: @Sendable () -> Void
+        func token(forceRefresh: Bool) async throws -> SecretToken {
+            if forceRefresh { onForceRefresh(); return SecretToken(refreshedToken) }
+            return SecretToken(initialToken)
+        }
+        func accountNamespace(forToken token: SecretToken) async throws -> String {
+            do { return try await resolver.resolveNamespace(token: token) }
+            catch { throw FullSyncError.authIdentityUnverifiable }
+        }
+    }
+
+    // origin normalization: scheme/host lowercased, default port dropped, path
+    // and user info discarded, non-http rejected.
+    static func verifyOriginNormalization() throws {
+        try require(RequestOrigin.normalize(URL(string: "HTTPS://Example.INVALID/usage?x=1")!) == "https://example.invalid", "https default-port origin not normalized")
+        try require(RequestOrigin.normalize(URL(string: "https://example.invalid:8443/x")!) == "https://example.invalid:8443", "non-default https port dropped")
+        try require(RequestOrigin.normalize(URL(string: "http://example.invalid:80")!) == "http://example.invalid", "http default port not dropped")
+        try require(RequestOrigin.normalize(URL(string: "http://user:pass@example.invalid/p")!) == "http://example.invalid", "user info not stripped")
+        try require(RequestOrigin.normalize(URL(string: "file:///tmp/x")!) == nil, "non-http scheme accepted")
+        try require(RequestOrigin.normalize(URL(string: "https:///nohost")!) == nil, "missing host accepted")
+    }
+
+    // positive integer id: accept int and digit-string; reject 0/neg/float/
+    // bool/non-digit/missing key.
+    static func verifyPositiveUserID() throws {
+        try require((try? OriginUserIdentityResolver.positiveUserID(from: jsonData(["id": 42]), keyPath: ["id"])) == 42, "positive int id rejected")
+        try require((try? OriginUserIdentityResolver.positiveUserID(from: jsonData(["user": ["id": 7]]), keyPath: ["user", "id"])) == 7, "nested id rejected")
+        try require((try? OriginUserIdentityResolver.positiveUserID(from: jsonData(["id": "1234"]), keyPath: ["id"])) == 1234, "digit-string id rejected")
+        for bad in [jsonData(["id": 0]), jsonData(["id": -3]), jsonData(["id": 1.5]), jsonData(["id": true]), jsonData(["id": "12a"]), jsonData(["other": 1]), Data("not json".utf8)] {
+            var threw = false
+            do { _ = try OriginUserIdentityResolver.positiveUserID(from: bad, keyPath: ["id"]) } catch { threw = true }
+            try require(threw, "invalid user id was accepted")
+        }
+    }
+
+    // namespace is versioned, stable for the same (origin,id), and distinct
+    // when either the origin or the id changes.
+    static func verifyNamespaceDerivation() throws {
+        let a = OriginUserIdentityResolver.namespace(origin: "https://example.invalid", userID: 1)
+        let aAgain = OriginUserIdentityResolver.namespace(origin: "https://example.invalid", userID: 1)
+        let diffID = OriginUserIdentityResolver.namespace(origin: "https://example.invalid", userID: 2)
+        let diffOrigin = OriginUserIdentityResolver.namespace(origin: "https://other.invalid", userID: 1)
+        try require(a == aAgain, "namespace not stable for same origin+id")
+        try require(a.hasPrefix(OriginUserIdentityResolver.namespaceVersion + ":"), "namespace not version-tagged")
+        try require(a != diffID && a != diffOrigin && diffID != diffOrigin, "namespace collided across origin/id")
+    }
+
+    // The resolver queries the endpoint with the shared auth header + static
+    // headers, accepts the configured status, derives the namespace, and fails
+    // closed on a malformed id, an unconfigured endpoint, or a 401.
+    static func verifyIdentityEndpointResolution() async throws {
+        let base = URL(string: "https://example.invalid")!
+        let config = IdentityEndpointConfiguration(
+            path: "/whoami", method: .get, responseIDKeyPath: ["id"], successStatusCodes: [200],
+            headerNames: .init(authToken: "X-Auth"), staticHeaders: [StaticHeader(name: "X-Client", value: "verifier")]
+        )
+        let ok = ScriptedIdentitySender([idResponse(200, ["id": 99])])
+        let namespace = try await OriginUserIdentityResolver(baseURL: base, configuration: config, sender: ok).resolveNamespace(token: SecretToken("tok"))
+        try require(namespace == OriginUserIdentityResolver.namespace(origin: "https://example.invalid", userID: 99), "resolved namespace mismatch")
+        try require(ok.calls.first?.headers["X-Auth"] == "tok", "identity request missing auth header")
+        try require(ok.calls.first?.headers["X-Client"] == "verifier", "identity request missing static header")
+        try require(ok.calls.first?.method == "GET" && ok.calls.first?.hasBody == false, "GET identity request shape wrong")
+        try require(ok.calls.first?.url.path == "/whoami", "identity request path wrong")
+
+        // POST variant attaches an empty JSON body and the content-type header.
+        let postConfig = IdentityEndpointConfiguration(path: "/whoami", method: .post, responseIDKeyPath: ["id"], successStatusCodes: [200], headerNames: .init(authToken: "X-Auth", contentType: "Content-Type"))
+        let postSender = ScriptedIdentitySender([idResponse(200, ["id": 5])])
+        _ = try await OriginUserIdentityResolver(baseURL: base, configuration: postConfig, sender: postSender).resolveNamespace(token: SecretToken("tok"))
+        try require(postSender.calls.first?.method == "POST" && postSender.calls.first?.hasBody == true, "POST identity request must carry a body")
+
+        // Malformed id, 401, and an unconfigured endpoint all fail closed.
+        var threw = false
+        do { _ = try await OriginUserIdentityResolver(baseURL: base, configuration: config, sender: ScriptedIdentitySender([idResponse(200, ["id": 0])])).resolveNamespace(token: SecretToken("tok")) } catch IdentityResolutionError.malformedResponse { threw = true }
+        try require(threw, "zero id did not fail closed")
+        threw = false
+        do { _ = try await OriginUserIdentityResolver(baseURL: base, configuration: config, sender: ScriptedIdentitySender([idResponse(401, [:])])).resolveNamespace(token: SecretToken("tok")) } catch IdentityResolutionError.notAuthenticated { threw = true }
+        try require(threw, "401 identity did not surface notAuthenticated")
+        threw = false
+        do { _ = try await OriginUserIdentityResolver(baseURL: base, configuration: IdentityEndpointConfiguration(), sender: ScriptedIdentitySender([idResponse(200, ["id": 1])])).resolveNamespace(token: SecretToken("tok")) } catch IdentityResolutionError.notConfigured { threw = true }
+        try require(threw, "unconfigured endpoint attempted a request")
+    }
+
+    // same/different/unknown/cross-namespace fencing at reserve time, driven by
+    // the endpoint-backed supplier. Same id -> proceeds; a different id under
+    // the same origin (same version prefix) -> authIdentityChanged; an
+    // unresolvable identity -> authIdentityUnverifiable; neither reaches begin.
+    static func verifyIdentityNamespaceFencing() async throws {
+        let base = URL(string: "https://example.invalid")!
+        let config = IdentityEndpointConfiguration(path: "/whoami", method: .get, responseIDKeyPath: ["id"], successStatusCodes: [200], headerNames: .init(authToken: "X-Auth"))
+        let pinned = OriginUserIdentityResolver.namespace(origin: "https://example.invalid", userID: 1)
+
+        // Same account: reserve proceeds and persists reserved state.
+        let sameSender = ScriptedFullSyncSender()
+        let sameIdentity = ScriptedIdentitySender([idResponse(200, ["id": 1])])
+        let sameTokens = EndpointTokens(initialToken: "a", refreshedToken: "a2", resolver: OriginUserIdentityResolver(baseURL: base, configuration: config, sender: sameIdentity), onForceRefresh: {})
+        let sameStore = tempStore(); defer { try? sameStore.discard() }
+        _ = try await FullSyncReporter(configuration: readyConfig(), sender: sameSender, tokenSupplier: sameTokens, retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }).reserve(hostname: "device", authIdentity: pinned, generationBaseline: 1, store: sameStore)
+        try require(sameSender.calls.count == 1 && (try sameStore.load()).phase == .reserved, "same-account reserve did not proceed")
+
+        // Different account (same origin, id 2): cross-namespace -> changed.
+        let diffSender = ScriptedFullSyncSender()
+        let diffIdentity = ScriptedIdentitySender([idResponse(200, ["id": 2])])
+        let diffTokens = EndpointTokens(initialToken: "a", refreshedToken: "a2", resolver: OriginUserIdentityResolver(baseURL: base, configuration: config, sender: diffIdentity), onForceRefresh: {})
+        do {
+            _ = try await FullSyncReporter(configuration: readyConfig(), sender: diffSender, tokenSupplier: diffTokens, retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }).reserve(hostname: "device", authIdentity: pinned, generationBaseline: 1, store: tempStore())
+            throw FullSyncVerificationError.failed("cross-namespace account was accepted")
+        } catch FullSyncError.authIdentityChanged {}
+        try require(diffSender.calls.isEmpty, "cross-namespace mismatch reached network")
+
+        // Unresolvable identity (endpoint 500) -> unverifiable, no network.
+        let unkSender = ScriptedFullSyncSender()
+        let unkIdentity = ScriptedIdentitySender([idResponse(500, [:])])
+        let unkTokens = EndpointTokens(initialToken: "a", refreshedToken: "a2", resolver: OriginUserIdentityResolver(baseURL: base, configuration: config, sender: unkIdentity), onForceRefresh: {})
+        do {
+            _ = try await FullSyncReporter(configuration: readyConfig(), sender: unkSender, tokenSupplier: unkTokens, retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }).reserve(hostname: "device", authIdentity: pinned, generationBaseline: 1, store: tempStore())
+            throw FullSyncVerificationError.failed("unverifiable identity was accepted")
+        } catch FullSyncError.authIdentityUnverifiable {}
+        try require(unkSender.calls.isEmpty, "unverifiable identity reached network")
+    }
+
+    // On a 401 the reporter forces exactly one token refresh, re-resolves the
+    // namespace through the endpoint, and proceeds only when it still matches
+    // the pinned identity; a refreshed credential that resolves to a different
+    // account fences even after the refresh.
+    static func verifyRefreshResolvesIdentityThroughEndpoint() async throws {
+        let base = URL(string: "https://example.invalid")!
+        let config = IdentityEndpointConfiguration(path: "/whoami", method: .get, responseIDKeyPath: ["id"], successStatusCodes: [200], headerNames: .init(authToken: "X-Auth"))
+        let pinned = OriginUserIdentityResolver.namespace(origin: "https://example.invalid", userID: 1)
+
+        // Happy refresh: endpoint always returns id 1, so post-refresh identity
+        // matches and the upload completes with exactly one forced refresh.
+        let sender = ScriptedFullSyncSender(); sender.commitBuckets = 1; sender.unauthorizedUntilRefresh = true
+        let refreshes = Counter()
+        let identity = ScriptedIdentitySender([idResponse(200, ["id": 1])])
+        let tokens = EndpointTokens(initialToken: "a", refreshedToken: "a2", resolver: OriginUserIdentityResolver(baseURL: base, configuration: config, sender: identity), onForceRefresh: { refreshes.increment(); sender.markRefreshed() })
+        let store = tempStore(); defer { try? store.discard() }
+        let result = try await FullSyncReporter(configuration: readyConfig(), sender: sender, tokenSupplier: tokens, retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }).upload(snapshot: makeSnapshot(buckets: 1, sessions: 0), authIdentity: pinned, store: store)
+        try require(result.bucketsUpserted == 1, "refresh-through-endpoint upload failed")
+        try require(refreshes.value == 1, "expected exactly one forced refresh")
+
+        // Refreshed credential resolves to a different account -> fence.
+        let sender2 = ScriptedFullSyncSender(); sender2.unauthorizedUntilRefresh = true
+        let identity2 = ScriptedIdentitySender([idResponse(200, ["id": 1]), idResponse(200, ["id": 1]), idResponse(200, ["id": 2])])
+        let tokens2 = EndpointTokens(initialToken: "a", refreshedToken: "a2", resolver: OriginUserIdentityResolver(baseURL: base, configuration: config, sender: identity2), onForceRefresh: { sender2.markRefreshed() })
+        do {
+            _ = try await FullSyncReporter(configuration: readyConfig(), sender: sender2, tokenSupplier: tokens2, retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }).upload(snapshot: makeSnapshot(buckets: 1, sessions: 0), authIdentity: pinned, store: tempStore())
+            throw FullSyncVerificationError.failed("post-refresh account change was accepted")
+        } catch FullSyncError.authIdentityChanged {}
+    }
+
+    // A configured JSON error code (not the HTTP status) triggers the same
+    // chunk shrink as a 413: a 400 carrying the code halves the 4-row chunk.
+    static func verifyPayloadTooLargeJSONCodeSplit() async throws {
+        var config = readyConfig(rows: 4)
+        config.payloadTooLargeCode = PayloadTooLargeCode(keyPath: ["error", "code"], stringValues: ["PAYLOAD_TOO_LARGE"])
+        let snapshot = makeSnapshot(buckets: 4, sessions: 0)
+        let sender = ScriptedFullSyncSender(); sender.commitBuckets = 4
+        // reserve(0), begin(1), first 4-row stage(2) -> 400 with the JSON code.
+        sender.responseAtCallIndex[2] = jsonData(["error": ["code": "PAYLOAD_TOO_LARGE"]])
+        sender.statusAtCallIndex = [2: 400]
+        let store = tempStore(); defer { try? store.discard() }
+        let result = try await FullSyncReporter(configuration: config, sender: sender, tokenSupplier: sameAccountTokens(), retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }).upload(snapshot: snapshot, authIdentity: "ns:account-1", store: store)
+        try require(result.bucketsUpserted == 4, "JSON-code split commit count wrong")
+        let actions = sender.calls.map { obj(rawBody($0))["action"] as? String }
+        try require(actions == ["reserve", "begin", "stage", "stage", "stage", "commit"], "JSON-code split action sequence wrong: \(actions)")
+    }
+
+    // A 501 surfaces the dedicated unsupported error, no commit is attempted,
+    // and the reserved state is left intact for the caller to decide.
+    static func verifyUnsupportedStatus() async throws {
+        let sender = ScriptedFullSyncSender(); sender.statusAtCallIndex = [1: 501]
+        let store = tempStore(); defer { try? store.discard() }
+        do {
+            _ = try await FullSyncReporter(configuration: readyConfig(), sender: sender, tokenSupplier: sameAccountTokens(), retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }).upload(snapshot: makeSnapshot(buckets: 1, sessions: 0), authIdentity: "ns:account-1", store: store)
+            throw FullSyncVerificationError.failed("501 did not surface unsupported")
+        } catch FullSyncError.unsupported {}
+        let actions = sender.calls.map { obj(rawBody($0))["action"] as? String }
+        try require(!actions.contains("commit"), "501 still committed")
+    }
+
+    // A 410 surfaces rejoinRequired and discards only the local upload state;
+    // the reporter never has access to external credentials, so they cannot be
+    // deleted here. The dedicated error lets the caller start a fresh join.
+    static func verifyRejoinRequiredKeepsCredentials() async throws {
+        let sender = ScriptedFullSyncSender(); sender.statusAtCallIndex = [1: 410]
+        let store = tempStore(); defer { try? store.discard() }
+        do {
+            _ = try await FullSyncReporter(configuration: readyConfig(), sender: sender, tokenSupplier: sameAccountTokens(), retrySleeper: ImmediateSleeper(), makeUploadID: { validUploadID }).upload(snapshot: makeSnapshot(buckets: 1, sessions: 0), authIdentity: "ns:account-1", store: store)
+            throw FullSyncVerificationError.failed("410 did not surface rejoinRequired")
+        } catch FullSyncError.rejoinRequired {}
+        try require(!store.hasState(), "410 did not discard local upload state")
+    }
+
+    // reserve retries a 500/502/503/504 with the reserve-specific 0.5s/1s
+    // backoff and its own retry budget, then succeeds. A recording sleeper
+    // proves the exact backoff schedule.
+    static func verifyReserveBackoffOnServerErrors() async throws {
+        let recorder = RecordingSleeper()
+        let sender = ScriptedFullSyncSender()
+        // reserve is call 0; fail it with 503 then 500, succeed on the third try.
+        sender.statusAtCallIndex = [0: 503, 1: 500]
+        let store = tempStore(); defer { try? store.discard() }
+        _ = try await FullSyncReporter(configuration: readyConfig(), sender: sender, tokenSupplier: sameAccountTokens(), retrySleeper: recorder, makeUploadID: { validUploadID }).reserve(hostname: "device", authIdentity: "ns:account-1", generationBaseline: 1, store: store)
+        try require(recorder.seconds == [0.5, 1], "reserve backoff schedule wrong: \(recorder.seconds)")
+        try require(sender.calls.count == 3, "reserve did not retry twice before success")
     }
 }
