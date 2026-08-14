@@ -43,6 +43,17 @@ public struct RequestHeaderNames: Sendable, Equatable {
         self.contentEncoding = contentEncoding
         self.contentType = contentType
     }
+
+    /// The non-empty header names this client sets itself (auth, timezone,
+    /// locale, content-encoding, content-type). Runtime/static headers are
+    /// forbidden from targeting any of these so a template can never overwrite
+    /// a client-controlled header. Comparison is case-insensitive because HTTP
+    /// header field names are case-insensitive.
+    public var reservedNames: Set<String> {
+        Set([authToken, timeZoneOffset, locale, contentEncoding, contentType]
+            .filter { !$0.isEmpty }
+            .map { $0.lowercased() })
+    }
 }
 
 /// A static request header (name/value) attached to every request. Callers use
@@ -91,5 +102,125 @@ public enum RequestEnvironment {
 
     private static func twoDigits(_ value: Int) -> String {
         value < 10 ? "0\(value)" : "\(value)"
+    }
+}
+
+// MARK: - Runtime header templates
+
+/// The error thrown when a header template cannot be resolved cleanly.
+/// Callers must treat this as a configuration error, not a soft warning.
+public enum HeaderTemplateError: Error, Equatable, Sendable {
+    /// The template references a variable key that was not supplied.
+    case unknownVariable(String)
+    /// A placeholder was opened with {{ but never closed.
+    case unclosedPlaceholder
+    /// The resolved value contains a CR or LF character that would break
+    /// HTTP header framing.
+    case newlineInValue(String)
+    /// The header name is empty or contains characters forbidden by
+    /// RFC 7230 (control chars, separators, colon, CRLF).
+    case invalidHeaderName(String)
+    /// The header name targets a client-controlled header (auth, timezone,
+    /// locale, content-encoding, content-type) and would overwrite it.
+    case protectedHeaderName(String)
+}
+
+/// Predefined variable keys the library recognises in header templates.
+/// Any key not in this set is rejected at resolve-time.
+public enum HeaderTemplateKey: String, Sendable, CaseIterable {
+    case platform
+    case appVersion = "app_version"
+    case userAgent = "user_agent"
+    case appID = "app_id"
+}
+
+/// A resolved set of runtime variable values used to expand header templates.
+/// Callers supply only the variables they know.
+public struct RuntimeHeaderContext: Sendable, Equatable {
+    private let values: [String: String]
+
+    public init(_ values: [HeaderTemplateKey: String] = [:]) {
+        self.values = Dictionary(uniqueKeysWithValues: values.map { ($0.key.rawValue, $0.value) })
+    }
+
+    /// Resolves {{key}} placeholders in template.
+    /// Throws HeaderTemplateError on any failure — fail-closed.
+    public func resolve(template: String) throws -> String {
+        var result = ""
+        var remaining = template[...]
+        while let open = remaining.range(of: "{{") {
+            result += remaining[..<open.lowerBound]
+            remaining = remaining[open.upperBound...]
+            guard let close = remaining.range(of: "}}") else {
+                throw HeaderTemplateError.unclosedPlaceholder
+            }
+            let key = String(remaining[..<close.lowerBound])
+            remaining = remaining[close.upperBound...]
+            guard let value = values[key] else {
+                throw HeaderTemplateError.unknownVariable(key)
+            }
+            guard !StaticHeader.containsLineBreak(value) else {
+                throw HeaderTemplateError.newlineInValue(key)
+            }
+            result += value
+        }
+        result += remaining
+        return result
+    }
+}
+
+extension StaticHeader {
+    /// Swift treats a CRLF pair as one extended grapheme cluster, so
+    /// `String.contains("\r")` and `contains("\n")` can both return false.
+    /// Inspect Unicode scalar values directly for HTTP framing characters.
+    public static func containsLineBreak(_ value: String) -> Bool {
+        value.unicodeScalars.contains { scalar in
+            scalar.value == 0x0A || scalar.value == 0x0D
+        }
+    }
+
+    public static func isValidName(_ name: String) -> Bool {
+        guard !name.isEmpty else { return false }
+        return name.unicodeScalars.allSatisfy { scalar in
+            let v = scalar.value
+            guard v >= 0x21, v != 0x7F else { return false }
+            switch v {
+            case 0x22, 0x28...0x29, 0x2C, 0x2F, 0x3A...0x40, 0x5B...0x5D, 0x7B, 0x7D:
+                return false
+            default:
+                return true
+            }
+        }
+    }
+
+    public static func resolved(
+        name: String,
+        template: String,
+        context: RuntimeHeaderContext
+    ) throws -> StaticHeader {
+        guard isValidName(name) else { throw HeaderTemplateError.invalidHeaderName(name) }
+        let value = try context.resolve(template: template)
+        guard !containsLineBreak(value) else {
+            throw HeaderTemplateError.newlineInValue(name)
+        }
+        return StaticHeader(name: name, value: value)
+    }
+
+    /// Resolves an ordered list of (name, template) pairs into concrete
+    /// headers, fail-closed. Any invalid name, unknown variable, unclosed
+    /// placeholder, CR/LF in the resolved value, or a name that collides
+    /// (case-insensitively) with a client-controlled header in `reservedNames`
+    /// aborts the whole batch by throwing. There is no partial result.
+    public static func resolvedList(
+        _ templates: [(name: String, template: String)],
+        context: RuntimeHeaderContext,
+        reservedNames: Set<String>
+    ) throws -> [StaticHeader] {
+        try templates.map { entry in
+            guard !reservedNames.contains(entry.name.lowercased()) else {
+                throw HeaderTemplateError.protectedHeaderName(entry.name)
+            }
+            return try resolved(name: entry.name, template: entry.template, context: context)
+        }
     }
 }

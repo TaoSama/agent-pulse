@@ -157,6 +157,13 @@ public struct IngestClientConfiguration: Sendable, Equatable {
 
 /// Errors surfaced by the ingest client. None embed credential bytes.
 public enum IngestClientError: Error, Equatable, Sendable {
+    /// Batch dimensions whose rows carry a per-row natural key.
+    public enum NaturalKeyDimension: String, Sendable, Equatable {
+        case buckets
+        case sessions
+        case autonomySessions
+    }
+
     /// No base URL / path was configured, so the client performs no networking.
     case configurationMissing
     /// The configured base URL and path could not be combined into a URL.
@@ -178,21 +185,28 @@ public enum IngestClientError: Error, Equatable, Sendable {
     case transportFailure
     /// The success response could not be decoded into the expected envelope.
     case malformedResponse
+    /// Two or more rows in one batch dimension collapsed to the same
+    /// normalized natural key. The batch is rejected before any token is
+    /// acquired or request built, so the failure has no external effect.
+    case duplicateNaturalKey(dimension: NaturalKeyDimension)
 }
 
 /// Builds and dispatches usage-ingest requests over an injected transport. The
 /// request contract (path, headers, gzip threshold, single refresh, identity
-/// fence) is honored, but every environment-specific value is supplied by the
-/// caller. An unconfigured client throws configurationMissing and never touches
-/// the network.
+/// fence, one-shot 413 autonomy fallback) is honored, but every
+/// environment-specific value is supplied by the caller. An unconfigured
+/// client throws configurationMissing and never touches the network.
 public struct UsageIngestClient: Sendable {
     /// Body byte count at or above which the request is gzip-compressed.
     public static let gzipMinimumBytes = 1024
-    /// Field-length caps applied before encoding (defense in depth).
-    static let sourceMaxBytes = 30
-    static let modelMaxBytes = 255
-    static let projectMaxBytes = 200
-    static let errorMaxBytes = 300
+    // Field-length caps and natural-key rejection now live in the shared
+    // UsageWireNormalizer so the incremental and full-sync paths apply an
+    // identical wire contract. These aliases keep the historical names in
+    // scope for readers of this type.
+    static var sourceMaxBytes: Int { UsageWireNormalizer.sourceMaxBytes }
+    static var modelMaxBytes: Int { UsageWireNormalizer.modelMaxBytes }
+    static var projectMaxBytes: Int { UsageWireNormalizer.projectMaxBytes }
+    static var errorMaxBytes: Int { UsageWireNormalizer.errorMaxBytes }
 
     private let configuration: IngestClientConfiguration
     private let tokenSupplier: TokenSupplying
@@ -228,16 +242,20 @@ public struct UsageIngestClient: Sendable {
 
     /// Sends a single ingest request. Applies field-length caps, encodes the
     /// body, compresses when large enough, and decodes the server envelope.
-    /// Throws configurationMissing (sending nothing) if not configured.
+    /// A 413 response on a body carrying autonomy fields triggers a single
+    /// rebuilt resend with every autonomy field removed. A batch whose rows
+    /// collapse to duplicate natural keys within one dimension is rejected
+    /// before any token acquisition or network I/O. Throws
+    /// configurationMissing (sending nothing) if not configured.
     @discardableResult
     public func ingest(_ request: UsageIngestRequest) async throws -> UsageIngestResponse {
         guard configuration.isConfigured else {
             throw IngestClientError.configurationMissing
         }
 
-        let normalizedRequest = normalized(request)
-        let rawBody = encoder.encode(normalizedRequest)
-        let responseBody = try await send(rawBody: rawBody)
+        let normalizedRequest = UsageWireNormalizer.normalize(request, hostname: configuration.hostname)
+        try UsageWireNormalizer.ensureUniqueNaturalKeys(normalizedRequest)
+        let responseBody = try await send(normalizedRequest)
         do {
             return try JSONDecoder().decode(UsageIngestResponse.self, from: responseBody)
         } catch {
@@ -294,28 +312,25 @@ public struct UsageIngestClient: Sendable {
         request.setValue(value, forHTTPHeaderField: name)
     }
 
-    // MARK: - Dispatch with single refresh + identity fence
+    // MARK: - Dispatch with single refresh, identity fence, and one-shot 413 fallback
 
-    private func send(rawBody: Data) async throws -> Data {
-        let useGzip = rawBody.count >= Self.gzipMinimumBytes
-        let body: Data
-        let gzipApplied: Bool
-        if useGzip, let compressed = GzipCompressor.compress(rawBody) {
-            body = compressed
-            gzipApplied = true
-        } else {
-            body = rawBody
-            gzipApplied = false
-        }
+    /// Status code marking a request body as too large. Handled specially
+    /// rather than through the generic retry policy: a body still carrying
+    /// autonomy fields is rebuilt without them and resent exactly once.
+    static let payloadTooLargeStatusCode = 413
 
+    private func send(_ request: UsageIngestRequest) async throws -> Data {
         let policy = configuration.retryPolicy
         var token = try await tokenSupplier.token(forceRefresh: false)
         var didForceRefresh = false
         var retryCount = 0
+        var isAutonomyDegraded = false
+        var currentRequest = request
+        var encoded = encodedBody(currentRequest)
 
         while true {
             do {
-                let response = try await sender.send(makeRequest(body: body, gzip: gzipApplied, token: token))
+                let response = try await sender.send(makeRequest(body: encoded.body, gzip: encoded.gzipApplied, token: token))
                 switch response.statusCode {
                 case 200...299:
                     return response.body
@@ -330,23 +345,24 @@ public struct UsageIngestClient: Sendable {
                     token = refreshedToken
                     // Immediate resend with the refreshed token, without
                     // spending a retry or a backoff.
-                    let retried = try await sender.send(makeRequest(body: body, gzip: gzipApplied, token: token))
-                    switch retried.statusCode {
-                    case 200...299:
-                        return retried.body
-                    case 401:
-                        throw IngestClientError.notAuthenticated
-                    default:
-                        if policy.isRetryable(retried), retryCount < policy.maxRetries {
-                            try await sleepBeforeRetry(policy, retryCount: retryCount)
-                            retryCount += 1
-                            continue
-                        }
-                        throw terminalFailure(for: retried)
-                    }
+                    continue
                 case 401:
                     // A forced refresh already happened; do not refresh again.
                     throw IngestClientError.notAuthenticated
+                case Self.payloadTooLargeStatusCode where !isAutonomyDegraded && currentRequest.containsAutonomyFields:
+                    // One-shot size fallback: drop every autonomy field, then
+                    // rebuild the JSON, the gzip decision, and the headers,
+                    // and resend once with the same token. No backoff, no
+                    // refresh, and no retry budget is spent.
+                    isAutonomyDegraded = true
+                    currentRequest = currentRequest.removingAutonomyFields()
+                    encoded = encodedBody(currentRequest)
+                    continue
+                case Self.payloadTooLargeStatusCode:
+                    // Nothing left to strip, or the fallback already fired.
+                    // A 413 is terminal: it never falls through to the generic
+                    // retry/backoff path.
+                    throw IngestClientError.httpFailure(statusCode: response.statusCode)
                 default:
                     if policy.isRetryable(response), retryCount < policy.maxRetries {
                         try await sleepBeforeRetry(policy, retryCount: retryCount)
@@ -373,6 +389,17 @@ public struct UsageIngestClient: Sendable {
         }
     }
 
+    /// Encodes the request and decides whether the wire body is gzipped.
+    /// Recomputed on every resend so a degraded (smaller) body is rebuilt
+    /// from scratch instead of reusing stale bytes or headers.
+    private func encodedBody(_ request: UsageIngestRequest) -> (body: Data, gzipApplied: Bool) {
+        let rawBody = encoder.encode(request)
+        if rawBody.count >= Self.gzipMinimumBytes, let compressed = GzipCompressor.compress(rawBody) {
+            return (compressed, true)
+        }
+        return (rawBody, false)
+    }
+
     private func sleepBeforeRetry(_ policy: RetryPolicy, retryCount: Int) async throws {
         try await retrySleeper.sleep(seconds: policy.backoff(forRetryIndex: retryCount + 1))
     }
@@ -389,47 +416,34 @@ public struct UsageIngestClient: Sendable {
 
     // MARK: - Normalization
 
-    private func normalized(_ request: UsageIngestRequest) -> UsageIngestRequest {
-        let hostname = CanonicalHostname.normalize(configuration.hostname)
-        var copy = request
-        copy.buckets = request.buckets.map { bucket in
-            var b = bucket
-            b.hostname = hostname
-            b.model = Self.truncate(bucket.model, Self.modelMaxBytes)
-            b.source = Self.truncate(bucket.source, Self.sourceMaxBytes)
-            b.project = Self.truncate(bucket.project, Self.projectMaxBytes)
-            return b
-        }
-        copy.sessions = request.sessions.map { session in
-            var s = session
-            s.hostname = hostname
-            s.source = Self.truncate(session.source, Self.sourceMaxBytes)
-            s.project = Self.truncate(session.project, Self.projectMaxBytes)
-            return s
-        }
-        copy.autonomySessions = request.autonomySessions.map { session in
-            var s = session
-            s.hostname = hostname
-            s.source = Self.truncate(session.source, Self.sourceMaxBytes)
-            s.project = Self.truncate(session.project, Self.projectMaxBytes)
-            return s
-        }
-        copy.autonomySourceStatuses = request.autonomySourceStatuses.map { status in
-            var s = status
-            s.hostname = hostname
-            s.source = Self.truncate(status.source, Self.sourceMaxBytes)
-            s.error = Self.truncate(status.error, Self.errorMaxBytes)
-            return s
-        }
-        return copy
+    /// Truncates to at most n UTF-8 bytes without splitting a multibyte scalar.
+    /// Retained as a thin passthrough to the shared normalizer so existing
+    /// callers and verifiers keep a stable entry point while the canonical
+    /// implementation lives in one place.
+    public static func truncate(_ value: String, _ maxBytes: Int) -> String {
+        UsageWireNormalizer.truncate(value, maxBytes)
+    }
+}
+
+private extension UsageIngestRequest {
+    /// True when the request carries at least one autonomy field the encoder
+    /// would emit. Empty values are omitted on the wire, so they cannot have
+    /// contributed to an oversized body.
+    var containsAutonomyFields: Bool {
+        !autonomySessions.isEmpty
+            || !autonomySourceStatuses.isEmpty
+            || !autonomyWindowStart.isEmpty
+            || !autonomyWindowEnd.isEmpty
     }
 
-    /// Truncates to at most n UTF-8 bytes without splitting a multibyte scalar.
-    public static func truncate(_ value: String, _ maxBytes: Int) -> String {
-        let utf8 = Array(value.utf8)
-        guard utf8.count > maxBytes else { return value }
-        var end = maxBytes
-        while end > 0 && (utf8[end] & 0xC0) == 0x80 { end -= 1 }
-        return String(decoding: utf8[0..<end], as: UTF8.self)
+    /// The same request with every autonomy field cleared, so the encoder
+    /// omits them. Buckets, sessions, and the full-sync flags are untouched.
+    func removingAutonomyFields() -> UsageIngestRequest {
+        var copy = self
+        copy.autonomySessions = []
+        copy.autonomySourceStatuses = []
+        copy.autonomyWindowStart = ""
+        copy.autonomyWindowEnd = ""
+        return copy
     }
 }

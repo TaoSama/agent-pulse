@@ -44,52 +44,65 @@ public struct URLSessionFullSyncRequestSender: FullSyncRequestSending {
 
 /// A `FullSyncTokenSupplying` that reuses the incremental path's command token
 /// plumbing: `CommandTokenSupplier` runs the caller-configured helper off the
-/// cooperative executor and honors the single forced refresh, while
-/// `TokenAccountIdentity` derives the stable, comparable account identity the
-/// core fences on. Both the token source and the claim keys are injected, so no
-/// environment-specific command or claim name is hardcoded here.
+/// cooperative executor and honors the single forced refresh. Account identity
+/// is resolved by an authenticated lookup against a configured identity
+/// endpoint (`OriginUserIdentityResolver`) rather than by inspecting token
+/// bytes, so a JWT claim change or a re-issued opaque token can never silently
+/// remap the account. Both the token source and the identity endpoint are
+/// injected, so no environment-specific command, path, header, or response key
+/// is hardcoded here.
 public struct CommandFullSyncTokenSupplier: FullSyncTokenSupplying {
     private let tokenSupplier: TokenSupplying
-    private let identity: TokenAccountIdentity
+    private let resolver: OriginUserIdentityResolver
 
-    /// Injects the token source and identity deriver directly. Useful for tests
-    /// and for reusing an already-constructed supplier.
-    public init(tokenSupplier: TokenSupplying, identity: TokenAccountIdentity) {
+    /// Injects the token source and identity resolver directly. Useful for
+    /// tests and for reusing an already-constructed supplier.
+    public init(tokenSupplier: TokenSupplying, resolver: OriginUserIdentityResolver) {
         self.tokenSupplier = tokenSupplier
-        self.identity = identity
+        self.resolver = resolver
     }
 
-    /// Builds the production supplier from the reporting configuration, wiring
-    /// the configured token command through `CommandTokenSupplier` and the
-    /// configured claim keys through `TokenAccountIdentity`. This mirrors how the
-    /// incremental client is assembled, so both paths resolve the same token and
-    /// the same identity for a given credential.
-    public init(configuration: TokenReportingConfiguration, runner: ProcessRunning = SubprocessRunner()) {
-        let provider = ConfiguredCommandTokenProvider(
-            configuration: configuration.tokenCommand.providerConfiguration,
-            runner: runner
-        )
-        self.init(
-            tokenSupplier: CommandTokenSupplier(provider: provider),
-            identity: TokenAccountIdentity(claimKeys: configuration.tokenAccountClaimKeys)
-        )
-    }
+    /// Builds the production supplier from the reporting configuration and the
+    /// resolved backend base URL, wiring the configured token command through
+    /// `CommandTokenSupplier` and the configured identity endpoint (path,
+    /// method, response id key, status codes, shared headers) through
+    /// `OriginUserIdentityResolver`. Every value arrives from configuration.
+   public init(
+       configuration: TokenReportingConfiguration,
+       baseURL: URL,
+       runner: ProcessRunning = SubprocessRunner(),
+       identitySender: HTTPRequestSending = URLSessionRequestSender()
+   ) {
+       let provider = ConfiguredCommandTokenProvider(
+           configuration: configuration.tokenCommand.providerConfiguration,
+           runner: runner
+       )
+       self.init(
+           tokenSupplier: CommandTokenSupplier(provider: provider),
+           resolver: OriginUserIdentityResolver(
+               baseURL: baseURL,
+                configuration: configuration.identityEndpointConfiguration() ?? IdentityEndpointConfiguration(),
+               sender: identitySender
+           )
+       )
+   }
 
     public func token(forceRefresh: Bool) async throws -> SecretToken {
         try await tokenSupplier.token(forceRefresh: forceRefresh)
     }
 
-    public func stableAccountIdentity(forToken token: SecretToken) -> String {
-        identity.comparisonIdentity(token.reveal())
+    public func accountNamespace(forToken token: SecretToken) async throws -> String {
+        try await resolver.resolveNamespace(token: token)
     }
 
-    /// Prefetches a token and derives its stable identity in one step, so a
-    /// coordinator can obtain the `authIdentity` the core's `upload` entry point
-    /// requires before starting an upload. The revealed token stays local to
-    /// this call and is never returned or stored alongside the identity.
+    /// Prefetches a token and resolves its account namespace in one step, so a
+    /// coordinator can obtain the pinned `authIdentity` the core's `upload`
+    /// entry point requires before starting an upload. The revealed token stays
+    /// local to this call and is never returned or stored alongside the
+    /// identity.
     public func prefetchIdentity(forceRefresh: Bool = false) async throws -> String {
         let token = try await tokenSupplier.token(forceRefresh: forceRefresh)
-        return stableAccountIdentity(forToken: token)
+        return try await accountNamespace(forToken: token)
     }
 }
 
@@ -113,5 +126,53 @@ public enum UsageFullSyncSnapshotMapper {
             autonomyWindowEnd: "",
             rawGeneration: snapshot.generation
         )
+    }
+
+    /// Normalizes a full-sync payload snapshot through the shared wire
+    /// normalizer and rejects any natural-key collision across every
+    /// dimension. This is a pure function: it performs no I/O and mutates no
+    /// shared state, so the caller can run it before reserving a fence,
+    /// writing upload state, taking a token, or opening any connection. A
+    /// collision throws `IngestClientError.duplicateNaturalKey`, matching the
+    /// incremental client byte-for-byte, and leaves the world untouched.
+    ///
+    /// The canonical hostname and per-field caps are applied here exactly as
+    /// the incremental client applies them in `ingest`, so a row staged by the
+    /// full-sync path serializes identically to the same row sent
+    /// incrementally. `rawGeneration` is preserved so the reservation's
+    /// generation fence still binds.
+    public static func normalizedPayloadSnapshot(
+        from snapshot: FullSyncPayloadSnapshot,
+        hostname: String
+    ) throws -> FullSyncPayloadSnapshot {
+        var request = UsageIngestRequest(
+            buckets: snapshot.buckets,
+            sessions: snapshot.sessions,
+            autonomySessions: snapshot.autonomySessions,
+            autonomySourceStatuses: snapshot.autonomySourceStatuses,
+            autonomyWindowStart: snapshot.autonomyWindowStart,
+            autonomyWindowEnd: snapshot.autonomyWindowEnd
+        )
+        request = UsageWireNormalizer.normalize(request, hostname: hostname)
+        try UsageWireNormalizer.ensureUniqueNaturalKeys(request)
+        return FullSyncPayloadSnapshot(
+            buckets: request.buckets,
+            sessions: request.sessions,
+            autonomySessions: request.autonomySessions,
+            autonomySourceStatuses: request.autonomySourceStatuses,
+            autonomyWindowStart: request.autonomyWindowStart,
+            autonomyWindowEnd: request.autonomyWindowEnd,
+            rawGeneration: snapshot.rawGeneration
+        )
+    }
+
+    /// Builds the normalized, collision-checked payload snapshot directly from
+    /// a ledger snapshot in one step. Convenience for callers that want to run
+    /// the guard before any fence reservation or network side-effect.
+    public static func normalizedPayloadSnapshot(
+        from snapshot: UsageFullSyncSnapshot,
+        hostname: String
+    ) throws -> FullSyncPayloadSnapshot {
+        try normalizedPayloadSnapshot(from: payloadSnapshot(from: snapshot), hostname: hostname)
     }
 }
