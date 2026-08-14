@@ -23,6 +23,27 @@ import Foundation
 struct UsageReportingSmoke {
     static func main() async {
         let env = ProcessInfo.processInfo.environment
+
+        // Diagnostic mode: parse one real JSONL file with the current parser and
+        // print timestamp coverage, without touching any ledger. Confirms the
+        // parser resolves real timestamps (no distantPast fallback) before a
+        // production rebuild. Prints only counts and derived bucket starts.
+        if let parsePath = env["AGENT_PULSE_SMOKE_PARSE_FILE"] {
+            parseFileDiagnostic(path: parsePath, source: env["AGENT_PULSE_SMOKE_PARSE_SOURCE"] ?? "codex")
+            return
+        }
+
+        // Rebuild-verify mode: run a parser rebuild against a *copy* of a ledger,
+        // re-scanning the real local JSONL roots with the current parser, then
+        // report bucketStart health. Never touches the production ledger; point
+        // AGENT_PULSE_SMOKE_REBUILD_LEDGER at a backup copy only. Read-only over
+        // the JSONL sources.
+        if let rebuildLedger = env["AGENT_PULSE_SMOKE_REBUILD_LEDGER"],
+           let hostname = env["AGENT_PULSE_SMOKE_HOSTNAME"] {
+            await rebuildVerify(ledgerPath: rebuildLedger, hostname: hostname)
+            return
+        }
+
         guard let ledgerPath = env["AGENT_PULSE_SMOKE_LEDGER"],
               let configPath = env["AGENT_PULSE_SMOKE_CONFIG"],
               let baseURLString = env["AGENT_PULSE_SMOKE_BASE_URL"],
@@ -90,6 +111,136 @@ struct UsageReportingSmoke {
             FileHandle.standardError.write(Data("[smoke] ERROR: \(error)\n".utf8))
             exit(1)
         }
+    }
+
+    /// Parse a single real JSONL file with the current parser and report
+    /// timestamp coverage plus a sample derived 30-minute bucket start. Read-only.
+    static func parseFileDiagnostic(path: String, source: String) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            FileHandle.standardError.write(Data("[parse] cannot read \(path)\n".utf8))
+            return
+        }
+        let parsed = UsageJSONLParser.parse(data: data, source: source, fileIdentity: "diagnostic", modifiedAt: Date())
+        let negative = parsed.events.filter { $0.timestamp.timeIntervalSince1970 < 0 }
+        print("[parse] parserVersion=\(UsageJSONLParser.parserVersion) source=\(source)")
+        print("[parse] events=\(parsed.events.count) diagnostics=\(parsed.diagnostics.count)")
+        print("[parse] negative(distantPast) timestamps=\(negative.count)")
+        if let first = parsed.events.min(by: { $0.timestamp < $1.timestamp }) {
+            let ms = Int64(first.timestamp.timeIntervalSince1970 * 1000)
+            let bucketMs = (ms / UsageLedgerStore.bucketMilliseconds) * UsageLedgerStore.bucketMilliseconds
+            print("[parse] earliest event ts=\(first.timestamp) → bucketStart=\(Date(timeIntervalSince1970: Double(bucketMs) / 1000))")
+        }
+        if let last = parsed.events.max(by: { $0.timestamp < $1.timestamp }) {
+            print("[parse] latest event ts=\(last.timestamp)")
+        }
+        // Aggregate the five components exactly as the ledger would, so a
+        // reference re-aggregation of the same file can be diffed field by field.
+        var input: Int64 = 0, output: Int64 = 0, cached: Int64 = 0, creation: Int64 = 0, reasoning: Int64 = 0
+        for e in parsed.events {
+            input += e.counts.input; output += e.counts.output
+            cached += e.counts.cachedInput; creation += e.counts.cacheCreationInput
+            reasoning += e.counts.reasoningOutput
+        }
+        print("[parse] AGG input=\(input) output=\(output) cached=\(cached) creation=\(creation) reasoning=\(reasoning)")
+        print("[parse] AGG fourSum=\(input + output + cached + reasoning) fiveSum=\(input + output + cached + creation + reasoning)")
+    }
+
+    /// The real local scan roots, matched to the app's production configuration.
+    private static var scanRoots: [(root: URL, source: String, subagents: Bool)] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return [
+            (home.appending(path: ".codex/sessions"), "codex", false),
+            (home.appending(path: ".codex/archived_sessions"), "codex", false),
+            (home.appending(path: ".claude/projects"), "claude-code", true),
+        ]
+    }
+
+    /// Run a parser rebuild against a ledger *copy*: reset the parser high-water
+    /// mark, re-scan the real JSONL roots with the current parser (the same
+    /// parse+record calls the app uses), finalize, then report bucketStart
+    /// health. Read-only over the JSONL sources; only the copied ledger is
+    /// written.
+    static func rebuildVerify(ledgerPath: String, hostname: String) async {
+        do {
+            let ledger = try UsageLedgerStore(path: ledgerPath)
+            let version = UsageJSONLParser.parserVersion
+            print("[rebuild] ledger=\(ledgerPath)")
+            print("[rebuild] requiresParserRebuild(v\(version))=\(try ledger.requiresParserRebuild(currentParserVersion: version))")
+
+            switch try ledger.hostnameState(current: hostname) {
+            case .match: print("[rebuild] hostname already \(hostname)")
+            case .unset, .mismatch:
+                print("[rebuild] aligning hostname → \(hostname)")
+                try ledger.rebuildForHostname(hostname)
+            }
+
+            try ledger.beginParserRebuild(targetParserVersion: version)
+            var scannedFiles = 0
+            var presentBySource: [String: [String]] = [:]
+            for entry in scanRoots {
+                let (present, files) = try rescanRoot(entry.root, source: entry.source,
+                                                      subagents: entry.subagents, ledger: ledger, hostname: hostname)
+                presentBySource[entry.source, default: []] += present
+                scannedFiles += files
+            }
+            for (source, present) in presentBySource {
+                try ledger.markFilesMissing(source: source, presentFileIDs: present)
+            }
+            let finalize = try ledger.finalizeDerived(hostname: hostname)
+            if try ledger.requiresRebuildCompletion() { try ledger.markRebuildCompleted() }
+            print("[rebuild] rescanned files=\(scannedFiles) eligible=\(finalize.reportingEligible) blocked=\(finalize.blockedReasons)")
+
+            let pending = try ledger.pendingBatch(hostname: hostname, maxBuckets: nil, maxSessions: nil)
+            print("[rebuild] pending buckets=\(pending.buckets.count) sessions=\(pending.sessions.count)")
+            let badStart = pending.buckets.filter { $0.bucket.bucketStart.timeIntervalSince1970 < 0 }
+            print("[rebuild] buckets with negative(distantPast) bucketStart=\(badStart.count)")
+            func fiveSum(_ c: UsageTokenCounts) -> Int64 {
+                c.input + c.output + c.cachedInput + c.cacheCreationInput + c.reasoningOutput
+            }
+            let distinctStarts = Set(pending.buckets.map { $0.bucket.bucketStart })
+            print("[rebuild] distinct bucketStart values=\(distinctStarts.count)")
+            if let sample = pending.buckets.max(by: { fiveSum($0.bucket.counts) < fiveSum($1.bucket.counts) }) {
+                let b = sample.bucket
+                print("[rebuild] top bucket: source=\(b.source) model=\(b.model) bucketStart=\(b.bucketStart) fiveSum=\(fiveSum(b.counts))")
+            }
+        } catch {
+            FileHandle.standardError.write(Data("[rebuild] ERROR: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
+    /// Re-scan one root with the current parser, mirroring the app's per-file
+    /// parse+record sequence. Returns the present fileIDs and the count of files
+    /// actually re-parsed.
+    private static func rescanRoot(_ root: URL, source: String, subagents: Bool,
+                                   ledger: UsageLedgerStore, hostname: String) throws -> (present: [String], reparsed: Int) {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return ([], 0)
+        }
+        guard let enumerator = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey], options: [.skipsHiddenFiles]
+        ) else { return ([], 0) }
+        var present: [String] = []
+        var reparsed = 0
+        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
+            guard values.isRegularFile == true else { continue }
+            let modifiedAt = values.contentModificationDate ?? Date.distantPast
+            let fileID = UsageJSONLParser.fileID(for: url.path)
+            present.append(fileID)
+            let isSubagent = subagents
+                && url.deletingPathExtension().lastPathComponent.hasPrefix("agent-")
+                && url.deletingLastPathComponent().lastPathComponent == "subagents"
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            let parsed = UsageJSONLParser.parse(data: data, source: source, fileIdentity: url.path,
+                                                modifiedAt: modifiedAt, isSubagent: isSubagent)
+            try ledger.record(events: parsed.events, sessionEvents: parsed.sessionEvents,
+                              editEntries: parsed.editEntries, editMetricsSupported: true,
+                              checkpoint: parsed.checkpoint, hostname: hostname)
+            reparsed += 1
+        }
+        return (present, reparsed)
     }
 
     /// Record a few synthetic token events (revision-tracked, non-legacy) into a
