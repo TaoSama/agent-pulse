@@ -432,8 +432,9 @@ struct AgentPulseCoreVerification {
         """
         let stableA = UsageJSONLParser.parse(data: Data(stableSourceA.utf8), source: "codex", fileIdentity: "stable-a")
         let stableB = UsageJSONLParser.parse(data: Data(stableSourceB.utf8), source: "codex", fileIdentity: "stable-b")
-        try require(stableA.events.count == 1, "identical snapshots in one rollout must deduplicate")
+        try require(stableA.events.count == 2, "repeated codex token_count events in one rollout are each counted once")
         try require(stableA.events[0].id == stableB.events[0].id, "Codex event id must ignore path, timestamp, and line index")
+        try require(stableA.events[1].id != stableA.events[0].id, "a repeated codex event gets a distinct ordinal id, not a collapsed duplicate")
 
         let incompleteTotal = UsageJSONLParser.parse(
             data: Data("""
