@@ -145,17 +145,13 @@ struct MenuBarSummaryView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Self.sectionSpacing) {
-            HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("Agent Pulse").font(.subheadline.weight(.semibold))
-                    Text("本机 Agent 活动").font(.caption2).foregroundStyle(.secondary)
-                }
+            HStack(alignment: .center, spacing: 8) {
+                Text("Agent Pulse").font(.subheadline.weight(.semibold))
                 Spacer()
                 Circle()
                     .fill(model.tps == nil ? Color.primary : trendColor)
                     .frame(width: 7, height: 7)
             }
-            .padding(.vertical, 1)
 
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .center, spacing: 16) {
@@ -256,20 +252,22 @@ private struct CompactMetric: View {
     let symbol: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        HStack(spacing: 8) {
             Label(title, systemImage: symbol)
-                .font(.caption2)
-                .foregroundStyle(Color.white)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(Color.white.opacity(0.75))
+            Spacer(minLength: 6)
             Text(value)
-                .font(.system(.title3, design: .rounded, weight: .semibold))
+                .font(.system(.callout, design: .rounded, weight: .semibold))
                 .monospacedDigit()
                 .foregroundStyle(Color.white)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.black, in: RoundedRectangle(cornerRadius: 10))
+        .frame(maxWidth: .infinity)
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 9))
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(title)
         .accessibilityValue(value)
     }
 }
