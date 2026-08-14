@@ -323,7 +323,8 @@ chmod 600 ~/.claude/.credentials/env/agent-pulse-cliproxy.env
 
 - schema v10、WAL 模式；分层保存原始 token/session 事件、skill/MCP 计数、已应用编辑行、派生的 30 分钟聚合 bucket 与 session、源文件 checkpoint 与按 hostname 隔离的同步状态。旧库通过增量列和新表无损迁移到 v10（parser version 仍为 v7）。
 - bucket 自然键为 `(hostname, source, model, project, bucket_start_ms)`；session 自然键为 `(hostname, source, session_hash)`。bucket 额外保存 skill 名称与次数、MCP server 次数、新增 / 删除 / 净行数；session 保存活跃秒数、消息数、小时直方图与 skill 名称。
-- hostname 下沉到原始事件层——每条原始 token/session/edit 事件记录采集时的本机 hostname；派生 recompute 按每条事件自带的 hostname 归属到对应 bucket/session，因此重建（rebuild）保留各机数据的多机快照，而非把整库重派到单一 host。canonical hostname 仅作本机上报身份。
+- hostname 下沉到原始事件层——每条原始 token/session/edit 事件都记录采集时的本机 hostname，便于设备改名时原地统一历史归属。派生（bucket/session）仍按单一当前 canonical hostname 归属。
+- **设备标识改名**：在设置里改了 canonical hostname 后，下一轮比对发现与账本旧名不一致时会弹确认框，不静默自动改。选「确认改名」在一个事务内把 usage_buckets / usage_sessions 及原始三表（usage_events / usage_session_events / usage_edit_entries）中旧名的行全部原地 UPDATE 成新名，并更新 sync_state.canonical_hostname；改名后这些派生行按现有 dirty 机制（revision>synced_revision）重新变 dirty 重新上报。选「否」则新名从此生效、历史保留旧名（同机两名共存，各自按 hostname 上报），且新名即刻成为 canonical，不再重复弹窗。
 - 数据库主文件及 WAL/SHM 边车文件会收紧为 `0600`。
 - 派生行逐行携带 revision 与 synced_revision：revision 大于 synced_revision 即为 dirty；ack 按（自然键 + revision 快照）精确匹配，避免误 ack 上传期间被重算的行。
 - 源文件删除后已入库历史仍保留；未变化文件按 size、mtime 与 parser version 跳过。

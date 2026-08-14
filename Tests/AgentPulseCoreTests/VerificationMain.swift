@@ -662,7 +662,7 @@ struct AgentPulseCoreVerification {
             ev("syn", .syntheticUser, "2026-03-01T00:02:00Z"),
             ev("a1", .assistant, "2026-03-01T00:00:10Z"), // (source,id) 去重
         ]
-        let sessions = UsageSessionAggregator.aggregate(events: events, fallbackHostname: "h")
+        let sessions = UsageSessionAggregator.aggregate(events: events, hostname: "h")
         try require(sessions.count == 1, "single session group")
         let s = sessions[0]
         try require(s.activeSeconds == 30, "active seconds segment rule: got \(s.activeSeconds)")
@@ -678,7 +678,7 @@ struct AgentPulseCoreVerification {
 
         // 注入 project resolver：project 作为内容字段贯通，但自然键 (source, sessionHash)
         // 与分组 / 聚合结果保持不变。
-        let withProject = UsageSessionAggregator.aggregate(events: events, fallbackHostname: "h") { source, sessionHash in
+        let withProject = UsageSessionAggregator.aggregate(events: events, hostname: "h") { source, sessionHash in
             source == "codex" && sessionHash == "sess" ? "acme" : ""
         }
         try require(withProject.count == 1, "project resolver must not change session grouping")
@@ -948,9 +948,8 @@ struct AgentPulseCoreVerification {
     }
 
 
-    // 6) hostname rebuild：canonical hostname 变化时从原始事件重建，**保留多机数据**。
-    // 原始事件每条自带采集机 hostname，重算按各事件自带 hostname 归属；rebuild 只更新本机身份
-    // （canonical_hostname），绝不把既有事件重派到新 host。
+    // 6) hostname 改名：确认改名走原地 UPDATE，把本地历史全部旧名改成新名（单机口径，不保留多机）。
+    // 「否」路径仅让新名生效、历史保留旧名（adoptHostname）。
     private static func verifyV2HostnameRebuild() throws {
         let db = tempUsageDB(); defer { cleanupDB(db) }
         let ledger = try UsageLedgerStore(path: db.path)
@@ -968,19 +967,33 @@ struct AgentPulseCoreVerification {
         try require(matchState == .match, "hostname should match after first ingest")
         if case .mismatch = try ledger.hostnameState(current: "new-host") {} else { try require(false, "changed hostname must be detected as mismatch") }
 
+        // 确认改名：历史全部原地改成 new-host，old-host 不再有派生行。
         try ledger.rebuildForHostname("new-host")
         let oldHostBuckets = try ledger.buckets(hostname: "old-host")
         let newHostBuckets = try ledger.buckets(hostname: "new-host")
-        // 多机保留：事件采集自 old-host，rebuild 后仍归属 old-host，绝不被重派到 new-host。
-        try require(oldHostBuckets.count == 1, "old host derived must be PRESERVED across rebuild (multi-machine data)")
-        try require(oldHostBuckets.first?.counts.total == 100, "old host totals preserved after rebuild")
-        try require(newHostBuckets.isEmpty, "new host has no events yet; rebuild must not fabricate rows for it")
+        try require(oldHostBuckets.isEmpty, "in-place rename: old-host derived rows must be moved to new-host")
+        try require(newHostBuckets.count == 1, "in-place rename: derived rows now attributed to new-host")
+        try require(newHostBuckets.first?.counts.total == 100, "in-place rename preserves totals under new-host")
         // canonical hostname（本机身份）已更新为 new-host。
         let stateAfterRebuild = try ledger.hostnameState(current: "new-host")
-        try require(stateAfterRebuild == .match, "canonical hostname updated to new host after rebuild")
-        // 重建后各 host 派生行为 dirty（synced_revision=0），可重新上报。
-        let pendingOld = try ledger.pendingBatch(hostname: "old-host")
-        try require(!pendingOld.isEmpty, "preserved old-host rows must be pending for re-upload after rebuild")
+        try require(stateAfterRebuild == .match, "canonical hostname updated to new host after rename")
+        // 改名后 new-host 派生行为 dirty（自然键变化，需重新上报）。
+        let pendingNew = try ledger.pendingBatch(hostname: "new-host")
+        try require(!pendingNew.isEmpty, "renamed rows must be pending for re-upload under new-host")
+
+        // 「否」路径（adoptHostname）：新名生效、历史保留旧名。
+        let adoptDB = tempUsageDB(); defer { cleanupDB(adoptDB) }
+        let adoptLedger = try UsageLedgerStore(path: adoptDB.path)
+        try adoptLedger.record(events: p.events, sessionEvents: p.sessionEvents, checkpoint: p.checkpoint, hostname: "old-host")
+        try adoptLedger.finalizeDerived(hostname: "old-host")
+        try adoptLedger.adoptHostname("new-host")
+        let adoptOldCount = try adoptLedger.buckets(hostname: "old-host").count
+        let adoptNewEmpty = try adoptLedger.buckets(hostname: "new-host").isEmpty
+        let adoptState = try adoptLedger.hostnameState(current: "new-host")
+        try require(adoptOldCount == 1, "adopt: history stays under old name")
+        try require(adoptNewEmpty, "adopt: no rows fabricated under new name")
+        // 关键：adopt 后当前配置(new)==canonical(new) 即为 .match，绝不再触发弹窗循环。
+        try require(adoptState == .match, "adopt: new name is now canonical, no re-prompt loop")
     }
 
     private static func verifyUniqueLegacyHostnameCandidate() throws {
@@ -1016,13 +1029,13 @@ struct AgentPulseCoreVerification {
             "a single durable hostname must be recoverable for legacy upgrade"
         )
 
-        // 保留多机语义：rebuild 不把既有事件重派到新 host，legacy-host 派生行仍在，
-        // 因此唯一候选仍是 legacy-host（second-host 无事件、无派生行）。
+        // 确认改名（原地 UPDATE）：legacy-host 派生行整体改到 second-host，
+        // 因此唯一候选变为 second-host（legacy-host 已无派生行）。
         try uniqueLedger.rebuildForHostname("second-host")
         let rebuiltCandidate = try uniqueLedger.uniqueLegacyHostnameCandidate()
         try require(
-            rebuiltCandidate == "legacy-host",
-            "rebuild preserves multi-machine data: the original host's derived rows remain, so it stays the unique candidate"
+            rebuiltCandidate == "second-host",
+            "in-place rename moves the only host's rows, so second-host becomes the unique candidate"
         )
 
         let ambiguousDB = tempUsageDB(); defer { cleanupDB(ambiguousDB) }
@@ -1478,7 +1491,7 @@ struct AgentPulseCoreVerification {
             try require(otherHostEligible, "对账门禁已移除：不影响其他 hostname")
         }
 
-        // hostname rebuild 保留多机数据：切换本机 hostname 不删除旧 host 派生行，旧 host 仍可上报。
+        // hostname 确认改名：原地把历史改到 new-host，old-host 无派生行；改名后行重新 dirty。
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             let ledger = try UsageLedgerStore(path: db.path)
@@ -1489,11 +1502,16 @@ struct AgentPulseCoreVerification {
             let oldHostEligible = try ledger.reportingEligible(hostname: "old-host")
             let newHostEligible = try ledger.reportingEligible(hostname: "new-host")
             let postRebuildFinalize = try ledger.finalizeDerived(hostname: "new-host")
-            try require(oldHostEligible, "多机保留：hostname rebuild 后旧 host 仍可上报")
-            try require(newHostEligible, "hostname rebuild 后新 host 可上报")
-            try require(postRebuildFinalize.reportingEligible && postRebuildFinalize.blockedReasons.isEmpty, "对账门禁已移除：hostname rebuild 后 finalize 不再阻断")
-            let oldHostBuckets = try ledger.buckets(hostname: "old-host")
-            try require(!oldHostBuckets.isEmpty, "多机保留：hostname rebuild 后旧 host 派生行仍在")
+            try require(oldHostEligible, "改名后旧 host 无待同步行，仍可上报（不被对账门禁阻断）")
+            try require(newHostEligible, "hostname 改名后新 host 可上报")
+            try require(postRebuildFinalize.reportingEligible && postRebuildFinalize.blockedReasons.isEmpty, "对账门禁已移除：hostname 改名后 finalize 不再阻断")
+            let renamedOldEmpty = try ledger.buckets(hostname: "old-host").isEmpty
+            let renamedNewEmpty = try ledger.buckets(hostname: "new-host").isEmpty
+            let renamedNewPending = try ledger.pendingBatch(hostname: "new-host").isEmpty
+            try require(renamedOldEmpty, "原地改名：旧 host 派生行已移出")
+            try require(!renamedNewEmpty, "原地改名：新 host 承接派生行")
+            // 改名把已 ack 的行移到新自然键，重新 dirty，须重新上报。
+            try require(!renamedNewPending, "改名后 new-host 行重新 dirty")
         }
     }
 
