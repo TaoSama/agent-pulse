@@ -29,6 +29,7 @@ struct MetricsLedgerPipelineVerification {
         let verifier = MetricsLedgerPipelineVerifier()
         try verifier.verifyV7MigrationIsAdditive()
         try verifier.verifyMetricsPersistAggregateAndMapToDerivedRows()
+        try verifier.verifyContentDedupKeyCollapsesForkCopies()
         try verifier.verifyCalendarWindowSummariesUseDerivedBucketsAndHostname()
         print("MetricsLedgerPipelineVerification: PASS")
     }
@@ -158,6 +159,93 @@ private struct MetricsLedgerPipelineVerifier {
         try require(pending.sessions.map(\.session) == sessions, "pending session payload must retain skills")
         try ledger.acknowledge(pending)
         try require(try ledger.pendingBatch(hostname: "host-a").isEmpty, "acknowledged metrics must no longer be pending")
+    }
+
+    /// 内容型去重键：fork/subagent 复制出的、内容逐字节相同的 codex 事件（不同
+    /// event_id、不同文件、无血缘指纹）必须在 finalize 折叠为单份，桶总量等于一份，
+    /// 而非两份。这直接对齐参考实现的跨文件 DedupKey 折叠。
+    func verifyContentDedupKeyCollapsesForkCopies() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let timestamp = try date("2026-08-14T02:05:00Z")
+        let source = "codex"
+        let sharedKey = "codex:deadbeefcafef00d1234567890abcdef"
+
+        // 两份 fork 副本：内容相同（同 counts），共享同一 codexDedupKey，但 event_id、
+        // 文件归属、时间戳不同，且 lineageFingerprint 为空 —— 血缘层不会折叠它们，
+        // 只有新增的内容折叠能把它们并成一份。
+        func forkCopy(id: String, file: String, ts: Date) -> UsageEvent {
+            UsageEvent(
+                id: id, source: source, model: "model-a", project: "project-a",
+                timestamp: ts, counts: UsageTokenCounts(input: 100, output: 20, cachedInput: 500, reportedTotal: 620),
+                sessionHash: "session-fork", sourceFileHash: file, hasTotalSnapshot: true,
+                lineageFingerprint: "", codexDedupKey: sharedKey
+            )
+        }
+        let copyA = forkCopy(id: "event-fork-a", file: "file-a", ts: timestamp)
+        let copyB = forkCopy(id: "event-fork-b", file: "file-b", ts: timestamp.addingTimeInterval(120))
+        let checkpointA = UsageFileCheckpoint(
+            fileID: "file-a", source: source, pathHash: "path-a", offset: 1, size: 1,
+            modifiedAt: timestamp, parserVersion: UsageJSONLParser.parserVersion, status: "complete"
+        )
+        let checkpointB = UsageFileCheckpoint(
+            fileID: "file-b", source: source, pathHash: "path-b", offset: 1, size: 1,
+            modifiedAt: timestamp, parserVersion: UsageJSONLParser.parserVersion, status: "complete"
+        )
+        try ledger.record(events: [copyA], checkpoint: checkpointA, hostname: "host-a")
+        try ledger.record(events: [copyB], checkpoint: checkpointB, hostname: "host-a")
+
+        let finalized = try ledger.finalizeDerived(hostname: "host-a")
+        try require(finalized.collapsedContentDuplicates == 1, "one fork copy must collapse by content dedup key")
+        try require(finalized.collapsedInheritedEvents == 0, "lineage layer must not touch empty-fingerprint fork copies")
+
+        let buckets = try ledger.buckets(hostname: "host-a")
+        let fiveSum = buckets.reduce(Int64(0)) { $0 + $1.counts.billableTotal }
+        try require(fiveSum == 620, "fork copies must contribute a single copy's tokens (620), not double (1240)")
+
+        // 反向：不同内容 → 不同 key → 不折叠。
+        let db2 = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: db2) }
+        let ledger2 = try UsageLedgerStore(path: db2.path)
+        let distinct = UsageEvent(
+            id: "event-distinct", source: source, model: "model-a", project: "project-a",
+            timestamp: timestamp, counts: UsageTokenCounts(input: 7, reportedTotal: 7),
+            sessionHash: "session-fork", sourceFileHash: "file-a", hasTotalSnapshot: true,
+            lineageFingerprint: "", codexDedupKey: "codex:0000000000000000ffffffffffffffff"
+        )
+        try ledger2.record(events: [copyA, distinct], checkpoint: checkpointA, hostname: "host-a")
+        let finalized2 = try ledger2.finalizeDerived(hostname: "host-a")
+        try require(finalized2.collapsedContentDuplicates == 0, "different content keys must not fold")
+
+        // largest-billable-wins：同键但后一份 counts 更大，必须换成更大的一份（不能被
+        // 快速路径误留小份）。同时后一份带 skill，折叠后桶必须保留该 skill（skill/mcp
+        // 并集不为空时快速路径不能跳过重建）。
+        let db3 = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: db3) }
+        let ledger3 = try UsageLedgerStore(path: db3.path)
+        let smallFirst = UsageEvent(
+            id: "event-small", source: source, model: "model-a", project: "project-a",
+            timestamp: timestamp, counts: UsageTokenCounts(input: 10, output: 2, reportedTotal: 12),
+            sessionHash: "session-fork", sourceFileHash: "file-a", hasTotalSnapshot: true,
+            lineageFingerprint: "", codexDedupKey: sharedKey
+        )
+        let bigSecond = UsageEvent(
+            id: "event-big", source: source, model: "model-a", project: "project-a",
+            timestamp: timestamp.addingTimeInterval(120),
+            counts: UsageTokenCounts(input: 1000, output: 200, reportedTotal: 1200),
+            sessionHash: "session-fork", sourceFileHash: "file-b", hasTotalSnapshot: true,
+            lineageFingerprint: "", codexDedupKey: sharedKey, skillCounts: ["big-skill": 1]
+        )
+        try ledger3.record(events: [smallFirst], checkpoint: checkpointA, hostname: "host-a")
+        try ledger3.record(events: [bigSecond], checkpoint: checkpointB, hostname: "host-a")
+        let finalized3 = try ledger3.finalizeDerived(hostname: "host-a")
+        try require(finalized3.collapsedContentDuplicates == 1, "larger fork copy must still collapse the smaller one")
+        let buckets3 = try ledger3.buckets(hostname: "host-a")
+        let fiveSum3 = buckets3.reduce(Int64(0)) { $0 + $1.counts.billableTotal }
+        try require(fiveSum3 == 1200, "largest-billable-wins must keep the bigger copy (1200), not the smaller (12)")
+        try require(buckets3.contains { $0.skills.contains("big-skill") },
+                    "skill from the kept copy must survive the content fold (fast-path must not drop non-empty skill union)")
     }
 
     func verifyCalendarWindowSummariesUseDerivedBucketsAndHostname() throws {

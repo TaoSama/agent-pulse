@@ -20,6 +20,12 @@ public struct UsageTokenCounts: Codable, Sendable, Equatable {
     public var total: Int64 {
         max(reportedTotal, input + output + cachedInput + cacheCreationInput + reasoningOutput)
     }
+
+    /// 五分量原始之和（不与 reportedTotal 取 max）。用于内容去重的 largest-total-wins
+    /// 比较，须与参考实现逐字节对齐，故用环绕加法且不掺入 reportedTotal。
+    public var billableTotal: Int64 {
+        input &+ output &+ cachedInput &+ cacheCreationInput &+ reasoningOutput
+    }
 }
 
 /// 稳健的 RFC3339 / ISO8601 时间戳解析。
@@ -103,6 +109,10 @@ public struct UsageEvent: Codable, Sendable, Equatable, Identifiable {
     /// 因此即便子会话改写了 timestamp / model，只要底层是同一累计快照即可被折叠。
     /// 为空表示无法据此证明重复。
     public let lineageFingerprint: String
+    /// 内容型去重键：仅 codex token 事件非空，由 model + 归一化 last 分量 + 原始 total
+    /// 快照分量派生，与 timestamp / path / session / rollout 无关。fork / subagent
+    /// 回放出的逐字节相同事件共享此键，供跨文件折叠去重。为空表示不参与内容折叠。
+    public let codexDedupKey: String
     /// 账本 UPSERT 合并策略，随事件持久化；由解析路径决定，取代按来源名硬编码分支。
     public let mergeStrategy: MergeStrategy
 
@@ -111,7 +121,7 @@ public struct UsageEvent: Codable, Sendable, Equatable, Identifiable {
     /// 本事件观测到的 MCP server 调用计数（server 名 -> 次数）。缺省为空。
     public let mcpCounts: [String: Int]
 
-    public init(id: String, source: String, model: String, project: String, timestamp: Date, counts: UsageTokenCounts, sessionHash: String, sourceFileHash: String, rolloutKey: String = "", parentRolloutKey: String = "", inherited: Bool = false, hasTotalSnapshot: Bool = false, lineageFingerprint: String = "", mergeStrategy: MergeStrategy = .overwrite, skillCounts: [String: Int] = [:], mcpCounts: [String: Int] = [:]) {
+    public init(id: String, source: String, model: String, project: String, timestamp: Date, counts: UsageTokenCounts, sessionHash: String, sourceFileHash: String, rolloutKey: String = "", parentRolloutKey: String = "", inherited: Bool = false, hasTotalSnapshot: Bool = false, lineageFingerprint: String = "", codexDedupKey: String = "", mergeStrategy: MergeStrategy = .overwrite, skillCounts: [String: Int] = [:], mcpCounts: [String: Int] = [:]) {
         self.id = id
         self.source = source
         self.model = model.isEmpty ? "unknown" : model
@@ -125,6 +135,7 @@ public struct UsageEvent: Codable, Sendable, Equatable, Identifiable {
         self.inherited = inherited
         self.hasTotalSnapshot = hasTotalSnapshot
         self.lineageFingerprint = lineageFingerprint
+        self.codexDedupKey = codexDedupKey
         self.mergeStrategy = mergeStrategy
         self.skillCounts = skillCounts
         self.mcpCounts = mcpCounts
@@ -132,7 +143,7 @@ public struct UsageEvent: Codable, Sendable, Equatable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case id, source, model, project, timestamp, counts, sessionHash, sourceFileHash
-        case rolloutKey, parentRolloutKey, inherited, hasTotalSnapshot, lineageFingerprint, mergeStrategy
+        case rolloutKey, parentRolloutKey, inherited, hasTotalSnapshot, lineageFingerprint, codexDedupKey, mergeStrategy
         case skillCounts, mcpCounts
     }
 
@@ -151,6 +162,7 @@ public struct UsageEvent: Codable, Sendable, Equatable, Identifiable {
         inherited = try container.decodeIfPresent(Bool.self, forKey: .inherited) ?? false
         hasTotalSnapshot = try container.decodeIfPresent(Bool.self, forKey: .hasTotalSnapshot) ?? false
         lineageFingerprint = try container.decodeIfPresent(String.self, forKey: .lineageFingerprint) ?? ""
+        codexDedupKey = try container.decodeIfPresent(String.self, forKey: .codexDedupKey) ?? ""
         // 旧数据缺该字段时回退 overwrite（历史仅 Codex 覆盖 + Claude 靠源名分支，
         // 迁移由账本层按 source 归类补齐；解码默认取安全的 overwrite）。
         mergeStrategy = try container.decodeIfPresent(MergeStrategy.self, forKey: .mergeStrategy) ?? .overwrite
