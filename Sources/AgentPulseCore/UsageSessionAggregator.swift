@@ -18,22 +18,27 @@ public enum UsageSessionAggregator {
     /// - projectForSession: 按自然键 (source, sessionHash) 解析该会话的 project 内容字段；
     ///   project 不参与分组 / 去重 / 排序（自然键仍为 hostname/source/sessionHash），
     ///   仅作为内容字段写入结果。默认返回空串，调用方（账本）可注入真实来源。
+    /// - fallbackHostname: 事件自带 hostname 为空（legacy 行）时的兜底采集机标识。
+    ///   会话按各事件自带 hostname 归属，实现本地保留多机快照；同一 (source, sessionHash)
+    ///   跨 hostname 视为不同会话（自然键含 hostname）。
     public static func aggregate(
         events: [UsageSessionEvent],
-        hostname: String,
+        fallbackHostname: String,
         projectForSession: (_ source: String, _ sessionHash: String) -> String = { _, _ in "" },
         skillsForSession: (_ source: String, _ sessionHash: String) -> [String] = { _, _ in [] }
     ) -> [UsageSession] {
-        // 1) 去重：按 (source, eventID)。
+        func hostFor(_ eventHostname: String) -> String { eventHostname.isEmpty ? fallbackHostname : eventHostname }
+
+        // 1) 去重：按 (hostname, source, eventID)。
         var deduped: [String: UsageSessionEvent] = [:]
         for event in events {
-            deduped["\(event.source)\u{0}\(event.id)"] = event
+            deduped["\(hostFor(event.hostname))\u{0}\(event.source)\u{0}\(event.id)"] = event
         }
 
-        // 2) 分组：按 (source, sessionHash)。
+        // 2) 分组：按 (hostname, source, sessionHash)。
         var grouped: [SessionGroupKey: [UsageSessionEvent]] = [:]
         for event in deduped.values {
-            grouped[SessionGroupKey(source: event.source, sessionHash: event.sessionHash), default: []].append(event)
+            grouped[SessionGroupKey(hostname: hostFor(event.hostname), source: event.source, sessionHash: event.sessionHash), default: []].append(event)
         }
 
         var utcCalendar = Calendar(identifier: .gregorian)
@@ -97,7 +102,7 @@ public enum UsageSessionAggregator {
             closeSegment()
 
             sessions.append(UsageSession(
-                hostname: hostname,
+                hostname: key.hostname,
                 source: key.source,
                 sessionHash: key.sessionHash,
                 project: projectForSession(key.source, key.sessionHash),
@@ -113,12 +118,14 @@ public enum UsageSessionAggregator {
         }
 
         return sessions.sorted { left, right in
+            if left.hostname != right.hostname { return left.hostname < right.hostname }
             if left.source != right.source { return left.source < right.source }
             return left.sessionHash < right.sessionHash
         }
     }
 
     private struct SessionGroupKey: Hashable {
+        let hostname: String
         let source: String
         let sessionHash: String
     }

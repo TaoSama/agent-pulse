@@ -3,9 +3,6 @@ import SQLite3
 
 private let usageSQLiteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-/// full sync 提交核对失败的内部信号：在事务内 throw 触发 ROLLBACK，确保 fail-closed 不落部分状态。
-private struct FullSyncFenced: Error { let reason: String; init(_ reason: String) { self.reason = reason } }
-
 public enum UsageLedgerError: Error, CustomStringConvertible {
     case sqlite(String)
     case invalidCheckpoint
@@ -18,13 +15,6 @@ public enum UsageLedgerError: Error, CustomStringConvertible {
         case .localDerivationPending: "local usage derivation is pending"
         }
     }
-}
-
-/// reserve-before-snapshot 的快照失败：generation 已被重算推进，快照整体放弃（不返回半快照）。
-/// 仅携带 generation 数字（expected/actual），不含 hostname、路径或用量等敏感数据。
-public enum UsageFullSyncSnapshotError: Error, Sendable, Equatable {
-    case staleGeneration(expected: Int64, actual: Int64)
-    case localDerivationPending
 }
 
 /// 待上传的单个 bucket 快照：自然键 + 内容 + 该行当前 revision 快照。
@@ -61,76 +51,6 @@ public struct UsagePendingBatch: Sendable, Equatable {
     }
 
     public var isEmpty: Bool { buckets.isEmpty && sessions.isEmpty }
-}
-
-/// 全量同步快照：单事务读取某 hostname 的**全部**派生行（含已 synced），用于与远端做
-/// 完整对账（reconciliation）。
-///
-/// - generation: 本次快照的单调世代号（读取不推进）。快照之后账本若被 finalize/rebuild 重算并
-///   推进 generation，则本快照过期；commitFullSync 以 generation 作为围栏（fence）整体拒绝陈旧提交。
-/// - buckets / sessions: 每行携带其 revision 快照；commit 时按「自然键 + revision 快照」精确匹配。
-/// - reconciliationReason: 当前 remote_reconciliation_required 的原因（无则 nil）。上层据此判断
-///   是否需要触发一次全量对账；成功 commit 后该门禁被清除。
-/// - payload fingerprint 由上层依据 buckets/sessions 内容计算（本层不做序列化假设）。
-public struct UsageFullSyncSnapshot: Sendable, Equatable {
-    public let hostname: String
-    public let generation: Int64
-    public let buckets: [UsagePendingBucket]
-    public let sessions: [UsagePendingSession]
-    public let reconciliationReason: String?
-
-    public init(hostname: String, generation: Int64, buckets: [UsagePendingBucket], sessions: [UsagePendingSession], reconciliationReason: String?) {
-        self.hostname = hostname
-        self.generation = generation
-        self.buckets = buckets
-        self.sessions = sessions
-        self.reconciliationReason = reconciliationReason
-    }
-
-    public var isEmpty: Bool { buckets.isEmpty && sessions.isEmpty }
-}
-
-/// 全量同步提交凭证：由上层在**远端已确认收妥整份快照**后回传给本层。
-///
-/// 必须携带发起时快照的 generation 与逐行 revision 快照。commitFullSync 会：
-/// 1) 用 generation 围栏确认账本自快照以来未被重算；
-/// 2) 逐行按 (自然键, revision 快照) 精确核对当前库行仍完全一致；
-/// 任一不满足即整体 fail-closed（不部分标记、不清 gate）。全部匹配且远端已确认后，才原子
-/// 地把全部行标记为已同步、清除 remote_reconciliation_required、恢复 reportingEligible。
-public struct UsageFullSyncCommit: Sendable, Equatable {
-    public let hostname: String
-    public let generation: Int64
-    public let buckets: [UsagePendingBucket]
-    public let sessions: [UsagePendingSession]
-
-    public init(hostname: String, generation: Int64, buckets: [UsagePendingBucket], sessions: [UsagePendingSession]) {
-        self.hostname = hostname
-        self.generation = generation
-        self.buckets = buckets
-        self.sessions = sessions
-    }
-
-    /// 从快照直接构造提交凭证（远端已确认整份快照时最常用）。
-    public init(snapshot: UsageFullSyncSnapshot) {
-        self.init(hostname: snapshot.hostname, generation: snapshot.generation, buckets: snapshot.buckets, sessions: snapshot.sessions)
-    }
-}
-
-/// 全量同步提交结果。committed == true 表示整份快照已原子标记同步且门禁清除；
-/// false 表示 fail-closed（附原因），此时库状态未被改动。
-public struct UsageFullSyncCommitResult: Sendable, Equatable {
-    public let committed: Bool
-    public let failureReason: String?
-
-    public init(committed: Bool, failureReason: String?) {
-        self.committed = committed
-        self.failureReason = failureReason
-    }
-
-    public static let success = UsageFullSyncCommitResult(committed: true, failureReason: nil)
-    public static func failed(_ reason: String) -> UsageFullSyncCommitResult {
-        UsageFullSyncCommitResult(committed: false, failureReason: reason)
-    }
 }
 
 /// canonical hostname 门禁状态。
@@ -175,7 +95,7 @@ public struct UsageFinalizeResult: Sendable, Equatable {
 /// - canonical hostname 变化时，从原始事件事务重建目标 hostname 派生聚合并清除旧 hostname。
 /// - 显式 rebuild 时事务性清空派生 + 原始 + checkpoint（仅显式 rebuild）。
 public final class UsageLedgerStore: @unchecked Sendable {
-    public static let schemaVersion: Int32 = 9
+    public static let schemaVersion: Int32 = 10
     public static let bucketMilliseconds: Int64 = 30 * 60 * 1_000
     public static let defaultMaxBucketsPerBatch = 500
     public static let defaultMaxSessionsPerBatch = 1_000
@@ -267,9 +187,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 try validateAttribution(events: events, sessionEvents: sessionEvents, editEntries: editEntries, fileID: fileID)
                 // 先删除该 fileID 的旧归属原始行，再插入本批新行：同事务实现「对该文件的原子替换」。
                 try deleteRawForFileUnlocked(fileID: fileID)
-                try insertRawEvents(events, fileID: fileID)
-                try insertRawSessionEvents(sessionEvents, fileID: fileID)
-                try insertRawEditEntries(editEntries, fileID: fileID)
+                try insertRawEvents(events, fileID: fileID, hostname: hostname)
+                try insertRawSessionEvents(sessionEvents, fileID: fileID, hostname: hostname)
+                try insertRawEditEntries(editEntries, fileID: fileID, hostname: hostname)
                 if editMetricsSupported && checkpoint.status == "complete" {
                     try markEditMetricSourceUnlocked(checkpoint.source)
                 }
@@ -279,11 +199,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
                     try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
                 }
-                // 无论 canonical 是首次确定还是已存在，都尝试把未绑定 host 的全局对账债务原子迁移到当前
-                // 非空 hostname，使其可被针对该 host 的全量同步驱动清理（而非永久 fail-closed）。
-                // relocate 在无 unassigned 债务时是 no-op，且保留已存在的 per-host 债务，不会覆盖。
-                // 注意：hostname 配置变更走 rebuildForHostname，另有其对账保护路径。
-                try relocateUnassignedReconciliationDebtUnlocked(to: hostname)
             }
         }
     }
@@ -313,7 +228,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         )
         try queue.sync {
             try transaction {
-                try insertRawEvents(events, fileID: fileID)
+                try insertRawEvents(events, fileID: fileID, hostname: hostname)
                 try writeCheckpoint(checkpoint)
                 if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
                     try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
@@ -351,15 +266,16 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    private func insertRawEvents(_ events: [UsageEvent], fileID: String) throws {
+    private func insertRawEvents(_ events: [UsageEvent], fileID: String, hostname: String) throws {
         // 合并策略随事件持久化（merge_strategy），不再按来源名硬编码：
         // - cumulativeMax（Claude-compatible）：同 msg.id 流式累计增长，逐列取最大保证不丢更新，
         //   且 model=unknown 时保留既有 model（流式早行不冲掉已知 model）。
         // - overwrite（Codex rollout）：event_id 稳定且携带修正后的独立计数，重解析直接覆盖。
+        // hostname 为采集机标识：文件级 replace 时按本机 hostname 写入，冲突更新也覆盖为最新采集机。
         let sql = """
             INSERT INTO usage_events
-            (event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,source_file_hash,rollout_key,parent_rollout_key,inherited,has_total_snapshot,lineage_fingerprint,codex_dedup_key,merge_strategy,skill_counts_json,mcp_counts_json,created_at_ms)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            (event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,source_file_hash,rollout_key,parent_rollout_key,inherited,has_total_snapshot,lineage_fingerprint,codex_dedup_key,merge_strategy,skill_counts_json,mcp_counts_json,hostname,created_at_ms)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(source_file_hash,event_id) DO UPDATE SET
               source=excluded.source,
               input_tokens=CASE WHEN excluded.merge_strategy='cumulativeMax' THEN MAX(input_tokens,excluded.input_tokens) ELSE excluded.input_tokens END,
@@ -381,7 +297,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
               codex_dedup_key=excluded.codex_dedup_key,
               merge_strategy=excluded.merge_strategy,
               skill_counts_json=excluded.skill_counts_json,
-              mcp_counts_json=excluded.mcp_counts_json;
+              mcp_counts_json=excluded.mcp_counts_json,
+              hostname=excluded.hostname;
             """
         let insert = try prepare(sql); defer { sqlite3_finalize(insert) }
         let existingCounts = try prepare("SELECT skill_counts_json,mcp_counts_json FROM usage_events WHERE source_file_hash=? AND event_id=?;")
@@ -412,16 +329,17 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try bind(insert, 20, event.mergeStrategy.rawValue)
             try bind(insert, 21, encodeStringIntMap(skillCounts))
             try bind(insert, 22, encodeStringIntMap(mcpCounts))
-            try bind(insert, 23, millis(Date()))
+            try bind(insert, 23, hostname)
+            try bind(insert, 24, millis(Date()))
             try done(insert)
         }
     }
 
-    private func insertRawSessionEvents(_ events: [UsageSessionEvent], fileID: String) throws {
+    private func insertRawSessionEvents(_ events: [UsageSessionEvent], fileID: String, hostname: String) throws {
         let sql = """
             INSERT OR IGNORE INTO usage_session_events
-            (event_id,source,session_hash,role,timestamp_ms,source_file_hash,created_at_ms)
-            VALUES (?,?,?,?,?,?,?);
+            (event_id,source,session_hash,role,timestamp_ms,source_file_hash,hostname,created_at_ms)
+            VALUES (?,?,?,?,?,?,?,?);
             """
         let insert = try prepare(sql); defer { sqlite3_finalize(insert) }
         for event in events {
@@ -429,16 +347,16 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try bind(insert, 1, event.id); try bind(insert, 2, event.source)
             try bind(insert, 3, event.sessionHash); try bind(insert, 4, event.role.rawValue)
             try bind(insert, 5, millis(event.timestamp)); try bind(insert, 6, fileID)
-            try bind(insert, 7, millis(Date()))
+            try bind(insert, 7, hostname); try bind(insert, 8, millis(Date()))
             try done(insert)
         }
     }
 
-    private func insertRawEditEntries(_ entries: [UsageEditEntry], fileID: String) throws {
+    private func insertRawEditEntries(_ entries: [UsageEditEntry], fileID: String, hostname: String) throws {
         let sql = """
             INSERT OR IGNORE INTO usage_edit_entries
-            (tool_use_id,source,model,project,timestamp_ms,lines_added,lines_deleted,source_file_hash,created_at_ms)
-            VALUES (?,?,?,?,?,?,?,?,?);
+            (tool_use_id,source,model,project,timestamp_ms,lines_added,lines_deleted,source_file_hash,hostname,created_at_ms)
+            VALUES (?,?,?,?,?,?,?,?,?,?);
             """
         let insert = try prepare(sql); defer { sqlite3_finalize(insert) }
         for entry in entries where !entry.toolUseID.isEmpty {
@@ -447,7 +365,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try bind(insert, 3, entry.model); try bind(insert, 4, entry.project)
             try bind(insert, 5, millis(entry.timestamp)); try bind(insert, 6, entry.added)
             try bind(insert, 7, entry.deleted); try bind(insert, 8, fileID)
-            try bind(insert, 9, millis(Date()))
+            try bind(insert, 9, hostname); try bind(insert, 10, millis(Date()))
             try done(insert)
         }
     }
@@ -485,11 +403,15 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let codexDedupKey: String
         let skillCounts: [String: Int]; let mcpCounts: [String: Int]
         let mergeStrategy: String
+        /// 采集机标识：派生聚合按各事件自带 hostname 归属，实现本地保留多机快照。
+        let hostname: String
     }
 
     private struct RawEditEntry {
         let source: String; let model: String; let project: String
         let timestampMs: Int64; let added: Int64; let deleted: Int64
+        /// 采集机标识：edit bucket 聚合按各条目自带 hostname 归属。
+        let hostname: String
     }
 
     /// v8 归属优先级 tier（数值越大优先级越高）。
@@ -552,7 +474,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                         codexDedupKey: preferred.codexDedupKey,
                         skillCounts: maximumCounts(existing.skillCounts, event.skillCounts),
                         mcpCounts: maximumCounts(existing.mcpCounts, event.mcpCounts),
-                        mergeStrategy: preferred.mergeStrategy
+                        mergeStrategy: preferred.mergeStrategy,
+                        hostname: preferred.hostname
                     )
                     collapsed += 1
                     continue
@@ -606,11 +529,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 codexDedupKey: keep.codexDedupKey,
                 skillCounts: mergedSkill,
                 mcpCounts: mergedMcp,
-                mergeStrategy: keep.mergeStrategy
+                mergeStrategy: keep.mergeStrategy,
+                hostname: keep.hostname
             )
         }
 
         // 2) 重算 buckets（按 hostname,source,model,project,bucketStart 聚合）。
+        // hostname 前置进聚合键：每条事件按其自带 hostname 归属，本地即保留多机快照。
+        // 传入的 hostname 参数仅作 legacy（hostname 为空）事件的兜底。
         struct BucketAgg {
             var counts = UsageTokenCounts()
             var skillCounts: [String: Int] = [:]
@@ -619,11 +545,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
             var linesDeleted: Int64 = 0
             var codeMetricVersion = 0
         }
+        func hostFor(_ eventHostname: String) -> String { eventHostname.isEmpty ? hostname : eventHostname }
         var buckets: [String: BucketAgg] = [:]
-        var bucketMeta: [String: (source: String, model: String, project: String, start: Int64)] = [:]
+        var bucketMeta: [String: (host: String, source: String, model: String, project: String, start: Int64)] = [:]
         for event in contentDeduped {
+            let host = hostFor(event.hostname)
             let start = (event.timestampMs / Self.bucketMilliseconds) * Self.bucketMilliseconds
-            let key = "\(event.source)\u{1}\(event.model)\u{1}\(event.project)\u{1}\(start)"
+            let key = "\(host)\u{1}\(event.source)\u{1}\(event.model)\u{1}\(event.project)\u{1}\(start)"
             var agg = buckets[key] ?? BucketAgg()
             let c = event.counts
             agg.counts = UsageTokenCounts(
@@ -636,7 +564,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             agg.skillCounts = UsageToolMetrics.mergeCounts(agg.skillCounts, event.skillCounts)
             agg.mcpCounts = UsageToolMetrics.mergeCounts(agg.mcpCounts, event.mcpCounts)
             buckets[key] = agg
-            bucketMeta[key] = (event.source, event.model, event.project, start)
+            bucketMeta[key] = (host, event.source, event.model, event.project, start)
         }
 
         let editMetricSources = try readEditMetricSourcesUnlocked()
@@ -645,17 +573,18 @@ public final class UsageLedgerStore: @unchecked Sendable {
             buckets[key]?.codeMetricVersion = UsageEditLines.codeMetricVersion
         }
         for edit in try readAllRawEditEntries() {
+            let host = hostFor(edit.hostname)
             let start = (edit.timestampMs / Self.bucketMilliseconds) * Self.bucketMilliseconds
-            let key = "\(edit.source)\u{1}\(edit.model)\u{1}\(edit.project)\u{1}\(start)"
+            let key = "\(host)\u{1}\(edit.source)\u{1}\(edit.model)\u{1}\(edit.project)\u{1}\(start)"
             var agg = buckets[key] ?? BucketAgg()
             agg.linesAdded = saturatedAdd(agg.linesAdded, edit.added)
             agg.linesDeleted = saturatedAdd(agg.linesDeleted, edit.deleted)
             agg.codeMetricVersion = UsageEditLines.codeMetricVersion
             buckets[key] = agg
-            bucketMeta[key] = (edit.source, edit.model, edit.project, start)
+            bucketMeta[key] = (host, edit.source, edit.model, edit.project, start)
         }
 
-        // 3) 重算 sessions（复用聚合器）。
+        // 3) 重算 sessions（复用聚合器，按各事件自带 hostname 归属）。
         let sessionEvents = try readAllSessionEvents()
         // session project 内容策略：以同一 (source, sessionHash) 下**最新有效** UsageEvent.project 为准
         // （按 timestamp 取最大，非空优先），无则回落空串。project 不参与自然键/分组/去重。
@@ -674,7 +603,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
         let sessions = UsageSessionAggregator.aggregate(
             events: sessionEvents,
-            hostname: hostname,
+            fallbackHostname: hostname,
             projectForSession: { source, sessionHash in
                 sessionProject["\(source)\u{1}\(sessionHash)"]?.project ?? ""
             },
@@ -684,89 +613,79 @@ public final class UsageLedgerStore: @unchecked Sendable {
         )
 
         // 4) 差异写入：仅对内容变化的行提升 revision（变 dirty），未变行保持原 revision/synced。
-        let newRevision = try nextRevisionUnlocked(hostname: hostname)
-        var changed = false
+        // 按「本次涉及的所有 hostname」逐 host 做增删与 revision 推进；每个 host 有独立 revision 计数。
 
-        var existingBuckets = try readBucketRowsUnlocked(hostname: hostname)
+        // 4a) buckets：先按 host 分组新聚合行，再逐 host 与既有行差异写入。
+        var bucketKeysByHost: [String: [String]] = [:]
         for (key, meta) in bucketMeta {
-            let aggregate = buckets[key]!
-            let bucket = UsageBucket(
-                hostname: hostname, source: meta.source, model: meta.model, project: meta.project,
-                bucketStart: date(meta.start), counts: aggregate.counts,
-                skillCounts: aggregate.skillCounts, mcpCounts: aggregate.mcpCounts,
-                linesAdded: aggregate.linesAdded, linesDeleted: aggregate.linesDeleted,
-                codeMetricVersion: aggregate.codeMetricVersion
-            )
-            let existing = existingBuckets[key]
-            if existing?.bucket != bucket {
-                try upsertBucketUnlocked(bucket, revision: newRevision)
-                changed = true
-            }
-            existingBuckets[key] = nil
+            bucketKeysByHost[meta.host, default: []].append(key)
         }
-        var removedSyncedBuckets = 0
-        var removedSyncedSessions = 0
-        // 删除不再出现的 bucket（例如显式 rebuild 后事件减少）。
-        for (key, row) in existingBuckets {
-            if row.synced > 0 { removedSyncedBuckets += 1 }
-            try deleteBucketUnlocked(hostname: hostname, key: key)
-            changed = true
-        }
+        var involvedHosts = Set(bucketKeysByHost.keys)
 
-        var existingSessions = try readSessionRowsUnlocked(hostname: hostname)
+        // 4b) sessions：按各 session 自带 hostname 分组。
+        var sessionsByHost: [String: [UsageSession]] = [:]
         for session in sessions {
-            let key = "\(session.source)\u{1}\(session.sessionHash)"
-            let existing = existingSessions[key]
-            if existing?.session != session {
-                try upsertSessionUnlocked(session, revision: newRevision)
-                changed = true
+            sessionsByHost[session.hostname, default: []].append(session)
+            involvedHosts.insert(session.hostname)
+        }
+        // 既有派生行可能分布在更多 host（例如本轮某 host 的行全部消失需删除）。
+        for host in try derivedHostnamesUnlocked() { involvedHosts.insert(host) }
+
+        for host in involvedHosts {
+            let newRevision = try nextRevisionUnlocked(hostname: host)
+            var hostChanged = false
+
+            var existingBuckets = try readBucketRowsUnlocked(hostname: host)
+            for key in bucketKeysByHost[host] ?? [] {
+                let meta = bucketMeta[key]!
+                let aggregate = buckets[key]!
+                let bucket = UsageBucket(
+                    hostname: host, source: meta.source, model: meta.model, project: meta.project,
+                    bucketStart: date(meta.start), counts: aggregate.counts,
+                    skillCounts: aggregate.skillCounts, mcpCounts: aggregate.mcpCounts,
+                    linesAdded: aggregate.linesAdded, linesDeleted: aggregate.linesDeleted,
+                    codeMetricVersion: aggregate.codeMetricVersion
+                )
+                // 派生行自然键含 host；existingBuckets 的 key 不含 host，用去掉 host 前缀的子键匹配。
+                let localKey = "\(meta.source)\u{1}\(meta.model)\u{1}\(meta.project)\u{1}\(meta.start)"
+                let existing = existingBuckets[localKey]
+                if existing?.bucket != bucket {
+                    try upsertBucketUnlocked(bucket, revision: newRevision)
+                    hostChanged = true
+                }
+                existingBuckets[localKey] = nil
             }
-            existingSessions[key] = nil
-        }
-        for (key, row) in existingSessions {
-            if row.synced > 0 { removedSyncedSessions += 1 }
-            try deleteSessionUnlocked(hostname: hostname, key: key)
-            changed = true
-        }
+            // 删除不再出现的 bucket（例如显式 rebuild 后事件减少）。
+            for (localKey, _) in existingBuckets {
+                try deleteBucketUnlocked(hostname: host, key: localKey)
+                hostChanged = true
+            }
 
-        // 非 reconciliation 类阻断（如无法证明的 inherited replay）单独持久到 per-host eligibility flag；
-        // reconciliation gate 用独立键，二者在 reportingEligible() 处正交组合。
-        // 关键：per-host flag 不得混入 reconciliation 原因，否则 full sync 清 gate 后无法区分两类阻断。
-        let nonReconciliationEligible = blockedReasons.isEmpty
+            var existingSessions = try readSessionRowsUnlocked(hostname: host)
+            for session in sessionsByHost[host] ?? [] {
+                let localKey = "\(session.source)\u{1}\(session.sessionHash)"
+                let existing = existingSessions[localKey]
+                if existing?.session != session {
+                    try upsertSessionUnlocked(session, revision: newRevision)
+                    hostChanged = true
+                }
+                existingSessions[localKey] = nil
+            }
+            for (localKey, _) in existingSessions {
+                try deleteSessionUnlocked(hostname: host, key: localKey)
+                hostChanged = true
+            }
 
-        // 远端协议尚无 tombstone。若本地重算删除了曾经 ack 的自然键，远端仍会保留旧行；
-        // 按 hostname 持久 fail-closed，避免下一次无变化 finalize 又自动恢复 reportingEligible，
-        // 也避免用一个全局键混记多个 host 的对账债务（否则任一 host 的全量同步会误清其它 host 的债务）。
-        if removedSyncedBuckets > 0 || removedSyncedSessions > 0 {
-            let reason = "removed \(removedSyncedBuckets) previously synced bucket(s) and \(removedSyncedSessions) session(s) without remote tombstone support"
-            try setTextUnlocked(key: reconciliationKey(hostname), value: reason)
-        }
-        // Reflect GLOBAL reconciliation debt: any hostname with outstanding debt blocks reporting,
-        // so append every pending host reason (deterministic order), not just this host s.
-        for debtHost in try pendingReconciliationHostsUnlocked() {
-            if let reason = try readReconciliationReasonUnlocked(hostname: debtHost) {
-                blockedReasons.append(reason)
+            if !hostChanged {
+                // 该 host 无变化则回退其 revision 计数，避免无谓递增。
+                try setIntUnlocked(key: revisionKey(host), value: newRevision - 1)
             }
         }
-        // 未绑定 host 的全局对账债务同样整体阻断上报。追加一个脱敏的通用原因（不含 hostname/路径/用量），
-        // 使 finalize 返回的 reportingEligible 与 reportingEligible() 的判定保持一致，避免返回 eligible=true
-        // 而实际 reportingEligible() 为 false。
-        if try hasUnassignedReconciliationUnlocked() {
-            blockedReasons.append("unassigned reconciliation debt pending until a canonical hostname is established")
-        }
 
-        if !changed {
-            // 无变化则回退 revision 计数，避免无谓递增。
-            try setIntUnlocked(key: revisionKey(hostname), value: newRevision - 1)
-        } else {
-            // 派生数据真实变化：推进全量同步 generation，使早于本次重算的 fullSyncSnapshot 提交被围栏拒绝。
-            try nextGenerationUnlocked()
-        }
-
-        // per-host flag 仅记录非 reconciliation 阻断；reconciliation 由独立 gate 在 reportingEligible() 组合。
-        try setTextUnlocked(key: reportingEligibleKey(hostname), value: nonReconciliationEligible ? "1" : "0")
-        // 对外返回的整体资格仍需综合两类阻断（blockedReasons 已含 reconciliation）。
+        // 非对账类阻断（如无法证明的 inherited replay）持久到 per-host eligibility flag。
+        // 本机身份为传入 hostname：finalize 是「本机完成一轮扫描」的显式信号，其上报资格记在本机 flag。
         let eligible = blockedReasons.isEmpty
+        try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
         return UsageFinalizeResult(reportingEligible: eligible, blockedReasons: blockedReasons, collapsedInheritedEvents: collapsed, collapsedContentDuplicates: contentCollapsed)
     }
 
@@ -774,12 +693,22 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try queue.sync {
             // 任一采集/派生阶段未完成都必须 fail-closed，绝不上报陈旧或不完整派生。
             guard try !hasLocalDerivationPendingUnlocked() else { return false }
-            // 未绑定 host 的全局对账债务：整体 fail-closed，直到迁移到真实 host 或被清理。
-            guard try !hasUnassignedReconciliationUnlocked() else { return false }
-            // 全局 fail-closed：任一 hostname 仍有未对账的远端残留（对账债务），整体不可上报。
-            guard try pendingReconciliationHostsUnlocked().isEmpty else { return false }
             return (try readTextUnlocked(key: reportingEligibleKey(hostname)) ?? "1") == "1"
         }
+    }
+
+    /// 派生表中出现过的全部非空 hostname（buckets ∪ sessions），供多机重算逐 host 差异写入。
+    private func derivedHostnamesUnlocked() throws -> [String] {
+        let statement = try prepare("""
+            SELECT DISTINCT hostname FROM (
+              SELECT hostname FROM usage_buckets
+              UNION SELECT hostname FROM usage_sessions
+            ) WHERE hostname<>'';
+            """)
+        defer { sqlite3_finalize(statement) }
+        var result: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
+        return result
     }
 
 
@@ -859,25 +788,28 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// not a general hostname detector: callers must prefer explicit configuration and persisted
     /// user choice, and must never guess when the ledger is ambiguous.
     public func uniqueLegacyHostnameCandidate() throws -> String? {
-        try queue.sync {
-            let statement = try prepare("""
-                SELECT hostname FROM (
-                  SELECT hostname FROM usage_buckets WHERE TRIM(hostname)<>''
-                  UNION
-                  SELECT hostname FROM usage_sessions WHERE TRIM(hostname)<>''
-                ) ORDER BY hostname LIMIT 2;
-                """)
-            defer { sqlite3_finalize(statement) }
-            var hostnames: [String] = []
-            var result = sqlite3_step(statement)
-            while result == SQLITE_ROW {
-                hostnames.append(text(statement, 0))
-                result = sqlite3_step(statement)
-            }
-            guard result == SQLITE_DONE else { throw error() }
-            guard hostnames.count == 1 else { return nil }
-            return hostnames[0]
+        try queue.sync { try uniqueLegacyHostnameCandidateUnlocked() }
+    }
+
+    /// unlocked 版：供迁移事务内复用（不能再进 queue.sync）。
+    private func uniqueLegacyHostnameCandidateUnlocked() throws -> String? {
+        let statement = try prepare("""
+            SELECT hostname FROM (
+              SELECT hostname FROM usage_buckets WHERE TRIM(hostname)<>''
+              UNION
+              SELECT hostname FROM usage_sessions WHERE TRIM(hostname)<>''
+            ) ORDER BY hostname LIMIT 2;
+            """)
+        defer { sqlite3_finalize(statement) }
+        var hostnames: [String] = []
+        var result = sqlite3_step(statement)
+        while result == SQLITE_ROW {
+            hostnames.append(text(statement, 0))
+            result = sqlite3_step(statement)
         }
+        guard result == SQLITE_DONE else { throw error() }
+        guard hostnames.count == 1 else { return nil }
+        return hostnames[0]
     }
 
     /// 兼容入口：汇总 usage_buckets 中所有 hostname 的全时段派生数据。
@@ -1057,7 +989,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private func readAllRawEvents(overwriteConflicts: inout [String]) throws -> [RawEvent] {
         // 读全部（跨文件）原始 token 行，稳定排序（含 source_file_hash 使跨文件同 id 顺序确定）。
         let activeFiles = try ownedActiveFileIDsUnlocked()
-        let sql = "SELECT event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,inherited,has_total_snapshot,lineage_fingerprint,codex_dedup_key,skill_counts_json,mcp_counts_json,merge_strategy,source_file_hash FROM usage_events ORDER BY timestamp_ms,event_id,source_file_hash;"
+        let sql = "SELECT event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,inherited,has_total_snapshot,lineage_fingerprint,codex_dedup_key,skill_counts_json,mcp_counts_json,merge_strategy,source_file_hash,hostname FROM usage_events ORDER BY timestamp_ms,event_id,source_file_hash;"
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
         var result: [TieredRawEvent] = []
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -1072,7 +1004,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     codexDedupKey: text(statement, 15),
                     skillCounts: decodeStringIntMap(text(statement, 16)),
                     mcpCounts: decodeStringIntMap(text(statement, 17)),
-                    mergeStrategy: text(statement, 18)
+                    mergeStrategy: text(statement, 18),
+                    hostname: text(statement, 20)
                 ),
                 tier: attributionTier(sourceFileHash: sourceFileHash, activeFiles: activeFiles)
             ))
@@ -1170,7 +1103,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 codexDedupKey: existing.codexDedupKey.isEmpty ? event.codexDedupKey : existing.codexDedupKey,
                 skillCounts: maximumCounts(existing.skillCounts, event.skillCounts),
                 mcpCounts: maximumCounts(existing.mcpCounts, event.mcpCounts),
-                mergeStrategy: cumulative ? "cumulativeMax" : existing.mergeStrategy
+                mergeStrategy: cumulative ? "cumulativeMax" : existing.mergeStrategy,
+                hostname: existing.hostname.isEmpty ? event.hostname : existing.hostname
             )
     }
 
@@ -1180,7 +1114,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // 仅当无任何 owned 行时保留 legacy。同 tier 内维持既有「按 timestamp,tool_use_id,source_file_hash
         // 稳定排序取首个」的确定性口径。
         let activeFiles = try ownedActiveFileIDsUnlocked()
-        let statement = try prepare("SELECT source,model,project,timestamp_ms,lines_added,lines_deleted,tool_use_id,source_file_hash FROM usage_edit_entries ORDER BY timestamp_ms,tool_use_id,source_file_hash;")
+        let statement = try prepare("SELECT source,model,project,timestamp_ms,lines_added,lines_deleted,tool_use_id,source_file_hash,hostname FROM usage_edit_entries ORDER BY timestamp_ms,tool_use_id,source_file_hash;")
         defer { sqlite3_finalize(statement) }
         var order: [String] = []
         var byKey: [String: (entry: RawEditEntry, tier: AttributionTier)] = [:]
@@ -1191,7 +1125,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 source: text(statement, 0), model: text(statement, 1), project: text(statement, 2),
                 timestampMs: sqlite3_column_int64(statement, 3),
                 added: max(0, sqlite3_column_int64(statement, 4)),
-                deleted: max(0, sqlite3_column_int64(statement, 5))
+                deleted: max(0, sqlite3_column_int64(statement, 5)),
+                hostname: text(statement, 8)
             )
             guard let existing = byKey[toolUseID] else {
                 byKey[toolUseID] = (entry, tier); order.append(toolUseID); continue
@@ -1216,7 +1151,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // 仅当无任何 owned 行时保留 legacy。同 tier 内维持既有「按 source,event_id,source_file_hash
         // 稳定排序取首个」的确定性口径。
         let activeFiles = try ownedActiveFileIDsUnlocked()
-        let statement = try prepare("SELECT event_id,source,session_hash,role,timestamp_ms,source_file_hash FROM usage_session_events ORDER BY source,event_id,source_file_hash;")
+        let statement = try prepare("SELECT event_id,source,session_hash,role,timestamp_ms,source_file_hash,hostname FROM usage_session_events ORDER BY source,event_id,source_file_hash;")
         defer { sqlite3_finalize(statement) }
         var order: [String] = []
         var byKey: [String: (event: UsageSessionEvent, tier: AttributionTier)] = [:]
@@ -1224,7 +1159,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             guard let role = UsageSessionEvent.Role(rawValue: text(statement, 3)) else { continue }
             let key = "\(text(statement, 1))\u{1}\(text(statement, 0))"
             let tier = attributionTier(sourceFileHash: text(statement, 5), activeFiles: activeFiles)
-            let event = UsageSessionEvent(id: text(statement, 0), source: text(statement, 1), sessionHash: text(statement, 2), role: role, timestamp: date(sqlite3_column_int64(statement, 4)))
+            let event = UsageSessionEvent(id: text(statement, 0), source: text(statement, 1), sessionHash: text(statement, 2), role: role, timestamp: date(sqlite3_column_int64(statement, 4)), hostname: text(statement, 6))
             guard let existing = byKey[key] else {
                 byKey[key] = (event, tier); order.append(key); continue
             }
@@ -1463,220 +1398,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
     }
 
 
-    // MARK: - Full sync (generation-fenced reconciliation over ALL rows)
-
-    /// 读取当前全量同步 generation（只读，不推进）。
-    ///
-    /// reserve-before-snapshot 流程：先取 baseline 并在远端预留，再用
-    /// fullSyncSnapshot(hostname:expectedGeneration:) 取同一 generation 的快照；
-    /// 期间账本若被 finalize/rebuild/reset 重算推进 generation，快照整体失败（不返回半快照）。
-    public func fullSyncGenerationBaseline() throws -> Int64 {
-        try queue.sync {
-            if try hasLocalDerivationPendingUnlocked() {
-                throw UsageFullSyncSnapshotError.localDerivationPending
-            }
-            return try readIntUnlocked(key: Self.fullSyncGenerationKey) ?? 0
-        }
-    }
-
-    /// 兼容入口：等价于 fullSyncSnapshot(hostname:expectedGeneration: nil)。
-    public func fullSyncSnapshot(hostname: String) throws -> UsageFullSyncSnapshot {
-        try fullSyncSnapshot(hostname: hostname, expectedGeneration: nil)
-    }
-
-    /// 单事务读取某 hostname 的**全部**派生行（含已 synced），并附当前单调 generation 与
-    /// reconciliation 原因，用于与远端做完整对账。
-    ///
-    /// generation 在同一事务内只读取、不推进：无数据变化时连续快照的 generation 必须相同，
-    /// 否则「远端已 committed、本地 crash 未及 commit」的上传在恢复时会因重拍快照 generation
-    /// 变大而永远无法通过 commit 围栏。generation 仅在派生数据真实变化（finalize 差异写入 /
-    /// rebuild / reset）时推进，快照后任何这类重算都会使旧快照的 commit 整体失效。
-    /// 快照与 generation 在同一事务内读取，避免读到半更新状态。
-    ///
-    /// expectedGeneration 非 nil 时，同一事务内先读 generation 并要求与之相等；不相等则抛
-    /// UsageFullSyncSnapshotError.staleGeneration 且不读取/返回任何行（无半快照）。
-    /// 全部行与 reconciliationReason 仍在同一一致性范围内读取。
-    public func fullSyncSnapshot(hostname: String, expectedGeneration: Int64?) throws -> UsageFullSyncSnapshot {
-        try queue.sync {
-            var snapshot = UsageFullSyncSnapshot(hostname: hostname, generation: 0, buckets: [], sessions: [], reconciliationReason: nil)
-            try transaction {
-                if try hasLocalDerivationPendingUnlocked() {
-                    throw UsageFullSyncSnapshotError.localDerivationPending
-                }
-                let generation = try readIntUnlocked(key: Self.fullSyncGenerationKey) ?? 0
-                if let expectedGeneration, expectedGeneration != generation {
-                    throw UsageFullSyncSnapshotError.staleGeneration(expected: expectedGeneration, actual: generation)
-                }
-                let buckets = try readAllBucketPendingUnlocked(hostname: hostname)
-                let sessions = try readAllSessionPendingUnlocked(hostname: hostname)
-                let reason = try readReconciliationReasonUnlocked(hostname: hostname)
-                snapshot = UsageFullSyncSnapshot(hostname: hostname, generation: generation, buckets: buckets, sessions: sessions, reconciliationReason: reason)
-            }
-            return snapshot
-        }
-    }
-
-    /// 指定 hostname 的 remote reconciliation 原因（无则 nil）。上层据此判断该 host 是否需要一次全量对账。
-    public func reconciliationReason(hostname: String) throws -> String? {
-        try queue.sync { try readReconciliationReasonUnlocked(hostname: hostname) }
-    }
-
-    /// 任一存在对账债务的 hostname 的原因（按 hostname 稳定排序取首个），无则 nil。
-    /// 便于观测「当前是否存在任何未对账残留」而不必先知道具体 host。
-    public func reconciliationReason() throws -> String? {
-        try queue.sync {
-            if let first = try pendingReconciliationHostsUnlocked().first {
-                return try readReconciliationReasonUnlocked(hostname: first)
-            }
-            // 无 per-host 债务时，仍需暴露未绑定 host 的全局债务，供观测层判断整体是否 fail-closed。
-            return try readTextUnlocked(key: Self.unassignedReconciliationKey).flatMap { $0.isEmpty ? nil : $0 }
-        }
-    }
-
-    /// 存在对账债务（远端旧行待删除）的 hostname 列表，按 hostname 升序稳定排序。
-    /// coordinator 据此优先驱动旧 host 的全量同步（即便它不是当前 canonical hostname）。
-    public func pendingReconciliationHosts() throws -> [String] {
-        try queue.sync { try pendingReconciliationHostsUnlocked() }
-    }
-
-    /// 提交一次全量同步：generation 围栏 + 逐行精确 revision 核对，整体成功或整体 fail-closed。
-    ///
-    /// 崩溃安全：全部核对与写入在单个 IMMEDIATE 事务内完成；核对不通过时直接返回失败且不改动任何
-    /// 行（不部分标记、不清 gate）。仅当 generation 未过期、且提交携带的每个 (自然键, revision 快照)
-    /// 与当前库行**精确一致**、且提交的行集与当前库该 hostname 全部行集合完全一致（无缺失/无多余）时，
-    /// 才原子地：把全部行 synced_revision 抬到其 revision、清除 remote_reconciliation_required、
-    /// 恢复 reportingEligible。
-    @discardableResult
-    public func commitFullSync(_ commit: UsageFullSyncCommit) throws -> UsageFullSyncCommitResult {
-        try queue.sync {
-            var result = UsageFullSyncCommitResult.failed("uninitialized")
-            do {
-                try transaction {
-                    // 失败路径统一 throw FullSyncFenced 触发 ROLLBACK，绝不落任何部分状态（即便未来在核对前新增写入）。
-                    // raw 派生 dirty（文件已 replace 但派生尚未重算）：整体 fail-closed，绝不据陈旧派生 commit。
-                    if try hasLocalDerivationPendingUnlocked() {
-                        throw FullSyncFenced("local derivation pending: scan or derived rebuild is incomplete")
-                    }
-                    // 1) generation 围栏：提交的 generation 必须等于当前 generation（快照后未被重算/推进）。
-                    let currentGeneration = try readIntUnlocked(key: Self.fullSyncGenerationKey) ?? 0
-                    guard commit.generation == currentGeneration else {
-                        throw FullSyncFenced("full sync generation fenced: commit=\(commit.generation) current=\(currentGeneration)")
-                    }
-
-                    // 2) 逐行核对当前库行（含 synced）与提交快照精确一致；同时校验行集合完全一致。
-                    // 自然键在库内因主键约束唯一；行集合计数相等 + 每个提交键精确命中，
-                    // 即可证明「无缺失、无多余、无重复键」。
-                    let liveBuckets = try readBucketRowsUnlocked(hostname: commit.hostname)
-                    let liveSessions = try readSessionRowsUnlocked(hostname: commit.hostname)
-                    guard liveBuckets.count == commit.buckets.count, liveSessions.count == commit.sessions.count else {
-                        throw FullSyncFenced("full sync row set changed since snapshot (buckets \(commit.buckets.count)->\(liveBuckets.count), sessions \(commit.sessions.count)->\(liveSessions.count))")
-                    }
-                    var seenBucketKeys = Set<String>(); seenBucketKeys.reserveCapacity(commit.buckets.count)
-                    for pending in commit.buckets {
-                        let b = pending.bucket
-                        let key = "\(b.source)\u{1}\(b.model)\u{1}\(b.project)\u{1}\(millis(b.bucketStart))"
-                        guard seenBucketKeys.insert(key).inserted else {
-                            throw FullSyncFenced("full sync commit contains duplicate bucket key: \(key)")
-                        }
-                        guard let row = liveBuckets[key] else {
-                            throw FullSyncFenced("full sync bucket missing since snapshot: \(key)")
-                        }
-                        guard row.revision == pending.revision, row.bucket == b else {
-                            throw FullSyncFenced("full sync bucket changed since snapshot: \(key)")
-                        }
-                    }
-                    var seenSessionKeys = Set<String>(); seenSessionKeys.reserveCapacity(commit.sessions.count)
-                    for pending in commit.sessions {
-                        let s = pending.session
-                        let key = "\(s.source)\u{1}\(s.sessionHash)"
-                        guard seenSessionKeys.insert(key).inserted else {
-                            throw FullSyncFenced("full sync commit contains duplicate session key: \(key)")
-                        }
-                        guard let row = liveSessions[key] else {
-                            throw FullSyncFenced("full sync session missing since snapshot: \(key)")
-                        }
-                        guard row.revision == pending.revision, row.session == s else {
-                            throw FullSyncFenced("full sync session changed since snapshot: \(key)")
-                        }
-                    }
-
-                    // 3) 全部精确匹配 -> 原子标记全部行 synced、清 gate、恢复上报资格。
-                    let nowMs = millis(Date())
-                    let bucketSQL = "UPDATE usage_buckets SET synced_revision=?, updated_at_ms=? WHERE hostname=? AND source=? AND model=? AND project=? AND bucket_start_ms=? AND revision=?;"
-                    let bucketStmt = try prepare(bucketSQL); defer { sqlite3_finalize(bucketStmt) }
-                    for pending in commit.buckets {
-                        let b = pending.bucket
-                        sqlite3_reset(bucketStmt); sqlite3_clear_bindings(bucketStmt)
-                        try bind(bucketStmt, 1, pending.revision); try bind(bucketStmt, 2, nowMs); try bind(bucketStmt, 3, b.hostname)
-                        try bind(bucketStmt, 4, b.source); try bind(bucketStmt, 5, b.model); try bind(bucketStmt, 6, b.project); try bind(bucketStmt, 7, millis(b.bucketStart)); try bind(bucketStmt, 8, pending.revision)
-                        try done(bucketStmt)
-                    }
-                    let sessionSQL = "UPDATE usage_sessions SET synced_revision=?, updated_at_ms=? WHERE hostname=? AND source=? AND session_hash=? AND revision=?;"
-                    let sessionStmt = try prepare(sessionSQL); defer { sqlite3_finalize(sessionStmt) }
-                    for pending in commit.sessions {
-                        let s = pending.session
-                        sqlite3_reset(sessionStmt); sqlite3_clear_bindings(sessionStmt)
-                        try bind(sessionStmt, 1, pending.revision); try bind(sessionStmt, 2, nowMs); try bind(sessionStmt, 3, s.hostname)
-                        try bind(sessionStmt, 4, s.source); try bind(sessionStmt, 5, s.sessionHash); try bind(sessionStmt, 6, pending.revision)
-                        try done(sessionStmt)
-                    }
-
-                    // 全量对账完成：远端已收妥整份快照，仅清除 reconciliation gate。
-                    // 不得无条件 set reportingEligible=1：per-host flag 记录的是非 reconciliation 阻断
-                    //（如无法证明的 inherited replay），full sync 与其无关，覆盖会造成 fail-open。
-                    // 清 gate 后由 reportingEligible() 正交组合：无 gate 且 flag==1 才恢复上报。
-                    // 只清 commit.hostname 自己的对账债务；其它 host 的债务保持不变，
-                    // 由后续针对各自 host 的全量同步分别清除。
-                    try deleteKeyUnlocked(reconciliationKey(commit.hostname))
-                    try setTextUnlocked(key: lastSyncedKey(commit.hostname), value: String(nowMs))
-                    result = .success
-                }
-            } catch let fenced as FullSyncFenced {
-                // 事务已 ROLLBACK：库状态未改动。返回失败原因，交由上层保持 fail-closed。
-                result = .failed(fenced.reason)
-            }
-            return result
-        }
-    }
-
-    /// 读取某 hostname 全部 bucket 行（含 synced），携带 revision 快照。
-    private func readAllBucketPendingUnlocked(hostname: String) throws -> [UsagePendingBucket] {
-        let sql = "SELECT source,model,project,bucket_start_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,skills_json,skill_counts_json,mcp_counts_json,lines_added,lines_deleted,code_metric_version,revision FROM usage_buckets WHERE hostname=? AND bucket_start_ms>=0 ORDER BY revision,bucket_start_ms,source,model,project;"
-        let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
-        var result: [UsagePendingBucket] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let counts = UsageTokenCounts(input: sqlite3_column_int64(statement, 4), output: sqlite3_column_int64(statement, 5), cachedInput: sqlite3_column_int64(statement, 6), cacheCreationInput: sqlite3_column_int64(statement, 7), reasoningOutput: sqlite3_column_int64(statement, 8), reportedTotal: sqlite3_column_int64(statement, 9))
-            let bucket = UsageBucket(
-                hostname: hostname, source: text(statement, 0), model: text(statement, 1), project: text(statement, 2),
-                bucketStart: date(sqlite3_column_int64(statement, 3)), counts: counts,
-                skills: decodeStringArray(text(statement, 10)), skillCounts: decodeStringIntMap(text(statement, 11)),
-                mcpCounts: decodeStringIntMap(text(statement, 12)), linesAdded: sqlite3_column_int64(statement, 13),
-                linesDeleted: sqlite3_column_int64(statement, 14), codeMetricVersion: Int(sqlite3_column_int64(statement, 15))
-            )
-            result.append(UsagePendingBucket(bucket: bucket, revision: sqlite3_column_int64(statement, 16)))
-        }
-        return result
-    }
-
-    /// 读取某 hostname 全部 session 行（含 synced），携带 revision 快照。
-    private func readAllSessionPendingUnlocked(hostname: String) throws -> [UsagePendingSession] {
-        let sql = "SELECT source,session_hash,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram,project,skills_json,revision FROM usage_sessions WHERE hostname=? AND first_activity_ms>=0 AND last_activity_ms>=0 ORDER BY revision,source,session_hash;"
-        let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
-        var result: [UsagePendingSession] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let session = UsageSession(
-                hostname: hostname, source: text(statement, 0), sessionHash: text(statement, 1),
-                project: text(statement, 9), skills: decodeStringArray(text(statement, 10)),
-                firstActivity: date(sqlite3_column_int64(statement, 2)), lastActivity: date(sqlite3_column_int64(statement, 3)),
-                activeSeconds: sqlite3_column_int64(statement, 4), messageCount: sqlite3_column_int64(statement, 5),
-                userMessageCount: sqlite3_column_int64(statement, 6), assistantEvents: sqlite3_column_int64(statement, 7),
-                hourHistogramUTC: decodeHistogram(text(statement, 8))
-            )
-            result.append(UsagePendingSession(session: session, revision: sqlite3_column_int64(statement, 11)))
-        }
-        return result
-    }
-
 
     // MARK: - Hostname gate + rebuild
 
@@ -1687,13 +1408,15 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    /// canonical hostname 变化时，从原始事件事务重建目标 hostname 派生聚合，
-    /// 清除所有旧 hostname 派生行，更新 canonical hostname 记录。
+    /// canonical hostname 变化时，从原始事件事务重建全部派生聚合。
+    ///
+    /// 保留多机语义：原始事件每条自带采集机 hostname，重算按各事件自带 hostname 归属，
+    /// 不再把整库事件重派到单一 host。清空派生后逐 host 重建，各机数据都保留。
+    /// canonical_hostname 仅作「本机身份」记录，供上报身份与 legacy 事件兜底使用。
     public func rebuildForHostname(_ hostname: String) throws {
         try queue.sync {
             try transaction {
                 try preserveRevisionHighWatermarksUnlocked()
-                try preserveSyncedDeletionBlockUnlocked(reasonPrefix: "hostname rebuild")
                 try exec("DELETE FROM usage_buckets;")
                 try exec("DELETE FROM usage_sessions;")
                 _ = try recomputeDerivedUnlocked(hostname: hostname)
@@ -1811,7 +1534,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 // 先把派生表中可能高于 sync_state 的 revision 合并进持久高水位。
                 // reset 后新行从高水位继续递增，旧在途 batch 因 revision 不匹配无法误 ack。
                 try preserveRevisionHighWatermarksUnlocked()
-                try preserveSyncedDeletionBlockUnlocked(reasonPrefix: "parser rebuild")
                 try exec("DELETE FROM usage_buckets;")
                 try exec("DELETE FROM usage_sessions;")
                 try exec("DELETE FROM usage_session_events;")
@@ -1819,22 +1541,15 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 try exec("DELETE FROM usage_edit_metric_sources;")
                 try exec("DELETE FROM usage_events;")
                 try exec("DELETE FROM usage_files;")
-                // full_sync_generation 单调不回退：保留其键，供 generation 围栏在 reset 后仍能拒绝旧在途提交。
-                // 同时保留未绑定 host 的全局对账债务键（独立前缀，不匹配 per-host LIKE，需显式排除），
-                // 否则 reset 会静默丢弃全局债务导致 fail-open。
-                let deleteStmt = try prepare("DELETE FROM sync_state WHERE key NOT LIKE 'revision\u{1}%' AND key NOT LIKE 'remote_reconciliation_required\u{1}%' AND key!=? AND key!=?;")
-                defer { sqlite3_finalize(deleteStmt) }
-                try bind(deleteStmt, 1, Self.fullSyncGenerationKey)
-                try bind(deleteStmt, 2, Self.unassignedReconciliationKey)
-                try done(deleteStmt)
+                // 清 sync_state，但保留 per-host revision 高水位（revision\u{1}*），
+                // 使 reset 后新行从高水位继续递增，旧在途 batch 因 revision 不匹配无法误 ack。
+                try exec("DELETE FROM sync_state WHERE key NOT LIKE 'revision\u{1}%';")
                 // 清库与 pending 标记同事务提交：进程在后续重扫期间退出，重启仍能继续 rebuild。
                 try setTextUnlocked(key: Self.rebuildPendingKey, value: "1")
                 // 持久记录本次 rebuild 的目标 parser 版本（若提供），供协调层校验重扫是否达到目标版本。
                 if let targetParserVersion {
                     try setIntUnlocked(key: Self.rebuildTargetParserVersionKey, value: Int64(targetParserVersion))
                 }
-                // 推进 generation：reset 后新快照从更高 generation 继续。
-                try nextGenerationUnlocked()
             }
         }
     }
@@ -1870,25 +1585,16 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let afterV3 = try scalar("PRAGMA user_version;")
         if afterV3 == 3 {
             try transaction {
-                // v3 -> v4: split the single global reconciliation debt key into per-hostname keys.
-                // Move any legacy debt to the canonical hostname when known; otherwise keep it as an
-                // unassigned/global debt (fail-closed for every host) until a hostname is learned or
-                // a successful full sync / manual clear resolves it. Never silently drop it.
-                try migrateLegacyReconciliationDebtUnlocked()
+                // v3 -> v4：历史版本曾在此拆分对账债务键。对账门禁已整体移除，本步不再写入任何
+                // 对账键，仅推进版本号；旧库遗留的对账键由 v9 -> v10 统一清理。
                 try exec("PRAGMA user_version=4;")
             }
         }
         let afterV4 = try scalar("PRAGMA user_version;")
         if afterV4 == 4 {
             try transaction {
-                // v4 -> v5: pre-revision-tracking derived rows carry revision=0 AND synced_revision=0.
-                // They may already exist on the remote (historically pushed) but the local ledger cannot
-                // prove it, and the pre-ack crash window is indistinguishable. finalize's diff-write also
-                // leaves them permanently non-pending whenever recomputed counts match. Register an
-                // initial full-sync reconciliation debt per hostname so reporting is fail-closed until a
-                // full sync reconciles them, and so a subsequent reset/rebuild cannot silently drop them
-                // without leaving remote-cleanup debt.
-                try markLegacyDerivedRowsAsInitialFullSyncDebtUnlocked()
+                // v4 -> v5：历史版本曾在此登记 legacy 派生行的初始全量同步对账债务。对账门禁已移除，
+                // 本步不再写入任何对账键，仅推进版本号；遗留键由 v9 -> v10 清理。
                 try exec("PRAGMA user_version=5;")
             }
         }
@@ -1957,6 +1663,54 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 try exec("PRAGMA user_version=9;")
             }
         }
+        let afterV9 = try scalar("PRAGMA user_version;")
+        if afterV9 == 9 {
+            try transaction {
+                try migrateV9ToV10Unlocked()
+                try exec("PRAGMA user_version=10;")
+            }
+        }
+    }
+
+    /// v9 -> v10：把采集机 hostname 下沉到原始事件层，rebuild 保留多机数据；并清理已废弃的
+    /// 对账门禁 / 全量同步 generation 键（对账门禁子系统已整体移除）。
+    ///
+    /// - 三张原始表各加 `hostname TEXT NOT NULL DEFAULT ''`（O(1) 元数据 ALTER，不改主键，
+    ///   保持 usage_events (source_file_hash,event_id) 的文件级 replace 幂等语义）。
+    /// - 一次性把旧行的空 hostname 回填成「当时的 canonical hostname」：优先读 sync_state 的
+    ///   canonical_hostname；缺失则用账本中唯一的历史 hostname 恢复；仍无则保留空串，由后续
+    ///   finalize 按传入 hostname 兜底。
+    /// - 若库里已有原始事件，置 raw 派生 dirty 位，确保回填后、首次 finalize 前不上报陈旧派生。
+    /// - 删除历史遗留的对账债务键与 full_sync_generation 键，避免旧库升上来卡在已废弃的门禁上。
+    private func migrateV9ToV10Unlocked() throws {
+        try addColumnIfMissing(table: "usage_events", column: "hostname", definition: "TEXT NOT NULL DEFAULT ''")
+        try addColumnIfMissing(table: "usage_session_events", column: "hostname", definition: "TEXT NOT NULL DEFAULT ''")
+        if try tableExistsUnlocked("usage_edit_entries") {
+            try addColumnIfMissing(table: "usage_edit_entries", column: "hostname", definition: "TEXT NOT NULL DEFAULT ''")
+        }
+
+        // 回填空 hostname：确定「当时的 canonical hostname」。
+        var backfill = try readTextUnlocked(key: Self.canonicalHostnameKey).flatMap { $0.isEmpty ? nil : $0 }
+        if backfill == nil { backfill = try uniqueLegacyHostnameCandidateUnlocked() }
+        if let host = backfill, !host.isEmpty {
+            for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
+                guard try tableExistsUnlocked(table) else { continue }
+                let statement = try prepare("UPDATE \(table) SET hostname=? WHERE hostname='';")
+                defer { sqlite3_finalize(statement) }
+                try bind(statement, 1, host); try done(statement)
+            }
+        }
+
+        // 若已有原始事件（历史库），置 raw 派生 dirty，直到一次成功 finalize 清除。
+        let hasEvents = try tableHasAnyRowUnlocked("usage_events")
+        let hasSessionEvents = try tableHasAnyRowUnlocked("usage_session_events")
+        let hasEditEntries = try tableHasAnyRowUnlocked("usage_edit_entries")
+        if hasEvents || hasSessionEvents || hasEditEntries {
+            try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
+        }
+
+        // 清理已废弃的对账门禁 / 全量同步 generation 键（子系统已整体移除）。
+        try exec("DELETE FROM sync_state WHERE key='full_sync_generation' OR key='remote_reconciliation_required' OR key='remote_reconciliation_required_unassigned' OR key LIKE 'remote_reconciliation_required\u{1}%';")
     }
 
     /// 幂等列新增：仅当目标列不存在时执行 ALTER，兼容已被其它路径升级过的库。
@@ -2142,135 +1896,19 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return next
     }
 
-    /// 全量同步 generation：全局单调计数（跨 hostname）。只在派生数据真实变化时推进——
-    /// finalize 差异写入、rebuild、reset；fullSyncSnapshot 读取不推进，保证无数据变化时
-    /// 连续快照 generation 相同，crash 恢复可用同一 generation 完成 commit。
-    /// generation 只增不减，reset/rebuild 后不回退（清库时保留其 sync_state 键）。
-    @discardableResult
-    private func nextGenerationUnlocked() throws -> Int64 {
-        let next = (try readIntUnlocked(key: Self.fullSyncGenerationKey) ?? 0) + 1
-        try setIntUnlocked(key: Self.fullSyncGenerationKey, value: next)
-        return next
-    }
-
     private func revisionKey(_ hostname: String) -> String { "revision\u{1}\(hostname)" }
     private func lastSyncedKey(_ hostname: String) -> String { "last_synced_at_ms\u{1}\(hostname)" }
     private func reportingEligibleKey(_ hostname: String) -> String { "reporting_eligible\u{1}\(hostname)" }
-    /// per-host reconciliation debt key (remote still holds old rows to delete): prefix + hostname.
-    private func reconciliationKey(_ hostname: String) -> String { "\(Self.reconciliationKeyPrefix)\(hostname)" }
-    private static let reconciliationKeyPrefix = "remote_reconciliation_required\u{1}"
-    /// Legacy v1 global reconciliation key (no hostname). Migrated to the per-host key under the canonical hostname.
-    private static let legacyReconciliationKey = "remote_reconciliation_required"
-    /// Unassigned/global reconciliation debt (no hostname known yet). Blocks reporting for every host
-    /// until it can be relocated to the canonical hostname (learned in record) or manually cleared.
-    /// Uses an INDEPENDENT prefix that does not start with reconciliationKeyPrefix, so the per-host
-    /// GLOB scan can never parse it into a pseudo-hostname / full-sync target.
-    private static let unassignedReconciliationKey = "remote_reconciliation_required_unassigned"
-   private static let fullSyncGenerationKey = "full_sync_generation"
    private static let rebuildPendingKey = "rebuild_pending"
    private static let rebuildCompletedParserVersionKey = "rebuild_completed_parser_version"
    private static let canonicalHostnameKey = "canonical_hostname"
     /// raw 派生 dirty 位：每次 raw replace（record）同事务置位；finalizeDerived 成功重算派生后同事务清除。
-    /// 置位期间 reportingEligible / fullSyncSnapshot / pendingBatch 一律 fail-closed，确保文件替换后、
+    /// 置位期间 reportingEligible / pendingBatch 一律 fail-closed，确保文件替换后、
     /// finalize 之前进程崩溃不会上报仍反映旧原始归属的陈旧派生。
     private static let rawDerivationPendingKey = "raw_derivation_pending"
     /// parser rebuild pending 持久记录目标 parser 版本（resetForRebuild 写入），供协调层用
     /// requiresRebuildCompletion/markRebuildCompleted 完成；自动路径不再依赖 reset。
     private static let rebuildTargetParserVersionKey = "rebuild_target_parser_version"
-
-    /// v3 -> v4 migration: relocate the legacy global reconciliation debt key to a per-host key.
-    private func migrateLegacyReconciliationDebtUnlocked() throws {
-        guard let legacy = try readTextUnlocked(key: Self.legacyReconciliationKey), !legacy.isEmpty else {
-            try deleteKeyUnlocked(Self.legacyReconciliationKey)
-            return
-        }
-        if let host = try readTextUnlocked(key: Self.canonicalHostnameKey), !host.isEmpty {
-            // Preserve an already-migrated per-host debt if one exists; never overwrite it.
-            if try readReconciliationReasonUnlocked(hostname: host) == nil {
-                try setTextUnlocked(key: reconciliationKey(host), value: legacy)
-            }
-        } else {
-            // No canonical hostname to bind the debt to. Keep it as unassigned/global debt so reporting
-            // stays fail-closed for every host until a hostname is learned or the debt is cleared,
-            // instead of dropping it (which would fail open). Never overwrite an existing unassigned debt.
-            if try readTextUnlocked(key: Self.unassignedReconciliationKey).flatMap({ $0.isEmpty ? nil : $0 }) == nil {
-                try setTextUnlocked(key: Self.unassignedReconciliationKey, value: legacy)
-            }
-        }
-        try deleteKeyUnlocked(Self.legacyReconciliationKey)
-    }
-
-    /// v4 -> v5 migration: mark pre-revision-tracking derived rows (revision=0 AND synced_revision=0)
-    /// as an initial full-sync reconciliation debt, one key per affected hostname. These rows cannot be
-    /// proven synced or unsynced, so a full sync must reconcile them before reporting resumes.
-    /// Idempotent: never overwrites an existing per-host debt reason.
-    private func markLegacyDerivedRowsAsInitialFullSyncDebtUnlocked() throws {
-        let statement = try prepare("""
-            SELECT hostname,SUM(bucket_count),SUM(session_count) FROM (
-              SELECT hostname,COUNT(*) AS bucket_count,0 AS session_count
-                FROM usage_buckets WHERE revision=0 AND synced_revision=0 GROUP BY hostname
-              UNION ALL
-              SELECT hostname,0 AS bucket_count,COUNT(*) AS session_count
-                FROM usage_sessions WHERE revision=0 AND synced_revision=0 GROUP BY hostname
-            ) GROUP BY hostname;
-            """)
-        defer { sqlite3_finalize(statement) }
-        var legacyRows: [(hostname: String, buckets: Int64, sessions: Int64)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            legacyRows.append((text(statement, 0), sqlite3_column_int64(statement, 1), sqlite3_column_int64(statement, 2)))
-        }
-        for item in legacyRows where item.buckets > 0 || item.sessions > 0 {
-            // Preserve an existing per-host debt reason; never overwrite it.
-            if try readReconciliationReasonUnlocked(hostname: item.hostname) != nil { continue }
-            let reason = "initial full sync required for \(item.buckets) legacy bucket(s) and \(item.sessions) session(s) with unknown remote sync state"
-            try setTextUnlocked(key: reconciliationKey(item.hostname), value: reason)
-        }
-    }
-    /// Reads the reconciliation debt reason for a hostname (nil when absent/empty; unlocked, call inside queue.sync).
-    private func readReconciliationReasonUnlocked(hostname: String) throws -> String? {
-        try readTextUnlocked(key: reconciliationKey(hostname)).flatMap { $0.isEmpty ? nil : $0 }
-    }
-
-    /// Hostnames that carry reconciliation debt, sorted ascending for stable ordering (unlocked).
-    private func pendingReconciliationHostsUnlocked() throws -> [String] {
-        let prefix = Self.reconciliationKeyPrefix
-        let statement = try prepare("SELECT key FROM sync_state WHERE key GLOB ? AND value<>'' ORDER BY key;")
-        defer { sqlite3_finalize(statement) }
-        var pat = ""
-        for ch in prefix {
-            if ch == "*" || ch == "?" || ch == "[" || ch == "]" {
-                pat.append("["); pat.append(ch); pat.append("]")
-            } else { pat.append(ch) }
-        }
-        try bind(statement, 1, pat + "*")
-        var hosts: [String] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            let key = text(statement, 0)
-            // The unassigned/global debt key shares the per-host prefix but is NOT a real hostname;
-            // never surface it as a full-sync target. It is handled separately in reportingEligible().
-            if key == Self.unassignedReconciliationKey { continue }
-            hosts.append(String(key.dropFirst(prefix.count)))
-        }
-        return hosts
-    }
-
-    /// True when an unassigned/global reconciliation debt is outstanding (no hostname bound yet).
-    /// Blocks reporting for every host until relocated to the canonical hostname or cleared.
-    private func hasUnassignedReconciliationUnlocked() throws -> Bool {
-        (try readTextUnlocked(key: Self.unassignedReconciliationKey).flatMap { $0.isEmpty ? nil : $0 }) != nil
-    }
-
-    /// Relocates any unassigned/global reconciliation debt onto a now-known canonical hostname, so it
-    /// becomes reconcilable via a per-host full sync. Preserves an existing per-host debt; never
-    /// overwrites it. Idempotent and safe to call whenever the canonical hostname is first learned.
-    private func relocateUnassignedReconciliationDebtUnlocked(to hostname: String) throws {
-        guard !hostname.isEmpty else { return }
-        guard let debt = try readTextUnlocked(key: Self.unassignedReconciliationKey).flatMap({ $0.isEmpty ? nil : $0 }) else { return }
-        if try readReconciliationReasonUnlocked(hostname: hostname) == nil {
-            try setTextUnlocked(key: reconciliationKey(hostname), value: debt)
-        }
-        try deleteKeyUnlocked(Self.unassignedReconciliationKey)
-    }
 
     private func preserveRevisionHighWatermarksUnlocked() throws {
         let statement = try prepare("""
@@ -2289,56 +1927,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
             if item.revision > current {
                 try setIntUnlocked(key: revisionKey(item.hostname), value: item.revision)
             }
-        }
-    }
-
-    private func preserveSyncedDeletionBlockUnlocked(reasonPrefix: String) throws {
-        let statement = try prepare("""
-            SELECT hostname,SUM(bucket_count),SUM(session_count) FROM (
-              SELECT hostname,COUNT(*) AS bucket_count,0 AS session_count
-                FROM usage_buckets WHERE synced_revision>0 GROUP BY hostname
-              UNION ALL
-              SELECT hostname,0 AS bucket_count,COUNT(*) AS session_count
-                FROM usage_sessions WHERE synced_revision>0 GROUP BY hostname
-            ) GROUP BY hostname;
-            """)
-        defer { sqlite3_finalize(statement) }
-        var deletions: [(hostname: String, buckets: Int64, sessions: Int64)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            deletions.append((
-                text(statement, 0),
-                sqlite3_column_int64(statement, 1),
-                sqlite3_column_int64(statement, 2)
-            ))
-        }
-        // per-host reconciliation debt: one key per affected hostname
-        for item in deletions where item.buckets > 0 || item.sessions > 0 {
-            let reason = "\(reasonPrefix) removed \(item.buckets) previously synced bucket(s) and \(item.sessions) session(s) without remote tombstone support"
-            try setTextUnlocked(key: reconciliationKey(item.hostname), value: reason)
-        }
-
-        // Legacy pre-revision-tracking rows (revision=0 AND synced_revision=0) have unknown remote sync
-        // state and may already exist on the remote. Deleting them during reset/rebuild must never fail
-        // open: register an initial full-sync debt for each affected host, but only when that host has no
-        // reconciliation debt yet (never overwrite a more specific synced-deletion reason set above).
-        let legacyStatement = try prepare("""
-            SELECT hostname,SUM(bucket_count),SUM(session_count) FROM (
-              SELECT hostname,COUNT(*) AS bucket_count,0 AS session_count
-                FROM usage_buckets WHERE revision=0 AND synced_revision=0 GROUP BY hostname
-              UNION ALL
-              SELECT hostname,0 AS bucket_count,COUNT(*) AS session_count
-                FROM usage_sessions WHERE revision=0 AND synced_revision=0 GROUP BY hostname
-            ) GROUP BY hostname;
-            """)
-        defer { sqlite3_finalize(legacyStatement) }
-        var legacyDeletions: [(hostname: String, buckets: Int64, sessions: Int64)] = []
-        while sqlite3_step(legacyStatement) == SQLITE_ROW {
-            legacyDeletions.append((text(legacyStatement, 0), sqlite3_column_int64(legacyStatement, 1), sqlite3_column_int64(legacyStatement, 2)))
-        }
-        for item in legacyDeletions where item.buckets > 0 || item.sessions > 0 {
-            if try readReconciliationReasonUnlocked(hostname: item.hostname) != nil { continue }
-            let reason = "\(reasonPrefix) removed \(item.buckets) legacy bucket(s) and \(item.sessions) session(s) with unknown remote sync state; initial full sync required"
-            try setTextUnlocked(key: reconciliationKey(item.hostname), value: reason)
         }
     }
 

@@ -193,18 +193,22 @@ public struct UsageSessionEvent: Codable, Sendable, Equatable, Identifiable {
     public let sourceFileHash: String
     public let role: Role
     public let timestamp: Date
+    /// 采集机标识（采集时的本机 hostname）。解析器不感知本机身份，默认空串；
+    /// 由账本在读取原始层时用事件所在行的 hostname 列回填，再按各事件自带 hostname 归属聚合。
+    public let hostname: String
 
-    public init(id: String, source: String, sessionHash: String, sourceFileHash: String = "", role: Role, timestamp: Date) {
+    public init(id: String, source: String, sessionHash: String, sourceFileHash: String = "", role: Role, timestamp: Date, hostname: String = "") {
         self.id = id
         self.source = source
         self.sessionHash = sessionHash
         self.sourceFileHash = sourceFileHash
         self.role = role
         self.timestamp = timestamp
+        self.hostname = hostname
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, source, sessionHash, sourceFileHash, role, timestamp
+        case id, source, sessionHash, sourceFileHash, role, timestamp, hostname
     }
 
     public init(from decoder: Decoder) throws {
@@ -215,7 +219,8 @@ public struct UsageSessionEvent: Codable, Sendable, Equatable, Identifiable {
             sessionHash: try container.decode(String.self, forKey: .sessionHash),
             sourceFileHash: try container.decodeIfPresent(String.self, forKey: .sourceFileHash) ?? "",
             role: try container.decode(Role.self, forKey: .role),
-            timestamp: try container.decode(Date.self, forKey: .timestamp)
+            timestamp: try container.decode(Date.self, forKey: .timestamp),
+            hostname: try container.decodeIfPresent(String.self, forKey: .hostname) ?? ""
         )
     }
 }

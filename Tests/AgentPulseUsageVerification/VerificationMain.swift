@@ -77,7 +77,6 @@ enum AgentPulseUsageVerification {
             try await verifyPartialAckAndRecovery()
             try await verifyMalformedAcknowledgementsRemainPending()
             try await verifyCancellationKeepsBatchPending()
-            try await FullSyncVerification.run()
             try await CoordinatorVerification.run()
         } catch {
             fputs("TEMP DIAG step failed: \(error)\n", stderr)

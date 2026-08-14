@@ -1,13 +1,12 @@
 import SwiftUI
 
-/// 设置页的 Token 统计 / 用量上报 / 全量同步三张深色卡片。
+/// 设置页的 Token 统计 / 用量上报两张深色卡片。
 struct TokenSyncSettingsSection: View {
     @ObservedObject var model: ApplicationModel
 
     var body: some View {
         tokenStatsCard
         reportingCard
-        fullSyncCard
     }
 
     // MARK: Token 统计
@@ -135,31 +134,6 @@ struct TokenSyncSettingsSection: View {
         }
     }
 
-    // MARK: 全量同步
-
-    private var fullSyncCard: some View {
-        SettingsCard(title: "全量同步", systemImage: "arrow.triangle.2.circlepath") {
-            VStack(alignment: .leading, spacing: 10) {
-                SettingsRow(title: "状态") {
-                    SettingsStatusBadge(text: fullSyncStateText, tone: fullSyncTone)
-                }
-
-                ForEach(model.tokenSyncStatus.fullSyncBlockReasons, id: \.self) { reason in
-                    SettingsFootnote("• \(reason)")
-                }
-
-                actionRow(
-                    title: fullSyncButtonTitle,
-                    systemImage: "tray.and.arrow.up",
-                    loading: model.tokenSyncStatus.fullSyncState == .running,
-                    disabled: fullSyncDisabled
-                ) {
-                    model.runTokenFullSync()
-                }
-            }
-        }
-    }
-
     /// 右对齐的主操作按钮行。
     private func actionRow(
         title: String,
@@ -221,11 +195,10 @@ struct TokenSyncSettingsSection: View {
         model.tokenSyncStatus.configurationStatus == .ready
     }
 
-    /// scan / report / full sync 任一在途时，互斥动作一律禁用，避免并发写账。
+    /// scan / report 任一在途时，互斥动作一律禁用，避免并发写账。
     private var anySyncInProgress: Bool {
         model.tokenSyncStatus.scanningInProgress
         || model.tokenSyncStatus.reportingInProgress
-        || model.tokenSyncStatus.fullSyncState == .running
     }
 
     private var scanDisabled: Bool {
@@ -299,42 +272,6 @@ struct TokenSyncSettingsSection: View {
             return "未配置 API 地址：仅本地统计，不会发起任何网络请求。"
         }
         return "启用后：应用启动时自动上报一次，之后每 30 分钟自动上报一次；也可点击「立即上报」手动触发。"
-    }
-
-    private var fullSyncStateText: String {
-        switch model.tokenSyncStatus.fullSyncState {
-        case .blocked: return "未就绪"
-        case .ready: return "就绪"
-        case .running: return "同步中"
-        case .completed: return "已完成"
-        case .failed: return "失败"
-        }
-    }
-
-    private var fullSyncTone: SettingsStatusTone {
-        switch model.tokenSyncStatus.fullSyncState {
-        case .ready, .completed: return .positive
-        case .running: return .neutral
-        case .failed: return .negative
-        case .blocked: return .warning
-        }
-    }
-
-    private var fullSyncButtonTitle: String {
-        switch model.tokenSyncStatus.fullSyncState {
-        case .blocked, .ready:
-            return "开始全量同步"
-        case .running:
-            return "正在全量同步…"
-        case .completed:
-            return "重新全量同步"
-        case .failed:
-            return "重试全量同步"
-        }
-    }
-
-    private var fullSyncDisabled: Bool {
-        model.tokenSyncStatus.fullSyncState != .ready || anySyncInProgress
     }
 
     private static let dateFormatter: DateFormatter = {

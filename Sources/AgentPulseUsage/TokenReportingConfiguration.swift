@@ -20,17 +20,6 @@ public struct TokenReportingConfiguration: Codable, Equatable, Sendable {
     public var localeEnvironmentVariables: [String]
     public var batch: Batch
     public var retry: Retry
-    /// Optional, configuration-driven full-sync endpoint and wire vocabulary.
-    /// Absent means the feature is unavailable while incremental reporting may
-    /// remain usable.
-    public var fullSync: FullSync?
-    /// Configuration-driven identity endpoint used to prove the account for the
-    /// full-sync path. It is queried with the same auth header/static headers as
-    /// the main request and must return a positive integer user id at the
-    /// configured response key; the namespace is then derived over the request
-    /// origin and that id. Absent means full-sync identity cannot be proven and
-    /// full-sync stays unavailable.
-    public var identityEndpoint: IdentityEndpoint?
     /// Names of the token claims used to derive a stable account identity.
     /// Generic issuer/subject defaults keep this environment-agnostic.
     public var accountClaimKeys: ClaimKeys
@@ -45,8 +34,6 @@ public struct TokenReportingConfiguration: Codable, Equatable, Sendable {
         localeEnvironmentVariables: [String] = [],
         batch: Batch = Batch(),
         retry: Retry = Retry(),
-        fullSync: FullSync? = nil,
-        identityEndpoint: IdentityEndpoint? = nil,
         accountClaimKeys: ClaimKeys = ClaimKeys()
     ) {
         self.canonicalHostname = canonicalHostname
@@ -58,8 +45,6 @@ public struct TokenReportingConfiguration: Codable, Equatable, Sendable {
         self.localeEnvironmentVariables = localeEnvironmentVariables
         self.batch = batch
         self.retry = retry
-        self.fullSync = fullSync
-        self.identityEndpoint = identityEndpoint
         self.accountClaimKeys = accountClaimKeys
     }
 
@@ -76,8 +61,6 @@ public struct TokenReportingConfiguration: Codable, Equatable, Sendable {
             .filter { !$0.isEmpty } ?? []
         batch = try container.decodeIfPresent(Batch.self, forKey: .batch) ?? Batch()
         retry = try container.decodeIfPresent(Retry.self, forKey: .retry) ?? Retry()
-        fullSync = try container.decodeIfPresent(FullSync.self, forKey: .fullSync)
-        identityEndpoint = try container.decodeIfPresent(IdentityEndpoint.self, forKey: .identityEndpoint)
         accountClaimKeys = try container.decodeIfPresent(ClaimKeys.self, forKey: .accountClaimKeys) ?? ClaimKeys()
     }
 
@@ -150,296 +133,6 @@ public struct TokenReportingConfiguration: Codable, Equatable, Sendable {
             lockContentionStatusCodes: Set(retry.lockContentionStatusCodes),
             lockContentionBodyFragments: retry.lockContentionBodyFragments
         )
-    }
-
-    public var isFullSyncReady: Bool {
-        guard isReady, let fullSync else { return false }
-       return fullSync.isValid && resolvedStaticHeaders() != nil
-   }
-
-    /// Full-sync additionally requires a valid identity endpoint so the account
-    /// can be proven by an authenticated lookup rather than trusting token
-    /// bytes. Without it, full-sync stays unavailable (fail-closed).
-    public var isIdentityEndpointReady: Bool {
-        guard let identityEndpoint else { return false }
-        return identityEndpoint.isValid
-    }
-
-    /// Maps the configured identity endpoint (plus the shared header names and
-    /// resolved static headers) into the reporting-layer resolver configuration.
-    /// Returns nil unless the endpoint is valid and the shared headers resolve,
-    /// so the resolver is never built from a partial configuration.
-    public func identityEndpointConfiguration() -> IdentityEndpointConfiguration? {
-        guard let identityEndpoint, identityEndpoint.isValid,
-              let method = identityEndpoint.parsedMethod,
-              let resolvedHeaders = resolvedStaticHeaders() else { return nil }
-        return IdentityEndpointConfiguration(
-            path: identityEndpoint.path,
-            method: method,
-            responseIDKeyPath: identityEndpoint.responseIDKeyPath,
-            successStatusCodes: Set(identityEndpoint.successStatusCodes),
-            headerNames: headers.requestHeaderNames,
-            staticHeaders: resolvedHeaders
-        )
-    }
-
-   public func fullSyncConfiguration(baseURL: URL, hostname: String) -> FullSyncConfiguration? {
-       guard let fullSync, fullSync.isValid,
-             isIdentityEndpointReady,
-              let resolvedHeaders = resolvedStaticHeaders() else { return nil }
-        return FullSyncConfiguration(
-            baseURL: baseURL,
-            path: fullSync.path,
-            hostname: hostname,
-            headerNames: headers.requestHeaderNames,
-            staticHeaders: resolvedHeaders,
-            localeEnvironmentVariables: localeEnvironmentVariables,
-            actionNames: fullSync.actionNames.protocolValue,
-            kindNames: fullSync.kindNames.protocolValue,
-            successStatuses: fullSync.successStatuses.protocolValue,
-            maxRowsPerChunk: fullSync.maxRowsPerChunk,
-            maxBytesPerChunk: fullSync.maxBytesPerChunk,
-            payloadTooLargeStatus: fullSync.payloadTooLargeStatus,
-            payloadTooLargeCode: fullSync.payloadTooLargeCode?.protocolValue,
-            retryPolicy: (fullSync.retry ?? retry).transportPolicy,
-            reserveRetryPolicy: fullSync.reserveRetry?.transportPolicy
-                ?? FullSyncConfiguration.defaultReserveRetryPolicy
-        )
-    }
-
-    public struct FullSync: Codable, Equatable, Sendable {
-        public var path: String
-        public var actionNames: ActionNames
-        public var kindNames: KindNames
-        public var successStatuses: SuccessStatuses
-       public var maxRowsPerChunk: Int
-       public var maxBytesPerChunk: Int
-       public var retry: Retry?
-        /// HTTP status the server uses to reject a chunk as too large. Default
-        /// 413. Configuration-driven so no numeric wire contract is hardcoded.
-        public var payloadTooLargeStatus: Int
-        /// Optional JSON error-code trigger for the too-large signal.
-        public var payloadTooLargeCode: PayloadTooLargeCodeRule?
-        /// Optional retry policy for the reserve request. Defaults to a short,
-        /// fixed 500/502/503/504 backoff when omitted.
-        public var reserveRetry: Retry?
-
-       public init(
-           path: String = "",
-           actionNames: ActionNames = ActionNames(),
-           kindNames: KindNames = KindNames(),
-           successStatuses: SuccessStatuses = SuccessStatuses(),
-           maxRowsPerChunk: Int = 2_000,
-           maxBytesPerChunk: Int = 8 * 1024 * 1024,
-            retry: Retry? = nil,
-            payloadTooLargeStatus: Int = 413,
-            payloadTooLargeCode: PayloadTooLargeCodeRule? = nil,
-            reserveRetry: Retry? = nil
-       ) {
-           self.path = path
-           self.actionNames = actionNames
-           self.kindNames = kindNames
-           self.successStatuses = successStatuses
-           self.maxRowsPerChunk = maxRowsPerChunk
-           self.maxBytesPerChunk = maxBytesPerChunk
-           self.retry = retry
-            self.payloadTooLargeStatus = payloadTooLargeStatus
-            self.payloadTooLargeCode = payloadTooLargeCode
-            self.reserveRetry = reserveRetry
-       }
-
-       public init(from decoder: any Decoder) throws {
-           let container = try decoder.container(keyedBy: CodingKeys.self)
-           path = TokenReportingConfiguration.trimmed(try container.decodeIfPresent(String.self, forKey: .path))
-           actionNames = try container.decodeIfPresent(ActionNames.self, forKey: .actionNames) ?? ActionNames()
-           kindNames = try container.decodeIfPresent(KindNames.self, forKey: .kindNames) ?? KindNames()
-           successStatuses = try container.decodeIfPresent(SuccessStatuses.self, forKey: .successStatuses) ?? SuccessStatuses()
-           maxRowsPerChunk = max(1, try container.decodeIfPresent(Int.self, forKey: .maxRowsPerChunk) ?? 2_000)
-           maxBytesPerChunk = max(1, try container.decodeIfPresent(Int.self, forKey: .maxBytesPerChunk) ?? 8 * 1024 * 1024)
-           retry = try container.decodeIfPresent(Retry.self, forKey: .retry)
-            payloadTooLargeStatus = try container.decodeIfPresent(Int.self, forKey: .payloadTooLargeStatus) ?? 413
-            payloadTooLargeCode = try container.decodeIfPresent(PayloadTooLargeCodeRule.self, forKey: .payloadTooLargeCode)
-            reserveRetry = try container.decodeIfPresent(Retry.self, forKey: .reserveRetry)
-       }
-
-       public var isValid: Bool {
-           path.hasPrefix("/")
-               && !path.hasPrefix("//")
-               && !actionNames.values.contains(where: \.isEmpty)
-               && !kindNames.values.contains(where: \.isEmpty)
-               && !successStatuses.values.contains(where: \.isEmpty)
-               && maxRowsPerChunk > 0
-               && maxBytesPerChunk > 0
-               && (retry?.isValid ?? true)
-                && (100...599).contains(payloadTooLargeStatus)
-                && (payloadTooLargeCode?.isValid ?? true)
-                && (reserveRetry?.isValid ?? true)
-       }
-
-        public struct ActionNames: Codable, Equatable, Sendable {
-            public var reserve: String
-            public var begin: String
-            public var stage: String
-            public var commit: String
-
-            public init(reserve: String = "reserve", begin: String = "begin", stage: String = "stage", commit: String = "commit") {
-                self.reserve = reserve; self.begin = begin; self.stage = stage; self.commit = commit
-            }
-
-            public init(from decoder: any Decoder) throws {
-                let container = try decoder.container(keyedBy: CodingKeys.self)
-                reserve = TokenReportingConfiguration.trimmed(try container.decodeIfPresent(String.self, forKey: .reserve))
-                begin = TokenReportingConfiguration.trimmed(try container.decodeIfPresent(String.self, forKey: .begin))
-                stage = TokenReportingConfiguration.trimmed(try container.decodeIfPresent(String.self, forKey: .stage))
-                commit = TokenReportingConfiguration.trimmed(try container.decodeIfPresent(String.self, forKey: .commit))
-            }
-
-            var values: [String] { [reserve, begin, stage, commit] }
-            var protocolValue: FullSyncActionNames { FullSyncActionNames(reserve: reserve, begin: begin, stage: stage, commit: commit) }
-        }
-
-        public struct KindNames: Codable, Equatable, Sendable {
-            public var buckets: String
-            public var sessions: String
-            public var autonomySessions: String
-
-            public init(buckets: String = "buckets", sessions: String = "sessions", autonomySessions: String = "autonomy") {
-                self.buckets = buckets; self.sessions = sessions; self.autonomySessions = autonomySessions
-            }
-
-            public init(from decoder: any Decoder) throws {
-                let container = try decoder.container(keyedBy: CodingKeys.self)
-                buckets = TokenReportingConfiguration.trimmed(try container.decodeIfPresent(String.self, forKey: .buckets))
-                sessions = TokenReportingConfiguration.trimmed(try container.decodeIfPresent(String.self, forKey: .sessions))
-                autonomySessions = TokenReportingConfiguration.trimmed(try container.decodeIfPresent(String.self, forKey: .autonomySessions))
-            }
-
-            var values: [String] { [buckets, sessions, autonomySessions] }
-            var protocolValue: FullSyncKindNames { FullSyncKindNames(buckets: buckets, sessions: sessions, autonomySessions: autonomySessions) }
-        }
-
-        /// Exact response status accepted for each protocol phase. Defaults match
-        /// the reserve/begin/stage/commit contract enforced by the upload core, so
-        /// a config that omits this section keeps behaving identically. Every value
-        /// is trimmed on decode and validated non-empty by `isValid`, so a blank
-        /// override fails closed rather than silently accepting any status.
-        public struct SuccessStatuses: Codable, Equatable, Sendable {
-            public var reserve: String
-            public var begin: String
-            public var stage: String
-            public var commit: String
-
-            public init(
-                reserve: String = "reserved",
-                begin: String = "staging",
-                stage: String = "staging",
-                commit: String = "committed"
-            ) {
-                self.reserve = reserve
-                self.begin = begin
-                self.stage = stage
-                self.commit = commit
-            }
-
-            public init(from decoder: any Decoder) throws {
-                let container = try decoder.container(keyedBy: CodingKeys.self)
-                reserve = try container.decodeIfPresent(String.self, forKey: .reserve).map(TokenReportingConfiguration.trimmed) ?? "reserved"
-                begin = try container.decodeIfPresent(String.self, forKey: .begin).map(TokenReportingConfiguration.trimmed) ?? "staging"
-                stage = try container.decodeIfPresent(String.self, forKey: .stage).map(TokenReportingConfiguration.trimmed) ?? "staging"
-                commit = try container.decodeIfPresent(String.self, forKey: .commit).map(TokenReportingConfiguration.trimmed) ?? "committed"
-            }
-
-           var values: [String] { [reserve, begin, stage, commit] }
-           var protocolValue: FullSyncSuccessStatuses { FullSyncSuccessStatuses(reserve: reserve, begin: begin, stage: stage, commit: commit) }
-       }
-
-        /// Configuration-driven JSON error-code trigger for the payload-too-large
-        /// signal. Locates a code at an ordered JSON key path and matches it
-        /// against accepted string and/or integer values.
-        public struct PayloadTooLargeCodeRule: Codable, Equatable, Sendable {
-            public var keyPath: [String]
-            public var stringValues: [String]
-            public var intValues: [Int]
-
-            public init(keyPath: [String] = [], stringValues: [String] = [], intValues: [Int] = []) {
-                self.keyPath = keyPath
-                self.stringValues = stringValues
-                self.intValues = intValues
-            }
-
-            public init(from decoder: any Decoder) throws {
-                let container = try decoder.container(keyedBy: CodingKeys.self)
-                keyPath = try container.decodeIfPresent([String].self, forKey: .keyPath)?
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty } ?? []
-                stringValues = try container.decodeIfPresent([String].self, forKey: .stringValues) ?? []
-                intValues = try container.decodeIfPresent([Int].self, forKey: .intValues) ?? []
-            }
-
-            public var isValid: Bool {
-                !keyPath.isEmpty && (!stringValues.isEmpty || !intValues.isEmpty)
-            }
-
-            var protocolValue: PayloadTooLargeCode {
-                PayloadTooLargeCode(
-                    keyPath: keyPath,
-                    stringValues: Set(stringValues),
-                    intValues: Set(intValues)
-                )
-            }
-        }
-   }
-
-    /// Configuration-driven identity endpoint. Every value (path, HTTP method,
-    /// the response key path locating the user id, and the accepted success
-    /// status codes) is read from reporting.json; nothing is hardcoded. The
-    /// endpoint reuses the main request's auth header and static headers.
-    public struct IdentityEndpoint: Codable, Equatable, Sendable {
-        public var path: String
-        public var method: String
-        /// Ordered JSON keys locating the positive-integer user id.
-        public var responseIDKeyPath: [String]
-        /// Accepted success status codes. Defaults to a single 200.
-        public var successStatusCodes: [Int]
-
-        public init(
-            path: String = "",
-            method: String = "GET",
-            responseIDKeyPath: [String] = [],
-            successStatusCodes: [Int] = [200]
-        ) {
-            self.path = path
-            self.method = method
-            self.responseIDKeyPath = responseIDKeyPath
-            self.successStatusCodes = successStatusCodes
-        }
-
-        public init(from decoder: any Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            path = TokenReportingConfiguration.trimmed(try container.decodeIfPresent(String.self, forKey: .path))
-            method = TokenReportingConfiguration.trimmed(try container.decodeIfPresent(String.self, forKey: .method)).uppercased()
-            responseIDKeyPath = try container.decodeIfPresent([String].self, forKey: .responseIDKeyPath)?
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty } ?? []
-            successStatusCodes = try container.decodeIfPresent([Int].self, forKey: .successStatusCodes) ?? [200]
-        }
-
-        var parsedMethod: IdentityRequestMethod? {
-            switch method.isEmpty ? "GET" : method {
-            case "GET": return .get
-            case "POST": return .post
-            default: return nil
-            }
-        }
-
-        public var isValid: Bool {
-            path.hasPrefix("/")
-                && !path.hasPrefix("//")
-                && !responseIDKeyPath.isEmpty
-                && parsedMethod != nil
-                && !successStatusCodes.isEmpty
-                && successStatusCodes.allSatisfy { (100...599).contains($0) }
-        }
     }
 
     /// Builds the account-identity claim keys injected into the ingest client

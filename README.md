@@ -182,18 +182,13 @@ open dist/AgentPulse.app
 - **完整累计值**：普通上报发送本地账本中该设备每个 bucket 的完整累计值，而非单次增量，服务端做幂等 upsert。
 - **严格 ACK**：仅当响应逐维度精确回执（buckets / sessions 数量完全一致）时才标记已同步；`2xx {}`、字段缺失、少计或多计一律保持 pending。
 - **按 revision 精确对账**：每行携带 revision 快照，ack 时按（自然键 + revision 快照）精确匹配；上传期间被重算的行不会被误 ack，保持 dirty。
-- **删除即 fail-closed**：删除已同步的派生数据会置位全局对账门禁，普通上报在对账完成前保持禁用，避免远端与本地静默失配。
-- **Runtime headers**：`runtimeHeaders` 仅支持 `platform`、`app_version`、`user_agent`、`app_id` 四个变量；未知变量、未闭合占位、CR/LF、非法 header 名或与受控 header 冲突都会让整份配置失效。增量上报与 full sync 使用同一套解析结果。
-- **统一 wire 规范化**：增量上报与 full sync 在取 token 和发请求前使用同一套 canonical hostname、字段 UTF-8 字节上限和自然键碰撞检查；发现碰撞时本次请求零外部副作用。
-- **全量同步就绪门禁**：full sync 需要 `reporting.json` 同时携带完整且合法的 `fullSync` 协议段与 `identityEndpoint`；缺失或不完整时状态保持 blocked（未就绪），不会发起任何请求。
+- **Runtime headers**：`runtimeHeaders` 仅支持 `platform`、`app_version`、`user_agent`、`app_id` 四个变量；未知变量、未闭合占位、CR/LF、非法 header 名或与受控 header 冲突都会让整份配置失效。增量上报按这套解析结果构造 header。
+- **统一 wire 规范化**：增量上报在取 token 和发请求前统一应用 canonical hostname、字段 UTF-8 字节上限和自然键碰撞检查；发现碰撞时本次请求零外部副作用。
 
-### 谁开谁报、累计 upsert 与 Full Sync
+### 谁开谁报与累计 upsert
 
 - **谁开谁报（本机 opt-in）**：本地长期采集与上报是两个相互独立的开关——采集默认开启（仅写本机 SQLite），上报默认关闭；只有在本机显式打开上报、填好 API 地址与 canonical hostname、且 `reporting.json` 校验通过时，这台设备才会以自己的 canonical hostname 作为上报身份上报自身账本。未开启上报的设备只在本地统计，不上报，也不代任何其他设备上报。
 - **普通上报 = 累计值幂等 upsert**：每一轮普通上报发送本地账本中该设备**每个 bucket 的完整累计值**（并非单次增量），服务端据此做幂等 upsert。因此漏报、乱序或重试都能自愈：相同自然键重复提交只会覆盖为同一累计值，不会重复累加。
-- **Full Sync 与普通上报的区别**：普通上报是持续、增量触发（启动一次 + 每 30 分钟）、只推送 dirty 行的累计值，服务端做幂等 upsert；Full Sync 则是一次显式的“把本机全部派生行与远端对齐”的修复动作，不依赖上报开关，可在上报关闭时手动执行。它先读取本地 generation 基线，再通过配置的 `identityEndpoint` 用当前 token 做一次认证请求，从配置的 JSON key path 读取正整数 user id，并以版本化的 `user-origin-v1` 哈希命名空间固定账号；不解析 token claim，也不信任整 token 摘要。身份无法证明、401 强制刷新后仍失败、或刷新后账号变化都会 fail-closed。随后向服务端 `reserve` 围栏；只有围栏持久化成功后，才读取同一 generation 的本地快照并执行 `begin → stage → commit`。分块 kind 为 `buckets`、`sessions`、`autonomy`，其中 autonomy 的行数组字段仍为 `autonomySessions`。远端确认 commit 后，本机才对账本做原子 commit（以 generation 与逐行 revision 快照为围栏）。若 reserve 后、快照前崩溃，会在 generation 未变化时复用原围栏；若远端已 commit 但本地 commit 前崩溃/重启，下次会命中幂等 committed 分支并重跑本地 commit。
-- **Full-sync 故障语义**：401 只允许一次强制刷新；刷新后身份变化或无法证明时终止。服务端使上传状态失效会丢弃本地上传状态并要求重新扫描；会话失效只丢弃上传状态后重新加入；协议不支持会明确失败。数据块过大时自动拆分重试，单行仍过大则失败；摘要不一致、ACK 数量不一致或本地 generation 漂移都保持 fail-closed，不把部分 stage 当作完成。
-- **历史源删除触发 reconciliation gate、Full Sync 修复后清除**：远端协议暂不支持 tombstone。一旦本地重算删除了曾经 ack 过的 bucket/session 自然键（例如清理或改动历史数据源导致派生行消失），会置位全局对账门禁（reconciliation required）并 fail-closed —— 在对账完成前普通上报持续禁用，界面给出被阻原因，防止远端保留本地已不存在的旧行造成静默失配。该门禁持久化，不会因下一次“无变化”的 finalize 自动解除；只有成功跑完一次 Full Sync（远端 commit 成功后本地账本原子 commit）才会清除对账门禁并恢复上报资格。即使本机已无待同步行，只要门禁已置位，Full Sync 仍会完整走一遍协议、由远端据整份快照删除旧行并回执确认，再清除门禁。
 - **API 地址仅本机配置、不随用量上传**：上报目标（base URL）只保存在本机应用偏好中，仅在发起上报时于内存中拼接请求；它既不写入账本 SQLite，也**不会作为任何字段包含在上传的用量 payload 里**。上传内容仅为聚合后的用量维度、token 计数与 hash 后的标识，不含地址、凭证、路径或会话正文。
 
 默认配置路径（文件由用户自行创建，缺失即保持本地模式）：
@@ -238,19 +233,6 @@ open dist/AgentPulse.app
     "errorKey": "error",
     "tokenKeyPath": ["data", "accessToken"]
   },
-  "fullSync": {
-    "path": "/your/full-sync/path",
-    "actionNames": { "reserve": "reserve", "begin": "begin", "stage": "stage", "commit": "commit" },
-    "kindNames": { "buckets": "buckets", "sessions": "sessions", "autonomySessions": "autonomy" },
-    "maxRowsPerChunk": 2000,
-    "maxBytesPerChunk": 8388608
-  },
-  "identityEndpoint": {
-    "path": "/your/identity/path",
-    "method": "GET",
-    "responseIDKeyPath": ["data", "user_id"],
-    "successStatusCodes": [200]
-  },
   "localeEnvironmentVariables": ["LC_ALL", "LANG"],
   "batch": { "maxBucketsPerBatch": 500, "maxSessionsPerBatch": 1000, "maxConcurrentBatches": 2 },
   "retry": { "maxRetries": 3, "retryableStatusCodes": [502, 503, 504], "backoffSeconds": [2, 5, 11] }
@@ -263,7 +245,7 @@ open dist/AgentPulse.app
 chmod 600 ~/Library/Application\ Support/AgentPulse/reporting.json
 ```
 
-base URL（API 地址）单独在设置中配置、仅保存在本机应用偏好（UserDefaults），发起上报时于内存中拼接请求，不写入账本 SQLite，也不会作为任何字段包含在上传的用量 payload 里。它按上述传输安全规则校验。取 token 命令的输出由 `statusKey` / `successStatus` / `errorKey` / `tokenKeyPath` 解析，token 不写入 SQLite、UserDefaults 或日志。`identityEndpoint` 复用同一 base URL、认证 header 与已解析的 metadata header；其响应只用于在内存中推导账号命名空间，不保存原始 user id 或响应体。
+base URL（API 地址）单独在设置中配置、仅保存在本机应用偏好（UserDefaults），发起上报时于内存中拼接请求，不写入账本 SQLite，也不会作为任何字段包含在上传的用量 payload 里。它按上述传输安全规则校验。取 token 命令的输出由 `statusKey` / `successStatus` / `errorKey` / `tokenKeyPath` 解析，token 不写入 SQLite、UserDefaults 或日志。
 
 ---
 
@@ -339,11 +321,11 @@ chmod 600 ~/.claude/.credentials/env/agent-pulse-cliproxy.env
 ~/Library/Application Support/AgentPulse/usage.sqlite3
 ```
 
-- schema v7、WAL 模式；分层保存原始 token/session 事件、skill/MCP 计数、已应用编辑行、派生的 30 分钟聚合 bucket 与 session、源文件 checkpoint 与按 hostname 隔离的同步状态。旧库通过增量列和新表无损迁移到 v7。
+- schema v10、WAL 模式；分层保存原始 token/session 事件、skill/MCP 计数、已应用编辑行、派生的 30 分钟聚合 bucket 与 session、源文件 checkpoint 与按 hostname 隔离的同步状态。旧库通过增量列和新表无损迁移到 v10（parser version 仍为 v7）。
 - bucket 自然键为 `(hostname, source, model, project, bucket_start_ms)`；session 自然键为 `(hostname, source, session_hash)`。bucket 额外保存 skill 名称与次数、MCP server 次数、新增 / 删除 / 净行数；session 保存活跃秒数、消息数、小时直方图与 skill 名称。
-- 数据库主文件及 WAL/SHM 边车文件会收紧为 `0600`；full-sync 断点状态也按 `0600` 单独保存在应用支持目录，状态包含协议围栏、阶段、计数、哈希、canonical hostname 和账号命名空间，不包含 token 或用量正文。
+- hostname 下沉到原始事件层——每条原始 token/session/edit 事件记录采集时的本机 hostname；派生 recompute 按每条事件自带的 hostname 归属到对应 bucket/session，因此重建（rebuild）保留各机数据的多机快照，而非把整库重派到单一 host。canonical hostname 仅作本机上报身份。
+- 数据库主文件及 WAL/SHM 边车文件会收紧为 `0600`。
 - 派生行逐行携带 revision 与 synced_revision：revision 大于 synced_revision 即为 dirty；ack 按（自然键 + revision 快照）精确匹配，避免误 ack 上传期间被重算的行。
-- 删除已同步的派生数据会置位全局对账门禁（reconciliation required），在对账完成前普通上报 fail-closed。
 - 源文件删除后已入库历史仍保留；未变化文件按 size、mtime 与 parser version 跳过。
 
 ---
@@ -357,10 +339,9 @@ swift run AgentPulseCoreVerification   # 核心采集 / TPS / 曲线逻辑
 swift run AgentPulseR2Verification     # R2 签名 / Key / URL
 swift run AgentPulseReportingVerification # 通用上报传输层
 swift run AgentPulseUsageVerification     # 账本到上报 payload 的离线组装
-swift run MetricsLedgerPipelineVerification # schema v7 与 tool/edit 指标管线
-swift run RuntimeHeaderParityVerification   # 增量 / full-sync header 一致性
+swift run MetricsLedgerPipelineVerification # schema 迁移与 tool/edit 指标管线
+swift run RuntimeHeaderParityVerification   # 增量上报 header 解析一致性
 swift run NaturalKeyGuardVerification       # wire 自然键碰撞门禁
-swift run FullSyncWireParityVerification    # 增量 / full-sync payload 一致性
 ```
 
 发布前还应在**离线副本**上执行生产数据库预检。该工具会拒绝活库及其硬链接，迁移并重扫指定副本，再检查 schema、parser、完整性、hostname、权限与指标；绝不能把活库路径传给它：
@@ -385,7 +366,7 @@ swift run AgentPulseCollectorSmoke
 - 只解析统计所需的日志字段；不保存、不上传、不展示会话正文、标题或完整 cwd。
 - 不在仓库或日志中写入 credential、签名请求或预签名 URL；R2 配置值仅在上传时读入内存。
 - SQLite 仅保存聚合数值、hash 标识与不含路径/正文的快照。
-- 可选上报不内置 API 地址、环境专用 header 或取 token 命令，凭证不会写入 SQLite、UserDefaults 或日志；full-sync 账号命名空间由配置的身份端点和正整数 user id 推导，不保存原始 user id。
+- 可选上报不内置 API 地址、环境专用 header 或取 token 命令，凭证不会写入 SQLite、UserDefaults 或日志。
 
 ---
 
@@ -395,7 +376,6 @@ swift run AgentPulseCollectorSmoke
 - TPS 为固定 180 秒 output-only 速率，区间线性摊分是缺少逐 token 时间戳时的稳定估计，不能还原微观逐 token 速度。
 - Completed 是可读本地 rollout 的下界，无法证明为非 automation 的记录不计入。
 - 费用采用内置 fallback 单价估算，只用于本地观察，不构成账单数据。
-- 全量同步需要 `reporting.json` 中完整合法的 `fullSync` 协议段、可证明账号身份的 `identityEndpoint`，并与配置权威 hostname 对齐；条件不满足时状态为“未就绪”、按钮禁用。
 
 ---
 

@@ -12,7 +12,6 @@ struct RuntimeHeaderParityVerification {
         try verifyProtectedHeaderOverrideRejected()
         try verifyReservedNames()
         try verifyConfigGatingZeroTrust()
-        try verifyIncrementalAndFullSyncShareResolvedHeaders()
         try verifyInvalidTemplateMakesConfigUnready()
         try verifyStatusReflectsResolvedHeaders()
         try verifyStaticHeaderSelfValidation()
@@ -94,19 +93,14 @@ struct RuntimeHeaderParityVerification {
         try expect(sparse.reservedNames == ["content-encoding", "content-type"], "empty names omitted")
     }
 
-   private static func readyConfiguration(runtimeHeaders: TokenReportingConfiguration.RuntimeHeaders = .init(), staticHeaders: [TokenReportingConfiguration.StaticHeaderValue] = [], fullSync: TokenReportingConfiguration.FullSync? = nil) -> TokenReportingConfiguration {
+   private static func readyConfiguration(runtimeHeaders: TokenReportingConfiguration.RuntimeHeaders = .init(), staticHeaders: [TokenReportingConfiguration.StaticHeaderValue] = []) -> TokenReportingConfiguration {
        TokenReportingConfiguration(
            canonicalHostname: "device",
            path: "/usage",
            headers: .init(authToken: "X-Auth", timeZoneOffset: "X-TZ", locale: "X-Locale", contentEncoding: "Content-Encoding", contentType: "Content-Type"),
            staticHeaders: staticHeaders,
            runtimeHeaders: runtimeHeaders,
-           tokenCommand: .init(executable: "/bin/echo", tokenKeyPath: ["token"]),
-            fullSync: fullSync,
-            // Full-sync now proves the account via a configured identity endpoint,
-            // so a full-sync-ready fixture must supply one. All values are generic
-            // placeholders; the real endpoint/path/key come only from reporting.json.
-            identityEndpoint: .init(path: "/whoami", method: "GET", responseIDKeyPath: ["id"], successStatusCodes: [200])
+           tokenCommand: .init(executable: "/bin/echo", tokenKeyPath: ["token"])
        )
    }
 
@@ -126,29 +120,9 @@ struct RuntimeHeaderParityVerification {
         try expect(!readyConfiguration(runtimeHeaders: badName).isReady, "illegal name => unready")
         let override = TokenReportingConfiguration.RuntimeHeaders(context: .init(platform: "macos"), templates: [.init(name: "content-type", template: "{{platform}}")])
         try expect(!readyConfiguration(runtimeHeaders: override).isReady, "protected override => unready")
-        let fs = TokenReportingConfiguration.FullSync(path: "/usage/full-sync")
-        try expect(!readyConfiguration(runtimeHeaders: override, fullSync: fs).isFullSyncReady, "override => full-sync unready")
-        try expect(readyConfiguration(fullSync: fs).isFullSyncReady, "valid config => full-sync ready")
-        let base = URL(string: "https://example.invalid")!
-        try expect(readyConfiguration(runtimeHeaders: override, fullSync: fs).fullSyncConfiguration(baseURL: base, hostname: "device") == nil, "invalid => nil full-sync config")
-    }
-
-    private static func verifyIncrementalAndFullSyncShareResolvedHeaders() throws {
-        let runtime = TokenReportingConfiguration.RuntimeHeaders(context: .init(platform: "macos", appVersion: "1.0", userAgent: "agent/1", appID: "abc"), templates: [.init(name: "X-Platform", template: "{{platform}}"), .init(name: "X-Version", template: "v{{app_version}}"), .init(name: "X-UA", template: "{{user_agent}}")])
-        let staticHeaders = [TokenReportingConfiguration.StaticHeaderValue(name: "X-Client", value: "verifier")]
-        let fs = TokenReportingConfiguration.FullSync(path: "/usage/full-sync")
-        let config = readyConfiguration(runtimeHeaders: runtime, staticHeaders: staticHeaders, fullSync: fs)
-        try expect(config.isReady && config.isFullSyncReady, "config ready for both transports")
-        let base = URL(string: "https://example.invalid")!
-        let incremental = config.ingestConfiguration(baseURL: base, hostname: "device")
-        guard let fullSync = config.fullSyncConfiguration(baseURL: base, hostname: "device") else {
-            throw VerificationError.failed("full-sync config unexpectedly nil")
-        }
-        try expect(incremental.staticHeaders == fullSync.staticHeaders, "resolved headers diverge between transports")
-        try expect(incremental.staticHeaders == [StaticHeader(name: "X-Client", value: "verifier"), StaticHeader(name: "X-Platform", value: "macos"), StaticHeader(name: "X-Version", value: "v1.0"), StaticHeader(name: "X-UA", value: "agent/1")], "resolved header set incorrect")
-        try expect(incremental.headerNames == fullSync.headerNames, "header names diverge")
     }
 }
+
 
 // MARK: - Appended coverage: status gating + static header self-validation
 extension RuntimeHeaderParityVerification {

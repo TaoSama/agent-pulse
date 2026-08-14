@@ -97,7 +97,6 @@ struct AgentPulseCoreVerification {
         try verifyVirtualBucketTargets()
         try verifyUsageLedgerAndParsers()
         try verifyUsageV2()
-        try verifyV5LegacyDerivedReconciliation()
         try verifyV8LegacyOwnedDedup()
         try await verifyLegacyRuntimeSnapshotIgnored()
         try verifyParserFixturesAndCollector()
@@ -273,14 +272,9 @@ struct AgentPulseCoreVerification {
         try verifyV2Migration()
         try verifyV2ParserRebuildSafety()
         try verifyV2RebuildCompletionPersistence()
-        try verifyV2FullSyncReconciliation()
-        try verifyV2FullSyncStableGenerationAcrossReads()
-        try verifyV2FullSyncReserveBeforeSnapshot()
-        try verifyV2FullSyncCrashRecoverySameGeneration()
-        try verifyV2FullSyncFailClosed()
-        try verifyV2FullSyncPreservesInheritedBlock()
-        try verifyV2FullSyncProjectFromRawNotDeduped()
+        try verifyV2ProjectFromRawNotDeduped()
         try verifyV2SessionProjectWireAndMigration()
+        try verifyV5CleanUpgradeAndPermissions()
     }
 
     // 1) fractional + 非 fractional RFC3339 解析；无效 timestamp 诊断并跳过（绝不 distantPast）。
@@ -668,7 +662,7 @@ struct AgentPulseCoreVerification {
             ev("syn", .syntheticUser, "2026-03-01T00:02:00Z"),
             ev("a1", .assistant, "2026-03-01T00:00:10Z"), // (source,id) 去重
         ]
-        let sessions = UsageSessionAggregator.aggregate(events: events, hostname: "h")
+        let sessions = UsageSessionAggregator.aggregate(events: events, fallbackHostname: "h")
         try require(sessions.count == 1, "single session group")
         let s = sessions[0]
         try require(s.activeSeconds == 30, "active seconds segment rule: got \(s.activeSeconds)")
@@ -684,7 +678,7 @@ struct AgentPulseCoreVerification {
 
         // 注入 project resolver：project 作为内容字段贯通，但自然键 (source, sessionHash)
         // 与分组 / 聚合结果保持不变。
-        let withProject = UsageSessionAggregator.aggregate(events: events, hostname: "h") { source, sessionHash in
+        let withProject = UsageSessionAggregator.aggregate(events: events, fallbackHostname: "h") { source, sessionHash in
             source == "codex" && sessionHash == "sess" ? "acme" : ""
         }
         try require(withProject.count == 1, "project resolver must not change session grouping")
@@ -954,7 +948,9 @@ struct AgentPulseCoreVerification {
     }
 
 
-    // 6) hostname rebuild：canonical hostname 变化时从原始事件重建，清除旧 hostname 派生。
+    // 6) hostname rebuild：canonical hostname 变化时从原始事件重建，**保留多机数据**。
+    // 原始事件每条自带采集机 hostname，重算按各事件自带 hostname 归属；rebuild 只更新本机身份
+    // （canonical_hostname），绝不把既有事件重派到新 host。
     private static func verifyV2HostnameRebuild() throws {
         let db = tempUsageDB(); defer { cleanupDB(db) }
         let ledger = try UsageLedgerStore(path: db.path)
@@ -975,14 +971,16 @@ struct AgentPulseCoreVerification {
         try ledger.rebuildForHostname("new-host")
         let oldHostBuckets = try ledger.buckets(hostname: "old-host")
         let newHostBuckets = try ledger.buckets(hostname: "new-host")
-        try require(oldHostBuckets.isEmpty, "old (wrong) hostname derived must be cleared")
-        try require(newHostBuckets.count == 1, "derived rebuilt under new hostname from append-only events")
-        try require(newHostBuckets.first?.counts.total == 100, "rebuilt totals preserved")
+        // 多机保留：事件采集自 old-host，rebuild 后仍归属 old-host，绝不被重派到 new-host。
+        try require(oldHostBuckets.count == 1, "old host derived must be PRESERVED across rebuild (multi-machine data)")
+        try require(oldHostBuckets.first?.counts.total == 100, "old host totals preserved after rebuild")
+        try require(newHostBuckets.isEmpty, "new host has no events yet; rebuild must not fabricate rows for it")
+        // canonical hostname（本机身份）已更新为 new-host。
         let stateAfterRebuild = try ledger.hostnameState(current: "new-host")
-        try require(stateAfterRebuild == .match, "canonical hostname updated after rebuild")
-        // 重建后应为 dirty（synced_revision=0），可重新上报。
-        let pendingNew = try ledger.pendingBatch(hostname: "new-host")
-        try require(!pendingNew.isEmpty, "rebuilt rows must be pending for re-upload")
+        try require(stateAfterRebuild == .match, "canonical hostname updated to new host after rebuild")
+        // 重建后各 host 派生行为 dirty（synced_revision=0），可重新上报。
+        let pendingOld = try ledger.pendingBatch(hostname: "old-host")
+        try require(!pendingOld.isEmpty, "preserved old-host rows must be pending for re-upload after rebuild")
     }
 
     private static func verifyUniqueLegacyHostnameCandidate() throws {
@@ -1018,11 +1016,13 @@ struct AgentPulseCoreVerification {
             "a single durable hostname must be recoverable for legacy upgrade"
         )
 
+        // 保留多机语义：rebuild 不把既有事件重派到新 host，legacy-host 派生行仍在，
+        // 因此唯一候选仍是 legacy-host（second-host 无事件、无派生行）。
         try uniqueLedger.rebuildForHostname("second-host")
         let rebuiltCandidate = try uniqueLedger.uniqueLegacyHostnameCandidate()
         try require(
-            rebuiltCandidate == "second-host",
-            "candidate must follow an explicit canonical hostname rebuild"
+            rebuiltCandidate == "legacy-host",
+            "rebuild preserves multi-machine data: the original host's derived rows remain, so it stays the unique candidate"
         )
 
         let ambiguousDB = tempUsageDB(); defer { cleanupDB(ambiguousDB) }
@@ -1096,124 +1096,13 @@ struct AgentPulseCoreVerification {
 
     // v4->v5 迁移与 legacy 派生行对账：证明既有 revision=0/synced=0 派生行不会永远非 pending 也不会被静默删除，
     // 未绑定 host 的全局对账债务不被丢弃，且 DB 文件权限收紧到 0600。全部走公开 API + 原始 SQLite 播种。
-    private static func verifyV5LegacyDerivedReconciliation() throws {
-        func seedSchema(_ path: String, userVersion: Int, extraSQL: String) throws {
-            var handle: OpaquePointer?
-            try require(sqlite3_open(path, &handle) == SQLITE_OK, "open raw db for v5 seeding")
-            defer { sqlite3_close(handle) }
-            let schema = """
-            CREATE TABLE usage_events(event_id TEXT PRIMARY KEY,source TEXT NOT NULL,model TEXT NOT NULL,project TEXT NOT NULL,timestamp_ms INTEGER NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_creation_input_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,session_hash TEXT NOT NULL,source_file_hash TEXT NOT NULL,created_at_ms INTEGER NOT NULL,rollout_key TEXT NOT NULL DEFAULT '',parent_rollout_key TEXT NOT NULL DEFAULT '',inherited INTEGER NOT NULL DEFAULT 0,has_total_snapshot INTEGER NOT NULL DEFAULT 0,lineage_fingerprint TEXT NOT NULL DEFAULT '');
-            CREATE TABLE usage_buckets(hostname TEXT NOT NULL,source TEXT NOT NULL,model TEXT NOT NULL,project TEXT NOT NULL,bucket_start_ms INTEGER NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_creation_input_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,updated_at_ms INTEGER NOT NULL,revision INTEGER NOT NULL DEFAULT 0,synced_revision INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(hostname,source,model,project,bucket_start_ms));
-            CREATE TABLE usage_files(file_id TEXT PRIMARY KEY,source TEXT NOT NULL,path_hash TEXT NOT NULL,read_offset INTEGER NOT NULL,file_size INTEGER NOT NULL,mtime_ms INTEGER NOT NULL,parser_version INTEGER NOT NULL,scan_status TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);
-            CREATE TABLE sync_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);
-            CREATE TABLE usage_session_events(event_id TEXT NOT NULL,source TEXT NOT NULL,session_hash TEXT NOT NULL,role TEXT NOT NULL,timestamp_ms INTEGER NOT NULL,created_at_ms INTEGER NOT NULL,PRIMARY KEY(source,event_id));
-            CREATE TABLE usage_sessions(hostname TEXT NOT NULL,source TEXT NOT NULL,session_hash TEXT NOT NULL,first_activity_ms INTEGER NOT NULL,last_activity_ms INTEGER NOT NULL,active_seconds INTEGER NOT NULL,message_count INTEGER NOT NULL,user_message_count INTEGER NOT NULL,assistant_events INTEGER NOT NULL,hour_histogram TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0,synced_revision INTEGER NOT NULL DEFAULT 0,updated_at_ms INTEGER NOT NULL,project TEXT NOT NULL DEFAULT '',PRIMARY KEY(hostname,source,session_hash));
-            \(extraSQL)
-            PRAGMA user_version=\(userVersion);
-            """
-            try require(sqlite3_exec(handle, schema, nil, nil, nil) == SQLITE_OK, "seed v\(userVersion) schema")
-        }
-        func rawBucketCount(_ path: String) throws -> Int {
-            var handle: OpaquePointer?
-            try require(sqlite3_open(path, &handle) == SQLITE_OK, "open raw db for count")
-            defer { sqlite3_close(handle) }
-            var stmt: OpaquePointer?
-            try require(sqlite3_prepare_v2(handle, "SELECT COUNT(*) FROM usage_buckets;", -1, &stmt, nil) == SQLITE_OK, "prepare count")
-            defer { sqlite3_finalize(stmt) }
-            _ = sqlite3_step(stmt)
-            return Int(sqlite3_column_int64(stmt, 0))
-        }
-
-        // 1) v4->v5：既有 revision=0/synced=0 legacy 派生行 → 每 host 登记 initial full-sync 债务，
-        //    reportingEligible fail-closed；这些行不作为增量 pending 发送（避免重复），idempotent。
-        do {
-            let db = tempUsageDB(); defer { cleanupDB(db) }
-            let extra = """
-            INSERT INTO usage_buckets VALUES('prod-host','codex','m','p',0,1,2,0,0,0,3,1000,0,0);
-            INSERT INTO usage_buckets VALUES('prod-host','codex','m','q',0,4,5,0,0,0,9,1000,0,0);
-            INSERT INTO sync_state VALUES('canonical_hostname','prod-host',1);
-            """
-            try seedSchema(db.path, userVersion: 4, extraSQL: extra)
-            let ledger = try UsageLedgerStore(path: db.path)
-            let eligible = try ledger.reportingEligible(hostname: "prod-host")
-            try require(!eligible, "v4->v5 legacy derived rows must fail-close reporting")
-            let reason = try ledger.reconciliationReason(hostname: "prod-host")
-            try require(reason != nil, "v4->v5 must register initial full-sync debt for legacy host")
-            let pending = try ledger.pendingBatch(hostname: "prod-host")
-            try require(pending.isEmpty, "legacy rev0 rows must not be sent as incremental pending (reconciled via full sync)")
-            let debtHosts = try ledger.pendingReconciliationHosts()
-            try require(debtHosts == ["prod-host"], "legacy host must appear as a full-sync debt target")
-
-            let reopened = try UsageLedgerStore(path: db.path)
-            let reopenedEligible = try reopened.reportingEligible(hostname: "prod-host")
-            try require(!reopenedEligible, "v5 migration must be idempotent across restart")
-            let reopenedHosts = try reopened.pendingReconciliationHosts()
-            try require(reopenedHosts == ["prod-host"], "v5 debt must persist across restart without duplication")
-        }
-
-        // 2) reset/rebuild 不静默删除 legacy rev0 行：删除后债务保留、reportingEligible 仍 fail-closed。
-        do {
-            let db = tempUsageDB(); defer { cleanupDB(db) }
-            let extra = """
-            INSERT INTO usage_buckets VALUES('prod-host','codex','m','p',0,1,2,0,0,0,3,1000,0,0);
-            INSERT INTO sync_state VALUES('canonical_hostname','prod-host',1);
-            """
-            try seedSchema(db.path, userVersion: 4, extraSQL: extra)
-            let ledger = try UsageLedgerStore(path: db.path)
-            try ledger.resetForRebuild()
-            let remaining = try rawBucketCount(db.path)
-            try require(remaining == 0, "reset must clear derived rows")
-            let reason = try ledger.reconciliationReason()
-            try require(reason != nil, "reset must preserve legacy reconciliation debt (no silent drop)")
-            let eligible = try ledger.reportingEligible(hostname: "prod-host")
-            try require(!eligible, "reset must keep reporting fail-closed for legacy debt host")
-            let debtHosts = try ledger.pendingReconciliationHosts()
-            try require(debtHosts == ["prod-host"], "reset must keep legacy host as a full-sync debt target")
-        }
-
-        // 3) v3->v4 未绑定 host 的全局 legacy 债务：不丢弃、整体 fail-closed；首次 record 学到 hostname 后原子迁移为可对账 per-host 债务。
-        do {
-            let db = tempUsageDB(); defer { cleanupDB(db) }
-            try seedSchema(db.path, userVersion: 3, extraSQL: "INSERT INTO sync_state VALUES('remote_reconciliation_required','legacy debt reason',1);")
-            let ledger = try UsageLedgerStore(path: db.path)
-            let anyEligible = try ledger.reportingEligible(hostname: "any-host")
-            try require(!anyEligible, "v3->v4 unassigned debt must fail-close every host")
-            let reason = try ledger.reconciliationReason()
-            try require(reason != nil, "v3->v4 unassigned debt must be preserved")
-            let debtHosts = try ledger.pendingReconciliationHosts()
-            try require(debtHosts.isEmpty, "unassigned debt must not surface as a pseudo-host full-sync target")
-
-            let file = "{\"type\":\"session_meta\",\"timestamp\":\"2026-08-01T00:00:00Z\",\"payload\":{\"id\":\"r\",\"session_id\":\"s\",\"cwd\":\"/w/p\"}}"
-            let parsed = UsageJSONLParser.parse(data: Data(file.utf8), source: "codex", fileIdentity: "v5.jsonl")
-            try ledger.record(events: parsed.events, sessionEvents: parsed.sessionEvents, checkpoint: parsed.checkpoint, hostname: "learned-host")
-            let relocatedHosts = try ledger.pendingReconciliationHosts()
-            try require(relocatedHosts == ["learned-host"], "unassigned debt must relocate to the learned canonical hostname")
-            let relocatedEligible = try ledger.reportingEligible(hostname: "learned-host")
-            try require(!relocatedEligible, "relocated debt must keep reporting fail-closed until reconciled")
-        }
-
-        // 4) v3->v4 已有 canonical hostname 的 legacy 全局债务：迁移绑定到该 host，per-host fail-closed。
-        do {
-            let db = tempUsageDB(); defer { cleanupDB(db) }
-            try seedSchema(db.path, userVersion: 3, extraSQL: """
-            INSERT INTO sync_state VALUES('remote_reconciliation_required','legacy debt reason',1);
-            INSERT INTO sync_state VALUES('canonical_hostname','known-host',1);
-            """)
-            let ledger = try UsageLedgerStore(path: db.path)
-            let debtHosts = try ledger.pendingReconciliationHosts()
-            try require(debtHosts == ["known-host"], "v3->v4 must bind legacy debt to the known canonical host")
-            let eligible = try ledger.reportingEligible(hostname: "known-host")
-            try require(!eligible, "bound legacy debt must fail-close reporting")
-        }
-
-        // 5) v1/v2 干净升级：无 legacy 债务、无 rev0 行时 v5 迁移必须纯 no-op（不误 block），常规写入/finalize/pending/ack/session 正常。
+    private static func verifyV5CleanUpgradeAndPermissions() throws {
+        // 1) 干净升级：全新库无历史包袱时 reportingEligible 为真，常规写入/finalize/pending/ack/session 正常。
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             let ledger = try UsageLedgerStore(path: db.path)
             let eligible = try ledger.reportingEligible(hostname: "fresh-host")
-            try require(eligible, "fresh v5 database must remain reporting eligible")
-            let reason = try ledger.reconciliationReason()
-            try require(reason == nil, "fresh v5 database must carry no reconciliation debt")
+            try require(eligible, "fresh database must remain reporting eligible")
             let jsonl = """
             {"type":"session_meta","timestamp":"2026-08-01T00:00:00Z","payload":{"id":"r","session_id":"s","cwd":"/w/proj"}}
             {"type":"response_item","timestamp":"2026-08-01T00:00:00Z","payload":{"type":"message","role":"user"}}
@@ -1232,7 +1121,7 @@ struct AgentPulseCoreVerification {
             try require(afterAck.isEmpty, "ack must clear pending for matching revision snapshot")
         }
 
-        // 6) DB 文件权限：db / -wal / -shm 均收紧到 0600（无 group/other 位）。
+        // 2) DB 文件权限：db / -wal / -shm 均收紧到 0600（无 group/other 位）。
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             _ = try UsageLedgerStore(path: db.path)
@@ -1543,11 +1432,12 @@ struct AgentPulseCoreVerification {
             try require(result.reportingEligible, "deleting an unsynced derived key must remain reporting eligible")
             let remainsEligible = try ledger.reportingEligible(hostname: "h")
             let correctedBuckets = try ledger.buckets(hostname: "h")
-            try require(remainsEligible, "unsynced deletion must not persist a reconciliation block")
+            try require(remainsEligible, "删除派生行不阻断上报：未同步自然键被删仍可上报")
             try require(correctedBuckets.count == 1 && correctedBuckets[0].project == "new", "unsynced metadata correction must replace the old derived key")
         }
 
-        // finalize 删除已同步自然键：全局、持久 fail-closed，后续 finalize 不得自动解封。
+        // 对账门禁已移除：finalize 删除已同步自然键不再阻断上报。
+        // 服务端以幂等累计 upsert 修复漏报/乱序，无 tombstone 协议，客户端不再置全局 fail-closed。
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             let ledger = try UsageLedgerStore(path: db.path)
@@ -1555,17 +1445,18 @@ struct AgentPulseCoreVerification {
             try ledger.finalizeDerived(hostname: "old-host")
             try ledger.acknowledge(ledger.pendingBatch(hostname: "old-host"))
             try ledger.record(events: [event(project: "new")], checkpoint: checkpoint(version: 2), hostname: "old-host")
-            let blocked = try ledger.finalizeDerived(hostname: "old-host")
-            try require(!blocked.reportingEligible && !blocked.blockedReasons.isEmpty, "synced key deletion in finalize must block reporting")
+            let result = try ledger.finalizeDerived(hostname: "old-host")
+            try require(result.reportingEligible && result.blockedReasons.isEmpty, "对账门禁已移除：finalize 删除已同步派生行不再阻断上报")
             let oldHostEligible = try ledger.reportingEligible(hostname: "old-host")
             let otherHostEligible = try ledger.reportingEligible(hostname: "other-host")
             let laterFinalize = try ledger.finalizeDerived(hostname: "old-host")
-            try require(!oldHostEligible, "finalize deletion block must cover original hostname")
-            try require(!otherHostEligible, "finalize deletion block must be global")
-            try require(!laterFinalize.reportingEligible, "later finalize must not clear reconciliation block")
+            try require(oldHostEligible, "finalize 删除已同步行后原 hostname 仍可上报")
+            try require(otherHostEligible, "对账门禁已移除：其他 hostname 不受影响")
+            try require(laterFinalize.reportingEligible, "后续 finalize 保持可上报")
         }
 
-        // reset 删除已同步派生行：全局 block 必须跨 reset 保留，并被后续 finalize 返回。
+        // 对账门禁已移除：reset 删除已同步派生行不再置位对账门禁。reset 期间的不可上报只来自
+        // rebuild pending（raw 派生未完成），完成重扫 + finalize + markRebuildCompleted 后即恢复可上报。
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             let ledger = try UsageLedgerStore(path: db.path)
@@ -1573,16 +1464,21 @@ struct AgentPulseCoreVerification {
             try ledger.finalizeDerived(hostname: "reset-host")
             try ledger.acknowledge(ledger.pendingBatch(hostname: "reset-host"))
             try ledger.resetForRebuild()
-            let resetHostEligible = try ledger.reportingEligible(hostname: "reset-host")
-            let otherHostEligible = try ledger.reportingEligible(hostname: "other-host")
-            try require(!resetHostEligible, "parser reset block must survive reset")
-            try require(!otherHostEligible, "parser reset block must cover every hostname")
+            // reset 后为 rebuild pending（并非对账门禁），故暂不可上报。
+            let resetPendingEligible = try ledger.reportingEligible(hostname: "reset-host")
+            try require(!resetPendingEligible, "reset 后处于 rebuild pending，暂不可上报")
             try ledger.record(events: [event()], checkpoint: checkpoint(version: 2), hostname: "reset-host")
             let postResetFinalize = try ledger.finalizeDerived(hostname: "reset-host")
-            try require(!postResetFinalize.reportingEligible, "post-reset finalize must expose reconciliation block")
+            try ledger.markRebuildCompleted()
+            // 完成重扫后：无对账门禁重新置位，恢复可上报。
+            let resetHostEligible = try ledger.reportingEligible(hostname: "reset-host")
+            let otherHostEligible = try ledger.reportingEligible(hostname: "other-host")
+            try require(postResetFinalize.reportingEligible, "reset 后 finalize 无对账门禁阻断")
+            try require(resetHostEligible, "对账门禁已移除：完成重扫后恢复可上报")
+            try require(otherHostEligible, "对账门禁已移除：不影响其他 hostname")
         }
 
-        // hostname rebuild 删除已同步派生行：切换 hostname 不能绕过全局 block。
+        // hostname rebuild 保留多机数据：切换本机 hostname 不删除旧 host 派生行，旧 host 仍可上报。
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             let ledger = try UsageLedgerStore(path: db.path)
@@ -1592,13 +1488,12 @@ struct AgentPulseCoreVerification {
             try ledger.rebuildForHostname("new-host")
             let oldHostEligible = try ledger.reportingEligible(hostname: "old-host")
             let newHostEligible = try ledger.reportingEligible(hostname: "new-host")
-            let thirdHostEligible = try ledger.reportingEligible(hostname: "third-host")
             let postRebuildFinalize = try ledger.finalizeDerived(hostname: "new-host")
-            _ = postRebuildFinalize.blockedReasons
-            try require(!oldHostEligible, "hostname rebuild block must cover old hostname")
-            try require(!newHostEligible, "hostname rebuild block must cover new hostname")
-            try require(!thirdHostEligible, "hostname rebuild block must be global")
-            try require(!postRebuildFinalize.reportingEligible, "post-hostname-rebuild finalize must remain blocked")
+            try require(oldHostEligible, "多机保留：hostname rebuild 后旧 host 仍可上报")
+            try require(newHostEligible, "hostname rebuild 后新 host 可上报")
+            try require(postRebuildFinalize.reportingEligible && postRebuildFinalize.blockedReasons.isEmpty, "对账门禁已移除：hostname rebuild 后 finalize 不再阻断")
+            let oldHostBuckets = try ledger.buckets(hostname: "old-host")
+            try require(!oldHostBuckets.isEmpty, "多机保留：hostname rebuild 后旧 host 派生行仍在")
         }
     }
 
@@ -3279,378 +3174,9 @@ struct AgentPulseCoreVerification {
         "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\"}}"
     }
 
-    // ===== Full sync ledger verifier (owned by implement_ledger_fullsync_api) =====
-
-    // FS-1) 全量快照含已 synced 行；generation fence；成功 commit 原子清 gate + mark synced + 恢复上报。
-    private static func verifyV2FullSyncReconciliation() throws {
-        let db = tempUsageDB(); defer { cleanupDB(db) }
-        var ledger: UsageLedgerStore? = try UsageLedgerStore(path: db.path)
-        func codexFile(_ session: String, ts: String, out: Int) -> String {
-            """
-            {"type":"session_meta","payload":{"session_id":"\(session)","thread_source":"user","cwd":"/w/proj-a"}}
-            {"type":"turn_context","payload":{"model":"m"}}
-            {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
-            {"timestamp":"\(ts)","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":\(out),"total_tokens":\(out)}}}}
-            """
-        }
-        let f1 = UsageJSONLParser.parse(data: Data(codexFile("s1", ts: "2026-09-01T00:00:00Z", out: 100).utf8), source: "codex", fileIdentity: "fs1.jsonl")
-        let f2 = UsageJSONLParser.parse(data: Data(codexFile("s2", ts: "2026-09-01T01:00:00Z", out: 200).utf8), source: "codex", fileIdentity: "fs2.jsonl")
-        try ledger!.record(events: f1.events, sessionEvents: f1.sessionEvents, checkpoint: f1.checkpoint, hostname: "h")
-        try ledger!.record(events: f2.events, sessionEvents: f2.sessionEvents, checkpoint: f2.checkpoint, hostname: "h")
-        try ledger!.finalizeDerived(hostname: "h")
-
-        // 先用增量 ack 把全部行标记 synced，以证明全量快照仍会读出已 synced 行。
-        let inc = try ledger!.pendingBatch(hostname: "h")
-        try require(!inc.isEmpty, "incremental batch should have dirty rows before ack")
-        try ledger!.acknowledge(inc)
-        let afterAckPending = try ledger!.pendingBatch(hostname: "h")
-        try require(afterAckPending.isEmpty, "all rows synced after incremental ack")
-
-        // 全量快照：即便无 dirty，也应读出全部行（含已 synced）。
-        let snapshot = try ledger!.fullSyncSnapshot(hostname: "h")
-        try require(snapshot.buckets.count == 2, "full sync snapshot must include ALL buckets incl synced: got \(snapshot.buckets.count)")
-        try require(snapshot.sessions.count == 2, "full sync snapshot must include ALL sessions incl synced: got \(snapshot.sessions.count)")
-        try require(snapshot.generation > 0, "snapshot carries a monotonic generation")
-        try require(snapshot.buckets.allSatisfy { $0.revision > 0 }, "each snapshot row carries its revision")
-
-        // generation fence：无数据变化时连续快照 generation 必须相同（读取不推进），
-        // 否则远端已 committed 后本地 crash，重拍快照 generation 变大将导致永远无法恢复。
-        let stableGen = snapshot.generation
-        let snapshot2 = try ledger!.fullSyncSnapshot(hostname: "h")
-        try require(snapshot2.generation == stableGen, "consecutive snapshots without data changes must share generation")
-        // 派生数据真实变化才推进 generation：写入新事件并 finalize 后，旧快照 commit 必须被围栏拒绝。
-        let f3 = UsageJSONLParser.parse(data: Data(codexFile("s3", ts: "2026-09-01T02:00:00Z", out: 300).utf8), source: "codex", fileIdentity: "fs3.jsonl")
-        try ledger!.record(events: f3.events, sessionEvents: f3.sessionEvents, checkpoint: f3.checkpoint, hostname: "h")
-        try ledger!.finalizeDerived(hostname: "h")
-        let fenced = try ledger!.commitFullSync(UsageFullSyncCommit(snapshot: snapshot))
-        try require(!fenced.committed, "stale-generation full sync commit must be fenced")
-        try require(fenced.failureReason?.contains("generation") == true, "fence reason mentions generation")
-
-        // Trigger reconciliation debt: rebuilding to a new host deletes the OLD host h synced rows.
-        // Per-host bookkeeping records the debt under h (the host that lost synced rows), not other-host.
-        try ledger!.rebuildForHostname("other-host")
-        let debtHosts = try ledger!.pendingReconciliationHosts()
-        try require(debtHosts == ["h"], "debt is recorded under the host whose synced rows were deleted")
-        let hEligible = try ledger!.reportingEligible(hostname: "h")
-        try require(!hEligible, "debt globally blocks reporting eligibility")
-
-        // The debt host h has no local rows left, but its snapshot still surfaces the reason,
-        // so an empty full sync can delete the stale remote rows for h.
-        let debtSnap = try ledger!.fullSyncSnapshot(hostname: "h")
-        try require(debtSnap.isEmpty, "debt host has no local rows after rebuild")
-        try require(debtSnap.reconciliationReason != nil, "debt-host snapshot surfaces the active reconciliation reason")
-
-        // Reconciling other-host must NOT clear h debt: it is a different host.
-        let snapOther = try ledger!.fullSyncSnapshot(hostname: "other-host")
-        try require(!snapOther.isEmpty, "rebuilt host has rows to reconcile")
-        try require(snapOther.reconciliationReason == nil, "other-host carries no debt of its own")
-        let otherOK = try ledger!.commitFullSync(UsageFullSyncCommit(snapshot: snapOther))
-        try require(otherOK.committed, "other-host full sync commit succeeds: \(otherOK.failureReason ?? "")")
-        let debtAfterOther = try ledger!.pendingReconciliationHosts()
-        try require(debtAfterOther == ["h"], "committing other-host must not clear h debt")
-
-        // Only an empty full sync targeting h clears h debt and restores eligibility.
-        let hCommit = try ledger!.commitFullSync(UsageFullSyncCommit(snapshot: debtSnap))
-        try require(hCommit.committed, "empty full sync for h commits: \(hCommit.failureReason ?? "")")
-        let clearedReason = try ledger!.reconciliationReason()
-        try require(clearedReason == nil, "h full sync clears reconciliation gate")
-        let clearedHosts = try ledger!.pendingReconciliationHosts()
-        try require(clearedHosts.isEmpty, "no pending debt after clearing h")
-        let restoredEligible = try ledger!.reportingEligible(hostname: "other-host")
-        try require(restoredEligible, "clearing all debt restores reporting eligibility")
-
-        // Cleared debt and synced state survive restart.
-        ledger = nil
-        let reopened = try UsageLedgerStore(path: db.path)
-        let restartHosts = try reopened.pendingReconciliationHosts()
-        try require(restartHosts.isEmpty, "cleared debt survives restart")
-        let restartReason = try reopened.reconciliationReason()
-        try require(restartReason == nil, "cleared gate survives restart")
-    }
-
-    // FS-GEN-1) 回归：无数据变化时连续 fullSyncSnapshot 的 generation 必须相同。
-    // 读取不推进 generation——否则远端已 committed 后本地 crash，重拍快照 generation 变大，
-    // 旧上传的 ledger commit 永远无法通过围栏，无法恢复。
-    private static func verifyV2FullSyncStableGenerationAcrossReads() throws {
-        let db = tempUsageDB(); defer { cleanupDB(db) }
-        let ledger = try UsageLedgerStore(path: db.path)
-        let f1 = UsageJSONLParser.parse(data: Data("""
-        {"type":"session_meta","payload":{"session_id":"g1","thread_source":"user","cwd":"/w/g1"}}
-        {"type":"turn_context","payload":{"model":"m"}}
-        {"timestamp":"2026-09-10T00:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
-        {"timestamp":"2026-09-10T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":10,"total_tokens":10}}}}
-        """.utf8), source: "codex", fileIdentity: "gen1.jsonl")
-        try ledger.record(events: f1.events, sessionEvents: f1.sessionEvents, checkpoint: f1.checkpoint, hostname: "h")
-        try ledger.finalizeDerived(hostname: "h")
-
-        let first = try ledger.fullSyncSnapshot(hostname: "h")
-        try require(first.generation > 0, "first snapshot after derived changes carries an advanced generation")
-        let second = try ledger.fullSyncSnapshot(hostname: "h")
-        let third = try ledger.fullSyncSnapshot(hostname: "h")
-        try require(second.generation == first.generation, "consecutive snapshots must share generation (read must not advance)")
-        try require(third.generation == first.generation, "repeated reads keep a stable generation")
-        try require(second.buckets == first.buckets && second.sessions == first.sessions, "stable snapshot content across reads")
-
-        // 无变化 finalize 也不推进 generation。
-        try ledger.finalizeDerived(hostname: "h")
-        let afterIdleFinalize = try ledger.fullSyncSnapshot(hostname: "h")
-        try require(afterIdleFinalize.generation == first.generation, "finalize without derived changes must not advance generation")
-
-        // 真实派生变化推进 generation，旧快照被围栏。
-        let f2 = UsageJSONLParser.parse(data: Data("""
-        {"type":"session_meta","payload":{"session_id":"g2","thread_source":"user","cwd":"/w/g2"}}
-        {"type":"turn_context","payload":{"model":"m"}}
-        {"timestamp":"2026-09-10T01:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
-        {"timestamp":"2026-09-10T01:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":20,"total_tokens":20}}}}
-        """.utf8), source: "codex", fileIdentity: "gen2.jsonl")
-        try ledger.record(events: f2.events, sessionEvents: f2.sessionEvents, checkpoint: f2.checkpoint, hostname: "h")
-        try ledger.finalizeDerived(hostname: "h")
-        let changed = try ledger.fullSyncSnapshot(hostname: "h")
-        try require(changed.generation > first.generation, "real derived changes must advance generation")
-        let staleCommit = try ledger.commitFullSync(UsageFullSyncCommit(snapshot: first))
-        try require(!staleCommit.committed, "pre-change snapshot commit must be fenced after derived changes")
-    }
-
-    // FS-RESERVE) reserve-before-snapshot：baseline 只读不推进；expectedGeneration 匹配成功；
-    // generation 变化后 stale 且不返回半快照；旧 API 兼容；无数据 / 有 gate 均正确。
-    private static func verifyV2FullSyncReserveBeforeSnapshot() throws {
-        let db = tempUsageDB(); defer { cleanupDB(db) }
-        let ledger = try UsageLedgerStore(path: db.path)
-        func codexFile(_ session: String, ts: String, out: Int) -> String {
-            """
-            {"type":"session_meta","payload":{"session_id":"\(session)","thread_source":"user","cwd":"/w/rs"}}
-            {"type":"turn_context","payload":{"model":"m"}}
-            {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
-            {"timestamp":"\(ts)","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":\(out),"total_tokens":\(out)}}}}
-            """
-        }
-
-        // 无数据：baseline 为 0 且读取不推进；expectedGeneration=0 的空快照成功。
-        let emptyBaseline = try ledger.fullSyncGenerationBaseline()
-        try require(emptyBaseline == 0, "fresh ledger baseline starts at 0")
-        let emptyBaselineAgain = try ledger.fullSyncGenerationBaseline()
-        try require(emptyBaselineAgain == emptyBaseline, "baseline read must not advance generation")
-        let emptySnap = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: emptyBaseline)
-        try require(emptySnap.isEmpty && emptySnap.generation == 0 && emptySnap.reconciliationReason == nil,
-                    "empty snapshot at baseline 0 must be empty with no gate")
-
-        // 旧 API 兼容：fullSyncSnapshot(hostname:) 与 expectedGeneration=nil 完全一致。
-        let compatEmpty = try ledger.fullSyncSnapshot(hostname: "h")
-        let explicitNil = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: nil)
-        try require(compatEmpty == explicitNil, "legacy snapshot must equal expectedGeneration=nil snapshot")
-
-        // 真实派生变化推进 generation；baseline 与快照 generation 一致。
-        let f1 = UsageJSONLParser.parse(data: Data(codexFile("rs1", ts: "2026-09-20T00:00:00Z", out: 10).utf8), source: "codex", fileIdentity: "rs1.jsonl")
-        try ledger.record(events: f1.events, sessionEvents: f1.sessionEvents, checkpoint: f1.checkpoint, hostname: "h")
-        try ledger.finalizeDerived(hostname: "h")
-        let baseline = try ledger.fullSyncGenerationBaseline()
-        try require(baseline > 0, "baseline advances with real derived changes")
-        let baselineAgain = try ledger.fullSyncGenerationBaseline()
-        try require(baselineAgain == baseline, "repeated baseline reads stay stable")
-
-        // 匹配成功：expectedGeneration == 当前 generation，内容与旧 API 快照逐字段一致。
-        let reserved = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: baseline)
-        try require(!reserved.isEmpty && reserved.generation == baseline, "reserved snapshot carries baseline generation")
-        let compatSnapshot = try ledger.fullSyncSnapshot(hostname: "h")
-        try require(reserved == compatSnapshot, "expected-matching snapshot equals legacy snapshot")
-
-        // generation 变化后：旧 baseline 取快照必须 stale 失败，且不返回半快照。
-        let f2 = UsageJSONLParser.parse(data: Data(codexFile("rs2", ts: "2026-09-20T01:00:00Z", out: 20).utf8), source: "codex", fileIdentity: "rs2.jsonl")
-        try ledger.record(events: f2.events, sessionEvents: f2.sessionEvents, checkpoint: f2.checkpoint, hostname: "h")
-        try ledger.finalizeDerived(hostname: "h")
-        let advanced = try ledger.fullSyncGenerationBaseline()
-        try require(advanced > baseline, "generation advances after derived change")
-
-        var halfSnapshot: UsageFullSyncSnapshot?
-        do {
-            halfSnapshot = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: baseline)
-            try require(false, "stale expectedGeneration must throw")
-        } catch let error as UsageFullSyncSnapshotError {
-            try require(error == .staleGeneration(expected: baseline, actual: advanced),
-                        "stale snapshot reports expected/actual generations: \(error)")
-        }
-        try require(halfSnapshot == nil, "stale failure must not return a partial snapshot")
-
-        // 新 baseline 立即可用。
-        let fresh = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: advanced)
-        try require(fresh.generation == advanced && !fresh.isEmpty, "snapshot succeeds at the advanced generation")
-
-        // 有 gate：先全量同步清 dirty，再 rebuild 到新 host 制造 synced 行删除 -> gate 置位。
-        try ledger.commitFullSync(UsageFullSyncCommit(snapshot: fresh))
-        try ledger.rebuildForHostname("h2")
-        let gatedBaseline = try ledger.fullSyncGenerationBaseline()
-        try require(gatedBaseline > advanced, "rebuild recomputes derived rows and advances generation")
-        let reason = try ledger.reconciliationReason()
-        try require(reason != nil, "deleting synced rows via rebuild sets reconciliation gate")
-
-        // gate and the generation fence are orthogonal within one snapshot. Reconciliation debt
-        // is recorded under the OLD host (h) whose synced rows were deleted, not the new host (h2):
-        // the debt-host snapshot surfaces the reason at the current baseline, h2 carries none.
-        let debtHostsList = try ledger.pendingReconciliationHosts()
-        try require(debtHostsList == ["h"], "debt is bookkept under the host that lost synced rows")
-        let debtSnap = try ledger.fullSyncSnapshot(hostname: "h", expectedGeneration: gatedBaseline)
-        try require(debtSnap.generation == gatedBaseline, "debt-host snapshot reads at current baseline")
-        try require(debtSnap.reconciliationReason == reason, "debt-host snapshot surfaces the active reconciliation reason")
-        let gatedSnap = try ledger.fullSyncSnapshot(hostname: "h2", expectedGeneration: gatedBaseline)
-        try require(!gatedSnap.isEmpty && gatedSnap.generation == gatedBaseline, "new-host snapshot succeeds at current baseline")
-        try require(gatedSnap.reconciliationReason == nil, "new host carries no reconciliation debt of its own")
-        do {
-            _ = try ledger.fullSyncSnapshot(hostname: "h2", expectedGeneration: advanced)
-            try require(false, "pre-rebuild baseline must be stale after rebuild")
-        } catch let error as UsageFullSyncSnapshotError {
-            try require(error == .staleGeneration(expected: advanced, actual: gatedBaseline),
-                        "post-rebuild snapshot reports expected/actual generations: \(error)")
-        }
-    }
-
-    // FS-GEN-2) 回归：模拟「远端已 committed、本地 crash 未及 ledger commit」——
-    // 重启后重拍快照 generation 必须与 crash 前相同，且可用该 generation 完成 ledger commit。
-    private static func verifyV2FullSyncCrashRecoverySameGeneration() throws {
-        let db = tempUsageDB(); defer { cleanupDB(db) }
-        var ledger: UsageLedgerStore? = try UsageLedgerStore(path: db.path)
-        let f1 = UsageJSONLParser.parse(data: Data("""
-        {"type":"session_meta","payload":{"session_id":"r1","thread_source":"user","cwd":"/w/r1"}}
-        {"type":"turn_context","payload":{"model":"m"}}
-        {"timestamp":"2026-09-11T00:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant"}}
-        {"timestamp":"2026-09-11T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":40,"total_tokens":40}}}}
-        """.utf8), source: "codex", fileIdentity: "rec1.jsonl")
-        try ledger!.record(events: f1.events, sessionEvents: f1.sessionEvents, checkpoint: f1.checkpoint, hostname: "h")
-        try ledger!.finalizeDerived(hostname: "h")
-
-        // crash 前：快照已上传并被远端 committed（本地尚未 commitFullSync）。
-        let beforeCrash = try ledger!.fullSyncSnapshot(hostname: "h")
-        try require(!beforeCrash.isEmpty, "snapshot has rows to reconcile")
-
-        // 模拟进程 crash：丢弃内存中的 store 句柄后重开同一数据库。
-        ledger = nil
-        let reopened = try UsageLedgerStore(path: db.path)
-
-        // 恢复：重拍快照 generation 必须与 crash 前相同。
-        let recovered = try reopened.fullSyncSnapshot(hostname: "h")
-        try require(recovered.generation == beforeCrash.generation,
-                    "post-crash re-snapshot must reuse the same generation: before=\(beforeCrash.generation) after=\(recovered.generation)")
-        try require(recovered.buckets == beforeCrash.buckets && recovered.sessions == beforeCrash.sessions,
-                    "post-crash snapshot content must be identical")
-
-        // 用恢复后的快照完成 ledger commit：围栏必须放行，全部行标记 synced。
-        let committed = try reopened.commitFullSync(UsageFullSyncCommit(snapshot: recovered))
-        try require(committed.committed, "post-crash ledger commit must succeed with the same generation: \(committed.failureReason ?? "")")
-        let pending = try reopened.pendingBatch(hostname: "h")
-        try require(pending.isEmpty, "all rows marked synced after recovered ledger commit")
-
-        // crash 前的旧快照凭证同样可提交（generation 与行内容均未变）——恢复路径幂等。
-        let idempotent = try reopened.commitFullSync(UsageFullSyncCommit(snapshot: beforeCrash))
-        try require(idempotent.committed, "re-committing the pre-crash snapshot stays idempotent: \(idempotent.failureReason ?? "")")
-    }
-
-    // FS-2) fail-closed：revision 变化 / 行删除 / 重复键 / 缺失键 -> 整体拒绝，不部分标记、不清 gate。
-    private static func verifyV2FullSyncFailClosed() throws {
-        let db = tempUsageDB(); defer { cleanupDB(db) }
-        let ledger = try UsageLedgerStore(path: db.path)
-        func codexFile(_ session: String, ts: String, out: Int) -> String {
-            """
-            {"type":"session_meta","payload":{"session_id":"\(session)","thread_source":"user","cwd":"/w/proj-b"}}
-            {"type":"turn_context","payload":{"model":"m"}}
-            {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
-            {"timestamp":"\(ts)","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":\(out),"total_tokens":\(out)}}}}
-            """
-        }
-        let a = UsageJSONLParser.parse(data: Data(codexFile("s1", ts: "2026-10-01T00:00:00Z", out: 100).utf8), source: "codex", fileIdentity: "fc1.jsonl")
-        let b = UsageJSONLParser.parse(data: Data(codexFile("s2", ts: "2026-10-01T01:00:00Z", out: 200).utf8), source: "codex", fileIdentity: "fc2.jsonl")
-        try ledger.record(events: a.events, sessionEvents: a.sessionEvents, checkpoint: a.checkpoint, hostname: "h")
-        try ledger.record(events: b.events, sessionEvents: b.sessionEvents, checkpoint: b.checkpoint, hostname: "h")
-        try ledger.finalizeDerived(hostname: "h")
-
-        // 快照后行被 finalize 重算（revision 抬升）：commit 必须整体 fail-closed。
-        let snap = try ledger.fullSyncSnapshot(hostname: "h")
-        let changed = UsageJSONLParser.parse(data: Data(codexFile("s1", ts: "2026-10-01T00:10:00Z", out: 101).utf8), source: "codex", fileIdentity: "fc1b.jsonl")
-        try ledger.record(events: changed.events, sessionEvents: changed.sessionEvents, checkpoint: changed.checkpoint, hostname: "h")
-        try ledger.finalizeDerived(hostname: "h")
-        let rejChange = try ledger.commitFullSync(UsageFullSyncCommit(snapshot: snap))
-        try require(!rejChange.committed, "row changed since snapshot must fail-closed")
-        // 未被误标记：仍有 dirty 行（00:00 桶被重算为 201）。
-        let afterRejPending = try ledger.pendingBatch(hostname: "h")
-        try require(!afterRejPending.isEmpty, "fail-closed must not partially mark rows synced")
-
-        // 重复键：手工在 commit 中放入重复 bucket -> 拒绝。
-        let fresh = try ledger.fullSyncSnapshot(hostname: "h")
-        if let first = fresh.buckets.first {
-            let dupCommit = UsageFullSyncCommit(hostname: "h", generation: fresh.generation, buckets: fresh.buckets + [first], sessions: fresh.sessions)
-            let rejDup = try ledger.commitFullSync(dupCommit)
-            try require(!rejDup.committed, "duplicate bucket key in commit must fail-closed")
-        }
-
-        // 行集合缺失：漏掉一行 -> count 不等 -> 拒绝。
-        let fresh2 = try ledger.fullSyncSnapshot(hostname: "h")
-        if fresh2.buckets.count >= 1 {
-            let missingCommit = UsageFullSyncCommit(hostname: "h", generation: fresh2.generation, buckets: Array(fresh2.buckets.dropLast()), sessions: fresh2.sessions)
-            let rejMissing = try ledger.commitFullSync(missingCommit)
-            try require(!rejMissing.committed, "missing row (row set shrink) must fail-closed")
-        }
-
-        // 缺失键（同 count 但键不匹配）：替换一个 bucket 的内容键 -> 拒绝。
-        let fresh3 = try ledger.fullSyncSnapshot(hostname: "h")
-        if let victim = fresh3.buckets.first {
-            let b = victim.bucket
-            let bogus = UsageBucket(hostname: b.hostname, source: b.source, model: b.model, project: b.project, bucketStart: b.bucketStart.addingTimeInterval(9_999), counts: b.counts)
-            var swapped = Array(fresh3.buckets.dropFirst())
-            swapped.append(UsagePendingBucket(bucket: bogus, revision: victim.revision))
-            let rejKey = try ledger.commitFullSync(UsageFullSyncCommit(hostname: "h", generation: fresh3.generation, buckets: swapped, sessions: fresh3.sessions))
-            try require(!rejKey.committed, "mismatched natural key (same count) must fail-closed")
-        }
-
-        // 全部 fail-closed 期间不得清 gate / 不误标记：现在做一次干净 commit 应仍能成功。
-        let clean = try ledger.fullSyncSnapshot(hostname: "h")
-        let okClean = try ledger.commitFullSync(UsageFullSyncCommit(snapshot: clean))
-        try require(okClean.committed, "a clean commit after fail-closed attempts still succeeds: \(okClean.failureReason ?? "")")
-        let cleanPending = try ledger.pendingBatch(hostname: "h")
-        try require(cleanPending.isEmpty, "clean commit marks all rows synced")
-    }
-
-    // FS-3) session project 贯通 + reopen 持久 + v2 旧库迁移到 v3（不丢数据、补 project 列）。
-    // FS-P0) 回归：per-host eligibility=0（无 reconciliation gate，仅 inherited replay 阻断）时，
-    // full sync 成功 commit 只清 reconciliation，绝不 fail-open 恢复上报。
-    private static func verifyV2FullSyncPreservesInheritedBlock() throws {
-        let db = tempUsageDB(); defer { cleanupDB(db) }
-        let ledger = try UsageLedgerStore(path: db.path)
-        // 继承回放但无完整 total 快照 -> 无法证明去重 -> per-host eligibility flag=0（非 reconciliation 阻断）。
-        let ts = "2026-12-01T00:00:00Z"
-        let childNoSnapshot = """
-        {"type":"session_meta","payload":{"id":"child-p0","session_id":"child-session-p0","parent_thread_id":"parent-p0","cwd":"/w/p"}}
-        {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
-        {"timestamp":"\(ts)","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":70,"total_tokens":70}}}}
-        """
-        let cnp = UsageJSONLParser.parse(data: Data(childNoSnapshot.utf8), source: "codex", fileIdentity: "child-p0.jsonl")
-        try require(cnp.events.first?.inherited == true, "child must be flagged inherited")
-        try require(cnp.events.first?.lineageFingerprint.isEmpty == true, "no total snapshot => no lineage fingerprint")
-        try ledger.record(events: cnp.events, sessionEvents: cnp.sessionEvents, checkpoint: cnp.checkpoint, hostname: "h")
-        let finalize = try ledger.finalizeDerived(hostname: "h")
-        try require(!finalize.reportingEligible, "unprovable inherited replay must block reporting")
-
-        // 无 reconciliation gate（仅 inherited replay 阻断）。
-        let reason = try ledger.reconciliationReason()
-        try require(reason == nil, "inherited replay block must NOT be a reconciliation gate")
-        let blockedEligible = try ledger.reportingEligible(hostname: "h")
-        try require(!blockedEligible, "reporting must be blocked before full sync")
-
-        // 全量快照 + 成功 commit。
-        let snap = try ledger.fullSyncSnapshot(hostname: "h")
-        let ok = try ledger.commitFullSync(UsageFullSyncCommit(snapshot: snap))
-        try require(ok.committed, "full sync commit should succeed on matching rows: \(ok.failureReason ?? "")")
-
-        // 关键断言：commit 后仍必须 false —— inherited replay 阻断未被 full sync 清掉（无 fail-open）。
-        let afterEligible = try ledger.reportingEligible(hostname: "h")
-        try require(!afterEligible, "full sync commit must NOT clear the inherited-replay block (no fail-open)")
-
-        // reopen 后仍保持阻断。
-        let reopened = try UsageLedgerStore(path: db.path)
-        let reopenedEligible = try reopened.reportingEligible(hostname: "h")
-        try require(!reopenedEligible, "inherited-replay block survives restart after full sync")
-    }
-
     // FS-PROJ) 回归：血缘去重会丢弃携带 project 的原始行，session project 必须从**全量 raw**取，
     // 而非 deduped —— 证明去重后仍能解析出正确 project。
-    private static func verifyV2FullSyncProjectFromRawNotDeduped() throws {
+    private static func verifyV2ProjectFromRawNotDeduped() throws {
         let db = tempUsageDB(); defer { cleanupDB(db) }
         let ledger = try UsageLedgerStore(path: db.path)
         let ts = "2026-12-15T00:00:00Z"
@@ -3714,8 +3240,6 @@ struct AgentPulseCoreVerification {
 
         let pending = try ledger!.pendingBatch(hostname: "h")
         try require(pending.sessions.first?.session.project == expectedProject, "pending session carries project")
-        let snap = try ledger!.fullSyncSnapshot(hostname: "h")
-        try require(snap.sessions.first?.session.project == expectedProject, "full sync snapshot session carries project")
 
         // reopen：project 持久化。
         ledger = nil
@@ -3747,10 +3271,6 @@ struct AgentPulseCoreVerification {
         try migrated.finalizeDerived(hostname: "h")
         let migratedBuckets = try migrated.buckets(hostname: "h")
         try require(migratedBuckets.first?.counts.total == 50, "migrated event rebuilds derived bucket after v3 migration")
-
-        // 迁移库仍能读全量快照（project 列已存在，默认空串不报错）。
-        let migratedSnap = try migrated.fullSyncSnapshot(hostname: "h")
-        try require(migratedSnap.generation > 0, "full sync usable on migrated v3 db")
 
         // 幂等：再次打开（已是 v3）不应报错、事件不丢。
         let reopenedV3 = try UsageLedgerStore(path: db2.path)

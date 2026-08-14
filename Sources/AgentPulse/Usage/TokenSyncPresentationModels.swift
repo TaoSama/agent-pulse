@@ -108,20 +108,6 @@ struct TokenUsageSummary: Sendable, Equatable {
     static let empty = TokenUsageSummary()
 }
 
-/// 全量同步的生命周期状态。
-enum TokenFullSyncState: String, Sendable, Equatable {
-    /// 安全门未通过（原因见 `fullSyncBlockReasons`）。
-    case blocked
-    /// 可以开始全量同步。
-    case ready
-    /// 正在上传。
-    case running
-    /// 本次全量同步完成。
-    case completed
-    /// 本次全量同步失败。
-    case failed
-}
-
 /// 本地凭证配置状态
 enum TokenConfigurationStatus: String, Sendable, Equatable {
     case ready
@@ -129,7 +115,7 @@ enum TokenConfigurationStatus: String, Sendable, Equatable {
     case invalid
 }
 
-/// 设置页「Token 统计 / 用量上报 / 全量同步」三块的状态快照。
+/// 设置页「Token 统计 / 用量上报」两块的状态快照。
 struct TokenSyncStatus: Sendable, Equatable {
     /// 本地长期采集开关（历史会话删除后数据仍保留）。
     var localCollectionEnabled: Bool
@@ -165,9 +151,6 @@ struct TokenSyncStatus: Sendable, Equatable {
     /// partialFailures 或 pending 非零时为 false，UI 不得显示成功。
     var lastReportSucceeded: Bool?
 
-    var fullSyncState: TokenFullSyncState
-    var fullSyncBlockReasons: [String]
-
     /// cliproxyapi 采集是否已配置（0600 配置文件 + 字段齐全）。
     var cliProxyConfigured: Bool = false
     /// cliproxyapi 采集错误（脱敏）；nil 表示无错误或未配置。
@@ -189,9 +172,7 @@ struct TokenSyncStatus: Sendable, Equatable {
         reportingBlockedReasons: [],
         pendingBuckets: 0,
         pendingSessions: 0,
-        lastReportSucceeded: nil,
-        fullSyncState: .blocked,
-        fullSyncBlockReasons: ["本地长期账本尚未接入"]
+        lastReportSucceeded: nil
     )
 }
 
@@ -215,7 +196,6 @@ protocol TokenSyncCoordinating: AnyObject {
     func start()
     func scanNow()
     func reportNow()
-    func runFullSync()
     func stop()
 }
 

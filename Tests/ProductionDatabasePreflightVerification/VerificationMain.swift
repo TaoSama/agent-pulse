@@ -57,9 +57,7 @@ struct ProductionDatabasePreflightVerification {
         try require(before.schemaVersion == 4, "expected production-copy schema v4, got v\(before.schemaVersion)")
         try require(before.events > 0 && before.buckets > 0 && before.files > 0, "production copy is unexpectedly empty")
         let protectedState = before.syncState.filter { key, _ in
-            key == "full_sync_generation"
-                || key.hasPrefix("revision\u{1}")
-                || key.hasPrefix("remote_reconciliation_required")
+            key.hasPrefix("revision\u{1}")
         }
 
         var scanTotals = ScanTotals()
@@ -69,14 +67,12 @@ struct ProductionDatabasePreflightVerification {
         var mcpCalls = 0
         var linesAdded: Int64 = 0
         var linesDeleted: Int64 = 0
-        var finalGeneration: Int64 = 0
-        var reconciliationPending = false
 
         do {
             let ledger = try UsageLedgerStore(path: databaseURL.path)
             let migrated = try readSnapshot(databaseURL)
-            try require(migrated.schemaVersion == Int64(UsageLedgerStore.schemaVersion), "migration did not reach schema v7")
-            try require(state(protectedState, isPreservedBy: migrated.syncState), "migration lost revision/generation/reconciliation state")
+            try require(migrated.schemaVersion == Int64(UsageLedgerStore.schemaVersion), "migration did not reach current schema v\(UsageLedgerStore.schemaVersion)")
+            try require(state(protectedState, isPreservedBy: migrated.syncState), "migration lost revision high-watermark state")
             let rebuildRequired = try ledger.requiresParserRebuild(
                 currentParserVersion: UsageJSONLParser.parserVersion
             )
@@ -137,8 +133,6 @@ struct ProductionDatabasePreflightVerification {
             }
             linesAdded = buckets.reduce(0) { saturatedAdd($0, $1.linesAdded) }
             linesDeleted = buckets.reduce(0) { saturatedAdd($0, $1.linesDeleted) }
-            finalGeneration = try ledger.fullSyncGenerationBaseline()
-            reconciliationPending = try ledger.reconciliationReason() != nil
 
             try require(scanTotals.files > 0 && scanTotals.bytes > 0, "no transcript files were scanned")
             let eventCount = try ledger.eventCount()
@@ -153,7 +147,7 @@ struct ProductionDatabasePreflightVerification {
         try checkpointWriteAheadLog(databaseURL)
         try verifyDatabase(databaseURL, expectedHostname: hostname)
         let final = try readSnapshot(databaseURL)
-        try require(final.schemaVersion == 7, "final database schema is not v7")
+        try require(final.schemaVersion == Int64(UsageLedgerStore.schemaVersion), "final database schema is not current v\(UsageLedgerStore.schemaVersion)")
         try require(final.events > 0 && final.buckets > 0 && final.sessions > 0 && final.files > 0, "final database is missing rebuilt data")
         try require(state(protectedState, isPreservedBy: final.syncState), "final database lost protected sync state")
         try verifyOwnerOnlyFiles(databaseURL)
@@ -164,7 +158,7 @@ struct ProductionDatabasePreflightVerification {
         print("files_scanned=\(scanTotals.files) bytes_scanned=\(scanTotals.bytes) diagnostics=\(scanTotals.diagnostics)")
         print("buckets=\(finalBucketCount) sessions=\(finalSessionCount)")
         print("skill_calls=\(skillCalls) mcp_calls=\(mcpCalls) lines_added=\(linesAdded) lines_deleted=\(linesDeleted)")
-        print("full_sync_generation=\(finalGeneration) reconciliation_pending=\(reconciliationPending)")
+        print("full_scan buckets=\(finalBucketCount) sessions=\(finalSessionCount) skills=\(skillCalls) mcp=\(mcpCalls) linesAdded=\(linesAdded) linesDeleted=\(linesDeleted)")
     }
 
     private static func scan(

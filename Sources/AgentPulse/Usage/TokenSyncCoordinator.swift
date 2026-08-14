@@ -49,14 +49,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 当前值时才更新句柄，避免旧任务取消后完成回调覆盖新任务句柄的竞态。
     private var scanGeneration: UInt64 = 0
     private var reportGeneration: UInt64 = 0
-    /// 全量同步任务句柄；与 scan/report 三方互斥，stop() 取消。
-    private var fullSyncTask: Task<Void, Never>?
-    /// 全量同步 generation：与 scan/report 同理，取消后旧回调按 generation 过期忽略。
-    private var fullSyncGeneration: UInt64 = 0
-    /// 最近一次全量同步的一次性结果文案（成功/失败原因）。
-    /// 用于在状态回落到 .ready/.blocked 后仍向用户展示“上次结果”，避免 completed/failed 永久粘滞
-    /// 而堵住重新/重试。nil 表示尚无历史结果。
-    private var fullSyncLastResultNote: String?
     /// 当自动上报在已有扫描期间被触发时，记住“扫描结束后上报”的意图。
     /// 关闭上报或 stop() 会清空，避免过期动作越过用户当前设置。
     private var reportAfterCurrentScan = false
@@ -65,7 +57,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 应用生命周期：start() 后置 true；stop() 置 false 后阻止后续自动动作。
     private var isRunning: Bool = false
     /// 启动时检测到 rebuild pending（已 reset 但未确认全部来源重扫成功）：
-    /// 置 true 后禁止一切网络动作（普通上报 / 恢复或执行全量同步），
+    /// 置 true 后禁止一切网络动作（普通上报），
     /// 先完整重扫全部来源；扫描成功清除 pending 后，再由 finishScan 恢复正常启动链路。
     private var rebuildRecoveryPending: Bool = false
 
@@ -153,15 +145,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let eligible = ledger.flatMap { (try? $0.reportingEligible(hostname: effectiveHostname)) } ?? true
         let pending = ledger.flatMap { (try? $0.pendingCounts(hostname: effectiveHostname)) } ?? (0, 0)
 
-        // 全量同步初始 readiness：依据当前配置能力动态判定（就绪→.ready，否则→.blocked）。
-        let initialFullSync = Self.initialFullSyncReadiness(
-            reporter: reporter,
-            configurationURL: configurationURL,
-            ingestBaseURL: baseURL,
-            authorityStatus: authority.status,
-            authorityHostname: authority.hostname,
-            hasLedger: ledger != nil
-        )
         statusSubject = CurrentValueSubject(TokenSyncStatus(
             localCollectionEnabled: localCollection,
             reportingEnabled: reporting,
@@ -178,9 +161,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             reportingBlockedReasons: [],
             pendingBuckets: pending.0,
             pendingSessions: pending.1,
-            lastReportSucceeded: nil,
-            fullSyncState: initialFullSync.0,
-            fullSyncBlockReasons: initialFullSync.1
+            lastReportSucceeded: nil
         ))
     }
 
@@ -237,9 +218,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     func setIngestBaseURL(_ url: String) {
         let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        // baseURL 变化会改变全量同步的目标端点：取消在途 full sync（可恢复，不清 state/gate），
-        // 递增 generation 使旧完成回调过期，并让状态回落到当前 readiness（.ready/.blocked）。
-        cancelInFlightFullSync()
         defaults.set(trimmed, forKey: DefaultsKey.ingestBaseURL)
         var stopAutoLoop = false
         updateStatus { status in
@@ -255,16 +233,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             autoLoopTask?.cancel()
             autoLoopTask = nil
         }
-        refreshFullSyncReadiness()
     }
 
     /// 保存用户 hostname：仅用于“配置权威缺失时”的本地采集标识；
     /// 若配置就绪，则以配置为权威（保存值不会覆盖权威）。
     func setCanonicalHostname(_ hostname: String) {
         let trimmed = Self.normalize(hostname)
-        // hostname 变化会改变全量同步绑定的身份/账本口径：取消在途 full sync（可恢复），
-        // 递增 generation 使旧回调过期，状态回落到当前 readiness。
-        cancelInFlightFullSync()
         defaults.set(trimmed, forKey: DefaultsKey.canonicalHostname)
         refreshConfigurationAuthority()
         let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
@@ -284,7 +258,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             autoLoopTask?.cancel()
             autoLoopTask = nil
         }
-        refreshFullSyncReadiness()
     }
 
     // MARK: - Scan (production chain)
@@ -296,8 +269,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 触发扫描；chainedReport=true 则扫描成功后串接一次上报（无论开关变化，
     /// 在 finishScan 里再校验 reportingEnabled）。
     private func scanNow(chainedReport: Bool) {
-        // 防重入；且不在上报或全量同步进行时启动扫描，避免 reset/rebuild 与在途上传竞争。
-        guard scanTask == nil, reportTask == nil, fullSyncTask == nil,
+        // 防重入；且不在上报进行时启动扫描，避免 rebuild 与在途上传竞争。
+        guard scanTask == nil, reportTask == nil,
               statusSubject.value.localCollectionEnabled, let ledger else { return }
         refreshConfigurationAuthority()
 
@@ -449,11 +422,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 status.pendingBuckets = outcome.pending.buckets
                 status.pendingSessions = outcome.pending.sessions
             }
-            // 扫描链路会完成 hostname 对齐；此前因此 blocked 的 full sync 现在可重新评估。
-            refreshFullSyncReadiness()
             // rebuild pending 恢复路径：本次扫描已完整跑完全部来源（无致命失败），
             // 且 off-main 已在 finalize 后清除 pending。此处确认已清除后再恢复正常启动链路
-            // （恢复全量同步 / 上报）。若因某种原因仍未清除，则保持 pending、绝不发网络请求。
+            // （恢复上报）。若因某种原因仍未清除，则保持 pending、绝不发网络请求。
             if rebuildRecoveryPending {
                 reportAfterCurrentScan = false
                 if isRebuildCompletionPending() {
@@ -485,8 +456,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     // MARK: - Report
 
     func reportNow() {
-        // 防重入；且不在扫描或全量同步进行时上报，避免与 reset/rebuild/对账竞争。
-        guard reportTask == nil, scanTask == nil, fullSyncTask == nil else { return }
+        // 防重入；且不在扫描进行时上报，避免与 rebuild 竞争。
+        guard reportTask == nil, scanTask == nil else { return }
         // rebuild pending 期间绝不发网络请求：必须先完整重扫全部来源并清除 pending。
         if isRebuildCompletionPending() {
             updateStatus { $0.reportingError = "本地重建未完成，请先完成完整扫描后再上报" }
@@ -574,549 +545,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
     }
 
-    /// 手动触发一次全量同步（reconciliation）。
-    ///
-    /// 与普通上报不同，全量同步**不依赖 reportingEnabled**：它是一次“把本机全部派生行与
-    /// 远端对齐”的显式修复动作，用户可在上报关闭时手动执行。但它仍要求：
-    /// - 本地账本可用；
-    /// - 配置就绪且携带 full-sync 协议段（reporting.json 的 fullSync）；
-    /// - baseURL 合法且 hostname 与配置权威一致（绝不 fallback Host.current）；
-    /// - 与 scan/report 三方互斥、无在途任务。
-    ///
-    /// 严格链路：hostname 校验 → generation baseline → token identity → remote reserve →
-    /// 同 generation ledger snapshot → remote complete → ledger atomic commit → finalize。
-    /// 远端已 committed 但本地 ledger commit 尚未完成时崩溃/重启：下次 reserve 会复用持久化
-    /// fence，completeUpload 命中幂等 committed 分支（零网络）并重跑 ledger commit + finalize。
-    /// 任一围栏（generation / row-set / identity）失败都 fail-closed：不清 state、不清 gate。
-    func runFullSync() {
-        // 三方互斥 + 防重入。
-        guard scanTask == nil, reportTask == nil, fullSyncTask == nil, let ledger else { return }
-        // rebuild pending 期间绝不 performFullSync（不发任何网络请求）：先完整重扫全部来源。
-        if isRebuildCompletionPending() {
-            updateStatus { status in
-                status.fullSyncState = .blocked
-                status.fullSyncBlockReasons = self.decorateWithLastResult(["本地重建未完成，需先完成完整扫描"])
-            }
-            return
-        }
-        refreshConfigurationAuthority()
-
-        // 统一 readiness 守门：缺配置 / 未 ready / 地址无效 / 缺 full-sync 协议段，一律保持 .blocked，
-        // 绝不置 .failed（缺配置属默认验收态，不是一次失败）。仅在满足全部条件后才进入 .running。
-        let (readiness, reasons) = Self.fullSyncReadiness(
-            reporter: reporter,
-            configurationURL: configurationURL,
-            status: statusSubject.value,
-            ledger: ledger
-        )
-        guard readiness == .ready else {
-            updateStatus { status in
-                status.fullSyncState = .blocked
-                status.fullSyncBlockReasons = self.decorateWithLastResult(reasons)
-            }
-            return
-        }
-
-        // readiness 已确保下列解析全部成功；仍以 guard 兜底，失败回落 .blocked。
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
-        guard !authority.hostname.isEmpty,
-              let baseURL = URL(string: statusSubject.value.ingestBaseURL),
-              TokenUsageReporter.isValidBaseURL(baseURL),
-              let configuration = try? TokenUsageReporter.loadConfiguration(from: configurationURL),
-              configuration.isFullSyncReady,
-              configuration.fullSyncConfiguration(baseURL: baseURL, hostname: authority.hostname) != nil else {
-            updateStatus { status in
-                status.fullSyncState = .blocked
-                status.fullSyncBlockReasons = self.decorateWithLastResult(["全量同步需要完整且可恢复的远端协议配置"])
-            }
-            return
-        }
-        let authorityHost = authority.hostname
-        // The worker resolves the actual target off-main: an older hostname with
-        // reconciliation debt takes priority over the current authority hostname.
-        updateStatus { status in
-            status.fullSyncState = .running
-            status.fullSyncBlockReasons = []
-        }
-
-        fullSyncGeneration &+= 1
-        let generation = fullSyncGeneration
-        fullSyncTask = Task { [weak self] in
-            let result = await Self.performFullSync(
-                ledger: ledger,
-                authorityHost: authorityHost,
-                baseURL: baseURL,
-                configuration: configuration
-            )
-            self?.finishFullSync(generation: generation, result: result)
-        }
-    }
-
-    /// 全量同步结果。均携带本次使用的 hostname，使完成回调用**同一** hostname 刷新账本派生态，
-    /// 避免期间 canonicalHostname 变化导致刷错口径。
-    private enum FullSyncOutcome {
-        /// 远端 committed 且账本已原子 commit（含幂等重放场景）。
-        case committed(hostname: String)
-        /// 无待同步行：账本快照为空且无对账 gate（已全部对齐），视作成功完成。
-        case nothingToSync(hostname: String)
-        /// 围栏失败（generation / row-set / identity）：fail-closed，未清 state/gate。
-        case fenced(hostname: String, reason: String)
-        /// 运行前置条件在离主线程核验时不满足。
-        case blocked(hostname: String, reason: String)
-        /// 取消。
-        case cancelled
-        /// 其他错误（脱敏文案）。
-        case failure(hostname: String, text: String)
-    }
-
-    /// 全量同步的后台执行：所有阻塞式 SQLite（快照/commit/finalize）都经 runOffMain 在专用队列执行，
-    /// 绝不在 MainActor 或 Swift cooperative 执行器上直接跑 SQLite；网络 I/O 在 URLSession。
-    /// 不触及 UI；结果经 finishFullSync 回主线程落状态。
-    nonisolated private static func performFullSync(
-        ledger: UsageLedgerStore,
-        authorityHost: String,
-        baseURL: URL,
-        configuration: TokenReportingConfiguration
-    ) async -> FullSyncOutcome {
-        var outcomeHostname = authorityHost
-        do {
-            // 1) SQLite target selection and hostname gate run off-main. A debt
-            // host is allowed to differ from the current authority host because
-            // it must receive an empty full sync to delete its stale remote rows.
-            // Without debt, the current authority host must match the ledger.
-            let target = try await runOffMain { gate -> (hostname: String, isDebtHost: Bool, state: UsageHostnameState) in
-                try gate.throwIfCancelled()
-                let debtHosts = try ledger.pendingReconciliationHosts()
-                let hostname = debtHosts.first ?? authorityHost
-                return (hostname, debtHosts.contains(hostname), try ledger.hostnameState(current: hostname))
-            }.get()
-            let hostname = target.hostname
-            outcomeHostname = hostname
-            if !target.isDebtHost, case .match = target.state {
-                // Current authority host is aligned.
-            } else if target.isDebtHost {
-                // The per-host debt itself authorizes cleanup of this old host.
-            } else {
-                return .blocked(
-                    hostname: hostname,
-                    reason: "本机标识与配置权威不一致，请先完成采集对齐"
-                )
-            }
-            try Task.checkCancellation()
-
-            guard let fullSyncConfig = configuration.fullSyncConfiguration(
-                baseURL: baseURL, hostname: hostname
-            ) else {
-                return .blocked(hostname: hostname, reason: "全量同步配置未就绪")
-            }
-
-            // 2) reserve 前固定账本 generation；后续 snapshot 必须读取同一 generation。
-            let generationBaseline = try await runOffMain { gate in
-                try gate.throwIfCancelled()
-                return try ledger.fullSyncGenerationBaseline()
-            }.get()
-            try Task.checkCancellation()
-
-            // 2.5) Preflight：在预取 token、reserve fence 或任何网络/状态副作用之前，
-            // 先按同一 baseline 读一份只读快照，做与增量链路完全一致的 wire 规范化
-            // （canonical hostname + 字段字节截断）与全量自然键碰撞校验。这一步是纯函数、
-            // 零副作用：
-            //   - 自然键碰撞 → 直接 fenced 返回，绝不 reserve、绝不取 token、绝不触网；
-            //   - generation 漂移（staleGeneration）→ 同样在任何副作用前提前返回。
-            // 通过后再进入 reserve → 按同一 baseline 重读 → completeUpload 流程，两次读取
-            // 用的 expectedGeneration 与传给 reserve 的 generationBaseline 一致，故
-            // reservation 的 generation fence 仍然成立。
-            let preflightSnapshot: UsageFullSyncSnapshot
-            do {
-                preflightSnapshot = try await runOffMain { gate in
-                    try gate.throwIfCancelled()
-                    return try ledger.fullSyncSnapshot(
-                        hostname: hostname,
-                        expectedGeneration: generationBaseline
-                    )
-                }.get()
-            } catch let snapshotError as UsageFullSyncSnapshotError {
-                switch snapshotError {
-                case .staleGeneration:
-                    return .fenced(hostname: hostname, reason: "本地数据已变化，请重新采集后再全量同步")
-                case .localDerivationPending:
-                    return .fenced(hostname: hostname, reason: "本地采集尚未完成，请完成扫描后再全量同步")
-                }
-            }
-            try Task.checkCancellation()
-            // 与后续 begin/stage/commit 相同的“空快照不可直接 no-op”判定：仅当既空且无
-            // 对账 gate 时才是真正无事可做，此时在任何 token/网络前直接返回。
-            if preflightSnapshot.isEmpty, preflightSnapshot.reconciliationReason == nil {
-                return .nothingToSync(hostname: hostname)
-            }
-            do {
-                _ = try UsageFullSyncSnapshotMapper.normalizedPayloadSnapshot(
-                    from: preflightSnapshot, hostname: hostname
-                )
-            } catch let ingestError as IngestClientError {
-                if case .duplicateNaturalKey = ingestError {
-                    // 整份快照存在自然键碰撞：与增量链路一致地拒绝，且发生在 token/网络/状态
-                    // 之前，故本次全量同步零副作用。
-                    return .fenced(hostname: hostname, reason: "本地数据存在重复自然键，请重新采集后再全量同步")
-                }
-                return .failure(hostname: hostname, text: fullSyncErrorText(ingestError))
-            }
-            try Task.checkCancellation()
-
-           // 3) 组装配置驱动的可恢复上传核心，并预取一次稳定账号身份。reserve 与
-           // completeUpload 始终复用这一 pinned identity。
-           // baseURL is passed so the identity endpoint resolves the account
-           // namespace over the same origin the full-sync requests target.
-           let tokenSupplier = CommandFullSyncTokenSupplier(
-               configuration: configuration, baseURL: baseURL
-           )
-            let reporter = FullSyncReporter(
-                configuration: fullSyncConfig,
-                sender: URLSessionFullSyncRequestSender(),
-                tokenSupplier: tokenSupplier
-            )
-            let authIdentity = try await tokenSupplier.prefetchIdentity()
-            try Task.checkCancellation()
-
-            // 4) 先向远端预留 fence，并原子持久化 reserved state。崩溃恢复会按相同
-            // hostname + identity + generation baseline 复用该 fence，不重复 reserve。
-            let store = FullSyncStateStore(directory: try fullSyncStateDirectory(hostname: hostname))
-            do {
-                _ = try await reporter.reserve(
-                    hostname: hostname,
-                    authIdentity: authIdentity,
-                    generationBaseline: generationBaseline,
-                    store: store
-                )
-            } catch FullSyncError.rescanRequired {
-                // 已持久化 state 与当前 baseline 不一致，不能开始上传；清掉过期 reservation，
-                // 下次重试将重新 reserve。
-                try reporter.finalize(store: store)
-                return .fenced(hostname: hostname, reason: "本地数据已变化，请重新采集后再全量同步")
-            }
-            try Task.checkCancellation()
-
-            // 5) reserve 后按 baseline 在单事务内取完整快照。generation 漂移时 ledger 不返回
-            // 半快照；清理刚才的 reservation，且绝不调用 begin/stage/commit。
-            let snapshot: UsageFullSyncSnapshot
-            do {
-                snapshot = try await runOffMain { gate in
-                    try gate.throwIfCancelled()
-                    return try ledger.fullSyncSnapshot(
-                        hostname: hostname,
-                        expectedGeneration: generationBaseline
-                    )
-                }.get()
-            } catch let snapshotError as UsageFullSyncSnapshotError {
-                switch snapshotError {
-                case .staleGeneration:
-                    try reporter.finalize(store: store)
-                    return .fenced(hostname: hostname, reason: "本地数据已变化，请重新采集后再全量同步")
-                case .localDerivationPending:
-                    try reporter.finalize(store: store)
-                    return .fenced(hostname: hostname, reason: "本地采集尚未完成，请完成扫描后再全量同步")
-                }
-            }
-            // 关键：空快照不可直接 no-op。
-            // reconciliation gate 可能是因为“曾经已同步的行被本地重算删除、且本机现为 0 行”而置位
-            //（远端协议无 tombstone，删除不会自动传播）。此时若跳过协议，远端会永久残留旧行，
-            // 且本地 gate 永不清除、上报资格永久 fail-closed。
-            // 因此只有当快照为空**且**没有待对账原因（gate 未置位）时，才是真正的“无事可做”；
-            // 此时安全清理仅含 fence 的 reserved state，不发送 begin/commit。
-            // 否则即便快照为空，也必须继续走 begin→(0 行 stage)→commit，
-            // 让远端据整份（空）快照删除旧行并回执确认，随后本地 commitFullSync 清 gate、恢复资格。
-            if snapshot.isEmpty, snapshot.reconciliationReason == nil {
-                try reporter.finalize(store: store)
-                return .nothingToSync(hostname: hostname)
-            }
-            try Task.checkCancellation()
-
-            // 6) snapshot 与 reservation generation 完全绑定后，才允许 begin/stage/commit。
-            // 用与增量链路完全一致的共享 normalizer 规范化整份快照并复核自然键；此处快照与
-            // preflight 同一 generation，规范化结果逐字节相同，因此 fingerprint / staged
-            // bytes 与增量 wire 一致。理论上 preflight 已放行，这里再核一次以保证送入
-            // completeUpload 的正是规范化后的 payload（fail-closed，零副作用地清理 reservation）。
-            let payload: FullSyncPayloadSnapshot
-            do {
-                payload = try UsageFullSyncSnapshotMapper.normalizedPayloadSnapshot(
-                    from: snapshot, hostname: hostname
-                )
-            } catch let ingestError as IngestClientError {
-                try reporter.finalize(store: store)
-                if case .duplicateNaturalKey = ingestError {
-                    return .fenced(hostname: hostname, reason: "本地数据存在重复自然键，请重新采集后再全量同步")
-                }
-                return .failure(hostname: hostname, text: fullSyncErrorText(ingestError))
-            }
-            do {
-                _ = try await reporter.completeUpload(
-                    snapshot: payload,
-                    authIdentity: authIdentity,
-                    store: store
-                )
-            } catch FullSyncError.rescanRequired {
-                // 同 generation 下 payload 仍无法绑定，视作需要重扫；reporter 已 fail-closed，
-                // 这里确保任何过期 state 都被清理。
-                try reporter.finalize(store: store)
-                return .fenced(hostname: hostname, reason: "本地数据已变化，请重新采集后再全量同步")
-            }
-            try Task.checkCancellation()
-
-            // 7) 远端已确认整份快照 → 账本原子 commit（generation 围栏 + 逐行 revision 精确核对）。
-            //    严格顺序：先 remote committed，后 ledger commit。围栏失败=fail-closed，不清 state/gate。
-            //    SQLite→runOffMain。
-            let commitResult = try await runOffMain { _ in
-                try ledger.commitFullSync(UsageFullSyncCommit(snapshot: snapshot))
-            }.get()
-            guard commitResult.committed else {
-                // 账本围栏拒绝（快照期间被重算 / 行集变化）：保留远端已 committed 的 state，
-                // 不调用 finalize，使下次重试仍能命中幂等 committed 分支并重跑 ledger commit。
-                return .fenced(hostname: hostname, reason: commitResult.failureReason ?? "全量同步账本围栏拒绝")
-            }
-
-            // 8) 账本已持久记录成功 → 清理可恢复上传 state（remote-ack → ledger-commit 窗口已闭合）。
-            try reporter.finalize(store: store)
-            return .committed(hostname: hostname)
-        } catch is CancellationError {
-            return .cancelled
-        } catch {
-            return .failure(hostname: outcomeHostname, text: fullSyncErrorText(error))
-        }
-    }
-
-    /// 全量同步完成回调（主线程）：仅当前 generation 有效，避免 stop 后旧回调覆盖。
-    /// 取消在途全量同步：cancel + 递增 generation（旧回调过期）+ 状态从 .running 回落到当前 readiness。
-    /// 不清 state/gate，可恢复。无在途任务时仅确保状态不停留在 .running。
-    private func cancelInFlightFullSync() {
-        fullSyncTask?.cancel()
-        fullSyncTask = nil
-        fullSyncGeneration &+= 1
-        if statusSubject.value.fullSyncState == .running {
-            // 直接落到一个非 running 的中间态，随后 refreshFullSyncReadiness 精确定级。
-            updateStatus { $0.fullSyncState = .blocked }
-            refreshFullSyncReadiness()
-        }
-    }
-
-    /// 全量同步完成回调（主线程）：仅当前 generation 有效，避免 stop 后旧回调覆盖。
-    /// 关键：completed/failed 不永久粘滞——记录“上次结果”文案后，状态立即依据当前 readiness
-    /// 回落到 .ready/.blocked，使 UI 可立即重新/重试；账本派生态用**本次 hostname**离主线程刷新。
-    private func finishFullSync(generation: UInt64, result: FullSyncOutcome) {
-        guard generation == fullSyncGeneration else { return }
-        fullSyncTask = nil
-        switch result {
-        case let .committed(hostname), let .nothingToSync(hostname):
-            fullSyncLastResultNote = "上次全量同步已完成"
-            refreshLedgerDerivedStatus(hostname: hostname, generation: generation)
-        case let .fenced(hostname, reason):
-            fullSyncLastResultNote = "上次全量同步未完成：\(reason)"
-            refreshLedgerDerivedStatus(hostname: hostname, generation: generation)
-        case let .blocked(hostname, reason):
-            _ = hostname
-            fullSyncLastResultNote = nil
-            updateStatus { status in
-                status.fullSyncState = .blocked
-                status.fullSyncBlockReasons = [reason]
-            }
-        case let .failure(hostname, text):
-            fullSyncLastResultNote = "上次全量同步失败：\(text)"
-            refreshLedgerDerivedStatus(hostname: hostname, generation: generation)
-        case .cancelled:
-            // 取消：不写“上次结果”，状态直接由 readiness 决定。
-            refreshFullSyncReadiness()
-        }
-    }
-
-    /// 用**指定 hostname**离主线程刷新账本派生态（pending + 上报资格），随后回主线程落状态，
-    /// 并把全量同步状态从 .running 回落到当前 readiness（.ready/.blocked，附“上次结果”文案）。
-    /// generation 守门：期间若 stop()/新任务推进了 generation，则丢弃这次刷新，避免 running 粘滞或错刷。
-    private func refreshLedgerDerivedStatus(hostname: String, generation: UInt64) {
-        guard let ledger else {
-            refreshFullSyncReadiness()
-            return
-        }
-        Task { [weak self] in
-            let derived = await Self.runOffMain { _ -> (Bool, Int, Int) in
-                let eligible = (try? ledger.reportingEligible(hostname: hostname)) ?? true
-                let pending = (try? ledger.pendingCounts(hostname: hostname)) ?? (0, 0)
-                return (eligible, pending.0, pending.1)
-            }
-            guard let self else { return }
-            // 只处理当前 generation：stop() 或新一轮 full sync 会推进 generation。
-            guard generation == self.fullSyncGeneration else { return }
-            if case let .success((eligible, pendingBuckets, pendingSessions)) = derived {
-                self.updateStatus { status in
-                    status.reportingEligible = eligible
-                    status.pendingBuckets = pendingBuckets
-                    status.pendingSessions = pendingSessions
-                }
-            }
-            self.refreshFullSyncReadiness()
-        }
-    }
-
-    /// 计算全量同步 readiness 并落状态：只要不在 .running，就依据当前配置能力回到 .ready/.blocked，
-    /// 并附带“上次结果”文案。绝不停留在 .completed/.failed（否则按钮永久禁用，无法重新/重试）。
-    private func refreshFullSyncReadiness() {
-        // 运行中不打断。
-        if statusSubject.value.fullSyncState == .running { return }
-        let (state, reasons) = Self.fullSyncReadiness(
-            reporter: reporter,
-            configurationURL: configurationURL,
-            status: statusSubject.value,
-            ledger: ledger
-        )
-        updateStatus { status in
-            status.fullSyncState = state
-            status.fullSyncBlockReasons = self.decorateWithLastResult(reasons)
-        }
-    }
-
-    /// 把“上次全量同步结果”文案并入展示原因列表（置顶），使结果不粘滞在 .completed/.failed 的同时
-    /// 仍向用户可见。无历史结果时原样返回。
-    private func decorateWithLastResult(_ reasons: [String]) -> [String] {
-        guard let note = fullSyncLastResultNote else { return reasons }
-        return [note] + reasons
-    }
-
-    /// 依据配置 + baseURL + hostname + full-sync 协议段，判定全量同步是否 ready。
-    private static func fullSyncReadiness(
-        reporter: TokenUsageReporter,
-        configurationURL: URL,
-        status: TokenSyncStatus,
-        ledger: UsageLedgerStore?
-    ) -> (TokenFullSyncState, [String]) {
-        guard ledger != nil else { return (.blocked, ["本地长期账本尚未接入"]) }
-        let authority = configurationAuthority(reporter: reporter, url: configurationURL)
-        guard authority.status == .ready, !authority.hostname.isEmpty else {
-            return (.blocked, ["全量同步需要完整且可恢复的远端协议配置"])
-        }
-        guard let baseURL = URL(string: status.ingestBaseURL), TokenUsageReporter.isValidBaseURL(baseURL) else {
-            return (.blocked, ["API 地址无效，无法全量同步"])
-        }
-        guard let configuration = try? TokenUsageReporter.loadConfiguration(from: configurationURL),
-              configuration.isFullSyncReady,
-              configuration.fullSyncConfiguration(baseURL: baseURL, hostname: authority.hostname) != nil else {
-            return (.blocked, ["全量同步需要完整且可恢复的远端协议配置"])
-        }
-        return (.ready, [])
-    }
-
-    /// init 期 readiness 判定：此时尚无 TokenSyncStatus，直接以已解析的配置权威/地址判定，
-    /// 与 fullSyncReadiness 语义一致。
-    private static func initialFullSyncReadiness(
-        reporter: TokenUsageReporter,
-        configurationURL: URL,
-        ingestBaseURL: String,
-        authorityStatus: TokenReportingConfigurationStatus,
-        authorityHostname: String,
-        hasLedger: Bool
-    ) -> (TokenFullSyncState, [String]) {
-        guard hasLedger else { return (.blocked, ["本地长期账本尚未接入"]) }
-        guard authorityStatus == .ready, !authorityHostname.isEmpty else {
-            return (.blocked, ["全量同步需要完整且可恢复的远端协议配置"])
-        }
-        guard let baseURL = URL(string: ingestBaseURL), TokenUsageReporter.isValidBaseURL(baseURL) else {
-            return (.blocked, ["API 地址无效，无法全量同步"])
-        }
-        guard let configuration = try? TokenUsageReporter.loadConfiguration(from: configurationURL),
-              configuration.isFullSyncReady,
-              configuration.fullSyncConfiguration(baseURL: baseURL, hostname: authorityHostname) != nil else {
-            return (.blocked, ["全量同步需要完整且可恢复的远端协议配置"])
-        }
-        return (.ready, [])
-    }
-
-    /// 全量同步状态目录：AppSupport/AgentPulse/full-sync/<safe-name>-<sha256 短 hash>。
-    /// hostname 先做文件系统安全化，再拼接对**原始** hostname 的 SHA256 短 hash：安全化可能把
-    /// 不同 hostname 折叠成同一 safe-name（如 "a/b" 与 "a_b"），附加原始 hash 可保证不同 hostname
-    /// 永不共享同一状态目录，避免跨 host 的 full-sync 状态互相污染。
-    nonisolated private static func fullSyncStateDirectory(hostname: String) throws -> URL {
-        let base = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
-        )
-        return base
-            .appending(path: "AgentPulse", directoryHint: .isDirectory)
-            .appending(path: "full-sync", directoryHint: .isDirectory)
-            .appending(path: stateDirectoryComponent(hostname), directoryHint: .isDirectory)
-    }
-
-    /// 稳定的单一安全路径分量：<safe-name>-<sha256 前 16 hex>。safe-name 供人读，短 hash 防碰撞。
-    nonisolated private static func stateDirectoryComponent(_ hostname: String) -> String {
-        "\(sanitizedHostname(hostname))-\(stableShortHash(hostname))"
-    }
-
-    /// 把 hostname 映射为单一安全路径分量：仅保留字母数字/点/连字符/下划线，其余替换为下划线；
-    /// 空结果回落到确定性占位，绝不产生空分量或路径穿越。
-    nonisolated private static func sanitizedHostname(_ hostname: String) -> String {
-        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-        var mapped = String(hostname.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" })
-        // 防御性：去掉纯点分量（"." / ".."）与前导点导致的隐藏/穿越语义。
-        while mapped.hasPrefix(".") { mapped.removeFirst() }
-        if mapped.isEmpty || mapped.allSatisfy({ $0 == "." }) { mapped = "host" }
-        return mapped
-    }
-
-    /// 原始 hostname 的稳定 SHA256 短 hash（前 16 位小写 hex）。确定性、跨进程一致，用于防碰撞。
-    nonisolated private static func stableShortHash(_ value: String) -> String {
-        let digest = SHA256.hash(data: Data(value.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined().prefix(16).description
-    }
-
-    /// 全量同步错误脱敏文案：覆盖核心围栏/传输/身份错误与账本围栏，绝不泄露凭证或原始响应体。
-    nonisolated private static func fullSyncErrorText(_ error: Error) -> String {
-        switch error {
-        case FullSyncError.configurationMissing:
-            return "全量同步配置不完整"
-        case FullSyncError.invalidURL:
-            return "API 地址无效"
-        case FullSyncError.authIdentityMissing, FullSyncError.authIdentityUnverifiable:
-            return "无法验证凭证账号，全量同步已被阻止"
-        case FullSyncError.authIdentityChanged:
-            return "凭证账号不一致，全量同步已被阻止"
-        case FullSyncError.notAuthenticated:
-            return "凭证无效或已过期"
-       case FullSyncError.rescanRequired:
-           return "本地数据已变化，请重新采集后再全量同步"
-        case FullSyncError.stateInvalidated:
-            return "远端已作废本次全量同步，请重新采集后再试"
-        case FullSyncError.rejoinRequired:
-            return "凭证或会话已失效，请重新登录后再全量同步"
-        case FullSyncError.unsupported:
-            return "远端暂不支持全量同步"
-        case FullSyncError.payloadTooLarge:
-            return "单块数据超过大小上限，无法全量同步"
-        case FullSyncError.chunkDigestMismatch:
-            return "本地暂存数据校验失败，请重试全量同步"
-        case FullSyncError.acknowledgementCountMismatch:
-            return "远端确认计数不一致，全量同步未完成"
-        case let FullSyncError.httpFailure(statusCode):
-            return "全量同步失败（HTTP \(statusCode)）"
-        case FullSyncError.transportFailure:
-            return "网络传输失败，请稍后重试"
-        case FullSyncError.malformedResponse:
-            return "全量同步响应无法解析"
-        case FullSyncError.corruptState:
-            return "本地全量同步状态损坏，请重试"
-        case let FullSyncError.invalidFenceRevision(revision):
-            return "远端围栏版本无效（\(revision)）"
-        default:
-            return errorText(error)
-        }
-    }
-
     /// 应用启动：触发首轮 scan（本地采集开启时）并按需串接上报；
     /// 若上报已启用则同时启动 30 分钟循环。多次调用幂等。
     func start() {
         guard !isRunning else { return }
         isRunning = true
-        // 启动即刷新配置权威与全量同步 readiness，使 UI 一开始就反映真实能力。
+        // 启动即刷新配置权威，使 UI 一开始就反映真实能力。
         refreshConfigurationAuthority()
         // 崩溃安全恢复的最高优先级：存在 rebuild pending（上次已 reset 清库但未确认全部来源
-        // 重扫成功）时，绝不能 resumeFullSync / performFullSync / 普通 report（即不发任何网络
-        // 请求）。必须先完整重扫全部 configured roots；仅当所有来源无致命失败、pending 被显式
-        // 清除后，finishScan 才恢复正常启动链路（恢复全量同步 / 上报）。
-        // 空库 + 债务 + pending 场景同样先重扫，不因存在 full-sync 债务而先行恢复上报。
+        // 重扫成功）时，绝不发任何网络请求（普通 report）。必须先完整重扫全部 configured roots；
+        // 仅当所有来源无致命失败、pending 被显式清除后，finishScan 才恢复正常启动链路（上报）。
         if isRebuildCompletionPending() {
             rebuildRecoveryPending = true
             if statusSubject.value.localCollectionEnabled {
@@ -1124,12 +562,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             }
             // 采集关闭时无法自动重扫：保持 pending，等待用户开启本地采集或手动扫描，
             // 期间仍禁止一切网络动作。不启动自动上报循环。
-            return
-        }
-        // 必须先恢复可恢复的 full-sync state，再启动新的扫描。若远端已经 committed、
-        // 本地 ledger commit 尚未完成，先扫描可能推进 generation，使恢复被永久围栏。
-        if resumeFullSyncIfPending() {
-            startAutoLoopIfNeeded()
             return
         }
         if statusSubject.value.localCollectionEnabled {
@@ -1151,79 +583,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     /// rebuild pending 期间完成一次全量重扫后：清除恢复标记并驱动正常启动链路
-    /// （恢复可续的全量同步，否则按开关扫描/上报），最后按需启动自动上报循环。
+    /// （按开关扫描/上报），最后按需启动自动上报循环。
     private func resumeStartupAfterRebuildRecovery() {
         rebuildRecoveryPending = false
         guard isRunning else { return }
-        if resumeFullSyncIfPending() {
-            startAutoLoopIfNeeded()
-            return
-        }
         if statusSubject.value.reportingEnabled {
             reportNow()
         }
         startAutoLoopIfNeeded()
-    }
-
-    /// 启动恢复：枚举“存在待恢复全量同步工作”的 hostname，据 readiness 分流恢复。
-    ///
-    /// 关键（P1 修复）：hostname 变更后，remote finalize 已完成但本地 ledger commit 尚未落地时
-    /// 崩溃，可恢复的 state 落在**旧 host** 的状态目录，且账本对该旧 host 记着 reconciliation 债务。
-    /// 若只看当前配置/本地 hostname，旧 host 的 state 永远发现不了：reconciliation gate 会持续
-    /// 全局 fail-closed 阻断增量上报，直到用户手动再次触发全量同步。因此这里必须枚举
-    /// pendingReconciliationHosts() 得到的债务 host（连同当前有效 hostname），逐个检查其状态目录，
-    /// 只要**任一** host 存在持久化 state 或对账债务，就认定有待恢复工作。
-    ///
-    /// 分流：
-    /// - readiness 就绪：触发 runFullSync（其 worker 会优先选择债务 host、命中已有 state 时对
-    ///   remote-committed 场景零网络重放），完成本地 ledger commit + finalize，闭合
-    ///   remote-ack → ledger-commit 窗口，并清除旧 host 的对账债务；
-    /// - 配置缺失/未就绪：无法安全恢复，给出“待恢复”提示（不改动 state/gate，等配置补齐后再来）。
-    @discardableResult
-    private func resumeFullSyncIfPending() -> Bool {
-        // 已有在途任务或非法前置，跳过。
-        guard fullSyncTask == nil, scanTask == nil, reportTask == nil, let ledger else { return false }
-        // rebuild / raw-derivation pending 期间绝不恢复/发起全量同步：先完整重扫全部来源、
-        // 成功 finalize 并清除全部 pending 后才允许任何网络动作。
-        if isRebuildCompletionPending() { return false }
-
-        // 候选 host 集合 = 账本对账债务 host ∪ 当前有效 hostname（配置权威优先，其次用户保存值）。
-        // 债务 host 可能与当前 hostname 不同（改名后的旧 host），绝不能只看当前配置。
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
-        let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
-        let currentHostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
-        let debtHosts = (try? ledger.pendingReconciliationHosts()) ?? []
-
-        var candidates: [String] = debtHosts
-        if !currentHostname.isEmpty, !candidates.contains(currentHostname) {
-            candidates.append(currentHostname)
-        }
-
-        // 是否存在待恢复工作：任一候选 host 有持久化 state（可续传）或有对账债务（需空全量同步清远端残留）。
-        let hasResumableState = candidates.contains { host in
-            guard let directory = try? Self.fullSyncStateDirectory(hostname: host) else { return false }
-            return FullSyncStateStore(directory: directory).hasState()
-        }
-        let hasPending = hasResumableState || !debtHosts.isEmpty
-        guard hasPending else { return false }
-
-        // 有待恢复工作：按当前 readiness 分流。
-        let (readiness, _) = Self.fullSyncReadiness(
-            reporter: reporter,
-            configurationURL: configurationURL,
-            status: statusSubject.value,
-            ledger: ledger
-        )
-        if readiness == .ready {
-            // runFullSync 的 worker 会 pendingReconciliationHosts().first 优先恢复旧 host，
-            // 对已有 state 命中幂等 committed 分支（零网络），并重跑 ledger commit + finalize。
-            runFullSync()
-        } else {
-            // 配置未就绪：无法安全恢复，明确提示待恢复，等待用户补齐配置。
-            fullSyncLastResultNote = "检测到未完成的全量同步，配置就绪后可自动恢复（待恢复）"
-            refreshFullSyncReadiness()
-        }
-        return true
     }
 
     /// 停止：取消 auto loop + 扫描 + 上报任务，并递增 generation
@@ -1241,15 +608,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         reportTask?.cancel()
         reportTask = nil
         reportGeneration &+= 1
-        // 取消在途全量同步：递增 generation 使旧回调过期，不清 state/gate（可恢复），
-        // 且状态不得停留在 .running——回落到当前 readiness（.ready/.blocked，附上次结果文案）。
-        fullSyncTask?.cancel()
-        fullSyncTask = nil
-        fullSyncGeneration &+= 1
-        if statusSubject.value.fullSyncState == .running {
-            updateStatus { $0.fullSyncState = .blocked }
-            refreshFullSyncReadiness()
-        }
     }
 
     /// 触发扫描并在扫描完成后按当前上报开关串接一次上报（scan 已在跑则直接尝试上报）。
@@ -1340,8 +698,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             autoLoopTask?.cancel()
             autoLoopTask = nil
         }
-        // 配置/地址/hostname 变化会影响全量同步能力：动态刷新 readiness。
-        refreshFullSyncReadiness()
     }
 
     // MARK: - Helpers
