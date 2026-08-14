@@ -293,21 +293,19 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             return
         }
 
-        // 配置就绪时必须与账本 hostname 对齐：mismatch 不再静默自动改名，改为弹窗征询用户；
-        // unset 时首次落库即对齐。
-        let configReady = authority.status == .ready && !authority.hostname.isEmpty
-        if configReady {
-            // 在主线程读取账本 hostname 状态（serial queue，非主队列，可安全调用）。
-            if case let .mismatch(stored) = (try? ledger.hostnameState(current: hostname)) ?? .unset {
-                // 已有弹窗等待决策时不重复弹，避免每轮扫描重复打扰；本轮不扫描，待用户决策后再触发。
-                guard !pendingHostnamePrompt else {
-                    updateStatus { $0.scanningInProgress = false }
-                    return
-                }
-                presentHostnameMismatch(old: stored, new: hostname)
+        // 有效 hostname（权威或本地设备标识，此处已保证非空）与账本旧 canonical 不一致时，
+        // 弹确认框征询用户，不再静默自动改名；unset 时首次落库即对齐。
+        // 触发只依赖 effectiveHostname，不挂 configReady——否则没配 reporting.json、只改本地
+        // 设备标识的用户（权威缺失）永远进不到弹窗分支。
+        if case let .mismatch(stored) = (try? ledger.hostnameState(current: hostname)) ?? .unset {
+            // 已有弹窗等待决策时不重复弹，避免每轮扫描重复打扰；本轮不扫描，待用户决策后再触发。
+            guard !pendingHostnamePrompt else {
                 updateStatus { $0.scanningInProgress = false }
                 return
             }
+            presentHostnameMismatch(old: stored, new: hostname)
+            updateStatus { $0.scanningInProgress = false }
+            return
         }
         updateStatus { $0.scanningInProgress = true }
 
