@@ -23,17 +23,32 @@ public struct CodexSessionMeta: Sendable, Equatable {
     public let cwd: String?
     /// 采集来源判定用（session_meta.payload.originator），如 "Codex Desktop"。
     public let originator: String?
+    /// 顶层判定辅助字段：payload.source 是否为标量入口来源（如 "exec"/"vscode"/"cli"）。
+    /// 新版 Codex Desktop 顶层会话的 thread_source 也可能是 "subagent"，此时只能靠 source 区分：
+    /// source 为字符串 → 顶层入口；source 为对象（含 subagent.thread_spawn）→ 派生子 agent。
+    /// 只保存派生布尔，不保存 source 对象里的 parent_thread_id / agent_path 等正文。
+    public let sourceIsScalarEntry: Bool
 
-    public init(sessionID: String, threadSource: String?, cwd: String?, originator: String?) {
+    public init(
+        sessionID: String,
+        threadSource: String?,
+        cwd: String?,
+        originator: String?,
+        sourceIsScalarEntry: Bool = false
+    ) {
         self.sessionID = sessionID
         self.threadSource = threadSource
         self.cwd = cwd
         self.originator = originator
+        self.sourceIsScalarEntry = sourceIsScalarEntry
     }
 
-    /// 顶层任务：thread_source 恰为 "user"。子 agent 会话为 "subagent"，必须排除。
+    /// 顶层任务判定，兼容新旧两种 session_meta 格式：
+    /// - 旧版：thread_source == "user" 即顶层，"subagent" 为子 agent。
+    /// - 新版：顶层会话的 thread_source 可能被标为 "subagent"，此时若 source 是标量入口来源
+    ///   （字符串）则仍为顶层；只有 source 为结构化对象（派生子 agent）时才排除。
     public var isTopLevel: Bool {
-        threadSource == "user"
+        threadSource == "user" || sourceIsScalarEntry
     }
 }
 
@@ -88,11 +103,18 @@ public enum CodexSessionParser {
         guard let sessionID, !sessionID.isEmpty else {
             return nil
         }
+        // payload.source 区分顶层入口与派生子 agent：字符串（"exec"/"vscode"/"cli" 等）为标量入口来源；
+        // 对象（如 {"subagent":{"thread_spawn":{...}}}）为派生子 agent；缺失则退回仅靠 thread_source 判定。
+        let sourceIsScalarEntry: Bool = {
+            guard let source = payload["source"] as? String else { return false }
+            return !source.isEmpty
+        }()
         return CodexSessionMeta(
             sessionID: sessionID,
             threadSource: payload["thread_source"] as? String,
             cwd: payload["cwd"] as? String,
-            originator: payload["originator"] as? String
+            originator: payload["originator"] as? String,
+            sourceIsScalarEntry: sourceIsScalarEntry
         )
     }
 
