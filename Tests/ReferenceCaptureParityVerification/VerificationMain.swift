@@ -2,8 +2,8 @@ import AgentPulseReporting
 import Foundation
 
 // Byte-level parity check between the Agent Pulse ingest encoder and a real
-// reference `/api/usage/ingest` request body captured from the running
-// reference CLI (version 1.3.299). The captured body is decoded, re-projected
+// reference `/api/usage/ingest` request body captured from a running external
+// reference CLI. The captured body is decoded, re-projected
 // into Agent Pulse payload structs, and re-encoded with the production
 // `UsageIngestEncoder`. We then assert, reading the *actual encoder output
 // bytes* (not an unordered dictionary), that:
@@ -16,12 +16,12 @@ import Foundation
 //
 // The captured fixtures are NOT checked into the repo (they carry local project
 // basenames and session hashes). Point the driver at them via
-// AGENT_PULSE_KABOO_CAPTURE_DIR; without it the driver self-tests against a
+// AGENT_PULSE_INGEST_CAPTURE_DIR; without it the driver self-tests against a
 // synthetic reference body so the target still builds and passes in CI.
 //
-// Run: AGENT_PULSE_KABOO_CAPTURE_DIR=/tmp/ingest-capture swift run KabooCaptureParityVerification
+// Run: AGENT_PULSE_INGEST_CAPTURE_DIR=/tmp/ingest-capture swift run ReferenceCaptureParityVerification
 @main
-struct KabooCaptureParityVerification {
+struct ReferenceCaptureParityVerification {
     enum VError: Error, CustomStringConvertible {
         case failed(String)
         var description: String { if case let .failed(m) = self { return m }; return "failed" }
@@ -53,7 +53,7 @@ struct KabooCaptureParityVerification {
             try compareArray(kind: "autonomy", ref: ref["autonomySessions"], ap: ap["autonomySessions"],
                              apOrders: apAutonomyOrders, label: name, counter: &checkedAutonomy)
         }
-        print("KabooCaptureParity: PASS — buckets=\(checkedBuckets) sessions=\(checkedSessions) autonomy=\(checkedAutonomy) across \(bodies.count) captured bodies")
+        print("ReferenceCaptureParity: PASS — buckets=\(checkedBuckets) sessions=\(checkedSessions) autonomy=\(checkedAutonomy) across \(bodies.count) captured bodies")
     }
 
     static func compareArray(kind: String, ref: Any?, ap: Any?,
@@ -290,7 +290,7 @@ struct KabooCaptureParityVerification {
 
     // MARK: - Fixture loading
     static func loadReferenceBodies() throws -> [(String, Data)] {
-        if let dir = ProcessInfo.processInfo.environment["AGENT_PULSE_KABOO_CAPTURE_DIR"] {
+        if let dir = ProcessInfo.processInfo.environment["AGENT_PULSE_INGEST_CAPTURE_DIR"] {
             let fm = FileManager.default
             let files = (try? fm.contentsOfDirectory(atPath: dir)) ?? []
             let bodies = files.filter { $0.hasSuffix(".body.json") }.sorted()
