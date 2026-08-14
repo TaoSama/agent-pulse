@@ -25,13 +25,20 @@ enum TokenWindowVirtualBuckets {
         return result
     }
 
-    /// 日窗口：保持真实总数 / 缓存，仅补上真实的按模型明细。
+    /// 日窗口：真实总数不变，补上真实的按模型明细，并统一缓存条口径——
+    /// 缓存 = 真实 cache read，新增 = 总数 − 缓存（含 output / cache creation），使缓存 + 新增 == 总数，
+    /// 与周 / 月 / 全部展示一致；命中率 = 缓存 / 总数。不改账本原始分量语义。
     private static func withRealModels(
         _ original: TokenUsageWindowSummary?,
         models: [UsageModelTokenSummary]
     ) -> TokenUsageWindowSummary? {
         guard var summary = original else { return nil }
         summary.perModel = models.map { TokenModelUsage(model: $0.model, totalTokens: $0.counts.total) }
+        let total = summary.totalTokens
+        let cached = max(0, min(total, summary.cachedTokens))
+        summary.cachedTokens = cached
+        summary.newTokens = total - cached
+        summary.cacheHitRate = total > 0 ? Double(cached) / Double(total) : nil
         return summary
     }
 
