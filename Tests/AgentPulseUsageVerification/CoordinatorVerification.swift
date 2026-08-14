@@ -17,7 +17,25 @@ enum CoordinatorVerification {
         try verifyStopCancelsEveryOperation(source)
         try verifyRebuildPendingBlocksNetworkUntilFullScan(source)
         try verifyFullScanEvidenceGatesRebuildCompletion(source)
+        try verifyHostnameMismatchPromptNotGatedByAuthority(source)
         print("TokenSyncCoordinator verification passed")
+    }
+
+    /// 设备标识改名弹窗必须只依赖 effectiveHostname（权威或本地），不得挂在 configReady/
+    /// authority 上——否则没配 reporting.json、只改本地设备标识的用户永远进不到弹窗分支。
+    private static func verifyHostnameMismatchPromptNotGatedByAuthority(_ source: String) throws {
+        let scanBody = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
+        // mismatch 判定与弹窗触发必须存在。
+        let mismatchOffset = try offset(of: "case let .mismatch(stored) = (try? ledger.hostnameState(current: hostname))", in: scanBody)
+        try require(scanBody.contains("presentHostnameMismatch(old: stored, new: hostname)"), "scanNow 未在 mismatch 时触发确认弹窗")
+        // configReady 不得再作为 mismatch 弹窗的门禁（若仍存在 configReady，必须不在弹窗触发之前把它作为条件）。
+        try require(
+            !scanBody.contains("let configReady ="),
+            "mismatch 弹窗仍被 configReady 门禁：本地设备标识路径将无法触发弹窗"
+        )
+        // hostname 非空 guard 必须在 mismatch 判定之前（保证 effectiveHostname 口径已生效）。
+        let hostnameGuardOffset = try offset(of: "guard !hostname.isEmpty else {", in: scanBody)
+        try require(hostnameGuardOffset < mismatchOffset, "mismatch 判定必须在 effectiveHostname 非空 guard 之后")
     }
 
     private static func verifyLegacyHostnameRecoveryPrecedence(_ source: String) throws {
