@@ -290,12 +290,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     /// 只写原始 token 事件（网络主动拉取的来源，如 cliproxy），并写一条合成 checkpoint。
     ///
-    /// 网络来源没有真实「文件偏移 / mtime」语义，但仍须写一条 usage_files 行，原因有二：
+    /// 网络来源不是「文件」：每个事件自带稳定的 per-event sourceFileHash（幂等键的一部分），
+    /// 不存在单一 fileID 的原子替换语义，因此不走 record() 的文件级 replace 路径，只做
+    /// 基于 (source_file_hash, event_id) 的幂等 upsert。仍写一条合成 checkpoint，原因有二：
     /// 1) requiresParserRebuild 把「有数据却无任何 checkpoint」判为需重建；纯网络来源账本
     ///    若不写 checkpoint 会每轮被 resetForRebuild 清空。
-    /// 2) checkpoint 的 parser_version 固定取一个足够大的稳定值，确保永远不小于当前本地
-    ///    JSONL 解析器版本，不会误触 parser 升级重建。
-    /// 归属到合成 fileID 并按文件级替换（先删该 fileID 旧行再插），幂等依赖稳定 event_id。
+    /// 2) checkpoint 的 parser_version 取一个足够大的稳定值，保证不小于任何本地 JSONL 解析器
+    ///    版本，从而永不触发 parser 升级重建。
     /// 扫描结束后仍须调用 finalizeDerived(hostname:)。
     public func recordNetworkEvents(_ events: [UsageEvent], source: String, hostname: String) throws {
         guard !events.isEmpty else { return }
@@ -312,8 +313,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
         )
         try queue.sync {
             try transaction {
-                try validateAttribution(events: events, sessionEvents: [], editEntries: [], fileID: fileID)
-                try deleteRawForFileUnlocked(fileID: fileID)
                 try insertRawEvents(events, fileID: fileID)
                 try writeCheckpoint(checkpoint)
                 if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
