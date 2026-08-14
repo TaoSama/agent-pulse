@@ -21,8 +21,8 @@ struct AgentPulseSettingsView: View {
         .frame(minWidth: 580, minHeight: 540)
     }
 
-    /// 窗口底色：略带蓝灰的深色，使卡片浮起、分区清晰，而非纯黑平铺。
-    private static let windowBackground = Color(red: 0.12, green: 0.12, blue: 0.14)
+    /// 窗口底色：中性灰，与菜单栏展开面板"灰底 + 纯黑卡"的对比关系一致，使纯黑卡浮起。
+    private static let windowBackground = Color(red: 0.22, green: 0.22, blue: 0.23)
 
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
@@ -134,11 +134,7 @@ enum SettingsStatusTone {
     }
 }
 
-/// 卡片底色：带灰度的深色而非纯黑，从略浅顶部到略深底部的细微渐变，制造浮起层次。
-private let settingsCardTopColor = Color(red: 0.17, green: 0.17, blue: 0.20)
-private let settingsCardBottomColor = Color(red: 0.13, green: 0.13, blue: 0.16)
-
-/// 深色卡片容器：标题 + 内容，与菜单面板同一视觉语言。
+/// 深色卡片容器：标题 + 内容，与菜单面板同一视觉语言（纯黑卡 + 细描边）。
 struct SettingsCard<Content: View>: View {
     let title: String
     let systemImage: String
@@ -155,19 +151,12 @@ struct SettingsCard<Content: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [settingsCardTopColor, settingsCardBottomColor],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
+                .fill(Color.black)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                .stroke(Color.white.opacity(0.1), lineWidth: 1)
         )
-        .shadow(color: Color.black.opacity(0.35), radius: 8, x: 0, y: 3)
     }
 }
 
@@ -218,11 +207,11 @@ struct SettingsField: View {
             .padding(.vertical, 7)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.black.opacity(0.28))
+                    .fill(Color.white.opacity(0.08))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
             )
             .accessibilityLabel(accessibilityLabel ?? title)
         }
@@ -254,19 +243,19 @@ struct SettingsToggleRow: View {
     }
 }
 
-/// 显眼开关：加大的胶囊轨道 + 白色滑块，内嵌「已开启 / 已关闭」文字，
-/// 开态用绿色高亮、关态用暗灰，状态一眼可辨。整块可点，替代不明显的系统 .switch。
+/// 开关：常规尺寸胶囊轨道 + 白色滑块，开态绿色高亮、关态暗灰，状态一眼可辨。
+/// 整块可点，替代不够显眼的系统 .switch。
 struct LoudToggle: View {
     @Binding var isOn: Bool
     var disabled: Bool = false
 
-    private static let width: CGFloat = 92
-    private static let height: CGFloat = 28
-    private static let knob: CGFloat = 22
+    private static let width: CGFloat = 44
+    private static let height: CGFloat = 26
+    private static let knob: CGFloat = 20
 
     private var trackColor: Color {
         if disabled { return Color.white.opacity(0.1) }
-        return isOn ? SettingsStatusTone.positive.color : Color.white.opacity(0.16)
+        return isOn ? SettingsStatusTone.positive.color : Color.white.opacity(0.18)
     }
 
     var body: some View {
@@ -276,11 +265,6 @@ struct LoudToggle: View {
             ZStack {
                 Capsule().fill(trackColor)
                 Capsule().stroke(Color.white.opacity(0.18), lineWidth: 1)
-                Text(isOn ? "已开启" : "已关闭")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(isOn ? Color.white : Color.white.opacity(0.75))
-                    .frame(maxWidth: .infinity, alignment: isOn ? .leading : .trailing)
-                    .padding(.horizontal, 11)
                 Circle()
                     .fill(Color.white)
                     .frame(width: Self.knob, height: Self.knob)
@@ -293,6 +277,8 @@ struct LoudToggle: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .focusable(false)
+        .focusEffectDisabled()
         .disabled(disabled)
         .accessibilityLabel(isOn ? "已开启" : "已关闭")
         .accessibilityAddTraits(isOn ? [.isSelected] : [])
@@ -326,6 +312,8 @@ struct SettingsRadioRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .focusable(false)
+        .focusEffectDisabled()
         .foregroundStyle(Color.white)
         .accessibilityLabel(title)
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])

@@ -254,8 +254,8 @@ private struct CompactMetric: View {
     var body: some View {
         HStack(spacing: 8) {
             Label(title, systemImage: symbol)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(Color.white.opacity(0.75))
+                .font(.caption)
+                .foregroundStyle(Color.white)
             Spacer(minLength: 6)
             Text(value)
                 .font(.system(.callout, design: .rounded, weight: .semibold))
@@ -263,9 +263,9 @@ private struct CompactMetric: View {
                 .foregroundStyle(Color.white)
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
-        .background(Color.black, in: RoundedRectangle(cornerRadius: 9))
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(title)
         .accessibilityValue(value)
