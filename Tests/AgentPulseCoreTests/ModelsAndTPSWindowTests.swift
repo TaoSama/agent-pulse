@@ -168,8 +168,21 @@ final class ModelsCodableTests: XCTestCase {
         let summary = UsageInputSummary(counts: counts)
 
         XCTAssertEqual(summary.cachedTokens, 60)
-        XCTAssertEqual(summary.newTokens, 40)
-        XCTAssertEqual(summary.cacheHitRate, 0.6, accuracy: 1e-9)
+        // 新增仅纯输入；cache creation 既不计入新增，也不进入命中率分母。
+        XCTAssertEqual(summary.newTokens, 30)
+        XCTAssertEqual(summary.cacheHitRate, 60.0 / 90.0, accuracy: 1e-9)
+    }
+
+    func testUsageCostEstimatorMatchesAuthoritativePricing() {
+        // opus-4-8 精确命中当代单价 5/25/0.5；cache creation 不计费。
+        let opus = UsageTokenCounts(input: 243_718, output: 190_630, cachedInput: 44_850_423, cacheCreationInput: 1_678_909)
+        let opusCost = UsageCostEstimator.cost(model: "claude-opus-4-8", counts: opus)
+        let expected = (243_718.0 * 5 + 190_630.0 * 25 + 44_850_423.0 * 0.5) / 1_000_000
+        XCTAssertEqual(opusCost, expected, accuracy: 1e-6)
+
+        // 未匹配模型走 fallback 3/15/0.3，无 reasoning 与 cache-creation 计价。
+        let unknown = UsageTokenCounts(input: 1_000_000, output: 1_000_000, cachedInput: 1_000_000, cacheCreationInput: 1_000_000, reasoningOutput: 1_000_000)
+        XCTAssertEqual(UsageCostEstimator.cost(model: "unlisted", counts: unknown), 3 + 15 + 0.3, accuracy: 1e-9)
     }
 
     func testUsageInputSummaryHasNoRateWithoutInputTokens() {
