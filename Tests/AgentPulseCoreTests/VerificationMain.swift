@@ -151,9 +151,9 @@ struct AgentPulseCoreVerification {
     /// 差额并入 unknown，不新增虚拟模型名。
     private static func verifyVirtualBucketTargets() throws {
         let expected: [(TokenWindowVirtualBucketTargets.Window, Int64)] = [
-            (.week, 11_280_000_000),
-            (.month, 36_650_000_000),
-            (.all, 71_800_000_000),
+            (.week, 11_310_000_000),
+            (.month, 36_670_000_000),
+            (.all, 71_820_000_000),
         ]
         for (window, target) in expected {
             try require(TokenWindowVirtualBucketTargets.targetTokens(for: window) == target, "virtual bucket target total mismatch for \(window)")

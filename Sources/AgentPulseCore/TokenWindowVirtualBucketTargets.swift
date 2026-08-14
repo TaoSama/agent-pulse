@@ -27,9 +27,9 @@ public enum TokenWindowVirtualBucketTargets {
     }
 
     /// 每个窗口的目标总 token（B=1e9，M=1e6），来自用户真实记录。
-    public static let weekTargetTokens: Int64 = 11_280_000_000
-    public static let monthTargetTokens: Int64 = 36_650_000_000
-    public static let allTargetTokens: Int64 = 71_800_000_000
+    public static let weekTargetTokens: Int64 = 11_310_000_000
+    public static let monthTargetTokens: Int64 = 36_670_000_000
+    public static let allTargetTokens: Int64 = 71_820_000_000
 
     /// 差额并入的兜底模型名。三个窗口的目标表均包含该条目。
     public static let residualModel = "unknown"
