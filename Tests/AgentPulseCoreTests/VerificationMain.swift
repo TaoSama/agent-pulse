@@ -435,6 +435,12 @@ struct AgentPulseCoreVerification {
         try require(stableA.events.count == 2, "repeated codex token_count events in one rollout are each counted once")
         try require(stableA.events[0].id == stableB.events[0].id, "Codex event id must ignore path, timestamp, and line index")
         try require(stableA.events[1].id != stableA.events[0].id, "a repeated codex event gets a distinct ordinal id, not a collapsed duplicate")
+        // Content dedup key is content-only: byte-identical turns (same model + last +
+        // total snapshot) share it across files/timestamps, so the finalize fold can
+        // collapse fork/replay copies into one bucket contribution.
+        try require(!stableA.events[0].codexDedupKey.isEmpty, "a complete-snapshot codex event must carry a content dedup key")
+        try require(stableA.events[0].codexDedupKey == stableA.events[1].codexDedupKey, "byte-identical repeated turns share one content dedup key")
+        try require(stableA.events[0].codexDedupKey == stableB.events[0].codexDedupKey, "content dedup key ignores path and timestamp across files")
 
         let incompleteTotal = UsageJSONLParser.parse(
             data: Data("""
@@ -444,6 +450,7 @@ struct AgentPulseCoreVerification {
             source: "codex", fileIdentity: "protocol-incomplete"
         )
         try require(!incompleteTotal.events[0].hasTotalSnapshot && incompleteTotal.events[0].lineageFingerprint.isEmpty, "complete total snapshot requires numeric input/output/total fields")
+        try require(incompleteTotal.events[0].codexDedupKey.isEmpty, "an incomplete total snapshot yields no content dedup key (never folded)")
 
         let inconsistentTotal = UsageJSONLParser.parse(
             data: Data("""
@@ -2113,7 +2120,7 @@ struct AgentPulseCoreVerification {
         }
 
         // 解析器版本已提升到 6（稳定 count-only 身份、MCP output gate 与边界修复）。
-        try require(UsageJSONLParser.parserVersion == 6, "parserVersion must advance to 6 for parser metric correctness fixes")
+        try require(UsageJSONLParser.parserVersion == 7, "parserVersion must advance to 7 for codex content dedup key")
 
         // 1) 技能计数：同名累加，键并入排序去重列表。
         let skill = try parse("claude_skill_tool_use.jsonl", source: "claude-code")

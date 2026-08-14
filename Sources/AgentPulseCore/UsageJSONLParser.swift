@@ -43,7 +43,10 @@ public enum UsageJSONLParser {
     /// v6：count-only 事件改用 source/session/turn/call 稳定身份并按同 turn 取最大，
     ///   直接 MCP 调用也必须由匹配 output 确认成功；修正 total 快照语义与 reasoning
     ///   比例拆分的 Int64 溢出边界。
-    public static let parserVersion = 6
+    /// v7：codex token 事件新增内容型去重键（codexDedupKey：model + 归一化 last 分量 +
+    ///   原始 total 快照分量，不含 timestamp/path/session/rollout），供跨文件折叠
+    ///   fork/subagent 回放出的重复 turn，消除历史累计的重复计数。
+    public static let parserVersion = 7
 
     /// 内建 rollout 来源标识。仅此来源走 Codex rollout 解析；其余一切来源按
     /// Claude transcript 处理。集中定义，避免分派处散落魔法字符串。
@@ -248,11 +251,18 @@ public enum UsageJSONLParser {
             codexEventOccurrences[baseEventID] = occurrence + 1
             let eventID = occurrence == 0 ? baseEventID : "\(baseEventID)#\(occurrence)"
 
+            // 仅在有完整 total 快照时生成内容型去重键（与参考实现一致）；缺快照的行
+            // 键为空，永不折叠，交由血缘层判定。
+            let codexDedupKey = hasTotalSnapshot
+                ? codexContentDedupKey(model: modelAtEmission, last: normalizedLast, rawTotal: totalUsage)
+                : ""
+
             result.append(UsageEvent(
                 id: eventID, source: sourceName, model: modelAtEmission, project: metadata.project,
                 timestamp: timestamp, counts: counts, sessionHash: activitySessionHash, sourceFileHash: fileHash,
                 rolloutKey: metadata.rolloutKey, parentRolloutKey: metadata.parentRolloutKey, inherited: inherited,
-                hasTotalSnapshot: hasTotalSnapshot, lineageFingerprint: lineageFingerprint
+                hasTotalSnapshot: hasTotalSnapshot, lineageFingerprint: lineageFingerprint,
+                codexDedupKey: codexDedupKey
             ))
         }
 
@@ -266,7 +276,8 @@ public enum UsageJSONLParser {
                     timestamp: event.timestamp, counts: event.counts, sessionHash: event.sessionHash,
                     sourceFileHash: event.sourceFileHash, rolloutKey: event.rolloutKey,
                     parentRolloutKey: event.parentRolloutKey, inherited: event.inherited,
-                    hasTotalSnapshot: event.hasTotalSnapshot, lineageFingerprint: event.lineageFingerprint
+                    hasTotalSnapshot: event.hasTotalSnapshot, lineageFingerprint: event.lineageFingerprint,
+                    codexDedupKey: event.codexDedupKey
                 )
             }
         }
@@ -827,7 +838,7 @@ public enum UsageJSONLParser {
             let type = string(object["type"])
             let rawSessionID = string(object["sessionId"]) ?? string(object["session_id"])
             // 保留真实 sessionHash（每行自带 sessionId）；缺失时才以文件兜底。
-            let sessionHash = rawSessionID.map(shortHash) ?? shortHash(fileHash)
+            let sessionHash = rawSessionID.map { shortHash($0) } ?? shortHash(fileHash)
 
             // 编辑关联：assistant 记录里的编辑 tool_use 用该记录的 model/project/timestamp
             // 归属，user 记录里的 tool_result 决定是否已应用成功。缺时间戳时跳过（无法归桶）。
@@ -1183,6 +1194,25 @@ public enum UsageJSONLParser {
         hash("total|\(root)|last|\(usageIdentity(last))|snapshot|\(usageIdentity(total))")
     }
 
+    /// 内容型去重键：仅由 model、归一化后的 last 分量与**原始** total 快照分量决定，
+    /// 与 timestamp / path / session / rollout 无关。fork / subagent 回放出的逐字节
+    /// 相同的 token_count 事件（只改时间戳或路径）会落到同一键上，供跨文件折叠。
+    /// last 分量取归一化值（input 已扣 cached/creation、output 已扣 reasoning），
+    /// total 分量取原始累计值（不扣减），cached 合并 cached_input + cache_read_input。
+    /// 键为 SHA256 前 16 字节（32 hex），带 "codex:" 命名空间前缀。
+    private static func codexContentDedupKey(model: String, last: UsageTokenCounts, rawTotal: [String: Any]) -> String {
+        let totalInput = integer(rawTotal["input_tokens"])
+        let totalOutput = integer(rawTotal["output_tokens"])
+        let totalCached = integer(rawTotal["cached_input_tokens"]) + integer(rawTotal["cache_read_input_tokens"])
+        let totalCacheCreation = integer(rawTotal["cache_creation_input_tokens"])
+        let totalReasoning = integer(rawTotal["reasoning_output_tokens"])
+        let totalTokens = integer(rawTotal["total_tokens"])
+        let payload = "codex-token|\(model)"
+            + "|\(last.input)|\(last.output)|\(last.cachedInput)|\(last.cacheCreationInput)|\(last.reasoningOutput)"
+            + "|\(totalInput)|\(totalOutput)|\(totalCached)|\(totalCacheCreation)|\(totalReasoning)|\(totalTokens)|\(last.reportedTotal)"
+        return "codex:" + shortHash(payload, hexLength: 32)
+    }
+
     private static func containsToolResult(_ value: Any?) -> Bool {
         if let object = value as? [String: Any] {
             if string(object["type"]) == "tool_result" { return true }
@@ -1208,6 +1238,7 @@ public enum UsageJSONLParser {
     private static func integer(_ value: Any?) -> Int64 { (value as? NSNumber)?.int64Value ?? Int64(value as? String ?? "") ?? 0 }
     private static func component(_ path: String) -> String { let value = URL(fileURLWithPath: path).lastPathComponent; return value.isEmpty ? "unknown" : value }
     private static func hash(_ value: String) -> String { SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined() }
-    /// 原始 session id 的 SHA256 前 16 hex。
-    private static func shortHash(_ value: String) -> String { String(hash(value).prefix(16)) }
+    /// 原始 session id 的 SHA256 前 `hexLength` 个 hex 字符（默认 16，即前 8 字节）。
+    /// content dedup key 传 32（前 16 字节），与参考实现的 `sha256[:16]` 逐字节一致。
+    private static func shortHash(_ value: String, hexLength: Int = 16) -> String { String(hash(value).prefix(hexLength)) }
 }
