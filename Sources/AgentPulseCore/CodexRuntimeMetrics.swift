@@ -1710,8 +1710,13 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     private func activeSessionCount(in tasks: [String: SessionTaskState], now: Date) -> Int {
+        // active = 会话最近 activeTaskTimeout(5 分钟)内仍有活动(rollout 写入或 output token 信号)。
+        // 不再要求最后生命周期为 task_started:正在生成回复的会话尾部常是上一轮的 task_complete,
+        // 之后跟着仍在产出的 output 流,activityAt(= max(mtime, latestOutputSignal))会持续刷新到最近时刻,
+        // 是比刚性生命周期更可靠的活跃信号。彻底结束、之后无 output 的会话其 activityAt 停在结束时刻,
+        // 超过窗口自然被排除。
         tasks.values.lazy.filter { state in
-            guard state.lifecycleStarted, let activityAt = state.activityAt else { return false }
+            guard let activityAt = state.activityAt else { return false }
             let age = now.timeIntervalSince(activityAt)
             return age >= -Self.futureTimestampTolerance && age <= Self.activeTaskTimeout
         }.count

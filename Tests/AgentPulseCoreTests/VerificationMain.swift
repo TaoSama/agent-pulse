@@ -2570,15 +2570,17 @@ struct AgentPulseCoreVerification {
         )
 
         let active = try await collector.scan(at: base)
-        try require(active.desktopActive == 1, "recent top-level Desktop started task was not the sole Desktop active")
+        // active 口径：会话最近 5 分钟内有活动即算 active，不再要求尾部生命周期为 task_started。
+        // recent / complete / aborted 三者 mtime 均在窗口内 → 全部 active；stale 超时 → 不计。
+        try require(active.desktopActive == 3, "recent Desktop sessions with activity in-window were not all active")
         try require(active.taskBreakdown.codexDesktop.totalTasks == 4, "Desktop total did not deduplicate current non-automation sessions")
-        try require(active.taskBreakdown.codexDesktop.activeTasks == 1, "Desktop active lifecycle/timeout mismatch")
+        try require(active.taskBreakdown.codexDesktop.activeTasks == 3, "Desktop active window mismatch")
         try require(active.taskBreakdown.codexCLI.totalTasks == 2, "Codex CLI total must equal current independent processes")
-        try require(active.taskBreakdown.codexCLI.activeTasks == 1, "Codex CLI active must be rollout-gated")
+        try require(active.taskBreakdown.codexCLI.activeTasks == 1, "Codex CLI active must be process-capped")
         try require(active.taskBreakdown.claudeCLI.totalTasks == 4, "Claude stale registry was counted or opened registries were missed")
         try require(active.taskBreakdown.claudeCLI.activeTasks == 1, "Claude busy registry count mismatch")
         try require(active.terminalActive == 2, "Terminal active did not sum Codex and Claude lifecycle activity")
-        try require(active.totalTasks == 10 && active.activeTasks == 3, "aggregate total/active breakdown mismatch")
+        try require(active.totalTasks == 10 && active.activeTasks == 5, "aggregate total/active breakdown mismatch")
         try require(active.completed.value == 1, "archive or automation completion leaked into current completed count")
         try require(!active.activeCountsArePartial, "healthy active sources were marked partial")
 
@@ -2586,12 +2588,16 @@ struct AgentPulseCoreVerification {
         try require(exited.terminalActive == 0, "exited terminal process did not disappear on the next scan")
         try require(exited.taskBreakdown.codexCLI.totalTasks == 0, "closed Codex CLI remained in total")
         try require(exited.taskBreakdown.claudeCLI.totalTasks == 0, "closed Claude CLI remained in total")
-        try require(exited.desktopActive == 1, "unchanged recent Desktop task did not survive cache reuse")
+        try require(exited.desktopActive == 3, "unchanged recent Desktop tasks did not survive cache reuse")
 
         let timedOut = try await collector.scan(
             at: base.addingTimeInterval(CodexRuntimeMetricsConfiguration.activeTaskTimeoutSeconds + 1)
         )
         try require(timedOut.desktopActive == 0, "stale started Desktop task did not time out after five minutes")
+
+        // 回归：正在生成下一轮的 Desktop 会话,尾部生命周期是上一轮的 task_complete,之后仍有 output token 流。
+        // 旧实现要求 lifecycleStarted 才计 active,会漏判这种“回合间仍在产出”的活跃会话(即用户上报的 bug)。
+        try await verifyDesktopActiveAfterCompleteWithTrailingOutput()
 
         let failingCollector = try CodexRuntimeMetricsCollector(
             configuration: .init(
@@ -2604,11 +2610,74 @@ struct AgentPulseCoreVerification {
             processScanner: FakeScanner(error: .launchFailed("fixture"))
         )
         let processUnavailable = try await failingCollector.scan(at: base)
-        try require(processUnavailable.desktopActive == 1, "process failure erased independently known Desktop active")
+        try require(processUnavailable.desktopActive == 3, "process failure erased independently known Desktop active")
         try require(processUnavailable.terminalActive == nil, "failed process scan fabricated a terminal count")
         try require(processUnavailable.taskBreakdown.codexCLI.quality == .unavailable, "process failure fabricated Codex CLI quality")
         try require(processUnavailable.taskBreakdown.claudeCLI.quality == .unavailable, "process failure fabricated Claude CLI quality")
         try require(processUnavailable.activeCountsArePartial, "failed process scan was not marked partial")
+    }
+
+    // 回归用例:Desktop 会话回合间正在生成——尾部生命周期是上一轮 task_complete,之后仍有 output token 流。
+    // 旧实现以 lifecycleStarted 为硬前提,会把这种活跃会话判为非 active(desktopActive=0),即用户上报的 bug。
+    private static func verifyDesktopActiveAfterCompleteWithTrailingOutput() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agentpulse-desktop-trailing-output-\(UUID().uuidString)", isDirectory: true)
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        let claudeSessions = root.appendingPathComponent("claude-sessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: claudeSessions, withIntermediateDirectories: true)
+        defer {
+            do { try FileManager.default.removeItem(at: root) }
+            catch { fputs("desktop trailing-output cleanup failed: \(error)\n", stderr) }
+        }
+
+        let base = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
+        let url = sessions.appendingPathComponent("rollout-generating.jsonl")
+        try writeRollout(
+            to: url,
+            cwd: "/tmp/project",
+            events: [
+                startedEvent(),
+                completeEvent(turnID: "t1"),
+                tokenEvent(at: base.addingTimeInterval(-2), totalOutput: 100),
+                tokenEvent(at: base.addingTimeInterval(-1), totalOutput: 260),
+            ],
+            sessionID: "generating",
+            threadSource: "user",
+            originator: "Codex Desktop"
+        )
+        try FileManager.default.setAttributes([.modificationDate: base], ofItemAtPath: url.path)
+
+        let configuration = CodexRuntimeMetricsConfiguration(
+            sessionsDirectories: [sessions],
+            automationRoots: [],
+            databaseURL: root.appendingPathComponent("trailing.sqlite"),
+            claudeSessionsDirectory: claudeSessions,
+            claudeProjectsDirectory: root.appendingPathComponent("missing-claude-projects")
+        )
+        let collector = try CodexRuntimeMetricsCollector(
+            configuration: configuration,
+            processScanner: FakeScanner(processes: [])
+        )
+
+        let active = try await collector.scan(at: base)
+        try require(
+            active.taskBreakdown.codexDesktop.totalTasks == 1,
+            "generating Desktop session was not counted as a task"
+        )
+        try require(
+            active.desktopActive == 1,
+            "Desktop session generating output after task_complete must count as active"
+        )
+
+        // 同一会话在 5 分钟窗口外(无新活动)必须回落为非 active,验证放宽 guard 未破坏超时下界。
+        let afterTimeout = try await collector.scan(
+            at: base.addingTimeInterval(CodexRuntimeMetricsConfiguration.activeTaskTimeoutSeconds + 1)
+        )
+        try require(
+            afterTimeout.desktopActive == 0,
+            "session with no activity for over five minutes must fall out of active"
+        )
     }
 
     private static func verifyClaudeDesktopCounting() async throws {
