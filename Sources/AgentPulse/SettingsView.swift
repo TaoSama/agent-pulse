@@ -21,18 +21,13 @@ struct AgentPulseSettingsView: View {
         .frame(minWidth: 580, minHeight: 540)
     }
 
-    /// 窗口底色：比卡片略浅的深灰，使黑底卡片浮起、分区清晰，而非纯黑平铺。
-    private static let windowBackground = Color(red: 0.09, green: 0.09, blue: 0.11)
+    /// 窗口底色：略带蓝灰的深色，使卡片浮起、分区清晰，而非纯黑平铺。
+    private static let windowBackground = Color(red: 0.12, green: 0.12, blue: 0.14)
 
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Agent Pulse")
-                    .font(.system(size: 17, weight: .semibold, design: .rounded))
-                Text("本机 Agent 活动 · 设置")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Color.white.opacity(0.5))
-            }
+            Text("Agent Pulse")
+                .font(.system(size: 17, weight: .semibold, design: .rounded))
             Spacer()
             HStack(spacing: 7) {
                 Circle()
@@ -139,6 +134,10 @@ enum SettingsStatusTone {
     }
 }
 
+/// 卡片底色：带灰度的深色而非纯黑，从略浅顶部到略深底部的细微渐变，制造浮起层次。
+private let settingsCardTopColor = Color(red: 0.17, green: 0.17, blue: 0.20)
+private let settingsCardBottomColor = Color(red: 0.13, green: 0.13, blue: 0.16)
+
 /// 深色卡片容器：标题 + 内容，与菜单面板同一视觉语言。
 struct SettingsCard<Content: View>: View {
     let title: String
@@ -149,19 +148,26 @@ struct SettingsCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 12) {
             Label(title, systemImage: systemImage)
                 .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(0.55))
+                .foregroundStyle(Color.white.opacity(0.6))
             content
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.black)
+                .fill(
+                    LinearGradient(
+                        colors: [settingsCardTopColor, settingsCardBottomColor],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
         )
+        .shadow(color: Color.black.opacity(0.35), radius: 8, x: 0, y: 3)
     }
 }
 
@@ -212,18 +218,18 @@ struct SettingsField: View {
             .padding(.vertical, 7)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.white.opacity(0.09))
+                    .fill(Color.black.opacity(0.28))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
             )
             .accessibilityLabel(accessibilityLabel ?? title)
         }
     }
 }
 
-/// 开关行：左标题（可带副标题），右侧开关。
+/// 开关行：左标题（可带副标题），右侧显眼开关（放大轨道 + 滑块 + 开/关文字）。
 struct SettingsToggleRow: View {
     let title: String
     var subtitle: String?
@@ -243,13 +249,53 @@ struct SettingsToggleRow: View {
             }
             .foregroundStyle(disabled ? Color.white.opacity(0.4) : Color.white)
             Spacer(minLength: 12)
-            Toggle("", isOn: $isOn)
-                .toggleStyle(.switch)
-                .labelsHidden()
-                .tint(SettingsStatusTone.positive.color)
-                .disabled(disabled)
-                .opacity(disabled ? 0.5 : 1)
+            LoudToggle(isOn: $isOn, disabled: disabled)
         }
+    }
+}
+
+/// 显眼开关：加大的胶囊轨道 + 白色滑块，内嵌「已开启 / 已关闭」文字，
+/// 开态用绿色高亮、关态用暗灰，状态一眼可辨。整块可点，替代不明显的系统 .switch。
+struct LoudToggle: View {
+    @Binding var isOn: Bool
+    var disabled: Bool = false
+
+    private static let width: CGFloat = 92
+    private static let height: CGFloat = 28
+    private static let knob: CGFloat = 22
+
+    private var trackColor: Color {
+        if disabled { return Color.white.opacity(0.1) }
+        return isOn ? SettingsStatusTone.positive.color : Color.white.opacity(0.16)
+    }
+
+    var body: some View {
+        Button {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.7)) { isOn.toggle() }
+        } label: {
+            ZStack {
+                Capsule().fill(trackColor)
+                Capsule().stroke(Color.white.opacity(0.18), lineWidth: 1)
+                Text(isOn ? "已开启" : "已关闭")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(isOn ? Color.white : Color.white.opacity(0.75))
+                    .frame(maxWidth: .infinity, alignment: isOn ? .leading : .trailing)
+                    .padding(.horizontal, 11)
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: Self.knob, height: Self.knob)
+                    .shadow(color: Color.black.opacity(0.35), radius: 2, x: 0, y: 1)
+                    .frame(maxWidth: .infinity, alignment: isOn ? .trailing : .leading)
+                    .padding(.horizontal, 3)
+            }
+            .frame(width: Self.width, height: Self.height)
+            .opacity(disabled ? 0.5 : 1)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .accessibilityLabel(isOn ? "已开启" : "已关闭")
+        .accessibilityAddTraits(isOn ? [.isSelected] : [])
     }
 }
 

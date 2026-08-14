@@ -78,22 +78,6 @@ struct TokenSummaryCard: View {
                     Text("本窗口暂无数据")
                         .font(.system(size: 10))
                 }
-
-                if !topModels.isEmpty {
-                    Divider().overlay(Color.white.opacity(0.15))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("按模型")
-                            .font(.system(size: 10, weight: .medium))
-                            .opacity(0.7)
-                        ForEach(topModels, id: \.model) { entry in
-                            TokenModelRow(
-                                model: entry.model,
-                                tokens: entry.totalTokens,
-                                total: selectedSummary?.totalTokens ?? 0
-                            )
-                        }
-                    }
-                }
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel(accessibilityLabel)
@@ -104,14 +88,6 @@ struct TokenSummaryCard: View {
     }
 
     private var selectedSummary: TokenUsageWindowSummary? { summary[selectedWindow] }
-
-    /// 当前窗口按 token 降序的前若干个模型（原始模型名，与 TPS 曲线一致，不做映射）。
-    private var topModels: [TokenModelUsage] {
-        let entries = selectedSummary?.perModel ?? []
-        return Array(entries.sorted { $0.totalTokens > $1.totalTokens }.prefix(Self.topModelCount))
-    }
-
-    private static let topModelCount = 5
 
     private var accessibilityLabel: String {
         let tokens = selectedSummary.map { String($0.totalTokens) } ?? "无数据"
@@ -134,35 +110,6 @@ private struct TokenFooterMetric: View {
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
         }
         .accessibilityElement(children: .combine)
-    }
-}
-
-/// 单个模型的 token 行：原始模型名 + 2 位小数 token + 占窗口总量百分比。
-private struct TokenModelRow: View {
-    let model: String
-    let tokens: Int64
-    let total: Int64
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Text(model)
-                .font(.system(size: 11))
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 4)
-            Text(percentText)
-                .font(.system(size: 10, design: .monospaced))
-                .opacity(0.7)
-            Text(TokenUsageFormatting.tokens(tokens))
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(model)，\(TokenUsageFormatting.tokens(tokens))，\(percentText)")
-    }
-
-    private var percentText: String {
-        guard total > 0 else { return "—" }
-        return TokenUsageFormatting.percent(Double(tokens) / Double(total))
     }
 }
 
