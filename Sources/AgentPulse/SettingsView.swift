@@ -17,17 +17,18 @@ struct AgentPulseSettingsView: View {
             .padding(16)
         }
         .background(Self.windowBackground)
-        .preferredColorScheme(.dark)
+        .preferredColorScheme(.light)
         .frame(minWidth: 580, minHeight: 540)
     }
 
-    /// 窗口底色：中性灰，与菜单栏展开面板"灰底 + 纯黑卡"的对比关系一致，使纯黑卡浮起。
-    private static let windowBackground = Color(red: 0.22, green: 0.22, blue: 0.23)
+    /// 窗口底色：接近白的浅灰，与菜单栏展开面板的浅色系统材质一致；纯黑卡浮于其上。
+    private static let windowBackground = Color(red: 0.94, green: 0.94, blue: 0.95)
 
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
             Text("Agent Pulse")
                 .font(.system(size: 17, weight: .semibold, design: .rounded))
+                .foregroundStyle(.primary)
             Spacer()
             HStack(spacing: 7) {
                 Circle()
@@ -36,7 +37,7 @@ struct AgentPulseSettingsView: View {
                 Text(statusText)
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
             }
-            .foregroundStyle(Color.white.opacity(0.75))
+            .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 2)
     }
@@ -105,7 +106,7 @@ struct AgentPulseSettingsView: View {
     }
 
     private var statusColor: Color {
-        if model.tps == nil { return Color.white.opacity(0.35) }
+        if model.tps == nil { return Color.secondary }
         return model.sparklineRegression.trend.color(for: model.trendColorMode)
     }
 
@@ -157,6 +158,9 @@ struct SettingsCard<Content: View>: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(Color.white.opacity(0.1), lineWidth: 1)
         )
+        // 卡片本身是纯黑，内部一律按深色语义渲染（白字、半透明白），
+        // 与菜单栏展开面板的黑卡白字一致，不随系统浅/深色外观翻转。
+        .environment(\.colorScheme, .dark)
     }
 }
 
