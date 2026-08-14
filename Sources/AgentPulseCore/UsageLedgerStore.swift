@@ -534,9 +534,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
             )
         }
 
-        // 2) 重算 buckets（按 hostname,source,model,project,bucketStart 聚合）。
-        // hostname 前置进聚合键：每条事件按其自带 hostname 归属，本地即保留多机快照。
-        // 传入的 hostname 参数仅作 legacy（hostname 为空）事件的兜底。
+        // 2) 重算 buckets（按 source,model,project,bucketStart 聚合）。
+        // 派生全部归属到传入的当前 hostname（单一本机口径）。原始层虽存各事件采集机 hostname，
+        // 但派生不做多机拆分——历史归属由 hostname 改名时的原地 UPDATE 统一维护。
         struct BucketAgg {
             var counts = UsageTokenCounts()
             var skillCounts: [String: Int] = [:]
@@ -545,13 +545,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
             var linesDeleted: Int64 = 0
             var codeMetricVersion = 0
         }
-        func hostFor(_ eventHostname: String) -> String { eventHostname.isEmpty ? hostname : eventHostname }
         var buckets: [String: BucketAgg] = [:]
-        var bucketMeta: [String: (host: String, source: String, model: String, project: String, start: Int64)] = [:]
+        var bucketMeta: [String: (source: String, model: String, project: String, start: Int64)] = [:]
         for event in contentDeduped {
-            let host = hostFor(event.hostname)
             let start = (event.timestampMs / Self.bucketMilliseconds) * Self.bucketMilliseconds
-            let key = "\(host)\u{1}\(event.source)\u{1}\(event.model)\u{1}\(event.project)\u{1}\(start)"
+            let key = "\(event.source)\u{1}\(event.model)\u{1}\(event.project)\u{1}\(start)"
             var agg = buckets[key] ?? BucketAgg()
             let c = event.counts
             agg.counts = UsageTokenCounts(
@@ -564,7 +562,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             agg.skillCounts = UsageToolMetrics.mergeCounts(agg.skillCounts, event.skillCounts)
             agg.mcpCounts = UsageToolMetrics.mergeCounts(agg.mcpCounts, event.mcpCounts)
             buckets[key] = agg
-            bucketMeta[key] = (host, event.source, event.model, event.project, start)
+            bucketMeta[key] = (event.source, event.model, event.project, start)
         }
 
         let editMetricSources = try readEditMetricSourcesUnlocked()
@@ -573,18 +571,17 @@ public final class UsageLedgerStore: @unchecked Sendable {
             buckets[key]?.codeMetricVersion = UsageEditLines.codeMetricVersion
         }
         for edit in try readAllRawEditEntries() {
-            let host = hostFor(edit.hostname)
             let start = (edit.timestampMs / Self.bucketMilliseconds) * Self.bucketMilliseconds
-            let key = "\(host)\u{1}\(edit.source)\u{1}\(edit.model)\u{1}\(edit.project)\u{1}\(start)"
+            let key = "\(edit.source)\u{1}\(edit.model)\u{1}\(edit.project)\u{1}\(start)"
             var agg = buckets[key] ?? BucketAgg()
             agg.linesAdded = saturatedAdd(agg.linesAdded, edit.added)
             agg.linesDeleted = saturatedAdd(agg.linesDeleted, edit.deleted)
             agg.codeMetricVersion = UsageEditLines.codeMetricVersion
             buckets[key] = agg
-            bucketMeta[key] = (host, edit.source, edit.model, edit.project, start)
+            bucketMeta[key] = (edit.source, edit.model, edit.project, start)
         }
 
-        // 3) 重算 sessions（复用聚合器，按各事件自带 hostname 归属）。
+        // 3) 重算 sessions（复用聚合器，全部归属当前 hostname）。
         let sessionEvents = try readAllSessionEvents()
         // session project 内容策略：以同一 (source, sessionHash) 下**最新有效** UsageEvent.project 为准
         // （按 timestamp 取最大，非空优先），无则回落空串。project 不参与自然键/分组/去重。
@@ -603,7 +600,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
         let sessions = UsageSessionAggregator.aggregate(
             events: sessionEvents,
-            fallbackHostname: hostname,
+            hostname: hostname,
             projectForSession: { source, sessionHash in
                 sessionProject["\(source)\u{1}\(sessionHash)"]?.project ?? ""
             },
@@ -613,77 +610,53 @@ public final class UsageLedgerStore: @unchecked Sendable {
         )
 
         // 4) 差异写入：仅对内容变化的行提升 revision（变 dirty），未变行保持原 revision/synced。
-        // 按「本次涉及的所有 hostname」逐 host 做增删与 revision 推进；每个 host 有独立 revision 计数。
+        let newRevision = try nextRevisionUnlocked(hostname: hostname)
+        var changed = false
 
-        // 4a) buckets：先按 host 分组新聚合行，再逐 host 与既有行差异写入。
-        var bucketKeysByHost: [String: [String]] = [:]
+        var existingBuckets = try readBucketRowsUnlocked(hostname: hostname)
         for (key, meta) in bucketMeta {
-            bucketKeysByHost[meta.host, default: []].append(key)
+            let aggregate = buckets[key]!
+            let bucket = UsageBucket(
+                hostname: hostname, source: meta.source, model: meta.model, project: meta.project,
+                bucketStart: date(meta.start), counts: aggregate.counts,
+                skillCounts: aggregate.skillCounts, mcpCounts: aggregate.mcpCounts,
+                linesAdded: aggregate.linesAdded, linesDeleted: aggregate.linesDeleted,
+                codeMetricVersion: aggregate.codeMetricVersion
+            )
+            let existing = existingBuckets[key]
+            if existing?.bucket != bucket {
+                try upsertBucketUnlocked(bucket, revision: newRevision)
+                changed = true
+            }
+            existingBuckets[key] = nil
         }
-        var involvedHosts = Set(bucketKeysByHost.keys)
+        // 删除不再出现的 bucket（例如事件减少）。
+        for (key, _) in existingBuckets {
+            try deleteBucketUnlocked(hostname: hostname, key: key)
+            changed = true
+        }
 
-        // 4b) sessions：按各 session 自带 hostname 分组。
-        var sessionsByHost: [String: [UsageSession]] = [:]
+        var existingSessions = try readSessionRowsUnlocked(hostname: hostname)
         for session in sessions {
-            sessionsByHost[session.hostname, default: []].append(session)
-            involvedHosts.insert(session.hostname)
+            let key = "\(session.source)\u{1}\(session.sessionHash)"
+            let existing = existingSessions[key]
+            if existing?.session != session {
+                try upsertSessionUnlocked(session, revision: newRevision)
+                changed = true
+            }
+            existingSessions[key] = nil
         }
-        // 既有派生行可能分布在更多 host（例如本轮某 host 的行全部消失需删除）。
-        for host in try derivedHostnamesUnlocked() { involvedHosts.insert(host) }
+        for (key, _) in existingSessions {
+            try deleteSessionUnlocked(hostname: hostname, key: key)
+            changed = true
+        }
 
-        for host in involvedHosts {
-            let newRevision = try nextRevisionUnlocked(hostname: host)
-            var hostChanged = false
-
-            var existingBuckets = try readBucketRowsUnlocked(hostname: host)
-            for key in bucketKeysByHost[host] ?? [] {
-                let meta = bucketMeta[key]!
-                let aggregate = buckets[key]!
-                let bucket = UsageBucket(
-                    hostname: host, source: meta.source, model: meta.model, project: meta.project,
-                    bucketStart: date(meta.start), counts: aggregate.counts,
-                    skillCounts: aggregate.skillCounts, mcpCounts: aggregate.mcpCounts,
-                    linesAdded: aggregate.linesAdded, linesDeleted: aggregate.linesDeleted,
-                    codeMetricVersion: aggregate.codeMetricVersion
-                )
-                // 派生行自然键含 host；existingBuckets 的 key 不含 host，用去掉 host 前缀的子键匹配。
-                let localKey = "\(meta.source)\u{1}\(meta.model)\u{1}\(meta.project)\u{1}\(meta.start)"
-                let existing = existingBuckets[localKey]
-                if existing?.bucket != bucket {
-                    try upsertBucketUnlocked(bucket, revision: newRevision)
-                    hostChanged = true
-                }
-                existingBuckets[localKey] = nil
-            }
-            // 删除不再出现的 bucket（例如显式 rebuild 后事件减少）。
-            for (localKey, _) in existingBuckets {
-                try deleteBucketUnlocked(hostname: host, key: localKey)
-                hostChanged = true
-            }
-
-            var existingSessions = try readSessionRowsUnlocked(hostname: host)
-            for session in sessionsByHost[host] ?? [] {
-                let localKey = "\(session.source)\u{1}\(session.sessionHash)"
-                let existing = existingSessions[localKey]
-                if existing?.session != session {
-                    try upsertSessionUnlocked(session, revision: newRevision)
-                    hostChanged = true
-                }
-                existingSessions[localKey] = nil
-            }
-            for (localKey, _) in existingSessions {
-                try deleteSessionUnlocked(hostname: host, key: localKey)
-                hostChanged = true
-            }
-
-            if !hostChanged {
-                // 该 host 无变化则回退其 revision 计数，避免无谓递增。
-                try setIntUnlocked(key: revisionKey(host), value: newRevision - 1)
-            }
+        if !changed {
+            // 无变化则回退 revision 计数，避免无谓递增。
+            try setIntUnlocked(key: revisionKey(hostname), value: newRevision - 1)
         }
 
         // 非对账类阻断（如无法证明的 inherited replay）持久到 per-host eligibility flag。
-        // 本机身份为传入 hostname：finalize 是「本机完成一轮扫描」的显式信号，其上报资格记在本机 flag。
         let eligible = blockedReasons.isEmpty
         try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
         return UsageFinalizeResult(reportingEligible: eligible, blockedReasons: blockedReasons, collapsedInheritedEvents: collapsed, collapsedContentDuplicates: contentCollapsed)
@@ -696,21 +669,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
             return (try readTextUnlocked(key: reportingEligibleKey(hostname)) ?? "1") == "1"
         }
     }
-
-    /// 派生表中出现过的全部非空 hostname（buckets ∪ sessions），供多机重算逐 host 差异写入。
-    private func derivedHostnamesUnlocked() throws -> [String] {
-        let statement = try prepare("""
-            SELECT DISTINCT hostname FROM (
-              SELECT hostname FROM usage_buckets
-              UNION SELECT hostname FROM usage_sessions
-            ) WHERE hostname<>'';
-            """)
-        defer { sqlite3_finalize(statement) }
-        var result: [String] = []
-        while sqlite3_step(statement) == SQLITE_ROW { result.append(text(statement, 0)) }
-        return result
-    }
-
 
     // MARK: - Reads
 
@@ -1408,20 +1366,71 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    /// canonical hostname 变化时，从原始事件事务重建全部派生聚合。
+    /// 本机身份从旧 canonical hostname 改名为新值时，把本地历史全部原地统一成新名字。
     ///
-    /// 保留多机语义：原始事件每条自带采集机 hostname，重算按各事件自带 hostname 归属，
-    /// 不再把整库事件重派到单一 host。清空派生后逐 host 重建，各机数据都保留。
-    /// canonical_hostname 仅作「本机身份」记录，供上报身份与 legacy 事件兜底使用。
+    /// 单机口径：不做 DELETE + 全库重算，只在一个事务里把所有旧 hostname 直接 UPDATE 成新
+    /// hostname —— 原始层三张表（hostname 为普通列，改名不撞主键）与派生两张表（hostname 属
+    /// 主键，改名可能撞已存在的新名行），并更新 sync_state.canonical_hostname。
+    ///
+    /// 派生行的 revision/synced_revision 原样保留：改名后其自然键中的 hostname 变了，等价于新
+    /// hostname 下的新自然键，revision 仍 > synced_revision（原本已 synced 的行也因键变化需在新
+    /// 名下重新上报），从而以增量方式重新对齐远端。服务端 upsert-only、无 tombstone，旧名残留
+    /// 由服务端自行处理，客户端不代管。
     public func rebuildForHostname(_ hostname: String) throws {
         try queue.sync {
+            let old = try readTextUnlocked(key: Self.canonicalHostnameKey) ?? ""
+            // 目标名与旧名相同（或旧名为空未设置过）时无需搬迁历史，仅落定 canonical。
+            guard old != hostname, !old.isEmpty else {
+                try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
+                return
+            }
             try transaction {
-                try preserveRevisionHighWatermarksUnlocked()
-                try exec("DELETE FROM usage_buckets;")
-                try exec("DELETE FROM usage_sessions;")
-                _ = try recomputeDerivedUnlocked(hostname: hostname)
+                let nowMs = millis(Date())
+                // 原始层：hostname 为普通列，直接原地改名，绝不撞主键。
+                try renameRawHostnameUnlocked(table: "usage_events", from: old, to: hostname)
+                try renameRawHostnameUnlocked(table: "usage_session_events", from: old, to: hostname)
+                if try tableExistsUnlocked("usage_edit_entries") {
+                    try renameRawHostnameUnlocked(table: "usage_edit_entries", from: old, to: hostname)
+                }
+                // 派生层：hostname 属主键。单机场景新名下本不该有行；为稳妥先清理新名下的既有行，
+                // 再把旧名行整体改到新名。改名后自然键（含 hostname）变了，等价于新名下的新行，
+                // 因此把 revision 提升到新名的新高水位、保持 synced_revision 不变，使其 dirty 重新上报。
+                let newRevision = try nextRevisionUnlocked(hostname: hostname)
+                try renameDerivedHostnameUnlocked(table: "usage_buckets", from: old, to: hostname, revision: newRevision, nowMs: nowMs)
+                try renameDerivedHostnameUnlocked(table: "usage_sessions", from: old, to: hostname, revision: newRevision, nowMs: nowMs)
                 try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
             }
+        }
+    }
+
+    /// 原始表 hostname 原地改名：hostname 为普通列，无主键冲突风险。
+    private func renameRawHostnameUnlocked(table: String, from old: String, to new: String) throws {
+        let statement = try prepare("UPDATE \(table) SET hostname=? WHERE hostname=?;")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, new); try bind(statement, 2, old)
+        try done(statement)
+    }
+
+    /// 派生表 hostname 原地改名：hostname 属主键，先删新名残留行再整体改名。改名后自然键（含 hostname）
+    /// 变化，等价于新名下从未同步过的新行，故把 revision 提升到新名新高水位、synced_revision 归零，
+    /// 保证 revision>synced_revision 而 dirty，须在新名下重新上报（避免旧名下的已 ack 高水位误判为已同步）。
+    private func renameDerivedHostnameUnlocked(table: String, from old: String, to new: String, revision: Int64, nowMs: Int64) throws {
+        let purge = try prepare("DELETE FROM \(table) WHERE hostname=?;")
+        do { defer { sqlite3_finalize(purge) }; try bind(purge, 1, new); try done(purge) }
+        let update = try prepare("UPDATE \(table) SET hostname=?, revision=?, synced_revision=0, updated_at_ms=? WHERE hostname=?;")
+        defer { sqlite3_finalize(update) }
+        try bind(update, 1, new); try bind(update, 2, revision); try bind(update, 3, nowMs); try bind(update, 4, old)
+        try done(update)
+    }
+
+    /// 采纳新的本机身份，但**不改动**任何历史行：仅把 canonical_hostname 更新为新名。
+    ///
+    /// 对应用户在改名确认弹窗中选择「否」——新名从此生效并承接后续新数据，历史保留旧名。
+    /// 结果是同一台机器上「旧名历史 + 新名新数据」共存（预期行为，非 bug），各自按其
+    /// hostname 上报。更新后 hostnameState(current: 新名) 即为 .match，不会再触发弹窗循环。
+    public func adoptHostname(_ hostname: String) throws {
+        try queue.sync {
+            try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
         }
     }
 

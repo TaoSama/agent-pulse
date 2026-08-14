@@ -60,6 +60,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 置 true 后禁止一切网络动作（普通上报），
     /// 先完整重扫全部来源；扫描成功清除 pending 后，再由 finishScan 恢复正常启动链路。
     private var rebuildRecoveryPending: Bool = false
+    /// 设备标识改名确认弹窗：检测到配置权威 hostname 与账本旧 canonical 不一致（.mismatch）时，
+    /// 由此回调向用户征询「是否把本地历史一并改名」。参数为 (旧名, 新名, 决策回调)；
+    /// 决策回调传 true=确认改名（原地 UPDATE 历史），false=否（仅新名生效、历史保留旧名）。
+    /// 由 App 层安装（NSAlert 实现）；缺失时（如无头/测试）默认走非破坏性的「否」路径。
+    var hostnameRenamePrompt: ((_ old: String, _ new: String, _ decide: @escaping (Bool) -> Void) -> Void)?
+    /// 改名弹窗已弹出、等待用户决策：置位期间不再重复弹窗，避免每轮扫描重复打扰。
+    private var pendingHostnamePrompt: Bool = false
 
     private let summarySubject: CurrentValueSubject<TokenUsageSummary, Never>
     private let statusSubject: CurrentValueSubject<TokenSyncStatus, Never>
@@ -286,8 +293,22 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             return
         }
 
-        // 配置就绪时必须与账本 hostname 对齐：mismatch 时以权威重建；unset 时首次落库即对齐。
+        // 配置就绪时必须与账本 hostname 对齐：mismatch 不再静默自动改名，改为弹窗征询用户；
+        // unset 时首次落库即对齐。
         let configReady = authority.status == .ready && !authority.hostname.isEmpty
+        if configReady {
+            // 在主线程读取账本 hostname 状态（serial queue，非主队列，可安全调用）。
+            if case let .mismatch(stored) = (try? ledger.hostnameState(current: hostname)) ?? .unset {
+                // 已有弹窗等待决策时不重复弹，避免每轮扫描重复打扰；本轮不扫描，待用户决策后再触发。
+                guard !pendingHostnamePrompt else {
+                    updateStatus { $0.scanningInProgress = false }
+                    return
+                }
+                presentHostnameMismatch(old: stored, new: hostname)
+                updateStatus { $0.scanningInProgress = false }
+                return
+            }
+        }
         updateStatus { $0.scanningInProgress = true }
 
         let currentParserVersion = UsageJSONLParser.parserVersion
@@ -320,15 +341,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             // 阻塞式 SQLite/文件扫描在后台队列执行（不阻塞主线程），不使用 detached 分叉。
             let result = await Self.runOffMain { gate in
                 try gate.throwIfCancelled()
-                // 配置就绪：确保账本派生对齐到权威 hostname。
-                if configReady {
-                    switch try ledger.hostnameState(current: hostname) {
-                    case .match, .unset:
-                        break
-                    case .mismatch:
-                        try ledger.rebuildForHostname(hostname)
-                    }
-                }
+                // hostname 对齐已在启动本 Task 前于主线程处理（mismatch 已由用户弹窗决策为
+                // rebuild 或 adopt，account 已对齐；此处账本状态必为 match/unset），无需再判定。
                 // 解析器升级或历史非法数据：绝不再 resetForRebuild（那会清空磁盘上已删除历史
                 // session 的 raw，无法恢复）。改为设置持久 parser rebuild pending（不清 raw），
                 // 随后本轮对所有 configured root 做文件级原子重解析：每个变化文件在 record 内
@@ -389,6 +403,44 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             let cancelled = Task.isCancelled
             self?.finishScan(generation: generation, cancelled: cancelled, chainedReport: chainedReport, result: result)
         }
+    }
+
+    /// 弹出「设备标识改名」确认弹窗（或在无回调时走非破坏性默认），并在用户决策后落地。
+    private func presentHostnameMismatch(old: String, new: String) {
+        pendingHostnamePrompt = true
+        guard let prompt = hostnameRenamePrompt else {
+            // 无 UI 回调（无头 / 测试）：默认走「否」——新名生效、历史保留旧名，非破坏且不进入循环。
+            resolveHostnameMismatch(old: old, new: new, rename: false)
+            return
+        }
+        prompt(old, new) { [weak self] rename in
+            // 决策回调可能在任意线程返回，统一回到主 actor 落地。
+            Task { @MainActor in
+                self?.resolveHostnameMismatch(old: old, new: new, rename: rename)
+            }
+        }
+    }
+
+    /// 落地用户对设备标识改名的决策：
+    /// - rename==true：原地把历史全部改名为新名（rebuildForHostname）。
+    /// - rename==false：仅让新名生效、历史保留旧名（adoptHostname）。
+    /// 两者都会把 canonical_hostname 更新为新名，因此之后比对为 .match，不再重复弹窗；
+    /// 落地后重新触发一次扫描，让新名承接后续采集。
+    private func resolveHostnameMismatch(old: String, new: String, rename: Bool) {
+        pendingHostnamePrompt = false
+        guard let ledger else { return }
+        do {
+            if rename {
+                try ledger.rebuildForHostname(new)
+            } else {
+                try ledger.adoptHostname(new)
+            }
+        } catch {
+            updateStatus { $0.configurationError = "设备标识改名失败" }
+            return
+        }
+        // 新名已生效，重新触发扫描；此时 hostnameState 为 .match，不会再弹窗。
+        if isRunning, statusSubject.value.localCollectionEnabled { scanNow(chainedReport: false) }
     }
 
     /// 把 cliproxy 采集配置状态与错误刷新到 UI（只在当前 generation 有效时）。

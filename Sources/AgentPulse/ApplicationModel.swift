@@ -79,6 +79,12 @@ final class ApplicationModel: ObservableObject {
         trendColorMode = TrendColorMode(rawValue: savedColorMode ?? "") ?? .risingGreen
         uploadService = UploadService(configPath: path)
         let tokenCoordinator = TokenSyncCoordinator()
+        tokenCoordinator.hostnameRenamePrompt = { old, new, decide in
+            // 决策回调在主线程弹出确认框；NSAlert 需在主线程运行。
+            Task { @MainActor in
+                decide(Self.confirmHostnameRename(old: old, new: new))
+            }
+        }
         tokenSyncCoordinator = tokenCoordinator
         tokenSummary = tokenCoordinator.summary
         tokenSyncStatus = tokenCoordinator.status
@@ -216,6 +222,21 @@ final class ApplicationModel: ObservableObject {
 
     private func format(_ value: Int?) -> String { value.map(String.init) ?? "—" }
     private func format(_ value: Double?) -> String { value.map { String(format: "%.1f", $0) } ?? "—" }
+
+    /// 设备标识改名确认框：检测到设备标识由旧名改为新名时，询问是否把本地历史一并改名。
+    /// 返回 true=确认改名（原地统一历史），false=否（新名生效、历史保留旧名）。
+    /// 深色外观与主面板一致；两个按钮分别为「确认改名」/「否」。
+    @MainActor
+    private static func confirmHostnameRename(old: String, new: String) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "设备标识已更改"
+        alert.informativeText = "检测到设备标识由「\(old)」改为「\(new)」。是否把本地历史数据中的「\(old)」一并改为「\(new)」？"
+        alert.addButton(withTitle: "确认改名")
+        alert.addButton(withTitle: "否")
+        alert.window.appearance = NSAppearance(named: .darkAqua)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
 }
 
 private extension MetricValue {
