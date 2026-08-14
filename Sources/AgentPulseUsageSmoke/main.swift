@@ -143,6 +143,15 @@ struct UsageReportingSmoke {
         }
         print("[parse] AGG input=\(input) output=\(output) cached=\(cached) creation=\(creation) reasoning=\(reasoning)")
         print("[parse] AGG fourSum=\(input + output + cached + reasoning) fiveSum=\(input + output + cached + creation + reasoning)")
+
+        // Optional: dump per-event content dedup keys (in file order) so a reference
+        // per-entry DedupKey list can be diffed one-to-one. Only prints when
+        // AGENT_PULSE_SMOKE_DUMP_DEDUP_KEYS is set, to keep the default output compact.
+        if ProcessInfo.processInfo.environment["AGENT_PULSE_SMOKE_DUMP_DEDUP_KEYS"] != nil {
+            for event in parsed.events {
+                print("[dedupkey] \(event.codexDedupKey)")
+            }
+        }
     }
 
     /// The real local scan roots, matched to the app's production configuration.
@@ -189,14 +198,33 @@ struct UsageReportingSmoke {
             let finalize = try ledger.finalizeDerived(hostname: hostname)
             if try ledger.requiresRebuildCompletion() { try ledger.markRebuildCompleted() }
             print("[rebuild] rescanned files=\(scannedFiles) eligible=\(finalize.reportingEligible) blocked=\(finalize.blockedReasons)")
+            print("[rebuild] collapsedInherited=\(finalize.collapsedInheritedEvents) collapsedContent=\(finalize.collapsedContentDuplicates)")
+
+            func fiveSum(_ c: UsageTokenCounts) -> Int64 { c.billableTotal }
+
+            // Windowed totals over all derived buckets (independent of the reporting
+            // gate), using GMT+8 natural-day boundaries so the numbers line up with
+            // the reference menu bar. Reference "now" is passed via the hostname run;
+            // we anchor to the ledger's latest bucket to avoid Date.now dependency.
+            let allBuckets = try ledger.buckets(hostname: hostname)
+            let positive = allBuckets.filter { $0.bucketStart.timeIntervalSince1970 >= 0 }
+            let negative = allBuckets.filter { $0.bucketStart.timeIntervalSince1970 < 0 }
+            let tz = TimeZone(secondsFromGMT: 8 * 3600)!
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = tz
+            let anchor = positive.map { $0.bucketStart }.max() ?? Date(timeIntervalSince1970: 0)
+            let dayStart = cal.startOfDay(for: anchor)
+            let weekStart = cal.date(byAdding: .day, value: -6, to: dayStart) ?? dayStart
+            let today = positive.filter { $0.bucketStart >= dayStart }.reduce(Int64(0)) { $0 + fiveSum($1.counts) }
+            let week = positive.filter { $0.bucketStart >= weekStart }.reduce(Int64(0)) { $0 + fiveSum($1.counts) }
+            let all = positive.reduce(Int64(0)) { $0 + fiveSum($1.counts) }
+            let bad = negative.reduce(Int64(0)) { $0 + fiveSum($1.counts) }
+            func b(_ v: Int64) -> String { String(format: "%.3fB", Double(v) / 1e9) }
+            print("[rebuild] anchor(GMT+8 day)=\(dayStart) fiveSum today=\(b(today)) week=\(b(week)) all=\(b(all))")
+            print("[rebuild] positive buckets=\(positive.count) negative(bad-history) buckets=\(negative.count) badFiveSum=\(b(bad))")
 
             let pending = try ledger.pendingBatch(hostname: hostname, maxBuckets: nil, maxSessions: nil)
             print("[rebuild] pending buckets=\(pending.buckets.count) sessions=\(pending.sessions.count)")
-            let badStart = pending.buckets.filter { $0.bucket.bucketStart.timeIntervalSince1970 < 0 }
-            print("[rebuild] buckets with negative(distantPast) bucketStart=\(badStart.count)")
-            func fiveSum(_ c: UsageTokenCounts) -> Int64 {
-                c.input + c.output + c.cachedInput + c.cacheCreationInput + c.reasoningOutput
-            }
             let distinctStarts = Set(pending.buckets.map { $0.bucket.bucketStart })
             print("[rebuild] distinct bucketStart values=\(distinctStarts.count)")
             if let sample = pending.buckets.max(by: { fiveSum($0.bucket.counts) < fiveSum($1.bucket.counts) }) {
