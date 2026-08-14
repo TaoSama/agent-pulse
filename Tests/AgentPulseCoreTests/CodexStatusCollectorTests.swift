@@ -72,10 +72,10 @@ final class CodexStatusCollectorTests: XCTestCase {
     // MARK: automation 过滤
 
     func testAutomationComponentMatch() {
-        XCTAssertTrue(CodexSessionParser.isUnderAutomation(cwd: "/Users/a/.codex/automations/x", automationRoots: []))
-        XCTAssertTrue(CodexSessionParser.isUnderAutomation(cwd: "/Users/a/Automations/x", automationRoots: []))
+        XCTAssertTrue(CodexSessionParser.isUnderAutomation(cwd: "/workspace/.codex/automations/x", automationRoots: []))
+        XCTAssertTrue(CodexSessionParser.isUnderAutomation(cwd: "/workspace/Automations/x", automationRoots: []))
         // 不得误伤形似目录名。
-        XCTAssertFalse(CodexSessionParser.isUnderAutomation(cwd: "/Users/a/my-automations-demo/x", automationRoots: []))
+        XCTAssertFalse(CodexSessionParser.isUnderAutomation(cwd: "/workspace/my-automations-demo/x", automationRoots: []))
         // 显式 root 前缀（按目录边界）。
         XCTAssertTrue(CodexSessionParser.isUnderAutomation(cwd: "/opt/robot/jobs/y", automationRoots: ["/opt/robot/jobs"]))
         XCTAssertFalse(CodexSessionParser.isUnderAutomation(cwd: "/opt/robot/jobs-extra", automationRoots: ["/opt/robot/jobs"]))

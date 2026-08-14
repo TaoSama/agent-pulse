@@ -266,7 +266,11 @@ public struct UsageIngestResponse: Sendable, Equatable, Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.bucketsUpserted = try container.decode(Int.self, forKey: .bucketsUpserted)
         self.sessionsUpserted = try container.decode(Int.self, forKey: .sessionsUpserted)
-        self.autonomySessionsUpserted = try container.decode(Int.self, forKey: .autonomySessionsUpserted)
+        // The reference ingest endpoint acknowledges only buckets and sessions,
+        // so this field is optional: a response omitting it decodes to 0 rather
+        // than failing. Incremental ingest sends no autonomy rows, so a zero
+        // here still exactly matches the request's autonomy count.
+        self.autonomySessionsUpserted = try container.decodeIfPresent(Int.self, forKey: .autonomySessionsUpserted) ?? 0
     }
 
     /// A batch is acknowledged only when every server count exactly matches

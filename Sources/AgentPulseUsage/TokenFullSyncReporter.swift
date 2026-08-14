@@ -56,6 +56,21 @@ public struct FullSyncReporter: Sendable {
         generationBaseline: Int64,
         store: FullSyncStateStore
     ) async throws -> FullSyncReservation {
+        try await mappingServerLifecycle(store: store) {
+            try await reserveCore(
+                hostname: hostname, authIdentity: authIdentity,
+                generationBaseline: generationBaseline, store: store
+            )
+        }
+    }
+
+    @discardableResult
+    private func reserveCore(
+        hostname: String,
+        authIdentity: String,
+        generationBaseline: Int64,
+        store: FullSyncStateStore
+    ) async throws -> FullSyncReservation {
         try validateConfiguration()
         let identity = try normalizedIdentity(authIdentity)
         let normalizedHostname = CanonicalHostname.normalize(hostname)
@@ -83,9 +98,13 @@ public struct FullSyncReporter: Sendable {
         let response = try await dispatch(
             rawBody: reserveEnvelope(hostname: normalizedHostname),
             identity: identity,
-            expectedStatus: configuration.successStatuses.reserve
+            expectedStatus: configuration.successStatuses.reserve,
+            retryPolicy: configuration.reserveRetryPolicy
         )
-        guard let fence = response.fenceRevision else { throw FullSyncError.malformedResponse }
+        // A reserve response that omits the fence field defaults to revision 0:
+        // an absent field is the same as an explicit zero on the wire. A present
+        // but negative value is still invalid.
+        let fence = response.fenceRevision ?? 0
         guard fence >= 0 else { throw FullSyncError.invalidFenceRevision(fence) }
         let state = FullSyncState(
             uploadID: uploadID, hostname: normalizedHostname, phase: .reserved, fenceRevision: fence,
@@ -102,6 +121,19 @@ public struct FullSyncReporter: Sendable {
     /// begin/stage/commit sequence. No implicit reservation is performed.
     @discardableResult
     public func completeUpload(
+        snapshot: FullSyncPayloadSnapshot,
+        authIdentity: String,
+        store: FullSyncStateStore
+    ) async throws -> FullSyncResult {
+        try await mappingServerLifecycle(store: store) {
+            try await completeUploadCore(
+                snapshot: snapshot, authIdentity: authIdentity, store: store
+            )
+        }
+    }
+
+    @discardableResult
+    private func completeUploadCore(
         snapshot: FullSyncPayloadSnapshot,
         authIdentity: String,
         store: FullSyncStateStore
@@ -175,11 +207,11 @@ public struct FullSyncReporter: Sendable {
             rawBody: baseEnvelope(action: configuration.actionNames.commit, state: current),
             identity: identity, expectedStatus: configuration.successStatuses.commit
         )
-        guard let buckets = response.bucketsUpserted,
-              let sessions = response.sessionsUpserted,
-              let autonomy = response.autonomySessionsUpserted else {
-            throw FullSyncError.malformedResponse
-        }
+        // A committed response may omit a zero count field: an absent per-kind
+        // upsert count defaults to 0, matching an explicit zero on the wire.
+        let buckets = response.bucketsUpserted ?? 0
+        let sessions = response.sessionsUpserted ?? 0
+        let autonomy = response.autonomySessionsUpserted ?? 0
         guard buckets == current.expectedBuckets, sessions == current.expectedSessions,
               autonomy == current.expectedAutonomySessions else {
             throw FullSyncError.acknowledgementCountMismatch
@@ -217,6 +249,28 @@ public struct FullSyncReporter: Sendable {
     /// commit. Safe to call when no state exists.
     public func finalize(store: FullSyncStateStore) throws {
         try store.discard()
+    }
+
+    /// Centralizes the server-lifecycle status mapping for the public entry
+    /// points. A 409 (stateInvalidated) discards the local upload state and is
+    /// surfaced as rescanRequired so the caller re-scans before retrying. A 410
+    /// (rejoinRequired) also discards only the local upload state and is
+    /// surfaced distinctly so the caller starts a fresh join; external
+    /// credentials are never touched here (the reporter has no access to them).
+    /// A 501 (unsupported) propagates unchanged. All other errors propagate.
+    private func mappingServerLifecycle<T>(
+        store: FullSyncStateStore,
+        _ body: () async throws -> T
+    ) async throws -> T {
+        do {
+            return try await body()
+        } catch FullSyncError.stateInvalidated {
+            try? store.discard()
+            throw FullSyncError.rescanRequired
+        } catch FullSyncError.rejoinRequired {
+            try? store.discard()
+            throw FullSyncError.rejoinRequired
+        }
     }
 
     // MARK: - Staging
@@ -419,6 +473,32 @@ public struct FullSyncReporter: Sendable {
         }
     }
 
+    /// Resolves the account namespace for a token via the injected supplier.
+    /// A supplier that cannot prove the identity throws, and the throw is
+    /// mapped to authIdentityUnverifiable so the upload fails closed rather
+    /// than proceeding under an unproven account.
+    private func resolveIdentity(forToken token: SecretToken) async throws -> String {
+        do {
+            return try await tokenSupplier.accountNamespace(forToken: token)
+        } catch let error as FullSyncError {
+            throw error
+        } catch {
+            throw FullSyncError.authIdentityUnverifiable
+        }
+    }
+
+    /// Resolves the token's namespace and fences it against the pinned identity.
+    private func requireSameResolvedIdentity(_ expected: String, forToken token: SecretToken) async throws {
+        try requireSameIdentity(expected, try await resolveIdentity(forToken: token))
+    }
+
+    /// True when a non-terminal response body carries the configured
+    /// payload-too-large JSON code, so the current chunk must be shrunk.
+    private func payloadTooLargeCodeMatches(_ response: HTTPResponse) -> Bool {
+        guard let code = configuration.payloadTooLargeCode else { return false }
+        return code.matches(response.body)
+    }
+
     private func validateConfiguration() throws {
         guard configuration.isConfigured else { throw FullSyncError.configurationMissing }
         _ = try endpointURL()
@@ -519,7 +599,10 @@ public struct FullSyncReporter: Sendable {
         root.putStringOmitEmpty("uploadId", uploadID)
         root.putStringOmitEmpty("hostname", hostname)
         if let kind { root.putString("kind", configuration.kindNames.wireToken(for: kind)) }
-        if let chunkIndex { root.putInt64("chunkIndex", Int64(chunkIndex)) }
+        // chunkIndex is omitted when zero (the first chunk of a kind) so the
+        // absent field defaults to 0 on the wire; a non-zero index is always
+        // emitted explicitly.
+        if let chunkIndex, chunkIndex != 0 { root.putInt64("chunkIndex", Int64(chunkIndex)) }
         root.putIntOmitZero("expectedBuckets", expectedBuckets)
         root.putIntOmitZero("expectedSessions", expectedSessions)
         root.putIntOmitZero("expectedAutonomy", expectedAutonomy)
@@ -610,7 +693,8 @@ public struct FullSyncReporter: Sendable {
     private func dispatch(
         rawBody: Data,
         identity: String,
-        expectedStatus: String
+        expectedStatus: String,
+        retryPolicy: RetryPolicy? = nil
     ) async throws -> FullSyncServerResponse {
         let useGzip = rawBody.count >= Self.gzipMinimumBytes
         let body: Data
@@ -623,7 +707,7 @@ public struct FullSyncReporter: Sendable {
             gzipApplied = false
         }
 
-        let policy = configuration.retryPolicy
+        let policy = retryPolicy ?? configuration.retryPolicy
         var didForceRefresh = false
         var retryCount = 0
 
@@ -631,9 +715,7 @@ public struct FullSyncReporter: Sendable {
             try Task.checkCancellation()
             do {
                 var token = try await tokenSupplier.token(forceRefresh: false)
-                try requireSameIdentity(
-                    identity, tokenSupplier.stableAccountIdentity(forToken: token)
-                )
+                try await requireSameResolvedIdentity(identity, forToken: token)
                 let response = try await sender.send(makeRequest(body: body, gzip: gzipApplied, token: token))
                 switch response.statusCode {
                 case 200...299:
@@ -641,31 +723,38 @@ public struct FullSyncReporter: Sendable {
                 case 401 where !didForceRefresh:
                     didForceRefresh = true
                     let refreshed = try await tokenSupplier.token(forceRefresh: true)
+                    // The refreshed credential must resolve to the same account
+                    // namespace as both the pre-refresh token and the pinned
+                    // identity; any drift or an unresolvable identity fences.
+                    let refreshedIdentity = try await resolveIdentity(forToken: refreshed)
                     try requireSameIdentity(
-                        tokenSupplier.stableAccountIdentity(forToken: token),
-                        tokenSupplier.stableAccountIdentity(forToken: refreshed)
+                        try await resolveIdentity(forToken: token), refreshedIdentity
                     )
-                    try requireSameIdentity(
-                        identity, tokenSupplier.stableAccountIdentity(forToken: refreshed)
-                    )
+                    try requireSameIdentity(identity, refreshedIdentity)
                     token = refreshed
                     let retried = try await sender.send(makeRequest(body: body, gzip: gzipApplied, token: token))
                     switch retried.statusCode {
                     case 200...299:
                         return try decode(retried.body, expectedStatus: expectedStatus)
                     case 401: throw FullSyncError.notAuthenticated
-                    case 409: throw FullSyncError.fenceConflict
-                    case 413: throw PayloadTooLargeSignal()
+                    case 409: throw FullSyncError.stateInvalidated
+                    case 410: throw FullSyncError.rejoinRequired
+                    case 501: throw FullSyncError.unsupported
+                    case configuration.payloadTooLargeStatus: throw PayloadTooLargeSignal()
                     default:
+                        if payloadTooLargeCodeMatches(retried) { throw PayloadTooLargeSignal() }
                         if policy.isRetryable(retried), retryCount < policy.maxRetries {
                             try await sleepBeforeRetry(policy, retryCount: retryCount); retryCount += 1; continue
                         }
                         throw FullSyncError.httpFailure(statusCode: retried.statusCode)
                     }
                 case 401: throw FullSyncError.notAuthenticated
-                case 409: throw FullSyncError.fenceConflict
-                case 413: throw PayloadTooLargeSignal()
+                case 409: throw FullSyncError.stateInvalidated
+                case 410: throw FullSyncError.rejoinRequired
+                case 501: throw FullSyncError.unsupported
+                case configuration.payloadTooLargeStatus: throw PayloadTooLargeSignal()
                 default:
+                    if payloadTooLargeCodeMatches(response) { throw PayloadTooLargeSignal() }
                     if policy.isRetryable(response), retryCount < policy.maxRetries {
                         try await sleepBeforeRetry(policy, retryCount: retryCount); retryCount += 1; continue
                     }

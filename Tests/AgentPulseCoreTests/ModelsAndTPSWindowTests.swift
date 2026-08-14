@@ -83,11 +83,11 @@ final class TPSWindowTests: XCTestCase {
 
     func testTokensInWindowAreGroupedByModel() {
         let window = TPSWindow(now: { date(100) })
-        window.record(TPSSample(timestamp: date(100), tokenCount: 180, durationSeconds: 0, source: .cli, model: "gpt-5.6-sol"))
+        window.record(TPSSample(timestamp: date(100), tokenCount: 180, durationSeconds: 0, source: .cli, model: "codex-test-model"))
         window.record(TPSSample(timestamp: date(100), tokenCount: 90, durationSeconds: 0, source: .cli, model: "claude-opus"))
         window.record(TPSSample(timestamp: date(100), tokenCount: 45, durationSeconds: 0, source: .cli, model: nil))
         let byModel = window.tokensInWindowByModel(referenceDate: date(100))
-        XCTAssertEqual(byModel["gpt-5.6-sol"], 180)
+        XCTAssertEqual(byModel["codex-test-model"], 180)
         XCTAssertEqual(byModel["claude-opus"], 90)
         XCTAssertEqual(byModel["unknown"], 45)
         XCTAssertEqual(byModel.values.reduce(0, +), window.tokensInWindow(referenceDate: date(100)), accuracy: 1e-9)
@@ -153,5 +153,52 @@ final class ModelsCodableTests: XCTestCase {
             try roundTrip(PulseCollectionError.parseFailed(reason: "bad json")),
             .parseFailed(reason: "bad json")
         )
+    }
+
+    func testUsageInputSummaryUsesInputOnlyCacheSemantics() {
+        let counts = UsageTokenCounts(
+            input: 30,
+            output: 1_000,
+            cachedInput: 60,
+            cacheCreationInput: 10,
+            reasoningOutput: 500,
+            reportedTotal: 2_000
+        )
+
+        let summary = UsageInputSummary(counts: counts)
+
+        XCTAssertEqual(summary.cachedTokens, 60)
+        XCTAssertEqual(summary.newTokens, 40)
+        XCTAssertEqual(summary.cacheHitRate, 0.6, accuracy: 1e-9)
+    }
+
+    func testUsageInputSummaryHasNoRateWithoutInputTokens() {
+        let summary = UsageInputSummary(
+            counts: UsageTokenCounts(output: 100, reasoningOutput: 20, reportedTotal: 120)
+        )
+
+        XCTAssertEqual(summary.cachedTokens, 0)
+        XCTAssertEqual(summary.newTokens, 0)
+        XCTAssertNil(summary.cacheHitRate)
+    }
+
+    func testUsageSummaryWindowsUseLocalCalendarBoundaries() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "Asia/Shanghai"))
+        let reference = try XCTUnwrap(calendar.date(from: DateComponents(
+            year: 2024, month: 2, day: 29, hour: 15, minute: 30
+        )))
+
+        let day = try XCTUnwrap(UsageSummaryWindow.day.interval(containing: reference, calendar: calendar))
+        XCTAssertEqual(day.start, calendar.date(from: DateComponents(year: 2024, month: 2, day: 29)))
+        XCTAssertEqual(day.end, calendar.date(from: DateComponents(year: 2024, month: 3, day: 1)))
+
+        let month = try XCTUnwrap(UsageSummaryWindow.month.interval(containing: reference, calendar: calendar))
+        XCTAssertEqual(month.start, calendar.date(from: DateComponents(year: 2024, month: 2, day: 1)))
+        XCTAssertEqual(month.end, calendar.date(from: DateComponents(year: 2024, month: 3, day: 1)))
+
+        let year = try XCTUnwrap(UsageSummaryWindow.year.interval(containing: reference, calendar: calendar))
+        XCTAssertEqual(year.start, calendar.date(from: DateComponents(year: 2024, month: 1, day: 1)))
+        XCTAssertEqual(year.end, calendar.date(from: DateComponents(year: 2025, month: 1, day: 1)))
     }
 }

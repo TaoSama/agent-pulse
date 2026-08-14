@@ -1,5 +1,8 @@
 import Foundation
 import SQLite3
+#if canImport(Darwin)
+import Darwin
+#endif
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
@@ -27,6 +30,7 @@ extension PulseSnapshot: SnapshotPersistable {
 /// 存储层错误，全部显式暴露，禁止吞错。
 public enum SQLiteSnapshotStoreError: Error, Equatable, CustomStringConvertible {
     case openFailed(code: Int32, message: String)
+    case filePermissionsFailed(path: String, code: Int32, message: String)
     case executeFailed(sql: String, code: Int32, message: String)
     case prepareFailed(sql: String, code: Int32, message: String)
     case bindFailed(index: Int32, code: Int32, message: String)
@@ -38,6 +42,8 @@ public enum SQLiteSnapshotStoreError: Error, Equatable, CustomStringConvertible 
         switch self {
         case let .openFailed(code, message):
             return "openFailed(code: \(code), message: \(message))"
+        case let .filePermissionsFailed(path, code, message):
+            return "filePermissionsFailed(path: \(path), code: \(code), message: \(message))"
         case let .executeFailed(sql, code, message):
             return "executeFailed(sql: \(sql), code: \(code), message: \(message))"
         case let .prepareFailed(sql, code, message):
@@ -76,10 +82,15 @@ public final class SQLiteSnapshotStore: @unchecked Sendable {
     private var db: OpaquePointer?
     private let queue: DispatchQueue
     private static let tableName = "snapshots"
+    private static let ownerOnlyPermissions: mode_t = 0o600
 
     /// 打开(或创建)指定路径数据库并初始化 schema。传入 ":memory:" 使用内存库。
     public init(path: String) throws {
         self.queue = DispatchQueue(label: "com.agentpulse.sqlite.\(UUID().uuidString)")
+        let databasePath = path == ":memory:" ? nil : path
+        if let databasePath {
+            try Self.prepareDatabaseFile(at: databasePath)
+        }
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         let openResult = sqlite3_open_v2(path, &handle, flags, nil)
@@ -104,6 +115,9 @@ public final class SQLiteSnapshotStore: @unchecked Sendable {
                 "CREATE INDEX IF NOT EXISTS idx_\(Self.tableName)_timestamp " +
                 "ON \(Self.tableName)(timestamp_ms);"
             )
+            if let databasePath {
+                try Self.enforceOwnerOnlyPermissions(databasePath: databasePath)
+            }
         } catch {
             sqlite3_close_v2(opened)
             self.db = nil
@@ -328,6 +342,68 @@ public final class SQLiteSnapshotStore: @unchecked Sendable {
     private func errmsg() -> String {
         guard let db else { return "no database handle" }
         return String(cString: sqlite3_errmsg(db))
+    }
+
+    private static func prepareDatabaseFile(at path: String) throws {
+        let descriptor = openDescriptor(path, flags: O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            let code = errno
+            throw SQLiteSnapshotStoreError.openFailed(code: code, message: systemMessage(for: code))
+        }
+        try setOwnerOnlyPermissions(descriptor: descriptor, path: path)
+    }
+
+    private static func enforceOwnerOnlyPermissions(databasePath: String) throws {
+        for suffix in ["", "-wal", "-shm"] {
+            let path = databasePath + suffix
+            let descriptor = openDescriptor(path, flags: O_RDWR | O_CLOEXEC | O_NOFOLLOW)
+            if descriptor < 0, errno == ENOENT {
+                continue
+            }
+            guard descriptor >= 0 else {
+                let code = errno
+                throw SQLiteSnapshotStoreError.filePermissionsFailed(
+                    path: path,
+                    code: code,
+                    message: systemMessage(for: code)
+                )
+            }
+            try setOwnerOnlyPermissions(descriptor: descriptor, path: path)
+        }
+    }
+
+    private static func openDescriptor(_ path: String, flags: Int32) -> Int32 {
+        while true {
+            let descriptor = Darwin.open(path, flags, ownerOnlyPermissions)
+            if descriptor >= 0 || errno != EINTR {
+                return descriptor
+            }
+        }
+    }
+
+    private static func setOwnerOnlyPermissions(descriptor: Int32, path: String) throws {
+        let chmodResult = Darwin.fchmod(descriptor, ownerOnlyPermissions)
+        let chmodCode = errno
+        let closeResult = Darwin.close(descriptor)
+        let closeCode = errno
+        if chmodResult != 0 {
+            throw SQLiteSnapshotStoreError.filePermissionsFailed(
+                path: path,
+                code: chmodCode,
+                message: systemMessage(for: chmodCode)
+            )
+        }
+        if closeResult != 0 {
+            throw SQLiteSnapshotStoreError.filePermissionsFailed(
+                path: path,
+                code: closeCode,
+                message: systemMessage(for: closeCode)
+            )
+        }
+    }
+
+    private static func systemMessage(for code: Int32) -> String {
+        String(cString: strerror(code))
     }
 
     private static func millis(from date: Date) -> Int64 {

@@ -128,8 +128,23 @@ public struct FullSyncConfiguration: Sendable, Equatable {
     /// Soft cap on raw (pre-gzip) chunk body bytes; a chunk that exceeds it is
     /// split, unless it is a single row (then rejected as too large).
     public var maxBytesPerChunk: Int
+    /// HTTP status the server uses to reject a staged chunk as too large. When
+    /// this status is seen the current unconfirmed chunk is halved and retried.
+    /// Configuration-driven so no numeric contract is baked onto the wire.
+    public var payloadTooLargeStatus: Int
+    /// Optional JSON error-code trigger for the too-large signal. When the
+    /// server answers a non-2xx/401/409/410/501 status whose body carries the
+    /// configured code at the configured key path, the chunk is halved and
+    /// retried just as for payloadTooLargeStatus. Absent means only the status
+    /// triggers a shrink.
+    public var payloadTooLargeCode: PayloadTooLargeCode?
     /// Retry policy applied to transient transport / status failures.
     public var retryPolicy: RetryPolicy
+    /// Retry policy applied specifically to the reserve request. Reserve is the
+    /// idempotent fence acquisition, so it retries a small fixed set of
+    /// transient server statuses with short backoffs, independent of the
+    /// staging/commit retry policy.
+    public var reserveRetryPolicy: RetryPolicy
 
     public init(
         baseURL: URL? = nil,
@@ -143,7 +158,10 @@ public struct FullSyncConfiguration: Sendable, Equatable {
         successStatuses: FullSyncSuccessStatuses = FullSyncSuccessStatuses(),
         maxRowsPerChunk: Int = 2_000,
         maxBytesPerChunk: Int = 8 * 1024 * 1024,
-        retryPolicy: RetryPolicy = RetryPolicy()
+        payloadTooLargeStatus: Int = 413,
+        payloadTooLargeCode: PayloadTooLargeCode? = nil,
+       retryPolicy: RetryPolicy = RetryPolicy(),
+        reserveRetryPolicy: RetryPolicy = FullSyncConfiguration.defaultReserveRetryPolicy
     ) {
         self.baseURL = baseURL
         self.path = path
@@ -156,7 +174,10 @@ public struct FullSyncConfiguration: Sendable, Equatable {
         self.successStatuses = successStatuses
         self.maxRowsPerChunk = maxRowsPerChunk
         self.maxBytesPerChunk = maxBytesPerChunk
+        self.payloadTooLargeStatus = payloadTooLargeStatus
+        self.payloadTooLargeCode = payloadTooLargeCode
         self.retryPolicy = retryPolicy
+        self.reserveRetryPolicy = reserveRetryPolicy
     }
 
     public var isConfigured: Bool {
@@ -167,8 +188,59 @@ public struct FullSyncConfiguration: Sendable, Equatable {
             && successStatuses.allTokensArePresent
     }
 
-    var effectiveMaxRowsPerChunk: Int { max(1, maxRowsPerChunk) }
-    var effectiveMaxBytesPerChunk: Int { max(1, maxBytesPerChunk) }
+   var effectiveMaxRowsPerChunk: Int { max(1, maxRowsPerChunk) }
+   var effectiveMaxBytesPerChunk: Int { max(1, maxBytesPerChunk) }
+
+    /// Reserve is the idempotent fence acquisition, so it retries a small fixed
+    /// set of transient server statuses (500/502/503/504) with short 0.5s then
+    /// 1s backoffs. Callers may override via reserveRetryPolicy.
+    public static let defaultReserveRetryPolicy = RetryPolicy(
+        maxRetries: 2,
+        retryableStatusCodes: [500, 502, 503, 504],
+        backoffSeconds: [0.5, 1]
+    )
+}
+
+/// A configuration-driven JSON error-code trigger for the payload-too-large
+/// signal. The code is located at an ordered JSON key path in the response
+/// body and matched against a set of accepted values. Both string and integer
+/// codes are supported so a server can signal "too large" without relying on a
+/// specific HTTP status.
+public struct PayloadTooLargeCode: Sendable, Equatable {
+    /// Ordered JSON keys locating the code in the response object.
+    public var keyPath: [String]
+    /// Accepted string code values (exact match).
+    public var stringValues: Set<String>
+    /// Accepted integer code values (exact match).
+    public var intValues: Set<Int>
+
+    public init(keyPath: [String], stringValues: Set<String> = [], intValues: Set<Int> = []) {
+        self.keyPath = keyPath
+        self.stringValues = stringValues
+        self.intValues = intValues
+    }
+
+    public var isConfigured: Bool {
+        !keyPath.isEmpty && (!stringValues.isEmpty || !intValues.isEmpty)
+    }
+
+    /// True when the JSON body carries a matching code at the configured path.
+    public func matches(_ body: Data) -> Bool {
+        guard isConfigured, let root = try? JSONSerialization.jsonObject(with: body) else { return false }
+        var current: Any? = root
+        for key in keyPath {
+            guard let object = current as? [String: Any], let next = object[key] else { return false }
+            current = next
+        }
+        guard let value = current else { return false }
+        if let string = value as? String, stringValues.contains(string) { return true }
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return false }
+            let doubleValue = number.doubleValue
+            if doubleValue.rounded() == doubleValue, intValues.contains(number.intValue) { return true }
+        }
+        return false
+    }
 }
 
 private extension FullSyncSuccessStatuses {
@@ -355,7 +427,16 @@ public enum FullSyncError: Error, Equatable, Sendable {
     case authIdentityUnverifiable
     case rescanRequired
     case payloadTooLarge(kind: FullSyncKind, chunkIndex: Int)
-    case fenceConflict
+    /// The server invalidated the upload state (HTTP 409). The local upload
+    /// state must be discarded and the caller must rescan before retrying.
+    case stateInvalidated
+    /// The server requires the client to rejoin because the credential/session
+    /// is no longer valid for this upload (HTTP 410). External credentials are
+    /// never deleted; only the local upload state is dropped so a fresh join
+    /// can start.
+    case rejoinRequired
+    /// The server does not support this operation (HTTP 501).
+    case unsupported
     case chunkDigestMismatch(kind: FullSyncKind, chunkIndex: Int)
     case acknowledgementCountMismatch
     case httpFailure(statusCode: Int)
@@ -390,14 +471,22 @@ public protocol FullSyncRequestSending: Sendable {
     func send(_ request: FullSyncTransportRequest) async throws -> HTTPResponse
 }
 
-/// Supplies the bearer token and the stable account identity derived from it,
-/// so the core can perform exactly one forced refresh on 401 and fence when the
-/// account provably changes. Injectable for tests and to reuse the incremental
-/// client's token plumbing.
+/// Supplies the bearer token and resolves the stable account namespace it maps
+/// to, so the core can perform exactly one forced refresh on 401 and fence when
+/// the account provably changes. Injectable for tests and to reuse the
+/// incremental client's token plumbing.
+///
+/// Identity is never derived from token bytes (no JWT claims, no whole-token
+/// digest). Instead the supplier queries a configured, authenticated identity
+/// endpoint for a positive integer user id and derives a versioned namespace
+/// over the normalized request origin and that id. Any failure to prove the
+/// identity must throw so the caller fails closed rather than continuing under
+/// an unverifiable account.
 public protocol FullSyncTokenSupplying: Sendable {
     func token(forceRefresh: Bool) async throws -> SecretToken
-    /// Derives a stable, comparable account identity from a revealed token.
-    /// Returns an empty string when it cannot be derived; empty is treated as
-    /// "unverifiable" and fences the upload.
-    func stableAccountIdentity(forToken token: SecretToken) -> String
+    /// Resolves the stable, comparable account namespace for a revealed token
+    /// by asking the configured identity endpoint. Throws when the identity
+    /// cannot be proven; a thrown error fences the upload. Implementations must
+    /// never return an empty or fabricated namespace on failure.
+    func accountNamespace(forToken token: SecretToken) async throws -> String
 }

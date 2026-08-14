@@ -84,12 +84,23 @@ struct AgentPulseCoreVerification {
         if try await reconcileFrozenSnapshotIfConfigured() {
             return
         }
+        if ProcessInfo.processInfo.environment["AGENT_PULSE_VERIFY_PARSER_METRICS_ONLY"] == "1" {
+            try verifyV2ParserProtocol()
+            try verifyV2ClaudeReasoningSplit()
+            try verifyToolMetricsAndEditLines()
+            print("AgentPulseCoreVerification(parser-metrics): PASS")
+            return
+        }
         try verifyTPSBoundaries()
         try verifySQLiteRoundTripAndRetention()
+        try verifyUsageSummarySemantics()
         try verifyUsageLedgerAndParsers()
         try verifyUsageV2()
+        try verifyV5LegacyDerivedReconciliation()
+        try verifyV8LegacyOwnedDedup()
         try await verifyLegacyRuntimeSnapshotIgnored()
         try verifyParserFixturesAndCollector()
+        try verifyToolMetricsAndEditLines()
         try await verifyOracleColdStartAndCandidateRules()
         try await verifyClaudeTPSIntegration()
         try await verifyActiveCountingRules()
@@ -98,6 +109,38 @@ struct AgentPulseCoreVerification {
         try verifySparklineAnalysis()
         try verifyCliProxyUsageParser()
         print("AgentPulseCoreVerification: PASS")
+    }
+
+    private static func verifyUsageSummarySemantics() throws {
+        let inputSummary = UsageInputSummary(counts: UsageTokenCounts(
+            input: 30,
+            output: 1_000,
+            cachedInput: 60,
+            cacheCreationInput: 10,
+            reasoningOutput: 500,
+            reportedTotal: 2_000
+        ))
+        try require(inputSummary.cachedTokens == 60, "cache hits must include cache reads only")
+        try require(inputSummary.newTokens == 40, "new tokens must include uncached input and cache creation only")
+        try requireApproximatelyEqual(inputSummary.cacheHitRate, 0.6, "cache hit denominator must include input token classes only")
+
+        let outputOnly = UsageInputSummary(counts: UsageTokenCounts(output: 100, reasoningOutput: 20))
+        try require(outputOnly.cacheHitRate == nil, "cache hit rate must be nil without input tokens")
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .gmt
+        guard let reference = calendar.date(from: DateComponents(year: 2024, month: 2, day: 29, hour: 15, minute: 30)),
+              let day = UsageSummaryWindow.day.interval(containing: reference, calendar: calendar),
+              let month = UsageSummaryWindow.month.interval(containing: reference, calendar: calendar),
+              let year = UsageSummaryWindow.year.interval(containing: reference, calendar: calendar) else {
+            throw VerificationFailure.assertion("usage summary calendar intervals must be constructible")
+        }
+        try require(day.start == calendar.date(from: DateComponents(year: 2024, month: 2, day: 29)), "day window start")
+        try require(day.end == calendar.date(from: DateComponents(year: 2024, month: 3, day: 1)), "day window end")
+        try require(month.start == calendar.date(from: DateComponents(year: 2024, month: 2, day: 1)), "month window start")
+        try require(month.end == calendar.date(from: DateComponents(year: 2024, month: 3, day: 1)), "month window end")
+        try require(year.start == calendar.date(from: DateComponents(year: 2024, month: 1, day: 1)), "year window start")
+        try require(year.end == calendar.date(from: DateComponents(year: 2025, month: 1, day: 1)), "year window end")
     }
 
     private static func verifyUsageLedgerAndParsers() throws {
@@ -125,8 +168,12 @@ struct AgentPulseCoreVerification {
         let database = FileManager.default.temporaryDirectory.appending(path: "usage-ledger-\(UUID().uuidString).sqlite")
         defer { for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: database.path + suffix) } }
         let ledger = try UsageLedgerStore(path: database.path)
-        try ledger.record(events: parsedCodex.events + parsedClaude.events, checkpoint: parsedClaude.checkpoint, hostname: "test-host")
-        try ledger.record(events: parsedCodex.events + parsedClaude.events, checkpoint: parsedClaude.checkpoint, hostname: "test-host")
+        // v8：record 是对 checkpoint.fileID 的文件级原子替换，每个文件各自 record（其行 sourceFileHash 与 fileID 相符）。
+        // 重复 record 同一文件验证幂等（替换而非累加）。
+        try ledger.record(events: parsedCodex.events, checkpoint: parsedCodex.checkpoint, hostname: "test-host")
+        try ledger.record(events: parsedClaude.events, checkpoint: parsedClaude.checkpoint, hostname: "test-host")
+        try ledger.record(events: parsedCodex.events, checkpoint: parsedCodex.checkpoint, hostname: "test-host")
+        try ledger.record(events: parsedClaude.events, checkpoint: parsedClaude.checkpoint, hostname: "test-host")
         try ledger.finalizeDerived(hostname: "test-host")
         let eventCount = try ledger.eventCount()
         let buckets = try ledger.buckets(hostname: "test-host")
@@ -154,9 +201,12 @@ struct AgentPulseCoreVerification {
         try verifyV2InheritedReplayDedup()
         try verifyV2ArchivedSessionIdentity()
         try verifyV2DirtyAckRaceAndRestart()
+        try verifyV2AcknowledgeProgressTimestamp()
         try verifyV2HostnameRebuild()
+        try verifyUniqueLegacyHostnameCandidate()
         try verifyV2Migration()
         try verifyV2ParserRebuildSafety()
+        try verifyV2RebuildCompletionPersistence()
         try verifyV2FullSyncReconciliation()
         try verifyV2FullSyncStableGenerationAcrossReads()
         try verifyV2FullSyncReserveBeforeSnapshot()
@@ -382,8 +432,15 @@ struct AgentPulseCoreVerification {
         """
         let stableA = UsageJSONLParser.parse(data: Data(stableSourceA.utf8), source: "codex", fileIdentity: "stable-a")
         let stableB = UsageJSONLParser.parse(data: Data(stableSourceB.utf8), source: "codex", fileIdentity: "stable-b")
-        try require(stableA.events.count == 1, "identical snapshots in one rollout must deduplicate")
+        try require(stableA.events.count == 2, "repeated codex token_count events in one rollout are each counted once")
         try require(stableA.events[0].id == stableB.events[0].id, "Codex event id must ignore path, timestamp, and line index")
+        try require(stableA.events[1].id != stableA.events[0].id, "a repeated codex event gets a distinct ordinal id, not a collapsed duplicate")
+        // Content dedup key is content-only: byte-identical turns (same model + last +
+        // total snapshot) share it across files/timestamps, so the finalize fold can
+        // collapse fork/replay copies into one bucket contribution.
+        try require(!stableA.events[0].codexDedupKey.isEmpty, "a complete-snapshot codex event must carry a content dedup key")
+        try require(stableA.events[0].codexDedupKey == stableA.events[1].codexDedupKey, "byte-identical repeated turns share one content dedup key")
+        try require(stableA.events[0].codexDedupKey == stableB.events[0].codexDedupKey, "content dedup key ignores path and timestamp across files")
 
         let incompleteTotal = UsageJSONLParser.parse(
             data: Data("""
@@ -393,6 +450,16 @@ struct AgentPulseCoreVerification {
             source: "codex", fileIdentity: "protocol-incomplete"
         )
         try require(!incompleteTotal.events[0].hasTotalSnapshot && incompleteTotal.events[0].lineageFingerprint.isEmpty, "complete total snapshot requires numeric input/output/total fields")
+        try require(incompleteTotal.events[0].codexDedupKey.isEmpty, "an incomplete total snapshot yields no content dedup key (never folded)")
+
+        let inconsistentTotal = UsageJSONLParser.parse(
+            data: Data("""
+            {"timestamp":"2026-02-01T06:10:00Z","type":"session_meta","payload":{"id":"rollout-inconsistent","session_id":"session-inconsistent"}}
+            {"timestamp":"2026-02-01T06:10:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3},"total_token_usage":{"input_tokens":2,"output_tokens":1,"total_tokens":99}}}}
+            """.utf8),
+            source: "codex", fileIdentity: "protocol-inconsistent"
+        )
+        try require(!inconsistentTotal.events[0].hasTotalSnapshot && inconsistentTotal.events[0].lineageFingerprint.isEmpty, "total snapshot must be numerically self-consistent")
 
         let cumulative = UsageJSONLParser.parse(
             data: Data("""
@@ -416,6 +483,7 @@ struct AgentPulseCoreVerification {
             source: "claude-code", fileIdentity: "claude-tool-result-fixture"
         )
         try require(claude.sessionEvents.map(\.role) == [.syntheticUser, .user, .assistant], "Claude tool_result user row must not count as a real prompt")
+        try require(!claude.events[0].hasTotalSnapshot, "Claude message usage is not a Codex total_token_usage lineage snapshot")
 
         let relocatedClaude = UsageJSONLParser.parse(
             data: Data("""
@@ -487,6 +555,17 @@ struct AgentPulseCoreVerification {
             source: "claude-code", fileIdentity: "claude-no-thinking"
         )
         try require(noThinking.events[0].counts.reasoningOutput == 0 && noThinking.events[0].counts.output == 100, "no thinking text => no split")
+
+        // Int64.max * thinkingChars 会超过 Int64；拆分必须用 full-width 算术且保持总量。
+        let overflowBoundary = UsageJSONLParser.parse(
+            data: Data("""
+            {"type":"assistant","timestamp":"2026-02-02T00:00:00Z","sessionId":"cs","cwd":"/w/p","message":{"id":"m-overflow","model":"claude-opus","content":[{"type":"thinking","thinking":"aa"},{"type":"text","text":"b"}],"usage":{"output_tokens":9223372036854775807}}}
+            """.utf8),
+            source: "claude-code", fileIdentity: "claude-overflow"
+        )
+        let overflowCounts = overflowBoundary.events[0].counts
+        try require(overflowCounts.reasoningOutput > 0 && overflowCounts.output > 0, "overflow-safe split must preserve both sides")
+        try require(overflowCounts.reasoningOutput + overflowCounts.output == Int64.max, "overflow-safe split must preserve Int64.max total")
     }
 
     // 1c) Claude subagent transcript：token 计入，但不产生任何 session 事件，且不做 thinking 拆分。
@@ -645,10 +724,10 @@ struct AgentPulseCoreVerification {
         """
         let data = Data(rollout.utf8)
         // 模拟文件从 sessions/ 移动到 archived_sessions/：内容相同，路径不同。
-        let live = UsageJSONLParser.parse(data: data, source: "codex", fileIdentity: "/Users/u/.codex/sessions/2026/05/01/rollout-archive.jsonl")
+        let live = UsageJSONLParser.parse(data: data, source: "codex", fileIdentity: "/workspace/.codex/sessions/2026/05/01/rollout-archive.jsonl")
         try ledger.record(events: live.events, sessionEvents: live.sessionEvents, checkpoint: live.checkpoint, hostname: "h")
         try ledger.finalizeDerived(hostname: "h")
-        let archived = UsageJSONLParser.parse(data: data, source: "codex", fileIdentity: "/Users/u/.codex/archived_sessions/rollout-archive.jsonl")
+        let archived = UsageJSONLParser.parse(data: data, source: "codex", fileIdentity: "/workspace/.codex/archived_sessions/rollout-archive.jsonl")
         try ledger.record(events: archived.events, sessionEvents: archived.sessionEvents, checkpoint: archived.checkpoint, hostname: "h")
         try ledger.finalizeDerived(hostname: "h")
 
@@ -658,8 +737,10 @@ struct AgentPulseCoreVerification {
         try require(buckets.count == 1 && buckets[0].counts.total == 10, "tokens must not double after archival re-scan")
         let rawEventCount = try ledger.eventCount()
         let rawSessionEventCount = try ledger.sessionEventCount()
-        try require(rawEventCount == 1, "token events dedup by stable event id")
-        try require(rawSessionEventCount == 3, "session events dedup by stable identity")
+        // v8：raw 层 PK 含 source_file_hash，跨文件同 logical event_id 共存（归档移动=两个文件身份）；
+        // 去重发生在聚合层（sessions/buckets 已断言不重复），raw 行数=每文件事件数之和。
+        try require(rawEventCount == 2, "token raw rows coexist across files (v8): got \(rawEventCount)")
+        try require(rawSessionEventCount == 6, "session raw rows coexist across files (v8): got \(rawSessionEventCount)")
         let s = sessions[0]
         try require(s.messageCount == 3 && s.userMessageCount == 1, "session timeline preserved exactly once")
     }
@@ -717,6 +798,95 @@ struct AgentPulseCoreVerification {
         try require(limited.buckets.count == 1 && limited.hasMore, "hard bucket limit must cap batch and set hasMore")
     }
 
+    // 5b) last_synced_at 只表示实际 ACK 进展：空批次、全 stale、重复 ACK 均不得推进；
+    // partial ACK 只要至少一行仍精确匹配，就应落账并推进时间。
+    private static func verifyV2AcknowledgeProgressTimestamp() throws {
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        let ledger = try UsageLedgerStore(path: db.path)
+        func codexFile(_ session: String, ts: String, out: Int, file: String) -> ParsedUsageFile {
+            UsageJSONLParser.parse(
+                data: Data("""
+                {"type":"session_meta","payload":{"session_id":"\(session)","thread_source":"user","cwd":"/workspace/p"}}
+                {"type":"turn_context","payload":{"model":"m"}}
+                {"timestamp":"\(ts)","type":"response_item","payload":{"type":"message","role":"assistant"}}
+                {"timestamp":"\(ts)","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":\(out),"total_tokens":\(out)}}}}
+                """.utf8),
+                source: "codex",
+                fileIdentity: file
+            )
+        }
+
+        let empty = UsagePendingBatch(hostname: "h", buckets: [], sessions: [], hasMore: false)
+        try ledger.acknowledge(empty)
+        let emptyTimestamp = try ledger.lastSyncedAt(hostname: "h")
+        try require(emptyTimestamp == nil, "empty ACK must not create a sync timestamp")
+
+        let firstA = codexFile("a", ts: "2026-06-01T00:00:00Z", out: 100, file: "ack-a1.jsonl")
+        let firstB = codexFile("b", ts: "2026-06-01T01:00:00Z", out: 200, file: "ack-b1.jsonl")
+        try ledger.record(events: firstA.events, sessionEvents: firstA.sessionEvents, checkpoint: firstA.checkpoint, hostname: "h")
+        try ledger.record(events: firstB.events, sessionEvents: firstB.sessionEvents, checkpoint: firstB.checkpoint, hostname: "h")
+        try ledger.finalizeDerived(hostname: "h")
+        let fullyStale = try ledger.pendingBatch(hostname: "h")
+        try require(fullyStale.buckets.count == 2 && fullyStale.sessions.count == 2, "stale ACK fixture must cover bucket and session rows")
+
+        let secondA = codexFile("a", ts: "2026-06-01T00:10:00Z", out: 101, file: "ack-a1.jsonl")
+        let secondB = codexFile("b", ts: "2026-06-01T01:10:00Z", out: 201, file: "ack-b1.jsonl")
+        try ledger.record(
+            events: secondA.events, sessionEvents: secondA.sessionEvents,
+            checkpoint: UsageFileCheckpoint(
+                fileID: secondA.checkpoint.fileID, source: secondA.checkpoint.source,
+                pathHash: secondA.checkpoint.pathHash, offset: 2, size: 2,
+                modifiedAt: secondA.checkpoint.modifiedAt.addingTimeInterval(1),
+                parserVersion: secondA.checkpoint.parserVersion, status: secondA.checkpoint.status
+            ),
+            hostname: "h"
+        )
+        try ledger.record(
+            events: secondB.events, sessionEvents: secondB.sessionEvents,
+            checkpoint: UsageFileCheckpoint(
+                fileID: secondB.checkpoint.fileID, source: secondB.checkpoint.source,
+                pathHash: secondB.checkpoint.pathHash, offset: 2, size: 2,
+                modifiedAt: secondB.checkpoint.modifiedAt.addingTimeInterval(1),
+                parserVersion: secondB.checkpoint.parserVersion, status: secondB.checkpoint.status
+            ),
+            hostname: "h"
+        )
+        try ledger.finalizeDerived(hostname: "h")
+
+        try ledger.acknowledge(fullyStale)
+        let staleTimestamp = try ledger.lastSyncedAt(hostname: "h")
+        try require(staleTimestamp == nil, "fully stale ACK must not advance last_synced_at")
+        let beforePartial = try ledger.pendingCounts(hostname: "h")
+        try require(beforePartial.buckets == 2 && beforePartial.sessions == 2, "fully stale ACK must leave every row pending")
+
+        let partial = try ledger.pendingBatch(hostname: "h")
+        let thirdA = codexFile("a", ts: "2026-06-01T00:20:00Z", out: 102, file: "ack-a1.jsonl")
+        try ledger.record(
+            events: thirdA.events, sessionEvents: thirdA.sessionEvents,
+            checkpoint: UsageFileCheckpoint(
+                fileID: thirdA.checkpoint.fileID, source: thirdA.checkpoint.source,
+                pathHash: thirdA.checkpoint.pathHash, offset: 3, size: 3,
+                modifiedAt: thirdA.checkpoint.modifiedAt.addingTimeInterval(2),
+                parserVersion: thirdA.checkpoint.parserVersion, status: thirdA.checkpoint.status
+            ),
+            hostname: "h"
+        )
+        try ledger.finalizeDerived(hostname: "h")
+
+        try ledger.acknowledge(partial)
+        let partialTimestamp = try ledger.lastSyncedAt(hostname: "h")
+        try require(partialTimestamp != nil, "partial ACK with matching rows must advance last_synced_at")
+        let afterPartial = try ledger.pendingCounts(hostname: "h")
+        try require(afterPartial.buckets == 1 && afterPartial.sessions == 1, "partial ACK must sync only the still-matching bucket and session")
+
+        Thread.sleep(forTimeInterval: 0.01)
+        try ledger.acknowledge(partial)
+        let repeatedTimestamp = try ledger.lastSyncedAt(hostname: "h")
+        try require(repeatedTimestamp == partialTimestamp, "repeating an already-applied/stale ACK must not advance last_synced_at")
+        let afterRepeat = try ledger.pendingCounts(hostname: "h")
+        try require(afterRepeat.buckets == 1 && afterRepeat.sessions == 1, "repeated ACK must not change pending rows")
+    }
+
 
     // 6) hostname rebuild：canonical hostname 变化时从原始事件重建，清除旧 hostname 派生。
     private static func verifyV2HostnameRebuild() throws {
@@ -747,6 +917,79 @@ struct AgentPulseCoreVerification {
         // 重建后应为 dirty（synced_revision=0），可重新上报。
         let pendingNew = try ledger.pendingBatch(hostname: "new-host")
         try require(!pendingNew.isEmpty, "rebuilt rows must be pending for re-upload")
+    }
+
+    private static func verifyUniqueLegacyHostnameCandidate() throws {
+        let emptyDB = tempUsageDB(); defer { cleanupDB(emptyDB) }
+        let emptyLedger = try UsageLedgerStore(path: emptyDB.path)
+        let emptyCandidate = try emptyLedger.uniqueLegacyHostnameCandidate()
+        try require(
+            emptyCandidate == nil,
+            "empty ledger must not invent a legacy hostname"
+        )
+
+        let uniqueDB = tempUsageDB(); defer { cleanupDB(uniqueDB) }
+        let uniqueLedger = try UsageLedgerStore(path: uniqueDB.path)
+        let first = UsageJSONLParser.parse(
+            data: Data("""
+            {"type":"session_meta","payload":{"session_id":"legacy-one","cwd":"/w/p"}}
+            {"type":"turn_context","payload":{"model":"m"}}
+            {"timestamp":"2026-07-01T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":1,"total_tokens":1}}}}
+            """.utf8),
+            source: "codex",
+            fileIdentity: "legacy-one.jsonl"
+        )
+        try uniqueLedger.record(
+            events: first.events,
+            sessionEvents: first.sessionEvents,
+            checkpoint: first.checkpoint,
+            hostname: "legacy-host"
+        )
+        try uniqueLedger.finalizeDerived(hostname: "legacy-host")
+        let uniqueCandidate = try uniqueLedger.uniqueLegacyHostnameCandidate()
+        try require(
+            uniqueCandidate == "legacy-host",
+            "a single durable hostname must be recoverable for legacy upgrade"
+        )
+
+        try uniqueLedger.rebuildForHostname("second-host")
+        let rebuiltCandidate = try uniqueLedger.uniqueLegacyHostnameCandidate()
+        try require(
+            rebuiltCandidate == "second-host",
+            "candidate must follow an explicit canonical hostname rebuild"
+        )
+
+        let ambiguousDB = tempUsageDB(); defer { cleanupDB(ambiguousDB) }
+        do {
+            let seededLedger = try UsageLedgerStore(path: ambiguousDB.path)
+            try seededLedger.record(
+                events: first.events,
+                sessionEvents: first.sessionEvents,
+                checkpoint: first.checkpoint,
+                hostname: "host-a"
+            )
+            try seededLedger.finalizeDerived(hostname: "host-a")
+        }
+        var handle: OpaquePointer?
+        try require(sqlite3_open(ambiguousDB.path, &handle) == SQLITE_OK, "open ambiguous legacy db")
+        let secondHostname = """
+        INSERT INTO usage_buckets
+          SELECT 'host-b',source,model,project,bucket_start_ms,input_tokens,output_tokens,
+                 cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,
+                 updated_at_ms,revision,synced_revision,skills_json,skill_counts_json,mcp_counts_json,
+                 lines_added,lines_deleted,lines_net,code_metric_version
+            FROM usage_buckets WHERE hostname='host-a';
+        """
+        try require(sqlite3_exec(handle, secondHostname, nil, nil, nil) == SQLITE_OK, "seed ambiguous legacy hosts")
+        sqlite3_close(handle)
+        handle = nil
+        // Open only after seeding; migration adds the remaining tables and columns.
+        let ambiguousLedger = try UsageLedgerStore(path: ambiguousDB.path)
+        let ambiguousCandidate = try ambiguousLedger.uniqueLegacyHostnameCandidate()
+        try require(
+            ambiguousCandidate == nil,
+            "multiple durable hostnames must remain fail-closed"
+        )
     }
 
     // 7) v1 -> v2 迁移：老库补齐血缘列与新表，仍可读写。
@@ -785,7 +1028,348 @@ struct AgentPulseCoreVerification {
         try require(migratedSessionEvents >= 1, "session events table usable after migration")
     }
 
+    // v4->v5 迁移与 legacy 派生行对账：证明既有 revision=0/synced=0 派生行不会永远非 pending 也不会被静默删除，
+    // 未绑定 host 的全局对账债务不被丢弃，且 DB 文件权限收紧到 0600。全部走公开 API + 原始 SQLite 播种。
+    private static func verifyV5LegacyDerivedReconciliation() throws {
+        func seedSchema(_ path: String, userVersion: Int, extraSQL: String) throws {
+            var handle: OpaquePointer?
+            try require(sqlite3_open(path, &handle) == SQLITE_OK, "open raw db for v5 seeding")
+            defer { sqlite3_close(handle) }
+            let schema = """
+            CREATE TABLE usage_events(event_id TEXT PRIMARY KEY,source TEXT NOT NULL,model TEXT NOT NULL,project TEXT NOT NULL,timestamp_ms INTEGER NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_creation_input_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,session_hash TEXT NOT NULL,source_file_hash TEXT NOT NULL,created_at_ms INTEGER NOT NULL,rollout_key TEXT NOT NULL DEFAULT '',parent_rollout_key TEXT NOT NULL DEFAULT '',inherited INTEGER NOT NULL DEFAULT 0,has_total_snapshot INTEGER NOT NULL DEFAULT 0,lineage_fingerprint TEXT NOT NULL DEFAULT '');
+            CREATE TABLE usage_buckets(hostname TEXT NOT NULL,source TEXT NOT NULL,model TEXT NOT NULL,project TEXT NOT NULL,bucket_start_ms INTEGER NOT NULL,input_tokens INTEGER NOT NULL,output_tokens INTEGER NOT NULL,cached_input_tokens INTEGER NOT NULL,cache_creation_input_tokens INTEGER NOT NULL,reasoning_output_tokens INTEGER NOT NULL,total_tokens INTEGER NOT NULL,updated_at_ms INTEGER NOT NULL,revision INTEGER NOT NULL DEFAULT 0,synced_revision INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(hostname,source,model,project,bucket_start_ms));
+            CREATE TABLE usage_files(file_id TEXT PRIMARY KEY,source TEXT NOT NULL,path_hash TEXT NOT NULL,read_offset INTEGER NOT NULL,file_size INTEGER NOT NULL,mtime_ms INTEGER NOT NULL,parser_version INTEGER NOT NULL,scan_status TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);
+            CREATE TABLE sync_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at_ms INTEGER NOT NULL);
+            CREATE TABLE usage_session_events(event_id TEXT NOT NULL,source TEXT NOT NULL,session_hash TEXT NOT NULL,role TEXT NOT NULL,timestamp_ms INTEGER NOT NULL,created_at_ms INTEGER NOT NULL,PRIMARY KEY(source,event_id));
+            CREATE TABLE usage_sessions(hostname TEXT NOT NULL,source TEXT NOT NULL,session_hash TEXT NOT NULL,first_activity_ms INTEGER NOT NULL,last_activity_ms INTEGER NOT NULL,active_seconds INTEGER NOT NULL,message_count INTEGER NOT NULL,user_message_count INTEGER NOT NULL,assistant_events INTEGER NOT NULL,hour_histogram TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0,synced_revision INTEGER NOT NULL DEFAULT 0,updated_at_ms INTEGER NOT NULL,project TEXT NOT NULL DEFAULT '',PRIMARY KEY(hostname,source,session_hash));
+            \(extraSQL)
+            PRAGMA user_version=\(userVersion);
+            """
+            try require(sqlite3_exec(handle, schema, nil, nil, nil) == SQLITE_OK, "seed v\(userVersion) schema")
+        }
+        func rawBucketCount(_ path: String) throws -> Int {
+            var handle: OpaquePointer?
+            try require(sqlite3_open(path, &handle) == SQLITE_OK, "open raw db for count")
+            defer { sqlite3_close(handle) }
+            var stmt: OpaquePointer?
+            try require(sqlite3_prepare_v2(handle, "SELECT COUNT(*) FROM usage_buckets;", -1, &stmt, nil) == SQLITE_OK, "prepare count")
+            defer { sqlite3_finalize(stmt) }
+            _ = sqlite3_step(stmt)
+            return Int(sqlite3_column_int64(stmt, 0))
+        }
+
+        // 1) v4->v5：既有 revision=0/synced=0 legacy 派生行 → 每 host 登记 initial full-sync 债务，
+        //    reportingEligible fail-closed；这些行不作为增量 pending 发送（避免重复），idempotent。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            let extra = """
+            INSERT INTO usage_buckets VALUES('prod-host','codex','m','p',0,1,2,0,0,0,3,1000,0,0);
+            INSERT INTO usage_buckets VALUES('prod-host','codex','m','q',0,4,5,0,0,0,9,1000,0,0);
+            INSERT INTO sync_state VALUES('canonical_hostname','prod-host',1);
+            """
+            try seedSchema(db.path, userVersion: 4, extraSQL: extra)
+            let ledger = try UsageLedgerStore(path: db.path)
+            let eligible = try ledger.reportingEligible(hostname: "prod-host")
+            try require(!eligible, "v4->v5 legacy derived rows must fail-close reporting")
+            let reason = try ledger.reconciliationReason(hostname: "prod-host")
+            try require(reason != nil, "v4->v5 must register initial full-sync debt for legacy host")
+            let pending = try ledger.pendingBatch(hostname: "prod-host")
+            try require(pending.isEmpty, "legacy rev0 rows must not be sent as incremental pending (reconciled via full sync)")
+            let debtHosts = try ledger.pendingReconciliationHosts()
+            try require(debtHosts == ["prod-host"], "legacy host must appear as a full-sync debt target")
+
+            let reopened = try UsageLedgerStore(path: db.path)
+            let reopenedEligible = try reopened.reportingEligible(hostname: "prod-host")
+            try require(!reopenedEligible, "v5 migration must be idempotent across restart")
+            let reopenedHosts = try reopened.pendingReconciliationHosts()
+            try require(reopenedHosts == ["prod-host"], "v5 debt must persist across restart without duplication")
+        }
+
+        // 2) reset/rebuild 不静默删除 legacy rev0 行：删除后债务保留、reportingEligible 仍 fail-closed。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            let extra = """
+            INSERT INTO usage_buckets VALUES('prod-host','codex','m','p',0,1,2,0,0,0,3,1000,0,0);
+            INSERT INTO sync_state VALUES('canonical_hostname','prod-host',1);
+            """
+            try seedSchema(db.path, userVersion: 4, extraSQL: extra)
+            let ledger = try UsageLedgerStore(path: db.path)
+            try ledger.resetForRebuild()
+            let remaining = try rawBucketCount(db.path)
+            try require(remaining == 0, "reset must clear derived rows")
+            let reason = try ledger.reconciliationReason()
+            try require(reason != nil, "reset must preserve legacy reconciliation debt (no silent drop)")
+            let eligible = try ledger.reportingEligible(hostname: "prod-host")
+            try require(!eligible, "reset must keep reporting fail-closed for legacy debt host")
+            let debtHosts = try ledger.pendingReconciliationHosts()
+            try require(debtHosts == ["prod-host"], "reset must keep legacy host as a full-sync debt target")
+        }
+
+        // 3) v3->v4 未绑定 host 的全局 legacy 债务：不丢弃、整体 fail-closed；首次 record 学到 hostname 后原子迁移为可对账 per-host 债务。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            try seedSchema(db.path, userVersion: 3, extraSQL: "INSERT INTO sync_state VALUES('remote_reconciliation_required','legacy debt reason',1);")
+            let ledger = try UsageLedgerStore(path: db.path)
+            let anyEligible = try ledger.reportingEligible(hostname: "any-host")
+            try require(!anyEligible, "v3->v4 unassigned debt must fail-close every host")
+            let reason = try ledger.reconciliationReason()
+            try require(reason != nil, "v3->v4 unassigned debt must be preserved")
+            let debtHosts = try ledger.pendingReconciliationHosts()
+            try require(debtHosts.isEmpty, "unassigned debt must not surface as a pseudo-host full-sync target")
+
+            let file = "{\"type\":\"session_meta\",\"timestamp\":\"2026-08-01T00:00:00Z\",\"payload\":{\"id\":\"r\",\"session_id\":\"s\",\"cwd\":\"/w/p\"}}"
+            let parsed = UsageJSONLParser.parse(data: Data(file.utf8), source: "codex", fileIdentity: "v5.jsonl")
+            try ledger.record(events: parsed.events, sessionEvents: parsed.sessionEvents, checkpoint: parsed.checkpoint, hostname: "learned-host")
+            let relocatedHosts = try ledger.pendingReconciliationHosts()
+            try require(relocatedHosts == ["learned-host"], "unassigned debt must relocate to the learned canonical hostname")
+            let relocatedEligible = try ledger.reportingEligible(hostname: "learned-host")
+            try require(!relocatedEligible, "relocated debt must keep reporting fail-closed until reconciled")
+        }
+
+        // 4) v3->v4 已有 canonical hostname 的 legacy 全局债务：迁移绑定到该 host，per-host fail-closed。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            try seedSchema(db.path, userVersion: 3, extraSQL: """
+            INSERT INTO sync_state VALUES('remote_reconciliation_required','legacy debt reason',1);
+            INSERT INTO sync_state VALUES('canonical_hostname','known-host',1);
+            """)
+            let ledger = try UsageLedgerStore(path: db.path)
+            let debtHosts = try ledger.pendingReconciliationHosts()
+            try require(debtHosts == ["known-host"], "v3->v4 must bind legacy debt to the known canonical host")
+            let eligible = try ledger.reportingEligible(hostname: "known-host")
+            try require(!eligible, "bound legacy debt must fail-close reporting")
+        }
+
+        // 5) v1/v2 干净升级：无 legacy 债务、无 rev0 行时 v5 迁移必须纯 no-op（不误 block），常规写入/finalize/pending/ack/session 正常。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            let ledger = try UsageLedgerStore(path: db.path)
+            let eligible = try ledger.reportingEligible(hostname: "fresh-host")
+            try require(eligible, "fresh v5 database must remain reporting eligible")
+            let reason = try ledger.reconciliationReason()
+            try require(reason == nil, "fresh v5 database must carry no reconciliation debt")
+            let jsonl = """
+            {"type":"session_meta","timestamp":"2026-08-01T00:00:00Z","payload":{"id":"r","session_id":"s","cwd":"/w/proj"}}
+            {"type":"response_item","timestamp":"2026-08-01T00:00:00Z","payload":{"type":"message","role":"user"}}
+            {"timestamp":"2026-08-01T00:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"cached_input_tokens":0,"cache_creation_input_tokens":0,"reasoning_output_tokens":0,"total_tokens":15}}}}
+            """
+            let parsed = UsageJSONLParser.parse(data: Data(jsonl.utf8), source: "codex", fileIdentity: "fresh.jsonl")
+            try ledger.record(events: parsed.events, sessionEvents: parsed.sessionEvents, checkpoint: parsed.checkpoint, hostname: "fresh-host")
+            let result = try ledger.finalizeDerived(hostname: "fresh-host")
+            try require(result.reportingEligible, "fresh finalize must be eligible")
+            let batch = try ledger.pendingBatch(hostname: "fresh-host")
+            try require(!batch.buckets.isEmpty, "freshly finalized buckets must be pending (revision>synced)")
+            let sessions = try ledger.sessions(hostname: "fresh-host")
+            try require(sessions.count == 1 && sessions[0].messageCount == 3, "session aggregation must produce one session from the recorded activity events")
+            try ledger.acknowledge(batch)
+            let afterAck = try ledger.pendingBatch(hostname: "fresh-host")
+            try require(afterAck.isEmpty, "ack must clear pending for matching revision snapshot")
+        }
+
+        // 6) DB 文件权限：db / -wal / -shm 均收紧到 0600（无 group/other 位）。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            _ = try UsageLedgerStore(path: db.path)
+            for suffix in ["", "-wal", "-shm"] {
+                let target = db.path + suffix
+                guard FileManager.default.fileExists(atPath: target) else { continue }
+                let attributes = try FileManager.default.attributesOfItem(atPath: target)
+                let perm = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? -1
+                try require(perm & 0o077 == 0, "usage DB file must not grant group/other access")
+            }
+        }
+    }
+
+
+
     // 8) parser rebuild 检测、revision 单调性与无 tombstone 时的全局上报门禁。
+
+    // 7b) v8 legacy/owned 去重：聚合前按归属优先级选行
+    //     (ownedActive > ownedHistory > legacy)，有更高优先级时完全忽略低级旧行；
+    //     删除/mark missing active 后历史仍保留；token/session/edit 同口径；
+    //     overwrite 同 tier 计数冲突 fail-closed。
+    private static func verifyV8LegacyOwnedDedup() throws {
+        func open(_ path: String) throws -> OpaquePointer? {
+            var handle: OpaquePointer?
+            try require(sqlite3_open(path, &handle) == SQLITE_OK, "open v8 db for direct seed")
+            return handle
+        }
+        func run(_ handle: OpaquePointer?, _ sql: String, _ label: String) throws {
+            try require(sqlite3_exec(handle, sql, nil, nil, nil) == SQLITE_OK,
+                        "\(label): \(String(cString: sqlite3_errmsg(handle)))")
+        }
+        // 直接写一条 owned/legacy token 行（跳过 record 的按 fileID 归属，模拟迁移后的真实混合库）。
+        func insertEvent(_ handle: OpaquePointer?, eventID: String, source: String = "codex",
+                         model: String = "m", project: String = "p", ts: Int64 = 0, output: Int64,
+                         session: String = "s", fileHash: String, strategy: String = "overwrite") throws {
+            try run(handle, """
+            INSERT INTO usage_events
+            (event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,source_file_hash,rollout_key,parent_rollout_key,inherited,has_total_snapshot,lineage_fingerprint,merge_strategy,skill_counts_json,mcp_counts_json,created_at_ms)
+            VALUES ('\(eventID)','\(source)','\(model)','\(project)',\(ts),0,\(output),0,0,0,\(output),'\(session)','\(fileHash)','','',0,0,'','\(strategy)','{}','{}',1);
+            """, "insert usage_events \(eventID)/\(fileHash)")
+        }
+        func insertSessionEvent(_ handle: OpaquePointer?, eventID: String, source: String = "codex",
+                                session: String = "s", role: String, ts: Int64, fileHash: String) throws {
+            try run(handle, """
+            INSERT INTO usage_session_events
+            (event_id,source,session_hash,role,timestamp_ms,source_file_hash,created_at_ms)
+            VALUES ('\(eventID)','\(source)','\(session)','\(role)',\(ts),'\(fileHash)',1);
+            """, "insert usage_session_events \(eventID)/\(fileHash)")
+        }
+        func insertEdit(_ handle: OpaquePointer?, toolUseID: String, source: String = "codex",
+                        model: String = "m", project: String = "p", ts: Int64 = 0,
+                        added: Int64, deleted: Int64, fileHash: String) throws {
+            try run(handle, """
+            INSERT INTO usage_edit_entries
+            (source,tool_use_id,model,project,timestamp_ms,lines_added,lines_deleted,source_file_hash,created_at_ms)
+            VALUES ('\(source)','\(toolUseID)','\(model)','\(project)',\(ts),\(added),\(deleted),'\(fileHash)',1);
+            """, "insert usage_edit_entries \(toolUseID)/\(fileHash)")
+        }
+        // 登记一个 owned 文件（scan_status 决定 active/missing）。
+        func insertFile(_ handle: OpaquePointer?, fileID: String, source: String = "codex", status: String) throws {
+            try run(handle, """
+            INSERT INTO usage_files
+            (file_id,source,path_hash,read_offset,file_size,mtime_ms,parser_version,scan_status,updated_at_ms)
+            VALUES ('\(fileID)','\(source)','\(fileID)',1,1,1,\(UsageJSONLParser.parserVersion),'\(status)',1);
+            """, "insert usage_files \(fileID)")
+        }
+        func outputTotal(_ ledger: UsageLedgerStore, hostname: String) throws -> Int64 {
+            try ledger.buckets(hostname: hostname).reduce(0) { $0 + $1.counts.output }
+        }
+
+        // 1) legacy 空归属 + owned 副本：同 (source,event_id) 只算 owned，一次。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            _ = try UsageLedgerStore(path: db.path) // 建 v8 schema
+            let handle = try open(db.path); defer { sqlite3_close(handle) }
+            try insertFile(handle, fileID: "fileA", status: "complete")
+            try insertEvent(handle, eventID: "e1", output: 100, fileHash: "fileA")  // ownedActive
+            try insertEvent(handle, eventID: "e1", output: 100, fileHash: "")        // legacy 副本
+            sqlite3_close(handle)
+            let ledger = try UsageLedgerStore(path: db.path)
+            _ = try ledger.finalizeDerived(hostname: "h")
+            let outputSum = try outputTotal(ledger, hostname: "h"); try require(outputSum == 100,
+                        "owned copy must supersede legacy empty-attribution duplicate (count once)")
+        }
+
+        // 2) 删除/mark missing active 后历史仍保留：owned 变 ownedHistory，仍算一次，不因 missing 丢历史。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            _ = try UsageLedgerStore(path: db.path)
+            let handle = try open(db.path); defer { sqlite3_close(handle) }
+            try insertFile(handle, fileID: "fileA", status: "complete")
+            try insertEvent(handle, eventID: "e1", output: 100, fileHash: "fileA")
+            try insertEvent(handle, eventID: "e1", output: 100, fileHash: "")
+            sqlite3_close(handle)
+            let ledger = try UsageLedgerStore(path: db.path)
+            try ledger.markFilesMissing(fileIDs: ["fileA"]) // active -> missing
+            _ = try ledger.finalizeDerived(hostname: "h")
+            let outputSum = try outputTotal(ledger, hostname: "h"); try require(outputSum == 100,
+                        "ownedHistory (missing file) still supersedes legacy and is retained once")
+        }
+
+        // 3) ownedActive > ownedHistory：active 副本存在时忽略 missing 文件的旧副本（取 active 计数）。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            _ = try UsageLedgerStore(path: db.path)
+            let handle = try open(db.path); defer { sqlite3_close(handle) }
+            try insertFile(handle, fileID: "active", status: "complete")
+            try insertFile(handle, fileID: "gone", status: "missing")
+            // overwrite 计数一致，避免误触发 fail-closed（此处只验优先级取胜）。
+            try insertEvent(handle, eventID: "e1", output: 100, fileHash: "active")
+            try insertEvent(handle, eventID: "e1", output: 100, fileHash: "gone")
+            try insertEvent(handle, eventID: "e1", output: 100, fileHash: "")
+            sqlite3_close(handle)
+            let ledger = try UsageLedgerStore(path: db.path)
+            _ = try ledger.finalizeDerived(hostname: "h")
+            let outputSum = try outputTotal(ledger, hostname: "h"); try require(outputSum == 100,
+                        "ownedActive supersedes ownedHistory and legacy for the same logical id")
+        }
+
+        // 4) 无任何 owned 时才保留 legacy。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            _ = try UsageLedgerStore(path: db.path)
+            let handle = try open(db.path); defer { sqlite3_close(handle) }
+            try insertEvent(handle, eventID: "e1", output: 42, fileHash: "")
+            sqlite3_close(handle)
+            let ledger = try UsageLedgerStore(path: db.path)
+            _ = try ledger.finalizeDerived(hostname: "h")
+            let outputSum = try outputTotal(ledger, hostname: "h"); try require(outputSum == 42,
+                        "legacy row must be retained when no owned row exists")
+        }
+
+        // 5) session：legacy 空归属 + owned 副本只算 owned；mark missing 后历史仍保留一条。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            _ = try UsageLedgerStore(path: db.path)
+            let handle = try open(db.path); defer { sqlite3_close(handle) }
+            try insertFile(handle, fileID: "fileA", status: "complete")
+            // 同 session 两条活动事件（一个 user、一个 assistant），各有 owned+legacy 副本。
+            try insertSessionEvent(handle, eventID: "u1", role: "user", ts: 0, fileHash: "fileA")
+            try insertSessionEvent(handle, eventID: "u1", role: "user", ts: 0, fileHash: "")
+            try insertSessionEvent(handle, eventID: "a1", role: "assistant", ts: 60000, fileHash: "fileA")
+            try insertSessionEvent(handle, eventID: "a1", role: "assistant", ts: 60000, fileHash: "")
+            sqlite3_close(handle)
+            let ledger = try UsageLedgerStore(path: db.path)
+            _ = try ledger.finalizeDerived(hostname: "h")
+            let sessions = try ledger.sessions(hostname: "h")
+            try require(sessions.count == 1 && sessions[0].messageCount == 2,
+                        "session events must dedup owned over legacy (2 unique events, not 4)")
+            try ledger.markFilesMissing(fileIDs: ["fileA"])
+            _ = try ledger.finalizeDerived(hostname: "h")
+            let afterMissing = try ledger.sessions(hostname: "h")
+            try require(afterMissing.count == 1 && afterMissing[0].messageCount == 2,
+                        "session history retained after file marked missing")
+        }
+
+        // 6) edit：legacy 空归属 + owned 副本只算 owned；mark missing 后历史仍保留一次。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            _ = try UsageLedgerStore(path: db.path)
+            let handle = try open(db.path); defer { sqlite3_close(handle) }
+            try insertFile(handle, fileID: "fileA", status: "complete")
+            try run(handle, "INSERT INTO usage_edit_metric_sources(source,created_at_ms) VALUES('codex',1);", "mark edit metric source")
+            try insertEvent(handle, eventID: "e1", output: 1, fileHash: "fileA")
+            try insertEdit(handle, toolUseID: "t1", added: 10, deleted: 2, fileHash: "fileA")
+            try insertEdit(handle, toolUseID: "t1", added: 10, deleted: 2, fileHash: "")
+            sqlite3_close(handle)
+            let ledger = try UsageLedgerStore(path: db.path)
+            _ = try ledger.finalizeDerived(hostname: "h")
+            func editTotals(_ l: UsageLedgerStore) throws -> (Int64, Int64) {
+                try l.buckets(hostname: "h").reduce((0, 0)) { ($0.0 + $1.linesAdded, $0.1 + $1.linesDeleted) }
+            }
+            let (added1, deleted1) = try editTotals(ledger)
+            try require(added1 == 10 && deleted1 == 2,
+                        "edit entries must dedup owned over legacy (count lines once)")
+            try ledger.markFilesMissing(fileIDs: ["fileA"])
+            _ = try ledger.finalizeDerived(hostname: "h")
+            let (added2, deleted2) = try editTotals(ledger)
+            try require(added2 == 10 && deleted2 == 2,
+                        "edit history retained after file marked missing")
+        }
+
+        // 7) overwrite 同 tier 计数冲突 fail-closed：两个 active 文件对同一 event 观测到不同计数。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            _ = try UsageLedgerStore(path: db.path)
+            let handle = try open(db.path); defer { sqlite3_close(handle) }
+            try insertFile(handle, fileID: "fileA", status: "complete")
+            try insertFile(handle, fileID: "fileB", status: "complete")
+            try insertEvent(handle, eventID: "e1", output: 100, fileHash: "fileA")
+            try insertEvent(handle, eventID: "e1", output: 250, fileHash: "fileB")
+            sqlite3_close(handle)
+            let ledger = try UsageLedgerStore(path: db.path)
+            let result = try ledger.finalizeDerived(hostname: "h")
+            try require(!result.reportingEligible && !result.blockedReasons.isEmpty,
+                        "conflicting overwrite counts across same-tier files must fail-closed")
+            // 确定性不制造混合事件：保留稳定排序首行计数（source_file_hash 'fileA' < 'fileB'）。
+            let outputSum = try outputTotal(ledger, hostname: "h"); try require(outputSum == 100,
+                        "conflicting overwrite must keep deterministic first row, never a blended count")
+        }
+    }
+
+
     private static func verifyV2ParserRebuildSafety() throws {
         // 跟随解析器当前版本，并断言上一版本会触发重建，覆盖 parserVersion 提升。
         let currentVersion = UsageJSONLParser.parserVersion
@@ -841,14 +1425,23 @@ struct AgentPulseCoreVerification {
             try require(historyRequiresRebuild, "history without checkpoints must require rebuild")
         }
 
-        // 当前版本 checkpoint 也不能掩盖 v1 distantPast / 任意 epoch 前错误时间。
+        // 活跃文件的当前 checkpoint 携带 epoch 前错误时间戳仍需 rebuild；
+        // 但 begin+完成目标版本且该 checkpoint 标 missing 后，历史坏时间不再无限触发。
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             let ledger = try UsageLedgerStore(path: db.path)
             let invalid = event(timestamp: Date(timeIntervalSince1970: -62_135_769_600))
-            try ledger.record(events: [invalid], checkpoint: checkpoint(version: currentVersion), hostname: "h")
+            let invalidCheckpoint = checkpoint(version: currentVersion)
+            try ledger.record(events: [invalid], checkpoint: invalidCheckpoint, hostname: "h")
             let timestampRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: currentVersion)
-            try require(timestampRequiresRebuild, "negative historical timestamp must require rebuild")
+            try require(timestampRequiresRebuild, "active checkpoint with pre-epoch timestamp must require rebuild")
+
+            // 完成目标版本 rebuild 并把该文件标 missing：历史坏时间不再触发。
+            try ledger.beginParserRebuild(targetParserVersion: currentVersion)
+            try ledger.markFilesMissing(fileIDs: [invalidCheckpoint.fileID])
+            try ledger.markRebuildCompleted()
+            let missingRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: currentVersion)
+            try require(!missingRequiresRebuild, "missing file's historical bad timestamp must not require rebuild after completed rebuild")
         }
 
         // reset 后 revision 不复用；reset 前的旧 batch 不能 ack 新生成的同自然键行。
@@ -860,10 +1453,12 @@ struct AgentPulseCoreVerification {
             let staleBatch = try ledger.pendingBatch(hostname: "h")
             try require(staleBatch.buckets.first?.revision == 1, "initial rebuild verification revision")
 
-            try ledger.resetForRebuild()
-            try ledger.record(events: [event()], checkpoint: checkpoint(version: currentVersion), hostname: "h")
-            try ledger.finalizeDerived(hostname: "h")
-            let rebuiltBatch = try ledger.pendingBatch(hostname: "h")
+			try ledger.resetForRebuild()
+			try ledger.record(events: [event()], checkpoint: checkpoint(version: currentVersion), hostname: "h")
+			try ledger.finalizeDerived(hostname: "h")
+			// v8 rebuild 状态机：reset 置 rebuild_pending，成功重扫+finalize 后须显式完成才能解除上报门。
+			try ledger.markRebuildCompleted()
+			let rebuiltBatch = try ledger.pendingBatch(hostname: "h")
             try require(rebuiltBatch.buckets.first?.revision == 2, "reset must preserve monotonic revision high watermark")
 
             try ledger.acknowledge(staleBatch)
@@ -939,6 +1534,72 @@ struct AgentPulseCoreVerification {
             try require(!thirdHostEligible, "hostname rebuild block must be global")
             try require(!postRebuildFinalize.reportingEligible, "post-hostname-rebuild finalize must remain blocked")
         }
+    }
+
+    // reset 后的 rebuild completion 是独立、持久的状态机：只有协调层显式确认所有来源成功后才能清除。
+    private static func verifyV2RebuildCompletionPersistence() throws {
+        let db = tempUsageDB(); defer { cleanupDB(db) }
+        var ledger: UsageLedgerStore? = try UsageLedgerStore(path: db.path)
+        let freshRequiresCompletion = try ledger!.requiresRebuildCompletion()
+        try require(!freshRequiresCompletion, "fresh ledger must not require rebuild completion")
+
+        try ledger!.resetForRebuild()
+        let resetRequiresCompletion = try ledger!.requiresRebuildCompletion()
+        try require(resetRequiresCompletion, "reset must atomically persist rebuild pending")
+
+        ledger = nil
+        var reopened: UsageLedgerStore? = try UsageLedgerStore(path: db.path)
+        let reopenedRequiresCompletion = try reopened!.requiresRebuildCompletion()
+        try require(reopenedRequiresCompletion, "rebuild pending must survive process restart")
+
+        let emptyCheckpoint = UsageFileCheckpoint(
+            fileID: "empty-file", source: "codex", pathHash: "empty-path",
+            offset: 0, size: 0, modifiedAt: Date(),
+            parserVersion: UsageJSONLParser.parserVersion, status: "complete"
+        )
+        try reopened!.record(events: [], checkpoint: emptyCheckpoint, hostname: "host")
+        try reopened!.finalizeDerived(hostname: "host")
+        let emptyScanRequiresCompletion = try reopened!.requiresRebuildCompletion()
+        try require(emptyScanRequiresCompletion, "empty scan and finalize must not complete rebuild")
+
+        let invalidCheckpoint = UsageFileCheckpoint(
+            fileID: "invalid-file", source: "claude-code", pathHash: "invalid-path",
+            offset: 2, size: 1, modifiedAt: Date(),
+            parserVersion: UsageJSONLParser.parserVersion, status: "complete"
+        )
+        do {
+            try reopened!.record(events: [], checkpoint: invalidCheckpoint, hostname: "host")
+            try require(false, "invalid checkpoint must fail")
+        } catch UsageLedgerError.invalidCheckpoint {
+            // Expected: a failed source scan cannot reach explicit rebuild completion.
+        }
+        let failedScanRequiresCompletion = try reopened!.requiresRebuildCompletion()
+        try require(failedScanRequiresCompletion, "failed scan must leave rebuild pending")
+
+        let event = UsageEvent(
+            id: "rebuilt-event", source: "codex", model: "model", project: "project",
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+            counts: UsageTokenCounts(output: 10),
+            sessionHash: "session", sourceFileHash: "rebuilt-file"
+        )
+        let completeCheckpoint = UsageFileCheckpoint(
+            fileID: "rebuilt-file", source: "codex", pathHash: "rebuilt-path",
+            offset: 1, size: 1, modifiedAt: Date(),
+            parserVersion: UsageJSONLParser.parserVersion, status: "complete"
+        )
+        try reopened!.record(events: [event], checkpoint: completeCheckpoint, hostname: "host")
+        try reopened!.finalizeDerived(hostname: "host")
+        let finalizedRequiresCompletion = try reopened!.requiresRebuildCompletion()
+        try require(finalizedRequiresCompletion, "record and finalize must not implicitly complete rebuild")
+
+        try reopened!.markRebuildCompleted()
+        let markedRequiresCompletion = try reopened!.requiresRebuildCompletion()
+        try require(!markedRequiresCompletion, "explicit completion must clear rebuild pending")
+
+        reopened = nil
+        let completed = try UsageLedgerStore(path: db.path)
+        let completedRequiresCompletion = try completed.requiresRebuildCompletion()
+        try require(!completedRequiresCompletion, "explicit rebuild completion must persist across restart")
     }
 
 
@@ -1134,11 +1795,11 @@ struct AgentPulseCoreVerification {
         let live = LiveRateSample(timestamp: base, state: .live, tokensInWindow: 360, latestSignalAt: base)
         try requireApproximatelyEqual(live.tps, 2, "live sample must derive TPS from fixed denominator")
         let byModel = TPSWindow(now: { base })
-        _ = byModel.record(TPSSample(timestamp: base, tokenCount: 180, durationSeconds: 0, source: .cli, model: "gpt-5.6-sol"))
+        _ = byModel.record(TPSSample(timestamp: base, tokenCount: 180, durationSeconds: 0, source: .cli, model: "codex-test-model"))
         _ = byModel.record(TPSSample(timestamp: base, tokenCount: 90, durationSeconds: 0, source: .cli, model: "claude-opus"))
         _ = byModel.record(TPSSample(timestamp: base, tokenCount: 45, durationSeconds: 0, source: .cli, model: nil))
         let modelTokens = byModel.tokensInWindowByModel(referenceDate: base)
-        try requireApproximatelyEqual(modelTokens["gpt-5.6-sol"], 180, "model TPS grouping lost Codex tokens")
+        try requireApproximatelyEqual(modelTokens["codex-test-model"], 180, "model TPS grouping lost Codex tokens")
         try requireApproximatelyEqual(modelTokens["claude-opus"], 90, "model TPS grouping lost Claude tokens")
         try requireApproximatelyEqual(modelTokens["unknown"], 45, "unattributed TPS must remain visible")
         try requireApproximatelyEqual(
@@ -1447,6 +2108,337 @@ struct AgentPulseCoreVerification {
         try require(snapshot.completedCountQuality == .partial, "local rollout count must be marked partial")
         try require(snapshot.completedScope == .allLocal, "local rollout count scope must be allLocal")
         try require(snapshot.completedIsLowerBound, "partial completed count must be marked lower bound")
+    }
+
+    private static func verifyToolMetricsAndEditLines() throws {
+        let fixtures = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures", isDirectory: true)
+        func parse(_ name: String, source: String, isSubagent: Bool = false) throws -> ParsedUsageFile {
+            let data = try Data(contentsOf: fixtures.appendingPathComponent(name))
+            return UsageJSONLParser.parse(data: data, source: source, fileIdentity: name, isSubagent: isSubagent)
+        }
+
+        // 解析器版本已提升到 6（稳定 count-only 身份、MCP output gate 与边界修复）。
+        try require(UsageJSONLParser.parserVersion == 7, "parserVersion must advance to 7 for codex content dedup key")
+
+        // 1) 技能计数：同名累加，键并入排序去重列表。
+        let skill = try parse("claude_skill_tool_use.jsonl", source: "claude-code")
+        try require(skill.events.count == 1, "skill fixture should yield one event")
+        let skillEvent = skill.events[0]
+        try require(skillEvent.skillCounts == ["frontend-design": 2, "brainstorming": 1], "skill counts mismatch: \(skillEvent.skillCounts)")
+        try require(UsageToolMetrics.mergeSkillCountKeys(skills: [], counts: skillEvent.skillCounts) == ["brainstorming", "frontend-design"], "skill presence union/order mismatch")
+        try require(skillEvent.mcpCounts.isEmpty, "skill fixture must not report mcp")
+
+        // 2) MCP 计数：mcp__server__tool 取 server 累加；Bash 与不完整 mcp__ 名排除。
+        let mcp = try parse("claude_mcp_tool_use.jsonl", source: "claude-code")
+        try require(mcp.events.count == 1, "mcp fixture should yield one event")
+        try require(mcp.events[0].mcpCounts == ["filesystem": 2, "github": 1], "mcp counts mismatch: \(mcp.events[0].mcpCounts)")
+        try require(mcp.events[0].skillCounts.isEmpty, "mcp fixture must not report skills")
+        try require(UsageToolMetrics.mcpServerFromToolUseName("mcp__bad") == nil, "incomplete mcp name must be rejected")
+        try require(UsageToolMetrics.mcpServerFromToolUseName("Bash") == nil, "non-mcp name must be rejected")
+
+        // 3) 编辑 applied gate + LCS 行差分：成功编辑计入，is_error 编辑排除。
+        let edit = try parse("claude_edit_applied.jsonl", source: "claude-code")
+        try require(edit.editEntries.count == 1, "only the applied edit should survive the result gate: \(edit.editEntries.count)")
+        try require(edit.sessionEvents.allSatisfy { $0.sourceFileHash == edit.checkpoint.fileID }, "all parsed Claude session events must belong to their checkpoint file")
+        try require(edit.editEntries.allSatisfy { $0.sourceFileHash == edit.checkpoint.fileID }, "all parsed Claude edit entries must belong to their checkpoint file")
+        let okEntry = edit.editEntries[0]
+        try require(okEntry.toolUseID == "tu-ok", "wrong edit survived gate: \(okEntry.toolUseID)")
+        try require(okEntry.added == 2 && okEntry.deleted == 1, "LCS line diff mismatch: +\(okEntry.added)/-\(okEntry.deleted)")
+
+        // 4) MultiEdit 求和 + 单笔 >2000 行整笔清零。
+        let cap = try parse("claude_edit_multiedit_cap.jsonl", source: "claude-code")
+        let capAgg = UsageEditLines.aggregate(cap.editEntries, bucketMilliseconds: UsageLedgerStore.bucketMilliseconds)
+        try require(capAgg.count == 1, "capped edits should collapse to one bucket delta")
+        try require(capAgg[0].added == 3 && capAgg[0].deleted == 1, "multiedit sum/cap mismatch: +\(capAgg[0].added)/-\(capAgg[0].deleted)")
+        try require(capAgg[0].net == 2, "net mismatch: \(capAgg[0].net)")
+
+        // 5) 生成 / 锁文件路径排除，仅业务文件计入。
+        let gen = try parse("claude_edit_generated_path.jsonl", source: "claude-code")
+        try require(gen.editEntries.count == 1, "generated/lock paths must be excluded: \(gen.editEntries.count)")
+        try require(gen.editEntries[0].toolUseID == "tu-real" && gen.editEntries[0].added == 2, "only the business-file write should count")
+        try require(UsageEditLines.isGeneratedEditPath("/x/node_modules/y.js"), "node_modules must be generated")
+        try require(!UsageEditLines.isGeneratedEditPath("/x/vendorized/y.go"), "vendorized must not match vendor component")
+
+        // 6) Codex apply_patch：+/- 计数、Move to 生成路径整段跳过、成功 gate、call_id 去重。
+        let codex = try parse("codex_apply_patch.jsonl", source: "codex")
+        try require(codex.editEntries.count == 1, "codex applied patch should yield one entry: \(codex.editEntries.count)")
+        try require(codex.sessionEvents.allSatisfy { $0.sourceFileHash == codex.checkpoint.fileID }, "all parsed Codex session events must belong to their checkpoint file")
+        try require(codex.editEntries.allSatisfy { $0.sourceFileHash == codex.checkpoint.fileID }, "all parsed Codex edit entries must belong to their checkpoint file")
+        let cxEntry = codex.editEntries[0]
+        try require(cxEntry.toolUseID == "cx-call-1", "codex dedup id mismatch: \(cxEntry.toolUseID)")
+        try require(cxEntry.added == 2 && cxEntry.deleted == 1, "codex +/- count (post move-to skip) mismatch: +\(cxEntry.added)/-\(cxEntry.deleted)")
+        try require(cxEntry.model == "codex-test-model", "codex edit should carry turn model")
+        try require(codex.events.contains { $0.counts.total == 150 }, "codex token event should still parse alongside edits")
+        try require(UsageEditLines.codexExecIsApplied("Script failed\nExit code: 0") == false, "programmatic wrapper failure must override quoted success marker")
+
+        // 7) Claude usage-less（零 token）Skill/MCP turn 物化 count-only 事件；同一 turn 的
+        //    fork 重刷按内容指纹去重折叠为一条；带 usage 的 turn 不受影响。
+        let countOnly = try parse("claude_count_only.jsonl", source: "claude-code")
+        let coEvents = countOnly.events.filter { !$0.skillCounts.isEmpty || !$0.mcpCounts.isEmpty }
+        try require(coEvents.count == 1, "usage-less skill/mcp turn must yield exactly one deduped count-only event: \(coEvents.count)")
+        let co = coEvents[0]
+        try require(co.counts.total == 0 && co.counts.output == 0 && co.counts.input == 0, "count-only event must carry zero tokens: \(co.counts)")
+        try require(co.skillCounts == ["distill": 1], "count-only skill counts mismatch: \(co.skillCounts)")
+        try require(co.mcpCounts == ["github": 1], "count-only mcp counts mismatch: \(co.mcpCounts)")
+        try require(co.mergeStrategy == .cumulativeMax, "count-only event must merge cumulativeMax")
+        try require(co.model == "claude-sonnet", "count-only event must carry the record model")
+        try require(!co.hasTotalSnapshot, "count-only event must not claim a total token snapshot")
+        try require(countOnly.events.contains { $0.counts.total == 15 }, "usage-bearing turn must still emit its token event alongside count-only")
+        // count-only 与真实 usage 事件 id 不相撞（不同 id 空间）。
+        try require(Set(countOnly.events.map { $0.id }).count == countOnly.events.count, "count-only id must not collide with usage event ids")
+
+        // 稳定 ID 必须绑定 source/session/message(turn)：跨 session 不碰撞；同 turn 内容/时间重写
+        // 仍保持同一 id 并逐维取最大；若同 turn 后续出现 usage，则不再额外物化 count-only。
+        let rewrittenA = UsageJSONLParser.parse(
+            data: Data("""
+            {"timestamp":"2026-08-11T00:00:00Z","type":"assistant","sessionId":"sess-stable","message":{"id":"msg-stable","model":"claude-sonnet","content":[{"type":"tool_use","name":"Skill","input":{"skill":"distill"}}]}}
+            """.utf8), source: "claude-code", fileIdentity: "count-stable-a"
+        )
+        let rewrittenB = UsageJSONLParser.parse(
+            data: Data("""
+            {"timestamp":"2026-08-11T00:10:00Z","type":"assistant","sessionId":"sess-stable","message":{"id":"msg-stable","model":"claude-sonnet","content":[{"type":"tool_use","name":"Skill","input":{"skill":"distill"}},{"type":"tool_use","name":"mcp__github__one","input":{}},{"type":"tool_use","name":"mcp__github__two","input":{}}]}}
+            """.utf8), source: "claude-code", fileIdentity: "count-stable-b"
+        )
+        try require(rewrittenA.events[0].id == rewrittenB.events[0].id, "same source/session/turn rewrite must preserve count-only id")
+        try require(rewrittenB.events[0].mcpCounts == ["github": 2], "same turn rewrite must carry the rewritten maximum counts")
+
+        let crossSession = UsageJSONLParser.parse(
+            data: Data("""
+            {"timestamp":"2026-08-11T00:00:00Z","type":"assistant","sessionId":"sess-a","message":{"id":"msg-shared","model":"claude-sonnet","content":[{"type":"tool_use","name":"Skill","input":{"skill":"distill"}}]}}
+            {"timestamp":"2026-08-11T00:00:00Z","type":"assistant","sessionId":"sess-b","message":{"id":"msg-shared","model":"claude-sonnet","content":[{"type":"tool_use","name":"Skill","input":{"skill":"distill"}}]}}
+            """.utf8), source: "claude-code", fileIdentity: "count-cross-session"
+        )
+        try require(crossSession.events.count == 2 && Set(crossSession.events.map(\.id)).count == 2, "equal turn ids in different sessions must not collide")
+
+        let usageRewrite = UsageJSONLParser.parse(
+            data: Data("""
+            {"timestamp":"2026-08-11T00:00:00Z","type":"assistant","sessionId":"sess-usage","message":{"id":"msg-usage","model":"claude-sonnet","content":[{"type":"tool_use","name":"Skill","input":{"skill":"distill"}}]}}
+            {"timestamp":"2026-08-11T00:00:01Z","type":"assistant","sessionId":"sess-usage","message":{"id":"msg-usage","model":"claude-sonnet","content":[{"type":"text","text":"done"}],"usage":{"output_tokens":5,"total_tokens":5}}}
+            """.utf8), source: "claude-code", fileIdentity: "count-usage-rewrite"
+        )
+        try require(usageRewrite.events.count == 1 && usageRewrite.events[0].skillCounts == ["distill": 1], "usage rewrite must absorb tool counts without a duplicate count-only event")
+
+        // 8) usage-less 且无 Skill/MCP：不产生任何事件（不虚构零 token 行）。
+        let noTool = try parse("claude_usageless_no_tool.jsonl", source: "claude-code")
+        try require(noTool.events.isEmpty, "usage-less record without skill/mcp must emit no event: \(noTool.events.count)")
+
+        // 9) usage-less Skill turn 但缺 timestamp：跳过（无法归桶），不物化。
+        let noTs = try parse("claude_count_only_no_ts.jsonl", source: "claude-code")
+        try require(noTs.events.isEmpty, "usage-less skill turn without timestamp must be skipped: \(noTs.events.count)")
+
+        // 10) Codex programmatic apply_patch（custom_tool_call name=exec，JS tools.apply_patch）：
+        //     programmatic 成功 gate 仅认「Script completed」；failed/running 排除；token 事件仍解析。
+        let prog = try parse("codex_apply_patch_programmatic.jsonl", source: "codex")
+        try require(prog.editEntries.count == 1, "only the confirmed programmatic success should survive: \(prog.editEntries.map { $0.toolUseID })")
+        let progEntry = prog.editEntries[0]
+        try require(progEntry.toolUseID == "pg-ok", "wrong programmatic call survived gate: \(progEntry.toolUseID)")
+        try require(progEntry.added == 2 && progEntry.deleted == 1, "programmatic +/- mismatch: +\(progEntry.added)/-\(progEntry.deleted)")
+        try require(progEntry.model == "codex-test-model", "programmatic edit must carry turn model")
+        try require(prog.events.contains { $0.counts.total == 150 }, "programmatic rollout token event must still parse")
+        // 纯函数直测：JS 提取与 gate。
+        let jsBody = UsageEditLines.codexProgrammaticPatchBody("const p = \"*** Begin Patch\\n*** Update File: a\\n@@\\n-x\\n+y\\n*** End Patch\"; await tools.apply_patch(p);")
+        try require(jsBody != nil && jsBody!.contains("*** Begin Patch") && jsBody!.contains("+y"), "programmatic JS body extraction failed: \(String(describing: jsBody))")
+        try require(UsageEditLines.codexProgrammaticPatchBody("const p = \"noop\"; text(p);") == nil, "non-apply_patch JS must not yield a body")
+        try require(UsageEditLines.codexProgrammaticExecIsApplied("Script completed\nOutput:\n"), "programmatic Script completed must be applied")
+        try require(!UsageEditLines.codexProgrammaticExecIsApplied("Script running with cell ID 7\n"), "programmatic running must not be applied")
+        try require(!UsageEditLines.codexProgrammaticExecIsApplied("Exit code: 0\nSuccess. Updated the following files"), "programmatic gate must not fall back to legacy markers")
+
+        // 11) Codex exec_command JSON args（decode-first 内层 cmd，还原被转义的换行）成功 gate。
+        let execJson = try parse("codex_apply_patch_exec_json.jsonl", source: "codex")
+        try require(execJson.editEntries.count == 1, "exec_command JSON apply_patch should yield one entry: \(execJson.editEntries.count)")
+        try require(execJson.editEntries[0].added == 2 && execJson.editEntries[0].deleted == 0, "exec_command JSON +/- mismatch: +\(execJson.editEntries[0].added)/-\(execJson.editEntries[0].deleted)")
+
+        // 12) Codex 直接 function_call 形态的 mcp__server__tool：必须有匹配成功 output；
+        //     error / unsupported / 无 output 排除；成功调用物化零-token count-only 事件。
+        let cxMCP = try parse("codex_mcp_function_call.jsonl", source: "codex")
+        let cxMCPCounts = cxMCP.events.filter { !$0.mcpCounts.isEmpty }
+        try require(cxMCPCounts.count == 2, "codex direct mcp should yield two count-only events (filesystem, github): \(cxMCPCounts.count)")
+        var mergedMCP: [String: Int] = [:]
+        for e in cxMCPCounts {
+            try require(e.counts.total == 0, "codex mcp count-only event must carry zero tokens: \(e.counts)")
+            try require(e.mergeStrategy == .cumulativeMax, "codex mcp count-only must merge cumulativeMax")
+            try require(e.model == "codex-test-model", "codex mcp count-only must carry turn model: \(e.model)")
+            try require(!e.hasTotalSnapshot, "codex mcp count-only must not claim a total token snapshot")
+            for (k, v) in e.mcpCounts { mergedMCP[k, default: 0] += v }
+        }
+        try require(mergedMCP == ["filesystem": 1, "github": 1], "codex direct mcp counts mismatch: \(mergedMCP)")
+        try require(cxMCPCounts.allSatisfy { $0.mcpCounts["notion"] == nil && $0.mcpCounts["slack"] == nil && $0.mcpCounts["linear"] == nil }, "failed/unsupported/unmatched direct mcp calls must be excluded")
+        try require(cxMCP.events.contains { $0.counts.total == 150 }, "codex mcp rollout token event must still parse")
+
+        // 13) Codex 技能读取：cat .../<name>/SKILL.md 计数；rg 对同路径不计（仅当模式匹配，不读内容）。
+        let cxSkillRead = try parse("codex_skill_read.jsonl", source: "codex")
+        let cxSkillReadCounts = cxSkillRead.events.filter { !$0.skillCounts.isEmpty }
+        try require(cxSkillReadCounts.count == 1, "codex skill read should yield exactly one count-only event (cat, not rg): \(cxSkillReadCounts.count)")
+        try require(cxSkillReadCounts[0].skillCounts == ["distill": 1], "codex skill read counts mismatch: \(cxSkillReadCounts[0].skillCounts)")
+        try require(cxSkillReadCounts[0].counts.total == 0, "codex skill read count-only must be zero tokens")
+
+        func codexSkillCommand(_ command: String) throws -> [String: Any] {
+            let data = try JSONSerialization.data(withJSONObject: ["cmd": command])
+            guard let arguments = String(data: data, encoding: .utf8) else {
+                throw VerificationFailure.assertion("failed to encode codex skill command")
+            }
+            return ["type": "response_item", "payload": ["type": "function_call", "name": "exec_command", "arguments": arguments]]
+        }
+        let sedReadCounts = UsageToolMetrics.countCodexSkillReads(try codexSkillCommand("sed -n '1,20p' /x/distill/SKILL.md"))
+        let sedWriteCounts = UsageToolMetrics.countCodexSkillReads(try codexSkillCommand("sed -i '' 's/a/b/' /x/distill/SKILL.md"))
+        let redirectedWriteCounts = UsageToolMetrics.countCodexSkillReads(try codexSkillCommand("cat /tmp/new-skill > /x/distill/SKILL.md"))
+        let redirectedReadCounts = UsageToolMetrics.countCodexSkillReads(try codexSkillCommand("cat /x/distill/SKILL.md > /tmp/copy"))
+        try require(sedReadCounts == ["distill": 1], "read-only sed must count as a skill read")
+        try require(sedWriteCounts.isEmpty, "sed -i skill writes must not count as reads")
+        try require(redirectedWriteCounts.isEmpty, "output redirection into SKILL.md must not count as a read")
+        try require(!redirectedReadCounts.isEmpty, "SKILL.md used as the input side of redirection must still count")
+
+        // 14) Codex 技能提及：用户消息里 [$name](…/SKILL.md) 计 1。
+        let cxSkillMarker = try parse("codex_skill_marker.jsonl", source: "codex")
+        let cxSkillMarkerCounts = cxSkillMarker.events.filter { !$0.skillCounts.isEmpty }
+        try require(cxSkillMarkerCounts.count == 1, "codex skill marker should yield one count-only event: \(cxSkillMarkerCounts.count)")
+        try require(cxSkillMarkerCounts[0].skillCounts == ["brainstorming": 1], "codex skill marker counts mismatch: \(cxSkillMarkerCounts[0].skillCounts)")
+
+        // 15) Codex programmatic MCP（JS tools.mcp__…）：仅「Script completed」成功 gate 计入；failed 排除。
+        let cxProgMCP = try parse("codex_programmatic_mcp.jsonl", source: "codex")
+        let cxProgMCPCounts = cxProgMCP.events.filter { !$0.mcpCounts.isEmpty }
+        try require(cxProgMCPCounts.count == 1, "codex programmatic mcp should yield one confirmed-success count-only event: \(cxProgMCPCounts.count)")
+        try require(cxProgMCPCounts[0].mcpCounts == ["slack": 1], "codex programmatic mcp counts mismatch (notion failed, excluded): \(cxProgMCPCounts[0].mcpCounts)")
+        try require(cxProgMCPCounts[0].counts.total == 0, "codex programmatic mcp count-only must be zero tokens")
+
+        // 15b) 直测 programmatic MCP 控制流可达性分析：只统计真正会被执行到的 tools.mcp__… 调用，
+        //      排除字符串 / 正则 / 注释 / 未调用函数体 / 未执行嵌套回调；重复调用按次计重。
+        let jsControlFlow = """
+        const quoted = "await tools.mcp__quoted__tool({})";
+        const regex = /await tools.mcp__regex__tool\\(\\{\\}\\)/;
+        // await tools.mcp__line_comment__tool({})
+        /* await tools.mcp__block_comment__tool({}) */
+        const config = {
+          text: "await tools.mcp__object_text__tool({})",
+          callback: async () => {
+            await tools.mcp__callback__tool({});
+            (async () => {
+              await tools.mcp__nested_iife__tool({});
+            })();
+          },
+          callbackExpression: async () => await tools.mcp__callback_expression__tool({}),
+          method: async function () {
+            await tools.mcp__function_value__tool({});
+          },
+          async shorthand() {
+            await tools.mcp__object_method__tool({});
+          },
+        };
+        await Promise.all(items.map(async item => await tools.mcp__map_callback__tool({ item })));
+        if (enabled) {
+          await tools.mcp__filesystem__read_file({ path: "/tmp/a" });
+        }
+        for (const issue of issues) {
+          await tools.mcp__github__create_issue(issue);
+        }
+        for await (const event of events) {
+          await tools.mcp__teams__send_message(event);
+        }
+        try {
+          await tools.mcp__memory__search({ query: "x" });
+        } catch (err) {
+          await tools.mcp__slack__search({ query: String(err) });
+        } finally {
+          await tools.mcp__notion__fetch({ id: "n" });
+        }
+        async function runLinear() {
+          await tools.mcp__linear__get_issue({ id: "L-1" });
+        }
+        await runLinear();
+        async function neverCalled() {
+          await tools.mcp__never_called__tool({});
+        }
+        async function neverMaps() {
+          return items.map(async item => await tools.mcp__nested_unexecuted_map__tool({ item }));
+        }
+        const runArrow = async () => await tools.mcp__azure__get_work_item({ id: "A-1" });
+        await runArrow();
+        const neverCalledArrow = async () => await tools.mcp__never_called_arrow__tool({});
+        const invoked = {
+          run: async () => { await tools.mcp__airtable__get_record({ id: "AT-1" }); },
+          expression: async () => await tools.mcp__monday__get_item({ id: "MO-1" }),
+          method: async function () { await tools.mcp__confluence__get_page({ id: "CF-1" }); },
+          async shorthand() { await tools.mcp__figma__get_file({ id: "FG-1" }); },
+        };
+        await invoked.run();
+        await invoked.expression();
+        await invoked.method();
+        await invoked.shorthand();
+        async function runRepeated() {
+          await tools.mcp__clickup__get_task({ id: "CU-1" });
+        }
+        await runRepeated();
+        await runRepeated();
+        if (enabled) await tools.mcp__calendar__list_events({});
+        const pendingPromise = tools.mcp__drive__get_file({ id: "D-1" });
+        await pendingPromise;
+        await Promise.all([
+          tools.mcp__asana__get_task({ id: "AS-1" }),
+          tools.mcp__dropbox__get_file({ id: "DB-1" }),
+        ]);
+        (async () => {
+          await tools.mcp__jira__get_issue({ id: "J-1" });
+        })();
+        """
+        let got = CodexProgrammaticMCP.toolUses(jsControlFlow)
+        let want: [String: Int] = [
+            "filesystem": 1, "github": 1, "teams": 1, "memory": 1, "slack": 1, "notion": 1,
+            "linear": 1, "azure": 1, "calendar": 1, "map_callback": 1, "drive": 1, "asana": 1,
+            "dropbox": 1, "clickup": 2, "airtable": 1, "monday": 1, "confluence": 1, "figma": 1, "jira": 1,
+        ]
+        try require(got == want, "programmatic MCP control-flow counts mismatch: \(got)")
+        for server in ["quoted", "regex", "line_comment", "block_comment", "object_text", "callback", "nested_iife", "callback_expression", "function_value", "object_method", "nested_unexecuted_map", "never_called", "never_called_arrow"] {
+            try require(got[server] == nil, "non-executed \(server) text must not count: \(got)")
+        }
+
+        // 16) Codex 编辑缺时间戳：无时间戳的 apply_patch 调用不生成可归桶 edit（无法归桶），
+        //     且不落入 epoch-0 桶；但乱序（output 先于 call）且 output 自身缺时间戳时，
+        //     仍能结算成功 gate，令带时间戳的调用正常计入。
+        let cxEditTS = try parse("codex_edit_missing_ts.jsonl", source: "codex")
+        try require(cxEditTS.editEntries.count == 1, "missing-ts codex edit call must not bucket; only the timestamped one survives: \(cxEditTS.editEntries.map { $0.toolUseID })")
+        let cxKept = cxEditTS.editEntries[0]
+        try require(cxKept.toolUseID == "cx-keep", "wrong codex edit survived: \(cxKept.toolUseID)")
+        try require(cxKept.added == 2 && cxKept.deleted == 1, "codex kept +/- mismatch: +\(cxKept.added)/-\(cxKept.deleted)")
+        try require(cxKept.timestamp.timeIntervalSince1970 > 0, "surviving codex edit must not fall into the epoch-0 bucket: \(cxKept.timestamp)")
+        try require(!cxEditTS.editEntries.contains { $0.timestamp.timeIntervalSince1970 == 0 }, "no codex edit may land in the epoch-0 bucket")
+        try require(cxEditTS.diagnostics.contains { $0.contains("edit call skipped (missing timestamp)") }, "missing-ts codex edit must emit a redacted diagnostic: \(cxEditTS.diagnostics)")
+        try require(!cxEditTS.diagnostics.contains { $0.contains("app.go") || $0.contains("Begin Patch") }, "diagnostic must not leak edit content")
+
+        // 17) Codex programmatic MCP 缺时间戳：无时间戳的调用不计数；带时间戳的调用即便其
+        //     output 自身缺时间戳，仍以「Script completed」结算并计入。
+        let cxProgTS = try parse("codex_programmatic_mcp_missing_ts.jsonl", source: "codex")
+        let cxProgTSCounts = cxProgTS.events.filter { !$0.mcpCounts.isEmpty }
+        try require(cxProgTSCounts.count == 1, "missing-ts programmatic mcp call must not count; only the timestamped one survives: \(cxProgTSCounts.count)")
+        try require(cxProgTSCounts[0].mcpCounts == ["github": 1], "programmatic mcp kept counts mismatch (slack call had no ts): \(cxProgTSCounts[0].mcpCounts)")
+        try require(cxProgTSCounts[0].timestamp.timeIntervalSince1970 > 0, "surviving programmatic mcp count-only must not be epoch-0: \(cxProgTSCounts[0].timestamp)")
+        try require(cxProgTS.diagnostics.contains { $0.contains("mcp call skipped (missing timestamp)") }, "missing-ts programmatic mcp must emit a redacted diagnostic: \(cxProgTS.diagnostics)")
+
+        // 18) Claude 编辑缺时间戳：无时间戳的 tool_use 不生成可归桶 edit；带时间戳的 tool_use
+        //     即便其 tool_result 自身缺时间戳，仍能结算 applied gate 并计入。
+        let clEditTS = try parse("claude_edit_missing_ts.jsonl", source: "claude-code")
+        try require(clEditTS.editEntries.count == 1, "missing-ts claude edit must not bucket; only the timestamped one survives: \(clEditTS.editEntries.map { $0.toolUseID })")
+        let clKept = clEditTS.editEntries[0]
+        try require(clKept.toolUseID == "tu-keep", "wrong claude edit survived: \(clKept.toolUseID)")
+        try require(clKept.added == 2 && clKept.deleted == 1, "claude kept +/- mismatch: +\(clKept.added)/-\(clKept.deleted)")
+        try require(clKept.timestamp.timeIntervalSince1970 > 0, "surviving claude edit must not fall into the epoch-0 bucket: \(clKept.timestamp)")
+        try require(clEditTS.diagnostics.contains { $0.contains("edit call skipped (missing timestamp)") }, "missing-ts claude edit must emit a redacted diagnostic: \(clEditTS.diagnostics)")
+
+        // 19) 整文件重解析确定性：同一字节流解析两次，edit / count-only / MCP 结果稳定
+        //     （id、+/-、计数、时间戳、diagnostics 一致），保证无隐藏顺序 / 进程内状态依赖。
+        for name in ["codex_edit_missing_ts.jsonl", "codex_programmatic_mcp_missing_ts.jsonl", "codex_mcp_function_call.jsonl", "codex_programmatic_mcp.jsonl", "claude_edit_missing_ts.jsonl"] {
+            let source = name.hasPrefix("claude") ? "claude-code" : "codex"
+            let a = try parse(name, source: source)
+            let b = try parse(name, source: source)
+            let aEdits = a.editEntries.map { "\($0.toolUseID)|\($0.added)|\($0.deleted)|\(Int64($0.timestamp.timeIntervalSince1970))" }.sorted()
+            let bEdits = b.editEntries.map { "\($0.toolUseID)|\($0.added)|\($0.deleted)|\(Int64($0.timestamp.timeIntervalSince1970))" }.sorted()
+            try require(aEdits == bEdits, "whole-file reparse edit determinism broken for \(name): \(aEdits) vs \(bEdits)")
+            let aTools = a.events.map { "\($0.id)|\(UsageToolMetrics.countMapFingerprint($0.skillCounts))|\(UsageToolMetrics.countMapFingerprint($0.mcpCounts))" }.sorted()
+            let bTools = b.events.map { "\($0.id)|\(UsageToolMetrics.countMapFingerprint($0.skillCounts))|\(UsageToolMetrics.countMapFingerprint($0.mcpCounts))" }.sorted()
+            try require(aTools == bTools, "whole-file reparse event/tool determinism broken for \(name): \(aTools) vs \(bTools)")
+            try require(a.diagnostics.sorted() == b.diagnostics.sorted(), "whole-file reparse diagnostics determinism broken for \(name)")
+        }
     }
 
     private static func verifyActiveCountingRules() async throws {
@@ -1913,7 +2905,7 @@ struct AgentPulseCoreVerification {
         try require(noData.completed.isLowerBound, "local completed metric must be a lower bound")
 
         try writeRollout(to: rollout, cwd: "/tmp/project", events: [
-            threadSettingsEvent(model: "seed-code"),
+            threadSettingsEvent(model: "custom-code-model"),
             modelFreePaddingEvent(byteCount: 600_000),
             tokenEvent(at: base, totalOutput: 100)
         ])
@@ -1927,11 +2919,11 @@ struct AgentPulseCoreVerification {
         let appended = try await collector.scan(at: base.addingTimeInterval(2))
         try requireApproximatelyEqual(appended.liveRate.tps, 1, "append-only cumulative delta was not tailed incrementally")
         try requireApproximatelyEqual(
-            appended.liveRate.modelTokensInWindow["seed-code"],
+            appended.liveRate.modelTokensInWindow["custom-code-model"],
             180,
             "thread_settings_applied model was not inherited by token_count delta"
         )
-        try require(appended.liveRate.modelTokensInWindow["unknown"] == nil, "known seed-code delta fell into unknown")
+        try require(appended.liveRate.modelTokensInWindow["unknown"] == nil, "known custom-code-model delta fell into unknown")
 
         try writeRollout(to: rollout, cwd: "/tmp/project", events: [
             tokenEvent(at: base.addingTimeInterval(-598), totalOutput: 0)
@@ -1998,7 +2990,7 @@ struct AgentPulseCoreVerification {
         try FileManager.default.createDirectory(at: promotedSessions, withIntermediateDirectories: true)
         let promotedRollout = promotedSessions.appendingPathComponent("rollout-promoted.jsonl")
         try writeRollout(to: promotedRollout, cwd: "/tmp/project", events: [
-            threadSettingsEvent(model: "gpt-5.6-sol"),
+            threadSettingsEvent(model: "codex-test-model"),
             tokenEvent(at: base.addingTimeInterval(-3_600), totalOutput: 100)
         ], sessionID: "promoted-verification")
         try FileManager.default.setAttributes(
@@ -2022,7 +3014,7 @@ struct AgentPulseCoreVerification {
         try appendLine(tokenEvent(at: base.addingTimeInterval(12), totalOutput: 380), to: promotedRollout)
         let promotedDelta = try await promotedCollector.scan(at: base.addingTimeInterval(12))
         try requireApproximatelyEqual(
-            promotedDelta.liveRate.modelTokensInWindow["gpt-5.6-sol"],
+            promotedDelta.liveRate.modelTokensInWindow["codex-test-model"],
             180,
             "promoted file lost its model context"
         )

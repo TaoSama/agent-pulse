@@ -1,0 +1,5 @@
+{"timestamp":"2026-08-11T00:00:00.000Z","type":"session_meta","payload":{"id":"rollout-ej-1","session_id":"conv-ej-1","cwd":"/workspace/Workspaces/proj-ej"}}
+{"timestamp":"2026-08-11T00:00:01.000Z","type":"turn_context","payload":{"model":"gpt-a","turn_id":"t1"}}
+{"timestamp":"2026-08-11T00:00:02.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"ej-1","arguments":"{\"cmd\":\"cat > /tmp/p.patch <<'EOF'\\n*** Begin Patch\\n*** Add File: pkg/new.go\\n+package pkg\\n+func F() {}\\n*** End Patch\\nEOF\\napply_patch < /tmp/p.patch\"}"}}
+{"timestamp":"2026-08-11T00:00:03.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"ej-1","output":"Chunk 1\nProcess exited with code 0"}}
+{"timestamp":"2026-08-11T00:00:04.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"gpt-a","last_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12},"total_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}
