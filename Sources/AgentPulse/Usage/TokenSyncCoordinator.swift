@@ -5,6 +5,13 @@ import AgentPulseCore
 import AgentPulseReporting
 import AgentPulseUsage
 
+/// 本地扫描的致命失败：来源根目录存在却无法枚举/访问。
+/// 用于区分“无内容”（非失败）与“无法证明已完整扫描”（失败），
+/// 从而绝不把源目录枚举失败当成“全量成功”。
+private enum TokenSyncScanError: Error {
+    case sourceRootNotEnumerable(source: String)
+}
+
 /// 维护本地长期采集、普通上报开关和状态展示，并串起完整生产链：
 /// 扫描（record 原始 token + session 事件）→ 按需 rebuild → finalizeDerived → summary →
 /// 上报资格门禁 → 可选普通上报。
@@ -30,6 +37,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     private let reporter: TokenUsageReporter
     /// cliproxyapi 主动拉取采集服务；配置缺失/失败时跳过，不影响本地文件采集。
     private let cliProxyService: CliProxyUsageService
+    private let usageSummaryCalendar: Calendar
+    /// 可选本地采集来源配置文件（owner-only 0600），独立于 reporting.json。
+    /// 缺失/非法不影响内建来源采集。
+    private let localCollectionURL: URL
 
     /// 扫描 / 上报任务句柄，用于防重入与 stop 取消。
     private var scanTask: Task<Void, Never>?
@@ -53,6 +64,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     private var autoLoopTask: Task<Void, Never>?
     /// 应用生命周期：start() 后置 true；stop() 置 false 后阻止后续自动动作。
     private var isRunning: Bool = false
+    /// 启动时检测到 rebuild pending（已 reset 但未确认全部来源重扫成功）：
+    /// 置 true 后禁止一切网络动作（普通上报 / 恢复或执行全量同步），
+    /// 先完整重扫全部来源；扫描成功清除 pending 后，再由 finishScan 恢复正常启动链路。
+    private var rebuildRecoveryPending: Bool = false
 
     private let summarySubject: CurrentValueSubject<TokenUsageSummary, Never>
     private let statusSubject: CurrentValueSubject<TokenSyncStatus, Never>
@@ -76,32 +91,58 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         defaults: UserDefaults = .standard,
         configurationURL: URL = TokenSyncCoordinator.defaultConfigurationURL(),
         reporter: TokenUsageReporter = TokenUsageReporter(),
-        cliProxyService: CliProxyUsageService = CliProxyUsageService()
+        cliProxyService: CliProxyUsageService = CliProxyUsageService(),
+        usageSummaryCalendar: Calendar = .autoupdatingCurrent
     ) {
         self.defaults = defaults
         self.configurationURL = configurationURL
         self.reporter = reporter
         self.cliProxyService = cliProxyService
+        self.usageSummaryCalendar = usageSummaryCalendar
+        self.localCollectionURL = TokenSyncCoordinator.defaultLocalCollectionURL()
         ledger = Self.openLedger()
 
-        // 从 DB 立即恢复 summary（同步读取，后续异步刷新）。
+        let localCollection = defaults.object(forKey: DefaultsKey.localCollectionEnabled) as? Bool ?? true
+        let storedReporting = defaults.object(forKey: DefaultsKey.reportingEnabled) as? Bool ?? false
+        let baseURL = defaults.string(forKey: DefaultsKey.ingestBaseURL) ?? ""
+        var storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
+
+        // 配置权威：以 reporting.json 的 canonical hostname 为准；配置未就绪时为空。
+        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
+        // 旧版数据库已经把 hostname 持久化在派生表，却没有写 UserDefaults。仅当配置和
+        // 用户保存值都为空、且账本能证明恰好一个非空 hostname 时，采纳并持久化该值，
+        // 让冷启动摘要立即恢复。多 hostname / 空库一律不猜；配置权威始终优先。
+        if authority.hostname.isEmpty,
+           storedHostname.isEmpty,
+           let candidate = ledger.flatMap({ try? $0.uniqueLegacyHostnameCandidate() }),
+           !candidate.isEmpty {
+            let normalizedCandidate = Self.normalize(candidate)
+            // Recovery must preserve the exact durable natural-key namespace. If normalization
+            // would alter it (for example, surrounding whitespace or an overlong legacy value),
+            // fail closed instead of selecting a hostname that has no matching derived rows.
+            if !normalizedCandidate.isEmpty, normalizedCandidate == candidate {
+                storedHostname = normalizedCandidate
+                defaults.set(storedHostname, forKey: DefaultsKey.canonicalHostname)
+            }
+        }
+        // 上报所用 hostname 权威优先；否则回落到用户保存的本地 hostname（仅用于本地采集）。
+        let effectiveHostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
+
+        // 冷启动只按已知 canonical hostname 恢复四个派生窗口。hostname 未知时保持空，
+        // 等首次扫描 record 播种账本身份后再发布，禁止回退到跨 hostname 的 legacy summary。
         let initialSummary: TokenUsageSummary
-        if let ledger, let dbSummary = try? ledger.summary() {
-            initialSummary = Self.summary(from: dbSummary)
+        if let ledger, !effectiveHostname.isEmpty {
+            initialSummary = (try? Self.summaries(
+                from: ledger,
+                hostname: effectiveHostname,
+                containing: Date(),
+                calendar: usageSummaryCalendar
+            )) ?? .empty
         } else {
             initialSummary = .empty
         }
         summarySubject = CurrentValueSubject(initialSummary)
 
-        let localCollection = defaults.object(forKey: DefaultsKey.localCollectionEnabled) as? Bool ?? true
-        let storedReporting = defaults.object(forKey: DefaultsKey.reportingEnabled) as? Bool ?? false
-        let baseURL = defaults.string(forKey: DefaultsKey.ingestBaseURL) ?? ""
-        let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
-
-        // 配置权威：以 reporting.json 的 canonical hostname 为准；配置未就绪时为空。
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
-        // 上报所用 hostname 权威优先；否则回落到用户保存的本地 hostname（仅用于本地采集）。
-        let effectiveHostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
         let canReport = !baseURL.isEmpty && !effectiveHostname.isEmpty && authority.status == .ready
         let reporting = canReport ? storedReporting : false
         if storedReporting && !canReport {
@@ -277,6 +318,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         updateStatus { $0.scanningInProgress = true }
 
         let currentParserVersion = UsageJSONLParser.parserVersion
+        // 在启动后台 Task 前捕获为局部常量：闭包内 self 为弱引用，不能直接访问实例存储属性。
+        let localSourcesURL = localCollectionURL
+        let summaryCalendar = usageSummaryCalendar
         scanGeneration &+= 1
         let generation = scanGeneration
         let cliProxyService = self.cliProxyService
@@ -312,25 +356,60 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                         try ledger.rebuildForHostname(hostname)
                     }
                 }
-                // 解析器升级或历史非法数据：完整重扫前显式重建。
+                // 解析器升级或历史非法数据：绝不再 resetForRebuild（那会清空磁盘上已删除历史
+                // session 的 raw，无法恢复）。改为设置持久 parser rebuild pending（不清 raw），
+                // 随后本轮对所有 configured root 做文件级原子重解析：每个变化文件在 record 内
+                // 事务性替换该 fileID 的旧 raw 并置派生 dirty；已消失文件仅标 missing、保留 raw。
+                // 仅当所有来源无致命失败、finalize 成功、且达到目标 parser 版本后，才显式清除。
                 if try ledger.requiresParserRebuild(currentParserVersion: currentParserVersion) {
-                    try ledger.resetForRebuild()
+                    try ledger.beginParserRebuild(targetParserVersion: currentParserVersion)
                 }
                 try gate.throwIfCancelled()
-                // 两来源扫描：同时 record parsed.events + parsed.sessionEvents。
-                try Self.scan(root: Self.codexSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate)
+                // 逐来源扫描并收集磁盘 present fileID；record 只处理变化文件（status!=complete 或
+                // size/mtime/parserVersion 不匹配），不触发派生重算。
+                // Codex sessions 与 archived_sessions 同为 source="codex"：必须合并两 root 的
+                // present 集合后，对 "codex" 只调用一次 markFilesMissing，否则会互相误标 missing。
+                var codexPresentFileIDs: [String] = []
+                codexPresentFileIDs += try Self.scan(root: Self.codexSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate)
                 try gate.throwIfCancelled()
                 // 归档会话不属于运行中 task 口径，但其已产生的 token 仍属于累计用量。
-                try Self.scan(root: Self.codexArchivedSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate)
+                codexPresentFileIDs += try Self.scan(root: Self.codexArchivedSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate)
                 try gate.throwIfCancelled()
-                try Self.scan(root: Self.claudeProjectsRoot, source: "claude-code", ledger: ledger, hostname: hostname, cancellation: gate)
+                try ledger.markFilesMissing(source: "codex", presentFileIDs: codexPresentFileIDs)
                 try gate.throwIfCancelled()
+                let claudePresentFileIDs = try Self.scan(root: Self.claudeProjectsRoot, source: "claude-code", includeSubagents: true, ledger: ledger, hostname: hostname, cancellation: gate)
+                try gate.throwIfCancelled()
+                try ledger.markFilesMissing(source: "claude-code", presentFileIDs: claudePresentFileIDs)
+                try gate.throwIfCancelled()
+                // 可选的用户声明本地来源（Claude-compatible transcript）。配置缺失/非法不影响内建来源。
+                // 每个自定义 source 独立聚合 present 集合，再各自按 source 标 missing。
+                var localPresentBySource: [String: [String]] = [:]
+                for local in Self.loadLocalCollectionSources(url: localSourcesURL) {
+                    let present = try Self.scan(root: local.root, source: local.source, includeSubagents: local.includeSubagents, ledger: ledger, hostname: hostname, cancellation: gate)
+                    localPresentBySource[local.source, default: []] += present
+                    try gate.throwIfCancelled()
+                }
+                for (source, present) in localPresentBySource {
+                    try ledger.markFilesMissing(source: source, presentFileIDs: present)
+                    try gate.throwIfCancelled()
+                }
                 // cliproxy 主动拉取事件：只写原始层，不写文件 checkpoint（网络来源无偏移语义）。
                 try ledger.recordNetworkEvents(networkEvents, source: CliProxyUsageParser.source, hostname: hostname)
                 try gate.throwIfCancelled()
                 // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
                 let finalize = try ledger.finalizeDerived(hostname: hostname)
-                let summary = try ledger.summary()
+                // 只有在所有来源都完整扫描（无致命失败：任一来源枚举失败 / 单文件 I/O 失败都会
+                // 在上面抛出并终止本次扫描，不会到达此处）后，才显式清除 rebuild pending。
+                // record/finalize 不会推断重扫已完成，清除是此处唯一入口。
+                if try ledger.requiresRebuildCompletion() {
+                    try ledger.markRebuildCompleted()
+                }
+                let summary = try Self.summaries(
+                    from: ledger,
+                    hostname: hostname,
+                    containing: Date(),
+                    calendar: summaryCalendar
+                )
                 let pending = try ledger.pendingCounts(hostname: hostname)
                 return ScanOutcome(summary: summary, finalize: finalize, pending: pending)
             }
@@ -372,6 +451,18 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             }
             // 扫描链路会完成 hostname 对齐；此前因此 blocked 的 full sync 现在可重新评估。
             refreshFullSyncReadiness()
+            // rebuild pending 恢复路径：本次扫描已完整跑完全部来源（无致命失败），
+            // 且 off-main 已在 finalize 后清除 pending。此处确认已清除后再恢复正常启动链路
+            // （恢复全量同步 / 上报）。若因某种原因仍未清除，则保持 pending、绝不发网络请求。
+            if rebuildRecoveryPending {
+                reportAfterCurrentScan = false
+                if isRebuildCompletionPending() {
+                    // 未清除（例如刚被并发再次 reset）：保持恢复态，等待下一轮重扫，不做任何网络动作。
+                    return
+                }
+                resumeStartupAfterRebuildRecovery()
+                return
+            }
             let shouldReport = chainedReport || reportAfterCurrentScan
             reportAfterCurrentScan = false
             if shouldReport, statusSubject.value.reportingEnabled {
@@ -382,6 +473,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             updateStatus { $0.scanningInProgress = false }
         case .failure:
             reportAfterCurrentScan = false
+            // 扫描失败（含来源目录枚举失败、单文件 I/O 失败）：保持 rebuild pending，
+            // 绝不清除、绝不发网络请求。恢复标记保留，待下次扫描重试。
             updateStatus { status in
                 status.scanningInProgress = false
                 status.configurationError = "本地扫描失败"
@@ -394,6 +487,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     func reportNow() {
         // 防重入；且不在扫描或全量同步进行时上报，避免与 reset/rebuild/对账竞争。
         guard reportTask == nil, scanTask == nil, fullSyncTask == nil else { return }
+        // rebuild pending 期间绝不发网络请求：必须先完整重扫全部来源并清除 pending。
+        if isRebuildCompletionPending() {
+            updateStatus { $0.reportingError = "本地重建未完成，请先完成完整扫描后再上报" }
+            return
+        }
         refreshConfigurationAuthority()
         let current = statusSubject.value
         guard current.reportingEnabled, let ledger else {
@@ -493,6 +591,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     func runFullSync() {
         // 三方互斥 + 防重入。
         guard scanTask == nil, reportTask == nil, fullSyncTask == nil, let ledger else { return }
+        // rebuild pending 期间绝不 performFullSync（不发任何网络请求）：先完整重扫全部来源。
+        if isRebuildCompletionPending() {
+            updateStatus { status in
+                status.fullSyncState = .blocked
+                status.fullSyncBlockReasons = self.decorateWithLastResult(["本地重建未完成，需先完成完整扫描"])
+            }
+            return
+        }
         refreshConfigurationAuthority()
 
         // 统一 readiness 守门：缺配置 / 未 ready / 地址无效 / 缺 full-sync 协议段，一律保持 .blocked，
@@ -611,9 +717,59 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             }.get()
             try Task.checkCancellation()
 
-            // 3) 组装配置驱动的可恢复上传核心，并预取一次稳定账号身份。reserve 与
-            // completeUpload 始终复用这一 pinned identity。
-            let tokenSupplier = CommandFullSyncTokenSupplier(configuration: configuration)
+            // 2.5) Preflight：在预取 token、reserve fence 或任何网络/状态副作用之前，
+            // 先按同一 baseline 读一份只读快照，做与增量链路完全一致的 wire 规范化
+            // （canonical hostname + 字段字节截断）与全量自然键碰撞校验。这一步是纯函数、
+            // 零副作用：
+            //   - 自然键碰撞 → 直接 fenced 返回，绝不 reserve、绝不取 token、绝不触网；
+            //   - generation 漂移（staleGeneration）→ 同样在任何副作用前提前返回。
+            // 通过后再进入 reserve → 按同一 baseline 重读 → completeUpload 流程，两次读取
+            // 用的 expectedGeneration 与传给 reserve 的 generationBaseline 一致，故
+            // reservation 的 generation fence 仍然成立。
+            let preflightSnapshot: UsageFullSyncSnapshot
+            do {
+                preflightSnapshot = try await runOffMain { gate in
+                    try gate.throwIfCancelled()
+                    return try ledger.fullSyncSnapshot(
+                        hostname: hostname,
+                        expectedGeneration: generationBaseline
+                    )
+                }.get()
+            } catch let snapshotError as UsageFullSyncSnapshotError {
+                switch snapshotError {
+                case .staleGeneration:
+                    return .fenced(hostname: hostname, reason: "本地数据已变化，请重新采集后再全量同步")
+                case .localDerivationPending:
+                    return .fenced(hostname: hostname, reason: "本地采集尚未完成，请完成扫描后再全量同步")
+                }
+            }
+            try Task.checkCancellation()
+            // 与后续 begin/stage/commit 相同的“空快照不可直接 no-op”判定：仅当既空且无
+            // 对账 gate 时才是真正无事可做，此时在任何 token/网络前直接返回。
+            if preflightSnapshot.isEmpty, preflightSnapshot.reconciliationReason == nil {
+                return .nothingToSync(hostname: hostname)
+            }
+            do {
+                _ = try UsageFullSyncSnapshotMapper.normalizedPayloadSnapshot(
+                    from: preflightSnapshot, hostname: hostname
+                )
+            } catch let ingestError as IngestClientError {
+                if case .duplicateNaturalKey = ingestError {
+                    // 整份快照存在自然键碰撞：与增量链路一致地拒绝，且发生在 token/网络/状态
+                    // 之前，故本次全量同步零副作用。
+                    return .fenced(hostname: hostname, reason: "本地数据存在重复自然键，请重新采集后再全量同步")
+                }
+                return .failure(hostname: hostname, text: fullSyncErrorText(ingestError))
+            }
+            try Task.checkCancellation()
+
+           // 3) 组装配置驱动的可恢复上传核心，并预取一次稳定账号身份。reserve 与
+           // completeUpload 始终复用这一 pinned identity。
+           // baseURL is passed so the identity endpoint resolves the account
+           // namespace over the same origin the full-sync requests target.
+           let tokenSupplier = CommandFullSyncTokenSupplier(
+               configuration: configuration, baseURL: baseURL
+           )
             let reporter = FullSyncReporter(
                 configuration: fullSyncConfig,
                 sender: URLSessionFullSyncRequestSender(),
@@ -656,6 +812,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 case .staleGeneration:
                     try reporter.finalize(store: store)
                     return .fenced(hostname: hostname, reason: "本地数据已变化，请重新采集后再全量同步")
+                case .localDerivationPending:
+                    try reporter.finalize(store: store)
+                    return .fenced(hostname: hostname, reason: "本地采集尚未完成，请完成扫描后再全量同步")
                 }
             }
             // 关键：空快照不可直接 no-op。
@@ -673,7 +832,22 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             try Task.checkCancellation()
 
             // 6) snapshot 与 reservation generation 完全绑定后，才允许 begin/stage/commit。
-            let payload = UsageFullSyncSnapshotMapper.payloadSnapshot(from: snapshot)
+            // 用与增量链路完全一致的共享 normalizer 规范化整份快照并复核自然键；此处快照与
+            // preflight 同一 generation，规范化结果逐字节相同，因此 fingerprint / staged
+            // bytes 与增量 wire 一致。理论上 preflight 已放行，这里再核一次以保证送入
+            // completeUpload 的正是规范化后的 payload（fail-closed，零副作用地清理 reservation）。
+            let payload: FullSyncPayloadSnapshot
+            do {
+                payload = try UsageFullSyncSnapshotMapper.normalizedPayloadSnapshot(
+                    from: snapshot, hostname: hostname
+                )
+            } catch let ingestError as IngestClientError {
+                try reporter.finalize(store: store)
+                if case .duplicateNaturalKey = ingestError {
+                    return .fenced(hostname: hostname, reason: "本地数据存在重复自然键，请重新采集后再全量同步")
+                }
+                return .failure(hostname: hostname, text: fullSyncErrorText(ingestError))
+            }
             do {
                 _ = try await reporter.completeUpload(
                     snapshot: payload,
@@ -902,10 +1076,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             return "凭证账号不一致，全量同步已被阻止"
         case FullSyncError.notAuthenticated:
             return "凭证无效或已过期"
-        case FullSyncError.rescanRequired:
-            return "本地数据已变化，请重新采集后再全量同步"
-        case FullSyncError.fenceConflict:
-            return "远端围栏冲突，请稍后重试"
+       case FullSyncError.rescanRequired:
+           return "本地数据已变化，请重新采集后再全量同步"
+        case FullSyncError.stateInvalidated:
+            return "远端已作废本次全量同步，请重新采集后再试"
+        case FullSyncError.rejoinRequired:
+            return "凭证或会话已失效，请重新登录后再全量同步"
+        case FullSyncError.unsupported:
+            return "远端暂不支持全量同步"
         case FullSyncError.payloadTooLarge:
             return "单块数据超过大小上限，无法全量同步"
         case FullSyncError.chunkDigestMismatch:
@@ -934,6 +1112,20 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         isRunning = true
         // 启动即刷新配置权威与全量同步 readiness，使 UI 一开始就反映真实能力。
         refreshConfigurationAuthority()
+        // 崩溃安全恢复的最高优先级：存在 rebuild pending（上次已 reset 清库但未确认全部来源
+        // 重扫成功）时，绝不能 resumeFullSync / performFullSync / 普通 report（即不发任何网络
+        // 请求）。必须先完整重扫全部 configured roots；仅当所有来源无致命失败、pending 被显式
+        // 清除后，finishScan 才恢复正常启动链路（恢复全量同步 / 上报）。
+        // 空库 + 债务 + pending 场景同样先重扫，不因存在 full-sync 债务而先行恢复上报。
+        if isRebuildCompletionPending() {
+            rebuildRecoveryPending = true
+            if statusSubject.value.localCollectionEnabled {
+                scanNow(chainedReport: false)
+            }
+            // 采集关闭时无法自动重扫：保持 pending，等待用户开启本地采集或手动扫描，
+            // 期间仍禁止一切网络动作。不启动自动上报循环。
+            return
+        }
         // 必须先恢复可恢复的 full-sync state，再启动新的扫描。若远端已经 committed、
         // 本地 ledger commit 尚未完成，先扫描可能推进 generation，使恢复被永久围栏。
         if resumeFullSyncIfPending() {
@@ -948,23 +1140,74 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         startAutoLoopIfNeeded()
     }
 
-    /// 启动恢复：若当前 hostname 的状态目录存在可恢复的全量同步 state，则据 readiness 决定：
-    /// - readiness 就绪：自动触发 runFullSync（upload 命中已有 state，remote-committed 时零网络重放），
-    ///   完成本地 ledger commit + finalize，闭合 remote-ack→ledger-commit 窗口；
-    /// - 配置缺失/未就绪：无法恢复，给出“待恢复”提示（不改动 state，等配置补齐后再来）。
+    /// 是否存在未确认完成的 rebuild（只读；账本不可用时视作无）。
+    private func isRebuildCompletionPending() -> Bool {
+        guard let ledger else { return false }
+        // 网络门禁：只要存在「parser 显式重建未确认完成」或「文件已 replace 但派生尚未成功
+        // 重算（raw derivation dirty）」任一挂起，都必须 fail-closed，绝不发任何网络请求。
+        let rebuildPending = (try? ledger.requiresRebuildCompletion()) ?? false
+        let derivationPending = (try? ledger.requiresDerivationCompletion()) ?? false
+        return rebuildPending || derivationPending
+    }
+
+    /// rebuild pending 期间完成一次全量重扫后：清除恢复标记并驱动正常启动链路
+    /// （恢复可续的全量同步，否则按开关扫描/上报），最后按需启动自动上报循环。
+    private func resumeStartupAfterRebuildRecovery() {
+        rebuildRecoveryPending = false
+        guard isRunning else { return }
+        if resumeFullSyncIfPending() {
+            startAutoLoopIfNeeded()
+            return
+        }
+        if statusSubject.value.reportingEnabled {
+            reportNow()
+        }
+        startAutoLoopIfNeeded()
+    }
+
+    /// 启动恢复：枚举“存在待恢复全量同步工作”的 hostname，据 readiness 分流恢复。
+    ///
+    /// 关键（P1 修复）：hostname 变更后，remote finalize 已完成但本地 ledger commit 尚未落地时
+    /// 崩溃，可恢复的 state 落在**旧 host** 的状态目录，且账本对该旧 host 记着 reconciliation 债务。
+    /// 若只看当前配置/本地 hostname，旧 host 的 state 永远发现不了：reconciliation gate 会持续
+    /// 全局 fail-closed 阻断增量上报，直到用户手动再次触发全量同步。因此这里必须枚举
+    /// pendingReconciliationHosts() 得到的债务 host（连同当前有效 hostname），逐个检查其状态目录，
+    /// 只要**任一** host 存在持久化 state 或对账债务，就认定有待恢复工作。
+    ///
+    /// 分流：
+    /// - readiness 就绪：触发 runFullSync（其 worker 会优先选择债务 host、命中已有 state 时对
+    ///   remote-committed 场景零网络重放），完成本地 ledger commit + finalize，闭合
+    ///   remote-ack → ledger-commit 窗口，并清除旧 host 的对账债务；
+    /// - 配置缺失/未就绪：无法安全恢复，给出“待恢复”提示（不改动 state/gate，等配置补齐后再来）。
     @discardableResult
     private func resumeFullSyncIfPending() -> Bool {
         // 已有在途任务或非法前置，跳过。
-        guard fullSyncTask == nil, scanTask == nil, reportTask == nil, ledger != nil else { return false }
-        // 需要一个 hostname 才能定位状态目录：优先配置权威，其次用户保存值。
+        guard fullSyncTask == nil, scanTask == nil, reportTask == nil, let ledger else { return false }
+        // rebuild / raw-derivation pending 期间绝不恢复/发起全量同步：先完整重扫全部来源、
+        // 成功 finalize 并清除全部 pending 后才允许任何网络动作。
+        if isRebuildCompletionPending() { return false }
+
+        // 候选 host 集合 = 账本对账债务 host ∪ 当前有效 hostname（配置权威优先，其次用户保存值）。
+        // 债务 host 可能与当前 hostname 不同（改名后的旧 host），绝不能只看当前配置。
         let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
         let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
-        let hostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
-        guard !hostname.isEmpty, let directory = try? Self.fullSyncStateDirectory(hostname: hostname) else { return false }
-        let store = FullSyncStateStore(directory: directory)
-        guard store.hasState() else { return false }
+        let currentHostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
+        let debtHosts = (try? ledger.pendingReconciliationHosts()) ?? []
 
-        // 有可恢复 state：按当前 readiness 分流。
+        var candidates: [String] = debtHosts
+        if !currentHostname.isEmpty, !candidates.contains(currentHostname) {
+            candidates.append(currentHostname)
+        }
+
+        // 是否存在待恢复工作：任一候选 host 有持久化 state（可续传）或有对账债务（需空全量同步清远端残留）。
+        let hasResumableState = candidates.contains { host in
+            guard let directory = try? Self.fullSyncStateDirectory(hostname: host) else { return false }
+            return FullSyncStateStore(directory: directory).hasState()
+        }
+        let hasPending = hasResumableState || !debtHosts.isEmpty
+        guard hasPending else { return false }
+
+        // 有待恢复工作：按当前 readiness 分流。
         let (readiness, _) = Self.fullSyncReadiness(
             reporter: reporter,
             configurationURL: configurationURL,
@@ -972,6 +1215,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             ledger: ledger
         )
         if readiness == .ready {
+            // runFullSync 的 worker 会 pendingReconciliationHosts().first 优先恢复旧 host，
+            // 对已有 state 命中幂等 committed 分支（零网络），并重跑 ledger commit + finalize。
             runFullSync()
         } else {
             // 配置未就绪：无法安全恢复，明确提示待恢复，等待用户补齐配置。
@@ -988,6 +1233,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         autoLoopTask?.cancel()
         autoLoopTask = nil
         reportAfterCurrentScan = false
+        // 清除 rebuild 恢复标记：下次 start() 会重新读取账本 pending 状态并重新分流。
+        rebuildRecoveryPending = false
         scanTask?.cancel()
         scanTask = nil
         scanGeneration &+= 1
@@ -1023,7 +1270,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 在 reportingEnabled=true 且未启动过时创建 30 分钟自动循环任务。
     /// 循环内每轮先判断当前开关，一旦被关掉即退出，不再触发。
     private func startAutoLoopIfNeeded() {
-        guard autoLoopTask == nil, isRunning, statusSubject.value.reportingEnabled else { return }
+        // rebuild pending 期间不启动自动上报循环（不发网络请求）。
+        guard autoLoopTask == nil, isRunning, statusSubject.value.reportingEnabled,
+              !isRebuildCompletionPending() else { return }
         autoLoopTask = Task { [weak self] in
             let interval = TokenSyncCoordinator.autoReportInterval
             while !Task.isCancelled {
@@ -1049,7 +1298,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     private struct ScanOutcome {
-        let summary: UsageSummary?
+        let summary: TokenUsageSummary
         let finalize: UsageFinalizeResult
         let pending: (buckets: Int, sessions: Int)
     }
@@ -1128,6 +1377,22 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     nonisolated private static var claudeProjectsRoot: URL {
         FileManager.default.homeDirectoryForCurrentUser.appending(path: ".claude/projects")
+    }
+
+    /// 可选本地采集来源配置文件（owner-only 0600），与 reporting.json 同目录、独立文件。
+    nonisolated private static func defaultLocalCollectionURL() -> URL {
+        let directory = (try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        )) ?? FileManager.default.temporaryDirectory
+        return directory.appending(path: "AgentPulse/local-sources.json")
+    }
+
+    /// 读取并校验本地采集来源；任何失败（权限/格式）都降级为空，不影响内建来源采集。
+    nonisolated private static func loadLocalCollectionSources(url: URL) -> [LocalCollectionSource] {
+        ((try? LocalCollectionConfigurationLoader.load(from: url)) ?? .empty).sources
     }
 
     /// 在专用后台队列上执行阻塞式工作（SQLite/文件 I/O），避免阻塞主线程，
@@ -1253,13 +1518,47 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         statusSubject.send(current)
     }
 
-    private func publish(_ summary: UsageSummary?) {
-        guard let summary else { summarySubject.send(.empty); return }
-        summarySubject.send(Self.summary(from: summary))
+    private func publish(_ summary: TokenUsageSummary) {
+        summarySubject.send(summary)
     }
 
-    private static func summary(from summary: UsageSummary) -> TokenUsageSummary {
-        TokenUsageSummary(
+    /// 四个窗口共享同一参考时刻、时区与 hostname，并且全部从 derived bucket 查询。
+    nonisolated private static func summaries(
+        from ledger: UsageLedgerStore,
+        hostname: String,
+        containing date: Date,
+        calendar: Calendar
+    ) throws -> TokenUsageSummary {
+        return TokenUsageSummary(
+            day: try ledger.summary(
+                window: .day,
+                containing: date,
+                hostname: hostname,
+                calendar: calendar
+            ).map(windowSummary(from:)),
+            month: try ledger.summary(
+                window: .month,
+                containing: date,
+                hostname: hostname,
+                calendar: calendar
+            ).map(windowSummary(from:)),
+            year: try ledger.summary(
+                window: .year,
+                containing: date,
+                hostname: hostname,
+                calendar: calendar
+            ).map(windowSummary(from:)),
+            all: try ledger.summary(
+                window: nil,
+                containing: date,
+                hostname: hostname,
+                calendar: calendar
+            ).map(windowSummary(from:))
+        )
+    }
+
+    nonisolated private static func windowSummary(from summary: UsageSummary) -> TokenUsageWindowSummary {
+        TokenUsageWindowSummary(
             totalTokens: summary.counts.total,
             estimatedCost: summary.estimatedCostUSD,
             cachedTokens: summary.cachedTokens,
@@ -1271,15 +1570,43 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     private static func openLedger() -> UsageLedgerStore? {
         do {
             let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appending(path: "AgentPulse", directoryHint: .isDirectory)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let ownerOnlyDirectoryPermissions = NSNumber(value: Int16(0o700))
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: ownerOnlyDirectoryPermissions]
+            )
+            // createDirectory does not tighten an existing directory. Apply the
+            // owner-only mode explicitly so the database path cannot be traversed
+            // by another local account even when it was created by an older build.
+            try FileManager.default.setAttributes(
+                [.posixPermissions: ownerOnlyDirectoryPermissions],
+                ofItemAtPath: directory.path
+            )
             return try UsageLedgerStore(path: directory.appending(path: "usage.sqlite3").path)
         } catch { return nil }
     }
 
     /// 扫描单一来源根目录：逐 jsonl 文件按 checkpoint 跳过未变更文件，
     /// 变更文件解析后同时写入 token 事件与 session 事件。不触发派生重算。
-    nonisolated private static func scan(root: URL, source: String, ledger: UsageLedgerStore, hostname: String, cancellation: CancellationGate) throws {
-        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey], options: [.skipsHiddenFiles]) else { return }
+    /// 扫描单个来源根目录。includeSubagents 控制是否把 subagents/agent-*.jsonl 视为子代理转录
+    /// （计入 token、不产 session 事件）。内建 codex 传 false，claude-compatible 来源可开启。
+    /// 返回本次在磁盘上实际枚举到的该来源文件 fileID 列表（present set）。调用方据此在扫描
+    /// 全部 root 后按 source 聚合，交给 Ledger 标记「磁盘已消失」文件为 missing（保留 raw 历史）。
+    @discardableResult
+    nonisolated private static func scan(root: URL, source: String, includeSubagents: Bool = false, ledger: UsageLedgerStore, hostname: String, cancellation: CancellationGate) throws -> [String] {
+        // 不存在的来源根目录：无需扫描，视作该来源“无内容”（非失败）。
+        // 但根目录存在却无法枚举，属致命失败：绝不能当作扫描成功静默吞掉，
+        // 否则会在数据缺失的情况下清除 rebuild pending / 误判“全量成功”。
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory) else { return [] }
+        guard isDirectory.boolValue else {
+            throw TokenSyncScanError.sourceRootNotEnumerable(source: source)
+        }
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey], options: [.skipsHiddenFiles]) else {
+            throw TokenSyncScanError.sourceRootNotEnumerable(source: source)
+        }
+        var presentFileIDs: [String] = []
         for case let url as URL in enumerator where url.pathExtension == "jsonl" {
             try cancellation.throwIfCancelled()
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
@@ -1288,7 +1615,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
             let modifiedAt = values.contentModificationDate ?? Date.distantPast
             let fileID = UsageJSONLParser.fileID(for: url.path)
+            presentFileIDs.append(fileID)
             if let checkpoint = try ledger.checkpoint(fileID: fileID),
+               checkpoint.status == "complete",
                checkpoint.size == fileSize,
                abs(checkpoint.modifiedAt.timeIntervalSince(modifiedAt)) < 0.001,
                checkpoint.parserVersion == UsageJSONLParser.parserVersion {
@@ -1300,10 +1629,18 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 source: source,
                 fileIdentity: url.path,
                 modifiedAt: modifiedAt,
-                isSubagent: source == "claude-code" && isClaudeSubagentTranscript(url)
+                isSubagent: includeSubagents && isClaudeSubagentTranscript(url)
             )
-            try ledger.record(events: parsed.events, sessionEvents: parsed.sessionEvents, checkpoint: parsed.checkpoint, hostname: hostname)
+            try ledger.record(
+                events: parsed.events,
+                sessionEvents: parsed.sessionEvents,
+                editEntries: parsed.editEntries,
+                editMetricsSupported: true,
+                checkpoint: parsed.checkpoint,
+                hostname: hostname
+            )
         }
+        return presentFileIDs
     }
 
     /// Claude Task 子代理转录的稳定磁盘布局：`subagents/agent-*.jsonl`。

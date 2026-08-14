@@ -11,6 +11,7 @@ let package = Package(
     products: [
         .executable(name: "AgentPulse", targets: ["AgentPulse"]),
         .executable(name: "AgentPulseCollectorSmoke", targets: ["AgentPulseCollectorSmoke"]),
+        .executable(name: "AgentPulseUsageSmoke", targets: ["AgentPulseUsageSmoke"]),
         .library(name: "AgentPulseCore", targets: ["AgentPulseCore"]),
         .library(name: "AgentPulseR2", targets: ["AgentPulseR2"]),
         .library(name: "AgentPulseReporting", targets: ["AgentPulseReporting"]),
@@ -38,6 +39,10 @@ let package = Package(
             name: "AgentPulseCollectorSmoke",
             dependencies: ["AgentPulseCore"]
         ),
+        .executableTarget(
+            name: "AgentPulseUsageSmoke",
+            dependencies: ["AgentPulseCore", "AgentPulseReporting", "AgentPulseUsage"]
+        ),
         .testTarget(
             name: "AgentPulseCoreTests",
             dependencies: ["AgentPulseCore"],
@@ -54,6 +59,11 @@ let package = Package(
                 "SQLiteSnapshotStoreTests.swift",
             ],
             sources: ["VerificationMain.swift"]
+        ),
+        .executableTarget(
+            name: "MetricsLedgerPipelineVerification",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/MetricsLedgerPipelineVerification"
         ),
         .testTarget(
             name: "AgentPulseR2Tests",
@@ -89,6 +99,36 @@ let package = Package(
                 "FullSyncVerification.swift",
                 "CoordinatorVerification.swift",
             ]
+        ),
+        .executableTarget(
+            name: "RuntimeHeaderParityVerification",
+            dependencies: ["AgentPulseReporting", "AgentPulseUsage"],
+            path: "Tests/RuntimeHeaderParityVerification"
+        ),
+        .executableTarget(
+            name: "NaturalKeyGuardVerification",
+            dependencies: ["AgentPulseReporting"],
+            path: "Tests/NaturalKeyGuardVerification"
+        ),
+        .executableTarget(
+            name: "FullSyncWireParityVerification",
+            dependencies: ["AgentPulseReporting", "AgentPulseUsage"],
+            path: "Tests/FullSyncWireParityVerification"
+        ),
+        .executableTarget(
+            name: "ProductionDatabasePreflightVerification",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/ProductionDatabasePreflightVerification"
+        ),
+        .executableTarget(
+            name: "SecureConfigVerification",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/SecureConfigVerification"
+        ),
+        .executableTarget(
+            name: "KabooCaptureParityVerification",
+            dependencies: ["AgentPulseReporting"],
+            path: "Tests/KabooCaptureParityVerification"
         ),
     ],
     swiftLanguageModes: [.v6]

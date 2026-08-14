@@ -1,2 +1,2 @@
-{"timestamp":"2026-08-10T00:00:00.000Z","type":"session_meta","payload":{"session_id":"77777777-7777-7777-8777-777777777777","thread_source":"user","cwd":"/Users/tester/Workspaces/project-f","originator":"Codex Desktop"}}
+{"timestamp":"2026-08-10T00:00:00.000Z","type":"session_meta","payload":{"session_id":"77777777-7777-7777-8777-777777777777","thread_source":"user","cwd":"/workspace/Workspaces/project-f","originator":"Codex Desktop"}}
 {"timestamp":"2026-08-10T00:02:00.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"aaaa7777-0000-0000-0000-000000000001"}}
