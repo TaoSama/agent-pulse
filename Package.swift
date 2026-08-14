@@ -126,9 +126,9 @@ let package = Package(
             path: "Tests/SecureConfigVerification"
         ),
         .executableTarget(
-            name: "KabooCaptureParityVerification",
+            name: "ReferenceCaptureParityVerification",
             dependencies: ["AgentPulseReporting"],
-            path: "Tests/KabooCaptureParityVerification"
+            path: "Tests/ReferenceCaptureParityVerification"
         ),
     ],
     swiftLanguageModes: [.v6]
