@@ -111,7 +111,7 @@ public enum UsageJSONLParser {
         var previousCumulative: UsageTokenCounts?
         var result: [UsageEvent] = []
         var editAccumulator = CodexEditAccumulator(source: sourceName, project: metadata.project, sourceFileHash: fileHash)
-        var seenEventIDs = Set<String>()
+        var codexEventOccurrences = [String: Int]()
         var seenSessionEventIDs = Set<String>()
         // 技能 / MCP count-only 事件统一按稳定的 session/turn/call 身份聚合；直接 MCP 与
         // programmatic JS 都由 mcpAccumulator 按 call_id 关联输出后结算。
@@ -235,11 +235,18 @@ public enum UsageJSONLParser {
             let lineageFingerprint = canProveLineage
                 ? totalSnapshotFingerprint(root: fingerprintRoot, last: normalizedLast, total: normalizedTotal!)
                 : ""
-            let eventID = codexEventID(
+            let baseEventID = codexEventID(
                 identityScope: codexEventIdentityScope(metadata), modelAtEmission: modelAtEmission,
                 last: normalizedLast, completeTotal: hasTotalSnapshot ? normalizedTotal : nil
             )
-            guard seenEventIDs.insert(eventID).inserted else { continue }
+            // Codex emits one token_count per turn; repeated identical events within
+            // a file are real repeated usage and are each counted once (matching the
+            // reference collector, which keeps every codex entry). The first
+            // occurrence keeps its stable id; later occurrences get an ordinal
+            // suffix so they are distinct events rather than collapsing into one.
+            let occurrence = codexEventOccurrences[baseEventID, default: 0]
+            codexEventOccurrences[baseEventID] = occurrence + 1
+            let eventID = occurrence == 0 ? baseEventID : "\(baseEventID)#\(occurrence)"
 
             result.append(UsageEvent(
                 id: eventID, source: sourceName, model: modelAtEmission, project: metadata.project,
