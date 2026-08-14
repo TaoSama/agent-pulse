@@ -122,11 +122,36 @@ struct AgentPulseCoreVerification {
             reportedTotal: 2_000
         ))
         try require(inputSummary.cachedTokens == 60, "cache hits must include cache reads only")
-        try require(inputSummary.newTokens == 40, "new tokens must include uncached input and cache creation only")
-        try requireApproximatelyEqual(inputSummary.cacheHitRate, 0.6, "cache hit denominator must include input token classes only")
+        try require(inputSummary.newTokens == 30, "new tokens must include uncached input only, excluding cache creation")
+        try requireApproximatelyEqual(inputSummary.cacheHitRate, 60.0 / 90.0, "cache hit denominator must be uncached input + cache reads only")
 
         let outputOnly = UsageInputSummary(counts: UsageTokenCounts(output: 100, reasoningOutput: 20))
         try require(outputOnly.cacheHitRate == nil, "cache hit rate must be nil without input tokens")
+
+        // 复现权威看板『日』窗口量级：cache read 主导 → 命中率 ≈ 99%，新增仅纯输入。
+        let dayWindow = UsageInputSummary(counts: UsageTokenCounts(
+            input: 243_718,
+            output: 190_630,
+            cachedInput: 44_850_423,
+            cacheCreationInput: 1_678_909
+        ))
+        try require(dayWindow.newTokens == 243_718, "day-window new tokens must be pure input, not input + cache creation")
+        try require(dayWindow.cachedTokens == 44_850_423, "day-window cached tokens must be cache reads")
+        try requireApproximatelyEqual(dayWindow.cacheHitRate, 44_850_423.0 / (243_718.0 + 44_850_423.0), "day-window cache hit rate must be cache read / (input + cache read) ≈ 99.5%")
+
+        // 费用口径：opus-4-8 精确命中当代单价 5/25/0.5，cache creation 不计费。
+        let opusCounts = UsageTokenCounts(input: 243_718, output: 190_630, cachedInput: 44_850_423, cacheCreationInput: 1_678_909)
+        let opusCost = UsageCostEstimator.cost(model: "claude-opus-4-8", counts: opusCounts)
+        let expectedOpusCost = (243_718.0 * 5 + 190_630.0 * 25 + 44_850_423.0 * 0.5) / 1_000_000
+        try requireApproximatelyEqual(opusCost, expectedOpusCost, "opus-4-8 must price via 5/25/0.5 and ignore cache creation")
+
+        // 更长的模型串优先：opus-4-8 不得回退到旧 Opus 4 的 15/75/1.5。
+        try require(opusCost < (243_718.0 * 15 + 190_630.0 * 75 + 44_850_423.0 * 1.5) / 1_000_000, "opus-4-8 must not fall back to legacy Opus-4 pricing")
+
+        // 未匹配模型走 fallback 3/15/0.3，无 reasoning 档，cache creation 不计费。
+        let unknownCounts = UsageTokenCounts(input: 1_000_000, output: 1_000_000, cachedInput: 1_000_000, cacheCreationInput: 1_000_000, reasoningOutput: 1_000_000)
+        let unknownCost = UsageCostEstimator.cost(model: "some-unlisted-model", counts: unknownCounts)
+        try requireApproximatelyEqual(unknownCost, 3 + 15 + 0.3, "fallback pricing must be 3/15/0.3 with no reasoning or cache-creation charge")
 
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .gmt

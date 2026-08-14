@@ -384,9 +384,12 @@ public struct UsageSession: Codable, Sendable, Equatable {
 
 /// 输入 token 的展示口径。
 ///
-/// - cachedTokens: 仅包含 cache read；cache creation 是本次新写入的输入，不是命中。
-/// - newTokens: 非缓存输入 + cache creation；不包含 output / reasoning。
-/// - cacheHitRate: cached / (input + cache creation + cached)；没有输入时为 nil。
+/// 与权威看板保持一致：cache creation（本次写入缓存的输入）既不计入新增，也不参与
+/// 命中率的分子或分母——它对主力数据源本就不进入用量聚合。
+///
+/// - cachedTokens: 仅包含 cache read（命中）。
+/// - newTokens: 仅纯输入（cache miss 部分）；不含 cache read、cache creation、output、reasoning。
+/// - cacheHitRate: cache read /（纯输入 + cache read）；没有输入时为 nil。
 public struct UsageInputSummary: Codable, Sendable, Equatable {
     public let cachedTokens: Int64
     public let newTokens: Int64
@@ -394,10 +397,9 @@ public struct UsageInputSummary: Codable, Sendable, Equatable {
 
     public init(counts: UsageTokenCounts) {
         cachedTokens = counts.cachedInput
-        let (newTokenCount, overflowed) = counts.input.addingReportingOverflow(counts.cacheCreationInput)
-        newTokens = overflowed ? Int64.max : newTokenCount
+        newTokens = counts.input
 
-        let denominator = Double(counts.input) + Double(counts.cacheCreationInput) + Double(counts.cachedInput)
+        let denominator = Double(counts.input) + Double(counts.cachedInput)
         cacheHitRate = denominator > 0 ? Double(counts.cachedInput) / denominator : nil
     }
 }
@@ -439,21 +441,100 @@ public struct UsageSummary: Codable, Sendable, Equatable {
     public var cachePercentage: Double? { inputSummary.cacheHitRate }
 }
 
+/// 单一模型的每百万 token 单价。
+///
+/// 与权威看板一致，只保留四档：input / output / cache read / reasoning。
+/// cache creation 没有独立计价档——它对主力数据源不进入计费。
 public struct UsageModelPrice: Sendable, Equatable {
     public let pattern: String
     public let inputPerMillion: Double
     public let outputPerMillion: Double
     public let cacheReadPerMillion: Double
-    public let cacheCreationPerMillion: Double
     public let reasoningPerMillion: Double
+
+    public init(pattern: String, inputPerMillion: Double, outputPerMillion: Double, cacheReadPerMillion: Double, reasoningPerMillion: Double) {
+        self.pattern = pattern
+        self.inputPerMillion = inputPerMillion
+        self.outputPerMillion = outputPerMillion
+        self.cacheReadPerMillion = cacheReadPerMillion
+        self.reasoningPerMillion = reasoningPerMillion
+    }
 }
 
 public enum UsageCostEstimator {
-    public static let fallback = UsageModelPrice(pattern: "", inputPerMillion: 3, outputPerMillion: 15, cacheReadPerMillion: 0.3, cacheCreationPerMillion: 3.75, reasoningPerMillion: 15)
+    /// 未匹配到任何模型时的兜底单价（每百万 token）：取当代中端会话模型量级，无 reasoning 档。
+    public static let fallback = UsageModelPrice(pattern: "", inputPerMillion: 3, outputPerMillion: 15, cacheReadPerMillion: 0.3, reasoningPerMillion: 0)
 
+    /// 按模型的每百万 token 单价表（USD），取当代公开牌价（含 OpenRouter 标准价）。
+    ///
+    /// pattern 以“子串命中且最长者优先”匹配（如 `claude-opus-4-8` 命中 `claude-opus-4-8`，
+    /// `traex/gpt-5.6-sol` 命中 `gpt-5.6-sol`）。未命中走 `fallback`。cache read 单价按各厂商
+    /// 实际牌价（并非统一比例）；cache creation 不参与计价。价格会随厂商调整而漂移，更新时
+    /// 请以厂商官方 / OpenRouter 牌价为准，勿散落魔法值。
+    public static let defaultPrices: [UsageModelPrice] = [
+        // Anthropic Claude（cache creation 不计费）
+        UsageModelPrice(pattern: "claude-fable-5", inputPerMillion: 10, outputPerMillion: 50, cacheReadPerMillion: 1.0, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-opus-5", inputPerMillion: 5, outputPerMillion: 25, cacheReadPerMillion: 0.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-opus-4-8", inputPerMillion: 5, outputPerMillion: 25, cacheReadPerMillion: 0.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-opus-4-7", inputPerMillion: 5, outputPerMillion: 25, cacheReadPerMillion: 0.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-opus-4-6", inputPerMillion: 5, outputPerMillion: 25, cacheReadPerMillion: 0.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-opus-4-5", inputPerMillion: 5, outputPerMillion: 25, cacheReadPerMillion: 0.5, reasoningPerMillion: 0),
+        // 旧 Opus 4/4.1 仍为 15/75/1.5；置于 4-x 新价之后，靠最长匹配区分。
+        UsageModelPrice(pattern: "claude-opus-4", inputPerMillion: 15, outputPerMillion: 75, cacheReadPerMillion: 1.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-sonnet-5", inputPerMillion: 2, outputPerMillion: 10, cacheReadPerMillion: 0.2, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-sonnet-4", inputPerMillion: 3, outputPerMillion: 15, cacheReadPerMillion: 0.3, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-haiku-4-5", inputPerMillion: 1, outputPerMillion: 5, cacheReadPerMillion: 0.1, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-3-5-sonnet", inputPerMillion: 3, outputPerMillion: 15, cacheReadPerMillion: 0.3, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-3-5-haiku", inputPerMillion: 0.8, outputPerMillion: 4, cacheReadPerMillion: 0.08, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "claude-3-opus", inputPerMillion: 15, outputPerMillion: 75, cacheReadPerMillion: 1.5, reasoningPerMillion: 0),
+        // OpenAI GPT-5.6 分档（Sol / Terra / Luna）与 5.5
+        UsageModelPrice(pattern: "gpt-5.6-sol", inputPerMillion: 5, outputPerMillion: 30, cacheReadPerMillion: 0.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-5.6-terra", inputPerMillion: 1, outputPerMillion: 6, cacheReadPerMillion: 0.1, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-5.6-luna", inputPerMillion: 0.1, outputPerMillion: 0.6, cacheReadPerMillion: 0.01, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-5.5", inputPerMillion: 5, outputPerMillion: 30, cacheReadPerMillion: 0.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-5.4", inputPerMillion: 2.5, outputPerMillion: 15, cacheReadPerMillion: 0.25, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-5.2", inputPerMillion: 1.75, outputPerMillion: 14, cacheReadPerMillion: 0.175, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-5.1", inputPerMillion: 1.25, outputPerMillion: 10, cacheReadPerMillion: 0.125, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-5", inputPerMillion: 1.25, outputPerMillion: 10, cacheReadPerMillion: 0.125, reasoningPerMillion: 0),
+        // OpenAI GPT-4 系列
+        UsageModelPrice(pattern: "gpt-4o", inputPerMillion: 2.5, outputPerMillion: 10, cacheReadPerMillion: 1.25, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-4o-mini", inputPerMillion: 0.15, outputPerMillion: 0.6, cacheReadPerMillion: 0.075, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-4-turbo", inputPerMillion: 10, outputPerMillion: 30, cacheReadPerMillion: 0, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-4.1", inputPerMillion: 2, outputPerMillion: 8, cacheReadPerMillion: 0.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-4.1-mini", inputPerMillion: 0.4, outputPerMillion: 1.6, cacheReadPerMillion: 0.1, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gpt-4.1-nano", inputPerMillion: 0.1, outputPerMillion: 0.4, cacheReadPerMillion: 0.025, reasoningPerMillion: 0),
+        // OpenAI reasoning
+        UsageModelPrice(pattern: "o1", inputPerMillion: 15, outputPerMillion: 60, cacheReadPerMillion: 7.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "o1-pro", inputPerMillion: 150, outputPerMillion: 600, cacheReadPerMillion: 0, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "o3", inputPerMillion: 2, outputPerMillion: 8, cacheReadPerMillion: 0.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "o3-mini", inputPerMillion: 1.1, outputPerMillion: 4.4, cacheReadPerMillion: 0.55, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "o4-mini", inputPerMillion: 1.1, outputPerMillion: 4.4, cacheReadPerMillion: 0.275, reasoningPerMillion: 0),
+        // DeepSeek V4 / V3
+        UsageModelPrice(pattern: "deepseek-v4-flash", inputPerMillion: 0.14, outputPerMillion: 0.28, cacheReadPerMillion: 0.028, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "deepseek-v4-pro", inputPerMillion: 1.168, outputPerMillion: 2.336, cacheReadPerMillion: 0.09855, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "deepseek-v3", inputPerMillion: 0.27, outputPerMillion: 1.12, cacheReadPerMillion: 0.135, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "deepseek-r1", inputPerMillion: 0.7, outputPerMillion: 2.5, cacheReadPerMillion: 0, reasoningPerMillion: 0),
+        // Google Gemini
+        UsageModelPrice(pattern: "gemini-2.5-pro", inputPerMillion: 1.25, outputPerMillion: 10, cacheReadPerMillion: 0.125, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gemini-2.5-flash", inputPerMillion: 0.3, outputPerMillion: 2.5, cacheReadPerMillion: 0.03, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "gemini-2.5-flash-lite", inputPerMillion: 0.1, outputPerMillion: 0.4, cacheReadPerMillion: 0.01, reasoningPerMillion: 0),
+        // xAI Grok
+        UsageModelPrice(pattern: "grok-4", inputPerMillion: 2, outputPerMillion: 6, cacheReadPerMillion: 0.5, reasoningPerMillion: 0),
+        UsageModelPrice(pattern: "grok-3", inputPerMillion: 3, outputPerMillion: 15, cacheReadPerMillion: 0, reasoningPerMillion: 0),
+    ]
+
+    /// 估算单个模型的费用（USD）。
+    ///
+    /// - prices 为空时使用与权威看板一致的 `defaultPrices`；显式传入则覆盖之。
+    /// - 计价 = input×单价 + output×单价 + cacheRead×单价 + reasoning×单价；cache creation 不计费。
     public static func cost(model: String, counts: UsageTokenCounts, prices: [UsageModelPrice] = []) -> Double {
         let lowered = model.lowercased()
-        let price = prices.filter { !$0.pattern.isEmpty && lowered.contains($0.pattern.lowercased()) }.max { $0.pattern.count < $1.pattern.count } ?? fallback
-        return (Double(counts.input) * price.inputPerMillion + Double(counts.output) * price.outputPerMillion + Double(counts.cachedInput) * price.cacheReadPerMillion + Double(counts.cacheCreationInput) * price.cacheCreationPerMillion + Double(counts.reasoningOutput) * price.reasoningPerMillion) / 1_000_000
+        let table = prices.isEmpty ? defaultPrices : prices
+        let price = table.filter { !$0.pattern.isEmpty && lowered.contains($0.pattern.lowercased()) }.max { $0.pattern.count < $1.pattern.count } ?? fallback
+        let inputCost = Double(counts.input) * price.inputPerMillion
+        let outputCost = Double(counts.output) * price.outputPerMillion
+        let cacheReadCost = Double(counts.cachedInput) * price.cacheReadPerMillion
+        let reasoningCost = Double(counts.reasoningOutput) * price.reasoningPerMillion
+        return (inputCost + outputCost + cacheReadCost + reasoningCost) / 1_000_000
     }
 }
