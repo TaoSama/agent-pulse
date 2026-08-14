@@ -148,7 +148,7 @@ public struct FullSyncState: Codable, Equatable, Sendable {
     /// confirmed chunk deliberately no longer depends on its local body.
     public func validate() throws {
         guard version == Self.currentVersion,
-              Self.isLowercaseHex(uploadID, count: 64),
+              Self.isLowercaseHex(uploadID, minCount: 32, maxCount: 64),
               !hostname.isEmpty, hostname == CanonicalHostname.normalize(hostname),
               !authIdentity.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               fenceRevision >= 0, generationBaseline >= 0, rawGeneration >= 0,
@@ -219,6 +219,18 @@ public struct FullSyncState: Codable, Equatable, Sendable {
 
     private static func isLowercaseHex(_ value: String, count: Int) -> Bool {
         value.utf8.count == count && value.utf8.allSatisfy {
+            (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0)
+                || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains($0)
+        }
+    }
+
+    /// A recovered upload ID is accepted when it is lowercase hex whose length
+    /// falls within an inclusive range. Freshly generated IDs are still exactly
+    /// 64 hex chars; on recovery a server-issued ID as short as 32 hex chars is
+    /// honored so an in-flight upload survives across differing ID lengths.
+    private static func isLowercaseHex(_ value: String, minCount: Int, maxCount: Int) -> Bool {
+        let length = value.utf8.count
+        return length >= minCount && length <= maxCount && value.utf8.allSatisfy {
             (UInt8(ascii: "0")...UInt8(ascii: "9")).contains($0)
                 || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains($0)
         }

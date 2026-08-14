@@ -13,6 +13,8 @@ private struct SampleSnapshot: SnapshotPersistable, Equatable {
 }
 
 final class SQLiteSnapshotStoreTests: XCTestCase {
+    private static let ownerOnlyPermissions = 0o600
+
     private func makeStore() throws -> SQLiteSnapshotStore {
         try SQLiteSnapshotStore(path: ":memory:")
     }
@@ -137,11 +139,49 @@ final class SQLiteSnapshotStoreTests: XCTestCase {
         XCTAssertEqual(try reopened.query(SampleSnapshot.self), [expected])
     }
 
+    func testDiskDatabaseAndSidecarsUseOwnerOnlyPermissionsOnCreateAndReopen() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agentpulse-permissions-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let databasePath = directory.appendingPathComponent("snapshots.sqlite").path
+        let paths = [databasePath, databasePath + "-wal", databasePath + "-shm"]
+        let original = try SQLiteSnapshotStore(path: databasePath)
+        try original.upsert(snap(at: 1234))
+        try assertOwnerOnlyPermissions(paths: paths)
+
+        for path in paths {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o644)],
+                ofItemAtPath: path
+            )
+        }
+        let reopened = try SQLiteSnapshotStore(path: databasePath)
+        XCTAssertEqual(try reopened.count(), 1)
+        try assertOwnerOnlyPermissions(paths: paths)
+    }
+
     func testOpenInvalidPathThrows() {
         XCTAssertThrowsError(try SQLiteSnapshotStore(path: "/nonexistent-\(UUID().uuidString)/x/db.sqlite")) { error in
             guard case SQLiteSnapshotStoreError.openFailed = error else {
                 return XCTFail("expected openFailed, got \(error)")
             }
+        }
+    }
+
+    private func assertOwnerOnlyPermissions(paths: [String], file: StaticString = #filePath, line: UInt = #line) throws {
+        for path in paths {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: path), "missing SQLite file: \(path)", file: file, line: line)
+            let attributes = try FileManager.default.attributesOfItem(atPath: path)
+            let permissions = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber, file: file, line: line)
+            XCTAssertEqual(
+                permissions.intValue & 0o777,
+                Self.ownerOnlyPermissions,
+                "unexpected permissions for \(path)",
+                file: file,
+                line: line
+            )
         }
     }
 

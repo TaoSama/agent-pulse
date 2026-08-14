@@ -69,13 +69,21 @@ private final class ScriptedBatchClient: UsageBatchReporting, @unchecked Sendabl
 @main
 enum AgentPulseUsageVerification {
     static func main() async throws {
-        try verifyConfigurationSafety()
-        try verifyPayloadMapping()
-        try await verifyPartialAckAndRecovery()
-        try await verifyMalformedAcknowledgementsRemainPending()
-        try await verifyCancellationKeepsBatchPending()
-        try await FullSyncVerification.run()
-        try await CoordinatorVerification.run()
+        do {
+            try verifyConfigurationSafety()
+            try verifyGeneralizedSourceDispatch()
+            try verifyLocalCollectionConfigValidation()
+            try verifyPayloadMapping()
+            try await verifyPartialAckAndRecovery()
+            try await verifyMalformedAcknowledgementsRemainPending()
+            try await verifyCancellationKeepsBatchPending()
+            try await FullSyncVerification.run()
+            try await CoordinatorVerification.run()
+        } catch {
+            fputs("TEMP DIAG step failed: \(error)\n", stderr)
+            for symbol in Thread.callStackSymbols { fputs("  \(symbol)\n", stderr) }
+            throw error
+        }
         print("AgentPulseUsage verification passed")
     }
 
@@ -364,5 +372,78 @@ enum AgentPulseUsageVerification {
 
     private static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
         guard try condition() else { throw VerificationError.failed(message) }
+    }
+
+    /// 泛化来源分派：任意非 codex 来源都走 Claude-compatible 解析并携带 cumulativeMax 合并策略；
+    /// 自定义非 Anthropic 模型不做 thinking 拆分；codex 保持 rollout 语义 + overwrite。
+    private static func verifyGeneralizedSourceDispatch() throws {
+        // 自定义 transcript：Claude 结构，model=custom-code-model（非 anthropic）。
+        let seedTranscript = """
+        {"type":"user","timestamp":"2026-03-01T00:00:00Z","sessionId":"seed-sess","message":{"content":[{"type":"text","text":"hi"}]}}
+        {"type":"assistant","timestamp":"2026-03-01T00:00:01Z","sessionId":"seed-sess","cwd":"/w/p","message":{"id":"seed-msg","model":"custom-code-model","content":[{"type":"thinking","thinking":"abcdef"},{"type":"text","text":"hi"}],"usage":{"output_tokens":100,"input_tokens":5,"total_tokens":105}}}
+        """
+        let seed = UsageJSONLParser.parse(data: Data(seedTranscript.utf8), source: "seed", fileIdentity: "seed.jsonl")
+        try require(!seed.sessionEvents.isEmpty, "non-codex source must emit session events (Claude-compatible path)")
+        try require(seed.events.count == 1, "seed transcript token usage counted")
+        try require(seed.events[0].mergeStrategy == .cumulativeMax, "non-codex event must carry cumulativeMax merge strategy")
+        try require(seed.events[0].counts.reasoningOutput == 0 && seed.events[0].counts.output == 100, "seed (non-anthropic) model must NOT split thinking into reasoning")
+
+        // 同结构但 anthropic 模型：仍走同一路径，但应用 thinking 拆分。验证 model 门控是唯一差异。
+        let claudeLike = seedTranscript.replacingOccurrences(of: "custom-code-model", with: "claude-opus")
+        let anth = UsageJSONLParser.parse(data: Data(claudeLike.utf8), source: "my-local", fileIdentity: "a.jsonl")
+        try require(anth.events[0].mergeStrategy == .cumulativeMax, "arbitrary non-codex source still cumulativeMax")
+        try require(anth.events[0].counts.reasoningOutput == 75, "anthropic-family model on non-codex source applies thinking split")
+
+        // codex 仍走 rollout 语义 + overwrite。
+        let codexRollout = """
+        {"type":"session_meta","timestamp":"2026-03-01T00:00:00Z","payload":{"id":"roll-1","cwd":"/w/p"}}
+        {"type":"turn_context","timestamp":"2026-03-01T00:00:01Z","payload":{"model":"codex-test-model"}}
+        {"type":"event_msg","timestamp":"2026-03-01T00:00:02Z","payload":{"type":"token_count","info":{"model":"codex-test-model","last_token_usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30},"total_token_usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}}}
+        """
+        let codex = UsageJSONLParser.parse(data: Data(codexRollout.utf8), source: "codex", fileIdentity: "c.jsonl")
+        try require(codex.events.count == 1, "codex rollout produces a token event")
+        try require(codex.events[0].mergeStrategy == .overwrite, "codex event must carry overwrite merge strategy")
+        try require(codex.events[0].model == "codex-test-model", "codex model resolved from turn_context")
+    }
+
+    /// 本地采集来源配置：format 白名单、内建来源保护、source 归一化、绝对路径要求、
+    /// 重复/别名 root 去重、0600 权限、非法 JSON。
+    private static func verifyLocalCollectionConfigValidation() throws {
+        func raw(_ s: String?, _ r: String?, _ f: String? = "claude", _ sub: Bool? = nil) -> LocalCollectionConfigurationLoader.RawLocalSource {
+            LocalCollectionConfigurationLoader.RawLocalSource(source: s, root: r, format: f, includeSubagents: sub)
+        }
+
+        // 内建来源不可被覆盖。
+        try require(LocalCollectionConfigurationLoader.sanitize([raw("codex", "/a")]).isEmpty, "reserved source 'codex' must be rejected")
+        try require(LocalCollectionConfigurationLoader.sanitize([raw("Claude-Code", "/a")]).isEmpty, "reserved source 'claude-code' must be rejected (case-insensitive)")
+
+        // format 非 claude 跳过。
+        try require(LocalCollectionConfigurationLoader.sanitize([raw("x", "/a", "jsonl")]).isEmpty, "non-claude format must be skipped")
+
+        // 非绝对路径跳过。
+        try require(LocalCollectionConfigurationLoader.sanitize([raw("x", "relative/dir")]).isEmpty, "non-absolute root must be skipped")
+
+        // source 归一化：大写/非法字符被清洗、长度受限、去重。
+        let normalized = LocalCollectionConfigurationLoader.sanitize([raw(" My Src! ", "/roots/a")])
+        try require(normalized.count == 1, "valid entry accepted")
+        try require(normalized[0].source == "mysrc", "source normalized to lowercase [a-z0-9._-]: got \(normalized[0].source)")
+        try require(normalized[0].includeSubagents == true, "includeSubagents defaults to true")
+
+        // 同一 source 去重（保留首个）。
+        try require(LocalCollectionConfigurationLoader.sanitize([raw("dup", "/roots/a"), raw("dup", "/roots/b")]).count == 1, "duplicate source collapsed")
+
+        // 别名/嵌套 root 去重：/roots/a 与其子孙 /roots/a/child 只接受首个。
+        let overlap = LocalCollectionConfigurationLoader.sanitize([raw("s1", "/roots/a"), raw("s2", "/roots/a/child")])
+        try require(overlap.count == 1, "overlapping (ancestor/descendant) roots must not both scan")
+
+        // includeSubagents=false 被尊重。
+        let noSub = LocalCollectionConfigurationLoader.sanitize([raw("s3", "/roots/x", "claude", false)])
+        try require(noSub.first?.includeSubagents == false, "includeSubagents=false respected")
+
+        // 空数据 -> empty；非法 JSON -> malformed。
+        try require(try LocalCollectionConfigurationLoader.decode(Data()).sources.isEmpty, "empty data decodes to empty config")
+        var threwMalformed = false
+        do { _ = try LocalCollectionConfigurationLoader.decode(Data("{not json".utf8)) } catch { threwMalformed = true }
+        try require(threwMalformed, "malformed JSON must throw")
     }
 }
