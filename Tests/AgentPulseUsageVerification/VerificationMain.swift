@@ -373,7 +373,7 @@ enum AgentPulseUsageVerification {
         guard try condition() else { throw VerificationError.failed(message) }
     }
 
-    /// 泛化来源分派：任意非 codex 来源都走 Claude-compatible 解析并携带 cumulativeMax 合并策略；
+    /// 泛化来源分派：任意非 codex 来源都走 Claude-compatible 解析并按 uuid 逐行独立计入（overwrite）；
     /// 自定义非 Anthropic 模型不做 thinking 拆分；codex 保持 rollout 语义 + overwrite。
     private static func verifyGeneralizedSourceDispatch() throws {
         // 自定义 transcript：Claude 结构，model=custom-code-model（非 anthropic）。
@@ -384,13 +384,13 @@ enum AgentPulseUsageVerification {
         let seed = UsageJSONLParser.parse(data: Data(seedTranscript.utf8), source: "seed", fileIdentity: "seed.jsonl")
         try require(!seed.sessionEvents.isEmpty, "non-codex source must emit session events (Claude-compatible path)")
         try require(seed.events.count == 1, "seed transcript token usage counted")
-        try require(seed.events[0].mergeStrategy == .cumulativeMax, "non-codex event must carry cumulativeMax merge strategy")
+        try require(seed.events[0].mergeStrategy == .overwrite, "non-codex event now carries overwrite (per-uuid independent; reference parity)")
         try require(seed.events[0].counts.reasoningOutput == 0 && seed.events[0].counts.output == 100, "seed (non-anthropic) model must NOT split thinking into reasoning")
 
         // 同结构但 anthropic 模型：仍走同一路径，但应用 thinking 拆分。验证 model 门控是唯一差异。
         let claudeLike = seedTranscript.replacingOccurrences(of: "custom-code-model", with: "claude-opus")
         let anth = UsageJSONLParser.parse(data: Data(claudeLike.utf8), source: "my-local", fileIdentity: "a.jsonl")
-        try require(anth.events[0].mergeStrategy == .cumulativeMax, "arbitrary non-codex source still cumulativeMax")
+        try require(anth.events[0].mergeStrategy == .overwrite, "arbitrary non-codex source now overwrite (per-uuid)")
         try require(anth.events[0].counts.reasoningOutput == 75, "anthropic-family model on non-codex source applies thinking split")
 
         // codex 仍走 rollout 语义 + overwrite。

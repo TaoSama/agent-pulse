@@ -226,9 +226,13 @@ struct AgentPulseCoreVerification {
         {"type":"assistant","timestamp":"\(timestamp)","cwd":"/workspace/demo","uuid":"row-2","message":{"id":"message-1","model":"model-b","usage":{"input_tokens":10,"output_tokens":25,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}}
         """
         let parsedClaude = UsageJSONLParser.parse(data: Data(claude.utf8), source: "claude-code", fileIdentity: "claude-fixture")
-        try require(parsedClaude.events.count == 1, "claude message-id dedup")
-        try require(parsedClaude.sessionEvents.count == 1, "claude message-id session event dedup")
-        try require(parsedClaude.events[0].counts.output == 25 && parsedClaude.events[0].counts.cacheCreationInput == 40, "claude max usage and cache creation")
+        // 参照口径（kaboo）：同 message.id 但 uuid 不同的两行是两次独立用量，各自成事件、bucket 层求和，
+        // 而非取最大去重。两行 → 两个 token 事件。
+        try require(parsedClaude.events.count == 2, "claude distinct-uuid rows must each become an event")
+        let claudeInputSum = parsedClaude.events.reduce(Int64(0)) { $0 + $1.counts.input }
+        let claudeOutputSum = parsedClaude.events.reduce(Int64(0)) { $0 + $1.counts.output }
+        let claudeCacheCreationSum = parsedClaude.events.reduce(Int64(0)) { $0 + $1.counts.cacheCreationInput }
+        try require(claudeInputSum == 20 && claudeOutputSum == 45 && claudeCacheCreationSum == 80, "claude distinct-uuid usage must sum per row")
 
         let database = FileManager.default.temporaryDirectory.appending(path: "usage-ledger-\(UUID().uuidString).sqlite")
         defer { for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: database.path + suffix) } }
@@ -243,9 +247,10 @@ struct AgentPulseCoreVerification {
         let eventCount = try ledger.eventCount()
         let buckets = try ledger.buckets(hostname: "test-host")
         let summary = try ledger.summary()
-        try require(eventCount == 2, "ledger idempotent event insert")
+        try require(eventCount == 3, "ledger idempotent event insert (codex 1 + claude 2 distinct-uuid)")
         try require(buckets.count == 2, "half-hour bucket dimensions")
-        try require(summary?.counts.total == codexCounts.total + parsedClaude.events[0].counts.total, "ledger summary total")
+        let claudeTotal = parsedClaude.events.reduce(Int64(0)) { $0 + $1.counts.total }
+        try require(summary?.counts.total == codexCounts.total + claudeTotal, "ledger summary total")
     }
 
     private static func tempUsageDB() -> URL {
@@ -691,7 +696,7 @@ struct AgentPulseCoreVerification {
         )
     }
 
-    // 3) Claude 同 msg.id 累计增长：账本按 UPSERT 取最大，不能丢更新。
+    // 3) Claude 同一行（同 uuid / 无 uuid 回退键）重扫：文件级替换 + 同 event id 覆盖，不重复累加。
     private static func verifyV2ClaudeGrowth() throws {
         let db = tempUsageDB(); defer { cleanupDB(db) }
         let ledger = try UsageLedgerStore(path: db.path)
@@ -711,8 +716,8 @@ struct AgentPulseCoreVerification {
         try ledger.finalizeDerived(hostname: "h")
         let claudeRows = try ledger.eventCount()
         let claudeGrown = try ledger.buckets(hostname: "h")
-        try require(claudeRows == 1, "claude same msg.id must stay one row")
-        try require(claudeGrown.first?.counts.total == 120, "claude growth must upsert-max, not drop or double: got \(claudeGrown.first?.counts.total ?? -1)")
+        try require(claudeRows == 1, "claude same line must stay one row")
+        try require(claudeGrown.first?.counts.total == 120, "claude re-scan must overwrite to latest, not drop or double: got \(claudeGrown.first?.counts.total ?? -1)")
     }
 
 
@@ -2121,7 +2126,7 @@ struct AgentPulseCoreVerification {
         }
 
         // 解析器版本已提升到 6（稳定 count-only 身份、MCP output gate 与边界修复）。
-        try require(UsageJSONLParser.parserVersion == 7, "parserVersion must advance to 7 for codex content dedup key")
+        try require(UsageJSONLParser.parserVersion == 8, "parserVersion must advance to 8 for Claude per-uuid summing (reference parity)")
 
         // 1) 技能计数：同名累加，键并入排序去重列表。
         let skill = try parse("claude_skill_tool_use.jsonl", source: "claude-code")
