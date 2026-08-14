@@ -21,7 +21,8 @@ public enum UsageSessionAggregator {
     public static func aggregate(
         events: [UsageSessionEvent],
         hostname: String,
-        projectForSession: (_ source: String, _ sessionHash: String) -> String = { _, _ in "" }
+        projectForSession: (_ source: String, _ sessionHash: String) -> String = { _, _ in "" },
+        skillsForSession: (_ source: String, _ sessionHash: String) -> [String] = { _, _ in [] }
     ) -> [UsageSession] {
         // 1) 去重：按 (source, eventID)。
         var deduped: [String: UsageSessionEvent] = [:]
@@ -100,6 +101,7 @@ public enum UsageSessionAggregator {
                 source: key.source,
                 sessionHash: key.sessionHash,
                 project: projectForSession(key.source, key.sessionHash),
+                skills: skillsForSession(key.source, key.sessionHash),
                 firstActivity: first.timestamp,
                 lastActivity: lastActivity,
                 activeSeconds: Int64(activeSeconds.rounded()),

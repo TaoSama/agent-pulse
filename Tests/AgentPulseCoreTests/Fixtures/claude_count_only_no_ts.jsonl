@@ -1,0 +1,1 @@
+{"type":"assistant","sessionId":"sess-nots","cwd":"/workspace/Workspaces/proj-nots","message":{"id":"msg-nots-1","model":"claude-sonnet","content":[{"type":"tool_use","name":"Skill","input":{"skill":"distill"}}]}}

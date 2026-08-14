@@ -1,0 +1,6 @@
+{"timestamp":"2026-08-13T00:00:00.000Z","type":"session_meta","payload":{"id":"rollout-cxts-1","session_id":"conv-cxts-1","cwd":"/workspace/Workspaces/proj-cxts"}}
+{"timestamp":"2026-08-13T00:00:01.000Z","type":"turn_context","payload":{"model":"codex-test-model","turn_id":"turn-1"}}
+{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"cx-skip","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/app.go\n@@\n context\n+added1\n-removed1\n*** End Patch\n"}}
+{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"cx-keep","output":"Success. Updated the following files:\nM src/keep.go"}}
+{"timestamp":"2026-08-13T00:00:04.000Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"cx-keep","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/keep.go\n@@\n context\n+kept1\n+kept2\n-gone1\n*** End Patch\n"}}
+{"timestamp":"2026-08-13T00:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"codex-test-model","last_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150},"total_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}}}

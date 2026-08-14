@@ -66,6 +66,18 @@ public enum UsageTimestamp {
 }
 
 public struct UsageEvent: Codable, Sendable, Equatable, Identifiable {
+    /// 原始 token 事件在账本 UPSERT（同 event_id 再次入库）时的合并策略。
+    ///
+    /// 由「解析路径」决定，而非来源名硬编码 —— 任何 Claude-compatible 来源都必须携带
+    /// cumulativeMax，否则同 msg.id 的流式累计增长行会被覆盖丢更新。
+    public enum MergeStrategy: String, Codable, Sendable {
+        /// Codex rollout 路径：event_id 稳定且每次携带修正后的独立计数，重解析直接覆盖。
+        case overwrite
+        /// Claude-compatible 路径：同 msg.id 多行携带单调增长的累计 usage，逐列取最大，
+        /// 且 model 为 unknown 时保留既有 model（避免流式早行把已知 model 冲掉）。
+        case cumulativeMax
+    }
+
     public let id: String
     public let source: String
     public let model: String
@@ -91,8 +103,15 @@ public struct UsageEvent: Codable, Sendable, Equatable, Identifiable {
     /// 因此即便子会话改写了 timestamp / model，只要底层是同一累计快照即可被折叠。
     /// 为空表示无法据此证明重复。
     public let lineageFingerprint: String
+    /// 账本 UPSERT 合并策略，随事件持久化；由解析路径决定，取代按来源名硬编码分支。
+    public let mergeStrategy: MergeStrategy
 
-    public init(id: String, source: String, model: String, project: String, timestamp: Date, counts: UsageTokenCounts, sessionHash: String, sourceFileHash: String, rolloutKey: String = "", parentRolloutKey: String = "", inherited: Bool = false, hasTotalSnapshot: Bool = false, lineageFingerprint: String = "") {
+    /// 本事件观测到的技能调用计数（skill 名 -> 次数）。缺省为空。
+    public let skillCounts: [String: Int]
+    /// 本事件观测到的 MCP server 调用计数（server 名 -> 次数）。缺省为空。
+    public let mcpCounts: [String: Int]
+
+    public init(id: String, source: String, model: String, project: String, timestamp: Date, counts: UsageTokenCounts, sessionHash: String, sourceFileHash: String, rolloutKey: String = "", parentRolloutKey: String = "", inherited: Bool = false, hasTotalSnapshot: Bool = false, lineageFingerprint: String = "", mergeStrategy: MergeStrategy = .overwrite, skillCounts: [String: Int] = [:], mcpCounts: [String: Int] = [:]) {
         self.id = id
         self.source = source
         self.model = model.isEmpty ? "unknown" : model
@@ -106,6 +125,38 @@ public struct UsageEvent: Codable, Sendable, Equatable, Identifiable {
         self.inherited = inherited
         self.hasTotalSnapshot = hasTotalSnapshot
         self.lineageFingerprint = lineageFingerprint
+        self.mergeStrategy = mergeStrategy
+        self.skillCounts = skillCounts
+        self.mcpCounts = mcpCounts
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, source, model, project, timestamp, counts, sessionHash, sourceFileHash
+        case rolloutKey, parentRolloutKey, inherited, hasTotalSnapshot, lineageFingerprint, mergeStrategy
+        case skillCounts, mcpCounts
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        source = try container.decode(String.self, forKey: .source)
+        model = try container.decode(String.self, forKey: .model)
+        project = try container.decode(String.self, forKey: .project)
+        timestamp = try container.decode(Date.self, forKey: .timestamp)
+        counts = try container.decode(UsageTokenCounts.self, forKey: .counts)
+        sessionHash = try container.decode(String.self, forKey: .sessionHash)
+        sourceFileHash = try container.decode(String.self, forKey: .sourceFileHash)
+        rolloutKey = try container.decodeIfPresent(String.self, forKey: .rolloutKey) ?? ""
+        parentRolloutKey = try container.decodeIfPresent(String.self, forKey: .parentRolloutKey) ?? ""
+        inherited = try container.decodeIfPresent(Bool.self, forKey: .inherited) ?? false
+        hasTotalSnapshot = try container.decodeIfPresent(Bool.self, forKey: .hasTotalSnapshot) ?? false
+        lineageFingerprint = try container.decodeIfPresent(String.self, forKey: .lineageFingerprint) ?? ""
+        // 旧数据缺该字段时回退 overwrite（历史仅 Codex 覆盖 + Claude 靠源名分支，
+        // 迁移由账本层按 source 归类补齐；解码默认取安全的 overwrite）。
+        mergeStrategy = try container.decodeIfPresent(MergeStrategy.self, forKey: .mergeStrategy) ?? .overwrite
+        // 后加内容字段：旧数据缺失时解码为空，保持向后兼容。
+        skillCounts = try container.decodeIfPresent([String: Int].self, forKey: .skillCounts) ?? [:]
+        mcpCounts = try container.decodeIfPresent([String: Int].self, forKey: .mcpCounts) ?? [:]
     }
 }
 
@@ -127,15 +178,33 @@ public struct UsageSessionEvent: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let source: String
     public let sessionHash: String
+    public let sourceFileHash: String
     public let role: Role
     public let timestamp: Date
 
-    public init(id: String, source: String, sessionHash: String, role: Role, timestamp: Date) {
+    public init(id: String, source: String, sessionHash: String, sourceFileHash: String = "", role: Role, timestamp: Date) {
         self.id = id
         self.source = source
         self.sessionHash = sessionHash
+        self.sourceFileHash = sourceFileHash
         self.role = role
         self.timestamp = timestamp
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, source, sessionHash, sourceFileHash, role, timestamp
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            id: try container.decode(String.self, forKey: .id),
+            source: try container.decode(String.self, forKey: .source),
+            sessionHash: try container.decode(String.self, forKey: .sessionHash),
+            sourceFileHash: try container.decodeIfPresent(String.self, forKey: .sourceFileHash) ?? "",
+            role: try container.decode(Role.self, forKey: .role),
+            timestamp: try container.decode(Date.self, forKey: .timestamp)
+        )
     }
 }
 
@@ -163,14 +232,66 @@ public struct UsageBucket: Codable, Sendable, Equatable {
     public let project: String
     public let bucketStart: Date
     public let counts: UsageTokenCounts
+    public let skills: [String]
+    public let skillCounts: [String: Int]
+    public let mcpCounts: [String: Int]
+    public let linesAdded: Int64
+    public let linesDeleted: Int64
+    public let linesNet: Int64
+    public let codeMetricVersion: Int
 
-    public init(hostname: String, source: String, model: String, project: String, bucketStart: Date, counts: UsageTokenCounts) {
+    public init(
+        hostname: String,
+        source: String,
+        model: String,
+        project: String,
+        bucketStart: Date,
+        counts: UsageTokenCounts,
+        skills: [String] = [],
+        skillCounts: [String: Int] = [:],
+        mcpCounts: [String: Int] = [:],
+        linesAdded: Int64 = 0,
+        linesDeleted: Int64 = 0,
+        codeMetricVersion: Int = 0
+    ) {
         self.hostname = hostname
         self.source = source
         self.model = model
         self.project = project
         self.bucketStart = bucketStart
         self.counts = counts
+        let normalizedSkillCounts = UsageToolMetrics.normalizeCounts(skillCounts)
+        self.skillCounts = normalizedSkillCounts
+        self.skills = UsageToolMetrics.mergeSkillCountKeys(skills: skills, counts: normalizedSkillCounts)
+        self.mcpCounts = UsageToolMetrics.normalizeCounts(mcpCounts)
+        self.linesAdded = max(0, linesAdded)
+        self.linesDeleted = max(0, linesDeleted)
+        let (net, overflowed) = self.linesAdded.subtractingReportingOverflow(self.linesDeleted)
+        self.linesNet = overflowed ? (self.linesAdded >= self.linesDeleted ? Int64.max : Int64.min) : net
+        self.codeMetricVersion = max(0, codeMetricVersion)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case hostname, source, model, project, bucketStart, counts
+        case skills, skillCounts, mcpCounts, linesAdded, linesDeleted, linesNet, codeMetricVersion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            hostname: try container.decode(String.self, forKey: .hostname),
+            source: try container.decode(String.self, forKey: .source),
+            model: try container.decode(String.self, forKey: .model),
+            project: try container.decode(String.self, forKey: .project),
+            bucketStart: try container.decode(Date.self, forKey: .bucketStart),
+            counts: try container.decode(UsageTokenCounts.self, forKey: .counts),
+            skills: try container.decodeIfPresent([String].self, forKey: .skills) ?? [],
+            skillCounts: try container.decodeIfPresent([String: Int].self, forKey: .skillCounts) ?? [:],
+            mcpCounts: try container.decodeIfPresent([String: Int].self, forKey: .mcpCounts) ?? [:],
+            linesAdded: try container.decodeIfPresent(Int64.self, forKey: .linesAdded) ?? 0,
+            linesDeleted: try container.decodeIfPresent(Int64.self, forKey: .linesDeleted) ?? 0,
+            codeMetricVersion: try container.decodeIfPresent(Int.self, forKey: .codeMetricVersion) ?? 0
+        )
     }
 }
 
@@ -189,6 +310,8 @@ public struct UsageSession: Codable, Sendable, Equatable {
     /// 内容字段：会话归属的 project（内容字段，不参与自然键）。
     /// 自然键仍为 hostname/source/sessionHash；project 仅描述内容，缺失时为空串。
     public let project: String
+    /// 会话内观测到的技能名（排序、去重）；不参与自然键。
+    public let skills: [String]
     public let firstActivity: Date
     public let lastActivity: Date
     public let activeSeconds: Int64
@@ -197,11 +320,12 @@ public struct UsageSession: Codable, Sendable, Equatable {
     public let assistantEvents: Int64
     public let hourHistogramUTC: [Int64]
 
-    public init(hostname: String, source: String, sessionHash: String, project: String = "", firstActivity: Date, lastActivity: Date, activeSeconds: Int64, messageCount: Int64, userMessageCount: Int64, assistantEvents: Int64, hourHistogramUTC: [Int64]) {
+    public init(hostname: String, source: String, sessionHash: String, project: String = "", skills: [String] = [], firstActivity: Date, lastActivity: Date, activeSeconds: Int64, messageCount: Int64, userMessageCount: Int64, assistantEvents: Int64, hourHistogramUTC: [Int64]) {
         self.hostname = hostname
         self.source = source
         self.sessionHash = sessionHash
         self.project = project
+        self.skills = UsageToolMetrics.normalizeSkills(skills).sorted()
         self.firstActivity = firstActivity
         self.lastActivity = lastActivity
         self.activeSeconds = max(0, activeSeconds)
@@ -217,7 +341,7 @@ public struct UsageSession: Codable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case hostname, source, sessionHash, project, firstActivity, lastActivity
+        case hostname, source, sessionHash, project, skills, firstActivity, lastActivity
         case activeSeconds, messageCount, userMessageCount, assistantEvents, hourHistogramUTC
     }
 
@@ -228,6 +352,7 @@ public struct UsageSession: Codable, Sendable, Equatable {
         let source = try container.decode(String.self, forKey: .source)
         let sessionHash = try container.decode(String.self, forKey: .sessionHash)
         let project = try container.decodeIfPresent(String.self, forKey: .project) ?? ""
+        let skills = try container.decodeIfPresent([String].self, forKey: .skills) ?? []
         let firstActivity = try container.decode(Date.self, forKey: .firstActivity)
         let lastActivity = try container.decode(Date.self, forKey: .lastActivity)
         let activeSeconds = try container.decode(Int64.self, forKey: .activeSeconds)
@@ -236,7 +361,7 @@ public struct UsageSession: Codable, Sendable, Equatable {
         let assistantEvents = try container.decode(Int64.self, forKey: .assistantEvents)
         let hourHistogramUTC = try container.decode([Int64].self, forKey: .hourHistogramUTC)
         self.init(
-            hostname: hostname, source: source, sessionHash: sessionHash, project: project,
+            hostname: hostname, source: source, sessionHash: sessionHash, project: project, skills: skills,
             firstActivity: firstActivity, lastActivity: lastActivity,
             activeSeconds: activeSeconds, messageCount: messageCount,
             userMessageCount: userMessageCount, assistantEvents: assistantEvents,
@@ -245,13 +370,51 @@ public struct UsageSession: Codable, Sendable, Equatable {
     }
 }
 
+/// 输入 token 的展示口径。
+///
+/// - cachedTokens: 仅包含 cache read；cache creation 是本次新写入的输入，不是命中。
+/// - newTokens: 非缓存输入 + cache creation；不包含 output / reasoning。
+/// - cacheHitRate: cached / (input + cache creation + cached)；没有输入时为 nil。
+public struct UsageInputSummary: Codable, Sendable, Equatable {
+    public let cachedTokens: Int64
+    public let newTokens: Int64
+    public let cacheHitRate: Double?
+
+    public init(counts: UsageTokenCounts) {
+        cachedTokens = counts.cachedInput
+        let (newTokenCount, overflowed) = counts.input.addingReportingOverflow(counts.cacheCreationInput)
+        newTokens = overflowed ? Int64.max : newTokenCount
+
+        let denominator = Double(counts.input) + Double(counts.cacheCreationInput) + Double(counts.cachedInput)
+        cacheHitRate = denominator > 0 ? Double(counts.cachedInput) / denominator : nil
+    }
+}
+
+/// 本地汇总可选的自然日历窗口。区间为左闭右开，并使用调用方传入日历的时区。
+public enum UsageSummaryWindow: String, Codable, Sendable, CaseIterable {
+    case day
+    case month
+    case year
+
+    public func interval(containing date: Date, calendar: Calendar = .current) -> DateInterval? {
+        let component: Calendar.Component
+        switch self {
+        case .day: component = .day
+        case .month: component = .month
+        case .year: component = .year
+        }
+        return calendar.dateInterval(of: component, for: date)
+    }
+}
+
 public struct UsageSummary: Codable, Sendable, Equatable {
     public let updatedAt: Date?
     public let counts: UsageTokenCounts
     public let estimatedCostUSD: Double
-    public var cachedTokens: Int64 { counts.cachedInput + counts.cacheCreationInput }
-    public var newTokens: Int64 { max(0, counts.total - cachedTokens) }
-    public var cachePercentage: Double? { counts.total > 0 ? Double(cachedTokens) / Double(counts.total) : nil }
+    public var inputSummary: UsageInputSummary { UsageInputSummary(counts: counts) }
+    public var cachedTokens: Int64 { inputSummary.cachedTokens }
+    public var newTokens: Int64 { inputSummary.newTokens }
+    public var cachePercentage: Double? { inputSummary.cacheHitRate }
 }
 
 public struct UsageModelPrice: Sendable, Equatable {
