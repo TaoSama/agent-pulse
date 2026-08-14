@@ -361,6 +361,10 @@ final class SettingsWindowController: NSWindowController {
         window.level = WindowInteraction.foregroundWindowLevel
         window.minSize = NSSize(width: 520, height: 480)
         window.isReleasedWhenClosed = false
+        // 设置页为深色卡片式设计，窗口外观固定为 dark，
+        // 保证标题栏与黑色内容背景一致，不受系统外观切换影响。
+        window.appearance = NSAppearance(named: .darkAqua)
+        window.backgroundColor = .black
         window.contentView = NSHostingView(rootView: AgentPulseSettingsView(model: model))
         super.init(window: window)
         window.center()
