@@ -213,7 +213,6 @@ final class ApplicationModel: ObservableObject {
     func setTokenIngestBaseURL(_ url: String) { tokenSyncCoordinator.setIngestBaseURL(url) }
     func scanTokenUsageNow() { tokenSyncCoordinator.scanNow() }
     func reportTokenUsageNow() { tokenSyncCoordinator.reportNow() }
-    func runTokenFullSync() { tokenSyncCoordinator.runFullSync() }
 
     private func format(_ value: Int?) -> String { value.map(String.init) ?? "—" }
     private func format(_ value: Double?) -> String { value.map { String(format: "%.1f", $0) } ?? "—" }

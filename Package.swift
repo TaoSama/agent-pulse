@@ -96,7 +96,6 @@ let package = Package(
             path: "Tests/AgentPulseUsageVerification",
             sources: [
                 "VerificationMain.swift",
-                "FullSyncVerification.swift",
                 "CoordinatorVerification.swift",
             ]
         ),
@@ -109,11 +108,6 @@ let package = Package(
             name: "NaturalKeyGuardVerification",
             dependencies: ["AgentPulseReporting"],
             path: "Tests/NaturalKeyGuardVerification"
-        ),
-        .executableTarget(
-            name: "FullSyncWireParityVerification",
-            dependencies: ["AgentPulseReporting", "AgentPulseUsage"],
-            path: "Tests/FullSyncWireParityVerification"
         ),
         .executableTarget(
             name: "ProductionDatabasePreflightVerification",
