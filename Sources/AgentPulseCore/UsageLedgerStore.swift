@@ -148,11 +148,14 @@ public struct UsageFinalizeResult: Sendable, Equatable {
     public let blockedReasons: [String]
     /// 本次因血缘证明被折叠（去重）的事件数。
     public let collapsedInheritedEvents: Int
+    /// 本次因内容型去重键（codexDedupKey）被折叠的事件数（fork/subagent 回放重复）。
+    public let collapsedContentDuplicates: Int
 
-    public init(reportingEligible: Bool, blockedReasons: [String], collapsedInheritedEvents: Int) {
+    public init(reportingEligible: Bool, blockedReasons: [String], collapsedInheritedEvents: Int, collapsedContentDuplicates: Int = 0) {
         self.reportingEligible = reportingEligible
         self.blockedReasons = blockedReasons
         self.collapsedInheritedEvents = collapsedInheritedEvents
+        self.collapsedContentDuplicates = collapsedContentDuplicates
     }
 }
 
@@ -172,7 +175,7 @@ public struct UsageFinalizeResult: Sendable, Equatable {
 /// - canonical hostname 变化时，从原始事件事务重建目标 hostname 派生聚合并清除旧 hostname。
 /// - 显式 rebuild 时事务性清空派生 + 原始 + checkpoint（仅显式 rebuild）。
 public final class UsageLedgerStore: @unchecked Sendable {
-    public static let schemaVersion: Int32 = 8
+    public static let schemaVersion: Int32 = 9
     public static let bucketMilliseconds: Int64 = 30 * 60 * 1_000
     public static let defaultMaxBucketsPerBatch = 500
     public static let defaultMaxSessionsPerBatch = 1_000
@@ -356,8 +359,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // - overwrite（Codex rollout）：event_id 稳定且携带修正后的独立计数，重解析直接覆盖。
         let sql = """
             INSERT INTO usage_events
-            (event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,source_file_hash,rollout_key,parent_rollout_key,inherited,has_total_snapshot,lineage_fingerprint,merge_strategy,skill_counts_json,mcp_counts_json,created_at_ms)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            (event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,source_file_hash,rollout_key,parent_rollout_key,inherited,has_total_snapshot,lineage_fingerprint,codex_dedup_key,merge_strategy,skill_counts_json,mcp_counts_json,created_at_ms)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(source_file_hash,event_id) DO UPDATE SET
               source=excluded.source,
               input_tokens=CASE WHEN excluded.merge_strategy='cumulativeMax' THEN MAX(input_tokens,excluded.input_tokens) ELSE excluded.input_tokens END,
@@ -376,6 +379,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
               inherited=excluded.inherited,
               has_total_snapshot=excluded.has_total_snapshot,
               lineage_fingerprint=excluded.lineage_fingerprint,
+              codex_dedup_key=excluded.codex_dedup_key,
               merge_strategy=excluded.merge_strategy,
               skill_counts_json=excluded.skill_counts_json,
               mcp_counts_json=excluded.mcp_counts_json;
@@ -405,10 +409,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try bind(insert, 13, fileID); try bind(insert, 14, event.rolloutKey)
             try bind(insert, 15, event.parentRolloutKey); try bind(insert, 16, event.inherited ? 1 : 0)
             try bind(insert, 17, event.hasTotalSnapshot ? 1 : 0); try bind(insert, 18, event.lineageFingerprint)
-            try bind(insert, 19, event.mergeStrategy.rawValue)
-            try bind(insert, 20, encodeStringIntMap(skillCounts))
-            try bind(insert, 21, encodeStringIntMap(mcpCounts))
-            try bind(insert, 22, millis(Date()))
+            try bind(insert, 19, event.codexDedupKey)
+            try bind(insert, 20, event.mergeStrategy.rawValue)
+            try bind(insert, 21, encodeStringIntMap(skillCounts))
+            try bind(insert, 22, encodeStringIntMap(mcpCounts))
+            try bind(insert, 23, millis(Date()))
             try done(insert)
         }
     }
@@ -478,6 +483,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let id: String; let source: String; let model: String; let project: String
         let timestampMs: Int64; let counts: UsageTokenCounts
         let sessionHash: String; let inherited: Bool; let hasTotalSnapshot: Bool; let lineageFingerprint: String
+        let codexDedupKey: String
         let skillCounts: [String: Int]; let mcpCounts: [String: Int]
         let mergeStrategy: String
     }
@@ -544,6 +550,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                         timestampMs: preferred.timestampMs, counts: preferred.counts, sessionHash: preferred.sessionHash,
                         inherited: preferred.inherited, hasTotalSnapshot: preferred.hasTotalSnapshot,
                         lineageFingerprint: preferred.lineageFingerprint,
+                        codexDedupKey: preferred.codexDedupKey,
                         skillCounts: maximumCounts(existing.skillCounts, event.skillCounts),
                         mcpCounts: maximumCounts(existing.mcpCounts, event.mcpCounts),
                         mergeStrategy: preferred.mergeStrategy
@@ -565,6 +572,45 @@ public final class UsageLedgerStore: @unchecked Sendable {
             blockedReasons.append("\(unprovable) inherited replay event(s) lack a complete total snapshot; cannot prove they are not duplicates")
         }
 
+        // 1.5) 内容型去重：折叠共享同一 codexDedupKey 的 codex 事件（fork / subagent
+        // 回放出的逐字节相同 turn）。同键保留 5 分量之和更大的一行（与参考实现的
+        // largest-total-wins 一致，不用 reportedTotal 以免偏差），skill/mcp 取 max 并集。
+        // 空键（含所有非 codex 事件）永不折叠。顺序在血缘去重之后，与参考实现的
+        // ①replay ②dedupKey 一致。
+        var dedupKeyIndexes: [String: Int] = [:]
+        var contentDeduped: [RawEvent] = []
+        contentDeduped.reserveCapacity(deduped.count)
+        var contentCollapsed = 0
+        for event in deduped {
+            guard !event.codexDedupKey.isEmpty else { contentDeduped.append(event); continue }
+            guard let existingIndex = dedupKeyIndexes[event.codexDedupKey] else {
+                dedupKeyIndexes[event.codexDedupKey] = contentDeduped.count
+                contentDeduped.append(event)
+                continue
+            }
+            let existing = contentDeduped[existingIndex]
+            contentCollapsed += 1
+            let mergedSkill = maximumCounts(existing.skillCounts, event.skillCounts)
+            let mergedMcp = maximumCounts(existing.mcpCounts, event.mcpCounts)
+            // 快速路径：保留行仍是 existing（新行不更大）且 skill/mcp 并集未变化，
+            // 免去整份 RawEvent 重建（codex token 事件的 skill/mcp 几乎恒空）。
+            if event.counts.billableTotal <= existing.counts.billableTotal,
+               mergedSkill == existing.skillCounts, mergedMcp == existing.mcpCounts {
+                continue
+            }
+            let keep = event.counts.billableTotal > existing.counts.billableTotal ? event : existing
+            contentDeduped[existingIndex] = RawEvent(
+                id: keep.id, source: keep.source, model: keep.model, project: keep.project,
+                timestampMs: keep.timestampMs, counts: keep.counts, sessionHash: keep.sessionHash,
+                inherited: keep.inherited, hasTotalSnapshot: keep.hasTotalSnapshot,
+                lineageFingerprint: keep.lineageFingerprint,
+                codexDedupKey: keep.codexDedupKey,
+                skillCounts: mergedSkill,
+                mcpCounts: mergedMcp,
+                mergeStrategy: keep.mergeStrategy
+            )
+        }
+
         // 2) 重算 buckets（按 hostname,source,model,project,bucketStart 聚合）。
         struct BucketAgg {
             var counts = UsageTokenCounts()
@@ -576,7 +622,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
         var buckets: [String: BucketAgg] = [:]
         var bucketMeta: [String: (source: String, model: String, project: String, start: Int64)] = [:]
-        for event in deduped {
+        for event in contentDeduped {
             let start = (event.timestampMs / Self.bucketMilliseconds) * Self.bucketMilliseconds
             let key = "\(event.source)\u{1}\(event.model)\u{1}\(event.project)\u{1}\(start)"
             var agg = buckets[key] ?? BucketAgg()
@@ -722,7 +768,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try setTextUnlocked(key: reportingEligibleKey(hostname), value: nonReconciliationEligible ? "1" : "0")
         // 对外返回的整体资格仍需综合两类阻断（blockedReasons 已含 reconciliation）。
         let eligible = blockedReasons.isEmpty
-        return UsageFinalizeResult(reportingEligible: eligible, blockedReasons: blockedReasons, collapsedInheritedEvents: collapsed)
+        return UsageFinalizeResult(reportingEligible: eligible, blockedReasons: blockedReasons, collapsedInheritedEvents: collapsed, collapsedContentDuplicates: contentCollapsed)
     }
 
     public func reportingEligible(hostname: String) throws -> Bool {
@@ -961,21 +1007,22 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private func readAllRawEvents(overwriteConflicts: inout [String]) throws -> [RawEvent] {
         // 读全部（跨文件）原始 token 行，稳定排序（含 source_file_hash 使跨文件同 id 顺序确定）。
         let activeFiles = try ownedActiveFileIDsUnlocked()
-        let sql = "SELECT event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,inherited,has_total_snapshot,lineage_fingerprint,skill_counts_json,mcp_counts_json,merge_strategy,source_file_hash FROM usage_events ORDER BY timestamp_ms,event_id,source_file_hash;"
+        let sql = "SELECT event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,inherited,has_total_snapshot,lineage_fingerprint,codex_dedup_key,skill_counts_json,mcp_counts_json,merge_strategy,source_file_hash FROM usage_events ORDER BY timestamp_ms,event_id,source_file_hash;"
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
         var result: [TieredRawEvent] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             let counts = UsageTokenCounts(input: sqlite3_column_int64(statement, 5), output: sqlite3_column_int64(statement, 6), cachedInput: sqlite3_column_int64(statement, 7), cacheCreationInput: sqlite3_column_int64(statement, 8), reasoningOutput: sqlite3_column_int64(statement, 9), reportedTotal: sqlite3_column_int64(statement, 10))
-            let sourceFileHash = text(statement, 18)
+            let sourceFileHash = text(statement, 19)
             result.append(TieredRawEvent(
                 event: RawEvent(
                     id: text(statement, 0), source: text(statement, 1), model: text(statement, 2), project: text(statement, 3),
                     timestampMs: sqlite3_column_int64(statement, 4), counts: counts, sessionHash: text(statement, 11),
                     inherited: sqlite3_column_int64(statement, 12) != 0, hasTotalSnapshot: sqlite3_column_int64(statement, 13) != 0,
                     lineageFingerprint: text(statement, 14),
-                    skillCounts: decodeStringIntMap(text(statement, 15)),
-                    mcpCounts: decodeStringIntMap(text(statement, 16)),
-                    mergeStrategy: text(statement, 17)
+                    codexDedupKey: text(statement, 15),
+                    skillCounts: decodeStringIntMap(text(statement, 16)),
+                    mcpCounts: decodeStringIntMap(text(statement, 17)),
+                    mergeStrategy: text(statement, 18)
                 ),
                 tier: attributionTier(sourceFileHash: sourceFileHash, activeFiles: activeFiles)
             ))
@@ -1070,6 +1117,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 inherited: existing.inherited && event.inherited,
                 hasTotalSnapshot: existing.hasTotalSnapshot || event.hasTotalSnapshot,
                 lineageFingerprint: existing.lineageFingerprint.isEmpty ? event.lineageFingerprint : existing.lineageFingerprint,
+                codexDedupKey: existing.codexDedupKey.isEmpty ? event.codexDedupKey : existing.codexDedupKey,
                 skillCounts: maximumCounts(existing.skillCounts, event.skillCounts),
                 mcpCounts: maximumCounts(existing.mcpCounts, event.mcpCounts),
                 mergeStrategy: cumulative ? "cumulativeMax" : existing.mergeStrategy
@@ -1848,6 +1896,15 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try transaction {
                 try migrateV7ToV8Unlocked()
                 try exec("PRAGMA user_version=8;")
+            }
+        }
+        let afterV8 = try scalar("PRAGMA user_version;")
+        if afterV8 == 8 {
+            try transaction {
+                // v8 -> v9：usage_events 新增内容型去重键列。旧行默认空串（不参与内容折叠），
+                // 由 parser v7 全库 rebuild 回填真实键；O(1) 元数据 ALTER。
+                try addColumnIfMissing(table: "usage_events", column: "codex_dedup_key", definition: "TEXT NOT NULL DEFAULT ''")
+                try exec("PRAGMA user_version=9;")
             }
         }
     }
