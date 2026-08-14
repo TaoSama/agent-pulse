@@ -172,23 +172,40 @@ struct AgentPulseCoreVerification {
         try require(month.start == reference.addingTimeInterval(-30 * 24 * 60 * 60), "month window start must be 30×24h before reference")
     }
 
-    /// 虚拟 bucket 一致性：周 / 月 / 全部三窗口分模型各条目之和 == 窗口目标总数。
-    /// 差额并入 unknown，不新增虚拟模型名。
+    /// 虚拟 bucket 一致性：
+    /// - 基线：周 / 月 / 全部分模型各条目之和 == 窗口基线总数（差额并入单个 unknown）。
+    /// - 基线 + 真实增量：merged 后各条目之和 == 基线总数 + 真实总量；同名真实增量正确累加。
     private static func verifyVirtualBucketTargets() throws {
         let expected: [(TokenWindowVirtualBucketTargets.Window, Int64)] = [
             (.week, 11_310_000_000),
             (.month, 36_670_000_000),
             (.all, 71_820_000_000),
         ]
-        for (window, target) in expected {
-            try require(TokenWindowVirtualBucketTargets.targetTokens(for: window) == target, "virtual bucket target total mismatch for \(window)")
-            let models = TokenWindowVirtualBucketTargets.reconciledModels(for: window)
-            try require(!models.isEmpty, "virtual bucket model breakdown empty for \(window)")
+        for (window, baseline) in expected {
+            try require(TokenWindowVirtualBucketTargets.baselineTokens(for: window) == baseline, "virtual bucket baseline total mismatch for \(window)")
+            let models = TokenWindowVirtualBucketTargets.baselineModels(for: window)
+            try require(!models.isEmpty, "virtual bucket baseline breakdown empty for \(window)")
             let sum = models.reduce(Int64(0)) { $0 + $1.tokens }
-            try require(sum == target, "virtual bucket per-model sum \(sum) != target \(target) for \(window)")
-            // 差额并入 unknown：unknown 条目存在且不新增其它虚拟模型名。
+            try require(sum == baseline, "virtual bucket baseline per-model sum \(sum) != baseline \(baseline) for \(window)")
+            // 差额并入 unknown：unknown 条目存在且唯一，不新增其它映射名。
             try require(models.contains(where: { $0.model == TokenWindowVirtualBucketTargets.residualModel }), "virtual bucket residual model missing for \(window)")
             try require(models.filter { $0.model == TokenWindowVirtualBucketTargets.residualModel }.count == 1, "virtual bucket residual model duplicated for \(window)")
+
+            // 真实增量叠加：一个已存在的模型 + 一个基线里没有的新模型。
+            let existingModel = models.first { $0.model != TokenWindowVirtualBucketTargets.residualModel }!.model
+            let real = [
+                TokenWindowVirtualBucketTargets.ModelTokens(model: existingModel, tokens: 1_000_000_000),
+                TokenWindowVirtualBucketTargets.ModelTokens(model: "brand-new-model", tokens: 500_000_000),
+            ]
+            let realTotal = real.reduce(Int64(0)) { $0 + $1.tokens }
+            let merged = TokenWindowVirtualBucketTargets.merged(window: window, real: real)
+            let mergedSum = merged.reduce(Int64(0)) { $0 + $1.tokens }
+            try require(mergedSum == baseline + realTotal, "merged per-model sum \(mergedSum) != baseline+real \(baseline + realTotal) for \(window)")
+            let baselineForExisting = models.first { $0.model == existingModel }!.tokens
+            try require(merged.first { $0.model == existingModel }?.tokens == baselineForExisting + 1_000_000_000, "real increment not accumulated onto existing model for \(window)")
+            try require(merged.first { $0.model == "brand-new-model" }?.tokens == 500_000_000, "real new model not appended for \(window)")
+            // merged 降序：相邻项非递增。
+            try require(zip(merged, merged.dropFirst()).allSatisfy { $0.tokens >= $1.tokens }, "merged breakdown not sorted descending for \(window)")
         }
     }
 

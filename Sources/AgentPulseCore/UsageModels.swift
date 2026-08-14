@@ -431,8 +431,17 @@ public enum UsageSummaryWindow: String, Codable, Sendable, CaseIterable {
     }
 }
 
-public struct UsageSummary: Codable, Sendable, Equatable {
-    public let updatedAt: Date?
+/// 单一模型在某窗口内的 token 汇总（原始模型名，不做展示映射）。
+public struct UsageModelTokenSummary: Sendable, Equatable {
+    public let model: String
+    public let counts: UsageTokenCounts
+    public init(model: String, counts: UsageTokenCounts) {
+        self.model = model
+        self.counts = counts
+    }
+}
+
+public struct UsageSummary: Codable, Sendable, Equatable {    public let updatedAt: Date?
     public let counts: UsageTokenCounts
     public let estimatedCostUSD: Double
     public var inputSummary: UsageInputSummary { UsageInputSummary(counts: counts) }

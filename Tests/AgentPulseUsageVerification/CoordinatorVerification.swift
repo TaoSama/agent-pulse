@@ -95,8 +95,8 @@ enum CoordinatorVerification {
         let summaries = try functionBody(matching: "nonisolated private static func summaries(", in: source)
         try require(
             source.contains("containing date: Date,\n        calendar: Calendar")
-                && summaries.components(separatedBy: "calendar: calendar").count - 1 == 4,
-            "day/week/month/all summaries must share the injected calendar"
+                && summaries.components(separatedBy: "calendar: calendar").count - 1 == 8,
+            "day/week/month/all token + per-model summaries must share the injected calendar"
         )
 
         let scan = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
