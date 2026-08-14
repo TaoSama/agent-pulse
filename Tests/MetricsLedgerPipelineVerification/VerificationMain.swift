@@ -257,11 +257,13 @@ private struct MetricsLedgerPipelineVerifier {
         let reference = try localDate(2026, 8, 14, 12, calendar: calendar)
 
         let inside = UsageTokenCounts(input: 10, output: 3, cachedInput: 5, cacheCreationInput: 2, reportedTotal: 20)
-        try insertBucket(database, hostname: "host-a", model: "unknown", at: localDate(2026, 8, 14, 0, calendar: calendar), counts: inside)
-        try insertBucket(database, hostname: "host-a", model: "model-a", at: localDate(2026, 8, 15, 0, calendar: calendar), counts: UsageTokenCounts(input: 20, reportedTotal: 20))
-        try insertBucket(database, hostname: "host-a", model: "model-a", at: localDate(2026, 7, 31, 23, minute: 30, calendar: calendar), counts: UsageTokenCounts(input: 30, reportedTotal: 30))
-        try insertBucket(database, hostname: "host-a", model: "model-a", at: localDate(2025, 12, 31, 23, minute: 30, calendar: calendar), counts: UsageTokenCounts(input: 40, reportedTotal: 40))
-        try insertBucket(database, hostname: "host-b", model: "model-a", at: localDate(2026, 8, 14, 0, calendar: calendar), counts: UsageTokenCounts(input: 99, reportedTotal: 99))
+        // 参考时刻 2026-08-14 12:00：day=[08-14 00:00,08-15 00:00)，week=[08-07 12:00,ref)，month=[07-15 12:00,ref)。
+        try insertBucket(database, hostname: "host-a", model: "unknown", at: localDate(2026, 8, 14, 0, calendar: calendar), counts: inside) // day + week + month
+        try insertBucket(database, hostname: "host-a", model: "model-a", at: localDate(2026, 8, 10, 0, calendar: calendar), counts: UsageTokenCounts(input: 20, reportedTotal: 20)) // week + month，非 day
+        try insertBucket(database, hostname: "host-a", model: "model-a", at: localDate(2026, 8, 1, 0, calendar: calendar), counts: UsageTokenCounts(input: 30, reportedTotal: 30)) // month，非 week
+        try insertBucket(database, hostname: "host-a", model: "model-a", at: localDate(2026, 7, 1, 0, calendar: calendar), counts: UsageTokenCounts(input: 40, reportedTotal: 40)) // 早于 month 起点
+        try insertBucket(database, hostname: "host-a", model: "model-a", at: localDate(2026, 8, 15, 0, calendar: calendar), counts: UsageTokenCounts(input: 50, reportedTotal: 50)) // 晚于 day/week/month 右界，仍计入 all-time
+        try insertBucket(database, hostname: "host-b", model: "model-a", at: localDate(2026, 8, 14, 0, calendar: calendar), counts: UsageTokenCounts(input: 99, reportedTotal: 99)) // 其它 hostname
 
         let day = try unwrap(ledger.summary(window: .day, containing: reference, hostname: "host-a", calendar: calendar), "day summary must exist")
         try require(day.counts == inside, "day window must be left-closed and right-open")
@@ -269,10 +271,10 @@ private struct MetricsLedgerPipelineVerifier {
         let expectedCost = UsageCostEstimator.cost(model: "unknown", counts: inside)
         try require(abs(day.estimatedCostUSD - expectedCost) <= 0.000_000_001, "unknown model cost must use estimator fallback")
 
-        try require(try ledger.summary(window: .month, containing: reference, hostname: "host-a", calendar: calendar)?.counts.input == 30, "month window boundaries")
-        try require(try ledger.summary(window: .year, containing: reference, hostname: "host-a", calendar: calendar)?.counts.input == 60, "year window boundaries")
-        try require(try ledger.summary(window: nil, containing: reference, hostname: "host-a", calendar: calendar)?.counts.input == 100, "hostname all-time summary")
-        try require(try ledger.summary()?.counts.input == 199, "legacy summary must remain cross-host all-time")
+        try require(try ledger.summary(window: .week, containing: reference, hostname: "host-a", calendar: calendar)?.counts.input == 30, "week window is the rolling 7-day range ending at the reference instant")
+        try require(try ledger.summary(window: .month, containing: reference, hostname: "host-a", calendar: calendar)?.counts.input == 60, "month window is the rolling 30-day range ending at the reference instant")
+        try require(try ledger.summary(window: nil, containing: reference, hostname: "host-a", calendar: calendar)?.counts.input == 150, "hostname all-time summary")
+        try require(try ledger.summary()?.counts.input == 249, "legacy summary must remain cross-host all-time")
         try require(try ledger.summary(window: .day, containing: localDate(2024, 1, 1, 12, calendar: calendar), hostname: "host-a", calendar: calendar) == nil, "empty summary window must return nil")
     }
 

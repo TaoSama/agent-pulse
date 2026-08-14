@@ -96,7 +96,7 @@ enum CoordinatorVerification {
         try require(
             source.contains("containing date: Date,\n        calendar: Calendar")
                 && summaries.components(separatedBy: "calendar: calendar").count - 1 == 4,
-            "day/month/year/all summaries must share the injected calendar"
+            "day/week/month/all summaries must share the injected calendar"
         )
 
         let scan = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
@@ -129,11 +129,13 @@ enum CoordinatorVerification {
 
         let ledger = try UsageLedgerStore(path: directory.appending(path: "usage.sqlite3").path)
         let hostname = "calendar-verification"
+        // day = 自然日 [03-10 00:00, 03-11 00:00)；week/month = 以 springReference 为右界向前 7/30×24h 的滚动窗口。
+        // 事件时刻均早于 springReference，且远离滚动窗口起点，避免 DST 偏移导致的临界翻转。
         let samples: [(String, Date, Int64)] = [
-            ("day", try localDate(2024, 3, 10, 0, 30, calendar: calendar), 1),
-            ("month", try localDate(2024, 3, 9, 23, 30, calendar: calendar), 2),
-            ("year", try localDate(2024, 2, 29, 23, 30, calendar: calendar), 4),
-            ("all", try localDate(2023, 12, 31, 23, 30, calendar: calendar), 8),
+            ("day", try localDate(2024, 3, 10, 11, 0, calendar: calendar), 1),   // day + week + month
+            ("week", try localDate(2024, 3, 5, 12, 0, calendar: calendar), 2),   // week + month，非 day
+            ("month", try localDate(2024, 2, 20, 12, 0, calendar: calendar), 4), // month，非 week
+            ("all", try localDate(2024, 1, 1, 12, 0, calendar: calendar), 8),    // 早于 month 起点，仅 all-time
         ]
         let events = samples.map { label, timestamp, tokens in
             UsageEvent(
@@ -151,13 +153,13 @@ enum CoordinatorVerification {
         _ = try ledger.finalizeDerived(hostname: hostname)
 
         let day = try ledger.summary(window: .day, containing: springReference, hostname: hostname, calendar: calendar)
+        let week = try ledger.summary(window: .week, containing: springReference, hostname: hostname, calendar: calendar)
         let month = try ledger.summary(window: .month, containing: springReference, hostname: hostname, calendar: calendar)
-        let year = try ledger.summary(window: .year, containing: springReference, hostname: hostname, calendar: calendar)
         let all = try ledger.summary(window: nil, containing: springReference, hostname: hostname, calendar: calendar)
-        try require(day?.counts.total == 1, "day summary crossed the injected time-zone boundary")
-        try require(month?.counts.total == 3, "month summary crossed the injected time-zone boundary")
-        try require(year?.counts.total == 7, "year summary crossed the injected time-zone boundary")
-        try require(all?.counts.total == 15, "all summary omitted history outside the calendar windows")
+        try require(day?.counts.total == 1, "day summary crossed the natural-day boundary")
+        try require(week?.counts.total == 3, "week summary is not the rolling 7-day range ending at the reference")
+        try require(month?.counts.total == 7, "month summary is not the rolling 30-day range ending at the reference")
+        try require(all?.counts.total == 15, "all summary omitted host history")
     }
 
     private static func localDate(

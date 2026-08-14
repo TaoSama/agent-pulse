@@ -1529,9 +1529,15 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         containing date: Date,
         calendar: Calendar
     ) throws -> TokenUsageSummary {
-        return TokenUsageSummary(
+        return TokenWindowVirtualBuckets.apply(to: TokenUsageSummary(
             day: try ledger.summary(
                 window: .day,
+                containing: date,
+                hostname: hostname,
+                calendar: calendar
+            ).map(windowSummary(from:)),
+            week: try ledger.summary(
+                window: .week,
                 containing: date,
                 hostname: hostname,
                 calendar: calendar
@@ -1542,19 +1548,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 hostname: hostname,
                 calendar: calendar
             ).map(windowSummary(from:)),
-            year: try ledger.summary(
-                window: .year,
-                containing: date,
-                hostname: hostname,
-                calendar: calendar
-            ).map(windowSummary(from:)),
             all: try ledger.summary(
                 window: nil,
                 containing: date,
                 hostname: hostname,
                 calendar: calendar
             ).map(windowSummary(from:))
-        )
+        ))
     }
 
     nonisolated private static func windowSummary(from summary: UsageSummary) -> TokenUsageWindowSummary {
