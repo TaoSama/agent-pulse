@@ -94,6 +94,7 @@ struct AgentPulseCoreVerification {
         try verifyTPSBoundaries()
         try verifySQLiteRoundTripAndRetention()
         try verifyUsageSummarySemantics()
+        try verifyVirtualBucketTargets()
         try verifyUsageLedgerAndParsers()
         try verifyUsageV2()
         try verifyV5LegacyDerivedReconciliation()
@@ -131,16 +132,39 @@ struct AgentPulseCoreVerification {
         calendar.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .gmt
         guard let reference = calendar.date(from: DateComponents(year: 2024, month: 2, day: 29, hour: 15, minute: 30)),
               let day = UsageSummaryWindow.day.interval(containing: reference, calendar: calendar),
-              let month = UsageSummaryWindow.month.interval(containing: reference, calendar: calendar),
-              let year = UsageSummaryWindow.year.interval(containing: reference, calendar: calendar) else {
+              let week = UsageSummaryWindow.week.interval(containing: reference, calendar: calendar),
+              let month = UsageSummaryWindow.month.interval(containing: reference, calendar: calendar) else {
             throw VerificationFailure.assertion("usage summary calendar intervals must be constructible")
         }
+        // 日 = 自然日历日（保留时区边界）。
         try require(day.start == calendar.date(from: DateComponents(year: 2024, month: 2, day: 29)), "day window start")
         try require(day.end == calendar.date(from: DateComponents(year: 2024, month: 3, day: 1)), "day window end")
-        try require(month.start == calendar.date(from: DateComponents(year: 2024, month: 2, day: 1)), "month window start")
-        try require(month.end == calendar.date(from: DateComponents(year: 2024, month: 3, day: 1)), "month window end")
-        try require(year.start == calendar.date(from: DateComponents(year: 2024, month: 1, day: 1)), "year window start")
-        try require(year.end == calendar.date(from: DateComponents(year: 2025, month: 1, day: 1)), "year window end")
+        // 周 = 以参考时刻为右界向前 7×24h 的滚动窗口（非自然周）。
+        try require(week.end == reference, "week window end must be the reference instant")
+        try require(week.start == reference.addingTimeInterval(-7 * 24 * 60 * 60), "week window start must be 7×24h before reference")
+        // 月 = 以参考时刻为右界向前 30×24h 的滚动窗口（非自然月）。
+        try require(month.end == reference, "month window end must be the reference instant")
+        try require(month.start == reference.addingTimeInterval(-30 * 24 * 60 * 60), "month window start must be 30×24h before reference")
+    }
+
+    /// 虚拟 bucket 一致性：周 / 月 / 全部三窗口分模型各条目之和 == 窗口目标总数。
+    /// 差额并入 unknown，不新增虚拟模型名。
+    private static func verifyVirtualBucketTargets() throws {
+        let expected: [(TokenWindowVirtualBucketTargets.Window, Int64)] = [
+            (.week, 11_280_000_000),
+            (.month, 36_650_000_000),
+            (.all, 71_800_000_000),
+        ]
+        for (window, target) in expected {
+            try require(TokenWindowVirtualBucketTargets.targetTokens(for: window) == target, "virtual bucket target total mismatch for \(window)")
+            let models = TokenWindowVirtualBucketTargets.reconciledModels(for: window)
+            try require(!models.isEmpty, "virtual bucket model breakdown empty for \(window)")
+            let sum = models.reduce(Int64(0)) { $0 + $1.tokens }
+            try require(sum == target, "virtual bucket per-model sum \(sum) != target \(target) for \(window)")
+            // 差额并入 unknown：unknown 条目存在且不新增其它虚拟模型名。
+            try require(models.contains(where: { $0.model == TokenWindowVirtualBucketTargets.residualModel }), "virtual bucket residual model missing for \(window)")
+            try require(models.filter { $0.model == TokenWindowVirtualBucketTargets.residualModel }.count == 1, "virtual bucket residual model duplicated for \(window)")
+        }
     }
 
     private static func verifyUsageLedgerAndParsers() throws {

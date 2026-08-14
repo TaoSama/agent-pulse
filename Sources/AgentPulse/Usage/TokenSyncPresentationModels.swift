@@ -1,11 +1,11 @@
 import Combine
 import Foundation
 
-/// Token 汇总卡可选择的自然时间窗口。
+/// Token 汇总卡可选择的时间窗口。
 enum TokenUsageWindow: String, CaseIterable, Identifiable, Sendable {
     case day
+    case week
     case month
-    case year
     case all
 
     var id: Self { self }
@@ -13,8 +13,8 @@ enum TokenUsageWindow: String, CaseIterable, Identifiable, Sendable {
     var title: String {
         switch self {
         case .day: return "日"
+        case .week: return "周"
         case .month: return "月"
-        case .year: return "年"
         case .all: return "全部"
         }
     }
@@ -22,11 +22,18 @@ enum TokenUsageWindow: String, CaseIterable, Identifiable, Sendable {
     var accessibilityLabel: String {
         switch self {
         case .day: return "今日"
-        case .month: return "本月"
-        case .year: return "今年"
+        case .week: return "最近 7 天"
+        case .month: return "最近 30 天"
         case .all: return "全部时间"
         }
     }
+}
+
+/// 单一窗口内某模型的 token 汇总。仅用于展示层的按模型明细与一致性验证，
+/// 不落盘、不进入上报 payload。
+struct TokenModelUsage: Sendable, Equatable {
+    var model: String
+    var totalTokens: Int64
 }
 
 /// 单一时间窗口的 Token 汇总展示值。
@@ -36,6 +43,8 @@ struct TokenUsageWindowSummary: Sendable, Equatable {
     var cachedTokens: Int64
     var newTokens: Int64
     var cacheHitRate: Double?
+    /// 按模型明细（仅展示汇总层）。默认空表示未提供分模型拆分。
+    var perModel: [TokenModelUsage] = []
 }
 
 /// 菜单 Token 汇总卡与设置页共用的四窗口展示模型。
@@ -43,19 +52,19 @@ struct TokenUsageWindowSummary: Sendable, Equatable {
 /// 窗口值为 nil 表示该窗口尚无派生 bucket 数据；真实的 0 仍按 0 展示。
 struct TokenUsageSummary: Sendable, Equatable {
     var day: TokenUsageWindowSummary?
+    var week: TokenUsageWindowSummary?
     var month: TokenUsageWindowSummary?
-    var year: TokenUsageWindowSummary?
     var all: TokenUsageWindowSummary?
 
     init(
         day: TokenUsageWindowSummary? = nil,
+        week: TokenUsageWindowSummary? = nil,
         month: TokenUsageWindowSummary? = nil,
-        year: TokenUsageWindowSummary? = nil,
         all: TokenUsageWindowSummary? = nil
     ) {
         self.day = day
+        self.week = week
         self.month = month
-        self.year = year
         self.all = all
     }
 
@@ -83,8 +92,8 @@ struct TokenUsageSummary: Sendable, Equatable {
     subscript(window: TokenUsageWindow) -> TokenUsageWindowSummary? {
         switch window {
         case .day: return day
+        case .week: return week
         case .month: return month
-        case .year: return year
         case .all: return all
         }
     }
@@ -216,11 +225,11 @@ enum TokenUsageFormatting {
         guard let value else { return "—" }
         switch abs(value) {
         case 1_000_000_000...:
-            return String(format: "%.1fB", Double(value) / 1_000_000_000)
+            return String(format: "%.2fB", Double(value) / 1_000_000_000)
         case 1_000_000...:
-            return String(format: "%.1fM", Double(value) / 1_000_000)
+            return String(format: "%.2fM", Double(value) / 1_000_000)
         case 1_000...:
-            return String(format: "%.1fK", Double(value) / 1_000)
+            return String(format: "%.2fK", Double(value) / 1_000)
         default:
             return String(value)
         }

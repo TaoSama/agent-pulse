@@ -182,23 +182,26 @@ final class ModelsCodableTests: XCTestCase {
         XCTAssertNil(summary.cacheHitRate)
     }
 
-    func testUsageSummaryWindowsUseLocalCalendarBoundaries() throws {
+    func testUsageSummaryWindowsUseDayCalendarAndRollingWeekMonth() throws {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "Asia/Shanghai"))
         let reference = try XCTUnwrap(calendar.date(from: DateComponents(
             year: 2024, month: 2, day: 29, hour: 15, minute: 30
         )))
 
+        // 日 = 自然日历日。
         let day = try XCTUnwrap(UsageSummaryWindow.day.interval(containing: reference, calendar: calendar))
         XCTAssertEqual(day.start, calendar.date(from: DateComponents(year: 2024, month: 2, day: 29)))
         XCTAssertEqual(day.end, calendar.date(from: DateComponents(year: 2024, month: 3, day: 1)))
 
-        let month = try XCTUnwrap(UsageSummaryWindow.month.interval(containing: reference, calendar: calendar))
-        XCTAssertEqual(month.start, calendar.date(from: DateComponents(year: 2024, month: 2, day: 1)))
-        XCTAssertEqual(month.end, calendar.date(from: DateComponents(year: 2024, month: 3, day: 1)))
+        // 周 = 最近 7×24h 滚动窗口，右界为参考时刻。
+        let week = try XCTUnwrap(UsageSummaryWindow.week.interval(containing: reference, calendar: calendar))
+        XCTAssertEqual(week.end, reference)
+        XCTAssertEqual(week.start, reference.addingTimeInterval(-7 * 24 * 60 * 60))
 
-        let year = try XCTUnwrap(UsageSummaryWindow.year.interval(containing: reference, calendar: calendar))
-        XCTAssertEqual(year.start, calendar.date(from: DateComponents(year: 2024, month: 1, day: 1)))
-        XCTAssertEqual(year.end, calendar.date(from: DateComponents(year: 2025, month: 1, day: 1)))
+        // 月 = 最近 30×24h 滚动窗口，右界为参考时刻。
+        let month = try XCTUnwrap(UsageSummaryWindow.month.interval(containing: reference, calendar: calendar))
+        XCTAssertEqual(month.end, reference)
+        XCTAssertEqual(month.start, reference.addingTimeInterval(-30 * 24 * 60 * 60))
     }
 }

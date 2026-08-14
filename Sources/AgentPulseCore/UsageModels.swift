@@ -402,20 +402,30 @@ public struct UsageInputSummary: Codable, Sendable, Equatable {
     }
 }
 
-/// 本地汇总可选的自然日历窗口。区间为左闭右开，并使用调用方传入日历的时区。
+/// 本地汇总可选的时间窗口。区间为左闭右开。
+///
+/// - `day`：调用方日历时区下的自然日历日（保留 DST 语义）。
+/// - `week`：以参考时刻为右界向前 7×24h 的滚动窗口（非自然周）。
+/// - `month`：以参考时刻为右界向前 30×24h 的滚动窗口（非自然月）。
 public enum UsageSummaryWindow: String, Codable, Sendable, CaseIterable {
     case day
+    case week
     case month
-    case year
+
+    /// 滚动窗口天数：周 = 最近 7 天，月 = 最近 30 天。
+    static let rollingWeekDays = 7
+    static let rollingMonthDays = 30
+    private static let secondsPerDay: TimeInterval = 24 * 60 * 60
 
     public func interval(containing date: Date, calendar: Calendar = .current) -> DateInterval? {
-        let component: Calendar.Component
         switch self {
-        case .day: component = .day
-        case .month: component = .month
-        case .year: component = .year
+        case .day:
+            return calendar.dateInterval(of: .day, for: date)
+        case .week:
+            return DateInterval(start: date.addingTimeInterval(-Double(Self.rollingWeekDays) * Self.secondsPerDay), end: date)
+        case .month:
+            return DateInterval(start: date.addingTimeInterval(-Double(Self.rollingMonthDays) * Self.secondsPerDay), end: date)
         }
-        return calendar.dateInterval(of: component, for: date)
     }
 }
 
