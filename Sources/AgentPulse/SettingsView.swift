@@ -34,6 +34,31 @@ struct AgentPulseSettingsView: View {
                     }
                 }
 
+                Section("cliproxyapi 用量采集") {
+                    TextField(".env 路径", text: $model.cliProxyConfigPath)
+                        .accessibilityLabel("cliproxyapi 配置文件路径")
+                    HStack {
+                        Text("只保存文件路径；base URL、management key 与目标 apikey 不会显示或写入 App 设置。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("恢复默认路径") {
+                            model.cliProxyConfigPath = CliProxyUsageService.defaultConfigPath
+                        }
+                    }
+                    HStack {
+                        Text("采集状态")
+                        Spacer()
+                        Text(model.tokenSyncStatus.cliProxyConfigured ? "已配置" : "未配置")
+                            .foregroundStyle(model.tokenSyncStatus.cliProxyConfigured ? .green : .secondary)
+                    }
+                    if let error = model.tokenSyncStatus.cliProxyError {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+
                 TokenSyncSettingsSection(model: model)
             }
             .formStyle(.grouped)

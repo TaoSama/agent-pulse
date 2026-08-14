@@ -46,6 +46,7 @@ final class ApplicationModel: ObservableObject {
     @Published private(set) var tokenSummary: TokenUsageSummary
     @Published private(set) var tokenSyncStatus: TokenSyncStatus
     @Published var configPath: String
+    @Published var cliProxyConfigPath: String
     @Published var trendColorMode: TrendColorMode
     @Published private(set) var hotKeyWarning: String?
     @Published private(set) var toast: ToastState?
@@ -71,6 +72,9 @@ final class ApplicationModel: ObservableObject {
             UserDefaults.standard.set(path, forKey: "r2ConfigPath")
         }
         configPath = path
+        // cliproxyapi 采集：仅保存配置文件路径到 UserDefaults；凭证与目标 key 永不落盘。
+        let savedCliProxyPath = UserDefaults.standard.string(forKey: CliProxyUsageService.configPathDefaultsKey)
+        cliProxyConfigPath = CliProxyUsageService.resolveConfigPath(saved: savedCliProxyPath)
         let savedColorMode = UserDefaults.standard.string(forKey: "trendColorMode")
         trendColorMode = TrendColorMode(rawValue: savedColorMode ?? "") ?? .risingGreen
         uploadService = UploadService(configPath: path)
@@ -134,6 +138,14 @@ final class ApplicationModel: ObservableObject {
             .sink { [weak self] path in
                 UserDefaults.standard.set(path, forKey: "r2ConfigPath")
                 self?.uploadService.configPath = path
+            }
+            .store(in: &cancellables)
+        $cliProxyConfigPath
+            .dropFirst()
+            .removeDuplicates()
+            .sink { path in
+                // 仅持久化路径字符串；凭证与目标 key 绝不写入 UserDefaults。
+                UserDefaults.standard.set(path, forKey: CliProxyUsageService.configPathDefaultsKey)
             }
             .store(in: &cancellables)
         $trendColorMode

@@ -28,6 +28,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     private let ledger: UsageLedgerStore?
     private let configurationURL: URL
     private let reporter: TokenUsageReporter
+    /// cliproxyapi 主动拉取采集服务；配置缺失/失败时跳过，不影响本地文件采集。
+    private let cliProxyService: CliProxyUsageService
 
     /// 扫描 / 上报任务句柄，用于防重入与 stop 取消。
     private var scanTask: Task<Void, Never>?
@@ -73,11 +75,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     init(
         defaults: UserDefaults = .standard,
         configurationURL: URL = TokenSyncCoordinator.defaultConfigurationURL(),
-        reporter: TokenUsageReporter = TokenUsageReporter()
+        reporter: TokenUsageReporter = TokenUsageReporter(),
+        cliProxyService: CliProxyUsageService = CliProxyUsageService()
     ) {
         self.defaults = defaults
         self.configurationURL = configurationURL
         self.reporter = reporter
+        self.cliProxyService = cliProxyService
         ledger = Self.openLedger()
 
         // 从 DB 立即恢复 summary（同步读取，后续异步刷新）。
@@ -275,7 +279,27 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let currentParserVersion = UsageJSONLParser.parserVersion
         scanGeneration &+= 1
         let generation = scanGeneration
+        let cliProxyService = self.cliProxyService
+        let cliProxyConfigPath = Self.cliProxyConfigPath(defaults: defaults)
         scanTask = Task { [weak self] in
+            // cliproxy 主动拉取（异步 HTTP）在进入阻塞式文件扫描之前完成；失败仅记状态、
+            // 返回空事件，绝不影响本地文件采集与既有链路。
+            var cliProxyEvents: [UsageEvent] = []
+            var cliProxyError: String?
+            let cliProxyConfigured = CliProxyUsageService.isConfigured(atPath: cliProxyConfigPath)
+            if cliProxyConfigured {
+                do {
+                    cliProxyEvents = try await cliProxyService.fetchUsageEvents(atPath: cliProxyConfigPath)
+                } catch is CancellationError {
+                    // 取消：走后续 cancelled 分支统一处理。
+                } catch {
+                    cliProxyError = (error as? LocalizedError)?.errorDescription ?? "cliproxyapi 采集失败"
+                }
+            }
+            self?.updateCliProxyStatus(configured: cliProxyConfigured, error: cliProxyError, generation: generation)
+
+            // 绑定为不可变值再进入 @Sendable worker，满足 Swift 6 并发捕获约束。
+            let networkEvents = cliProxyEvents
             // 阻塞式 SQLite/文件扫描在后台队列执行（不阻塞主线程），不使用 detached 分叉。
             let result = await Self.runOffMain { gate in
                 try gate.throwIfCancelled()
@@ -301,7 +325,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 try gate.throwIfCancelled()
                 try Self.scan(root: Self.claudeProjectsRoot, source: "claude-code", ledger: ledger, hostname: hostname, cancellation: gate)
                 try gate.throwIfCancelled()
-                // 两来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
+                // cliproxy 主动拉取事件：只写原始层，不写文件 checkpoint（网络来源无偏移语义）。
+                try ledger.recordNetworkEvents(networkEvents, source: CliProxyUsageParser.source, hostname: hostname)
+                try gate.throwIfCancelled()
+                // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
                 let finalize = try ledger.finalizeDerived(hostname: hostname)
                 let summary = try ledger.summary()
                 let pending = try ledger.pendingCounts(hostname: hostname)
@@ -309,6 +336,15 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             }
             let cancelled = Task.isCancelled
             self?.finishScan(generation: generation, cancelled: cancelled, chainedReport: chainedReport, result: result)
+        }
+    }
+
+    /// 把 cliproxy 采集配置状态与错误刷新到 UI（只在当前 generation 有效时）。
+    private func updateCliProxyStatus(configured: Bool, error: String?, generation: UInt64) {
+        guard generation == scanGeneration else { return }
+        updateStatus { status in
+            status.cliProxyConfigured = configured
+            status.cliProxyError = error
         }
     }
 
@@ -1073,6 +1109,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     private static func normalize(_ value: String) -> String {
         CanonicalHostname.normalize(value)
+    }
+
+    /// 解析 cliproxy 配置路径：UserDefaults 只存路径（不含凭证），为空回退默认。
+    private static func cliProxyConfigPath(defaults: UserDefaults) -> String {
+        CliProxyUsageService.resolveConfigPath(
+            saved: defaults.string(forKey: CliProxyUsageService.configPathDefaultsKey)
+        )
     }
 
     nonisolated private static var codexSessionsRoot: URL {

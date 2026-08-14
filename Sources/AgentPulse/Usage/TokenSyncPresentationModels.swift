@@ -80,6 +80,11 @@ struct TokenSyncStatus: Sendable, Equatable {
     var fullSyncState: TokenFullSyncState
     var fullSyncBlockReasons: [String]
 
+    /// cliproxyapi 采集是否已配置（0600 配置文件 + 字段齐全）。
+    var cliProxyConfigured: Bool = false
+    /// cliproxyapi 采集错误（脱敏）；nil 表示无错误或未配置。
+    var cliProxyError: String? = nil
+
     static let localOnly = TokenSyncStatus(
         localCollectionEnabled: true,
         reportingEnabled: false,

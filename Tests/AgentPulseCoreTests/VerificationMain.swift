@@ -96,6 +96,7 @@ struct AgentPulseCoreVerification {
         try await verifyClaudeDesktopCounting()
         try await verifyRuntimeCollectorAndPersistence()
         try verifySparklineAnalysis()
+        try verifyCliProxyUsageParser()
         print("AgentPulseCoreVerification: PASS")
     }
 
@@ -2576,4 +2577,122 @@ struct AgentPulseCoreVerification {
         try require(reopenedV3Count == 1, "reopening v3 db is idempotent and lossless")
     }
 
+    // MARK: - cliproxyapi usage parser
+
+    private static func verifyCliProxyUsageParser() throws {
+        let targetKey = "sk-target-example"
+        let otherKey = "sk-other-example"
+        let targetHash = CliProxyUsageParser.apiKeyHash(for: targetKey)
+        let otherHash = CliProxyUsageParser.apiKeyHash(for: otherKey)
+        try require(targetHash.count == 64, "SHA256 hex must be 64 chars")
+        try require(targetHash != otherHash, "distinct keys must hash differently")
+
+        // 构造两条目标 key 明细（不同 model / 时间）、一条他 key 明细（须被过滤）、
+        // 一条零用量明细（须跳过）、一条无时间戳明细（须跳过）。
+        let payload: [String: Any] = [
+            "total_requests": 4,
+            "apis": [
+                "POST /v1/chat/completions": [
+                    "models": [
+                        "model-a": [
+                            "details": [
+                                [
+                                    "timestamp": "2026-08-09T16:24:58.500000000Z",
+                                    "api_key_hash": targetHash,
+                                    "resolved_model": "model-a",
+                                    "tokens": [
+                                        "input_tokens": 100, "output_tokens": 40,
+                                        "reasoning_tokens": 10, "cache_read_tokens": 30,
+                                        "cache_creation_tokens": 5, "cached_tokens": 0,
+                                        "cache_tokens": 0, "total_tokens": 140,
+                                    ],
+                                ],
+                                [
+                                    "timestamp": "2026-08-09T17:00:00Z",
+                                    "api_key_hash": otherHash,
+                                    "resolved_model": "model-a",
+                                    "tokens": ["input_tokens": 999, "output_tokens": 999, "total_tokens": 1998],
+                                ],
+                                [
+                                    // 零用量：跳过。
+                                    "timestamp": "2026-08-09T17:10:00Z",
+                                    "api_key_hash": targetHash,
+                                    "resolved_model": "model-a",
+                                    "tokens": ["input_tokens": 0, "output_tokens": 0, "total_tokens": 0],
+                                ],
+                                [
+                                    // 无时间戳：跳过。
+                                    "api_key_hash": targetHash,
+                                    "resolved_model": "model-a",
+                                    "tokens": ["input_tokens": 5, "output_tokens": 5, "total_tokens": 10],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                "POST /v1/messages": [
+                    "models": [
+                        "model-b": [
+                            "details": [
+                                [
+                                    "timestamp": "2026-08-10T09:00:00Z",
+                                    "api_key_hash": targetHash,
+                                    "resolved_model": "model-b",
+                                    "tokens": ["input_tokens": 50, "output_tokens": 20, "total_tokens": 70],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ],
+        ]
+        let data = try JSONSerialization.data(withJSONObject: payload)
+
+        let events = CliProxyUsageParser.parse(data: data, targetAPIKey: targetKey)
+        try require(events.count == 2, "must extract exactly the two valid target-key details, got \(events.count)")
+        try require(events.allSatisfy { $0.source == CliProxyUsageParser.source }, "source must be cliproxy")
+        let identity = CliProxyUsageParser.apiKeyIdentity(for: targetKey)
+        try require(events.allSatisfy { $0.project == identity && $0.sessionHash == identity }, "identity must be hashed key, never plaintext")
+        try require(!events.contains { $0.model == "model-a" && $0.counts.total == 1998 }, "other key must be filtered out")
+
+        // token 映射：model-a 明细 input=100(含 cache_read 30 + creation 5)、output=40(含 reasoning 10)。
+        guard let modelA = events.first(where: { $0.model == "model-a" }) else {
+            throw VerificationFailure.assertion("missing model-a event")
+        }
+        try require(modelA.counts.cachedInput == 30, "cachedInput mapping failed: \(modelA.counts.cachedInput)")
+        try require(modelA.counts.cacheCreationInput == 5, "cacheCreation mapping failed: \(modelA.counts.cacheCreationInput)")
+        try require(modelA.counts.input == 65, "net input mapping failed: \(modelA.counts.input)")
+        try require(modelA.counts.reasoningOutput == 10, "reasoning mapping failed")
+        try require(modelA.counts.output == 30, "net output mapping failed: \(modelA.counts.output)")
+        try require(modelA.counts.total == 140, "total mapping failed: \(modelA.counts.total)")
+
+        // 幂等：同一份数据再解析，event id 必须完全一致。
+        let again = CliProxyUsageParser.parse(data: data, targetAPIKey: targetKey)
+        try require(Set(events.map(\.id)) == Set(again.map(\.id)), "event ids must be stable across parses")
+
+        // 空 / 非法输入稳健返回空。
+        try require(CliProxyUsageParser.parse(data: Data("not json".utf8), targetAPIKey: targetKey).isEmpty, "invalid json must yield empty")
+        try require(CliProxyUsageParser.parse(data: data, targetAPIKey: "").isEmpty, "empty target key must yield empty")
+
+        // 账本闭环：recordNetworkEvents（无 checkpoint）+ finalizeDerived → cliproxy bucket。
+        let databaseURL = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString + ".sqlite3")
+        defer { try? FileManager.default.removeItem(at: databaseURL) }
+        let ledger = try UsageLedgerStore(path: databaseURL.path)
+        let hostname = "device"
+        try ledger.recordNetworkEvents(events, source: CliProxyUsageParser.source, hostname: hostname)
+        // 重复 record 不应重复计数（幂等）。
+        try ledger.recordNetworkEvents(again, source: CliProxyUsageParser.source, hostname: hostname)
+        _ = try ledger.finalizeDerived(hostname: hostname)
+        let buckets = try ledger.buckets(hostname: hostname)
+        let cliProxyBuckets = buckets.filter { $0.source == CliProxyUsageParser.source }
+        try require(!cliProxyBuckets.isEmpty, "cliproxy buckets must be produced")
+        let cliProxyTotal = cliProxyBuckets.reduce(Int64(0)) { $0 + $1.counts.total }
+        try require(cliProxyTotal == 210, "cliproxy bucket total must equal 140+70=210, got \(cliProxyTotal)")
+        let ledgerEventCount = try ledger.eventCount()
+        try require(ledgerEventCount == 2, "duplicate recordNetworkEvents must remain idempotent")
+
+        // recordNetworkEvents 不得写入 usage_files checkpoint（网络来源无 parser 版本轴）。
+        let needsRebuild = try ledger.requiresParserRebuild(currentParserVersion: UsageJSONLParser.parserVersion)
+        try require(!needsRebuild, "cliproxy events must not trigger parser rebuild")
+    }
 }

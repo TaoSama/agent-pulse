@@ -250,6 +250,35 @@ R2_SECRET_ACCESS_KEY=your-secret-access-key
 
 ---
 
+## 🔌 cliproxyapi 用量采集
+
+在菜单栏的「设置…」→「cliproxyapi 用量采集」中可修改配置文件位置，默认位于当前用户家目录：
+
+```text
+~/.claude/.credentials/env/agent-pulse-cliproxy.env
+```
+
+配置文件格式（全部为占位示例）：
+
+```dotenv
+CLIPROXY_BASE_URL=http://your-cliproxy-host:port
+CLIPROXY_MANAGEMENT_KEY=your-management-secret-key
+CLIPROXY_TARGET_API_KEY=sk-the-apikey-to-monitor
+```
+
+创建后请立即收紧权限：
+
+```bash
+chmod 600 ~/.claude/.credentials/env/agent-pulse-cliproxy.env
+```
+
+- 采集在本地长期采集的同一节奏（应用启动一次 + 每 30 分钟）随扫描触发：拉取 cliproxyapi management 的 `GET /v0/management/usage`，在**本地**按目标 apikey 的 `SHA256` 与响应中的 `api_key_hash` 精确比对，只提取目标 key 的 token 用量。
+- 用量以来源 `cliproxy` 并入既有 usage 账本与上报链路（30 分钟 bucket、按 revision 精确对账），复用现有上报开关与协议，不新造上报通道。
+- 鉴权用 `Authorization: Bearer <management-key>`；生产地址要求 `https`，`http` 仅在 loopback 或私有内网地址放行。响应无界，设有最大字节保护，超限或拉取失败时**跳过本轮**，绝不影响本地文件采集与既有链路。
+- 配置文件必须为 `0600`，否则视为无效并禁用采集（不崩溃）。应用只把 `.env` 的**路径**保存到 UserDefaults；base URL、management key、目标 apikey 只在采集时读入内存，绝不写入 UserDefaults、SQLite 或日志。账本只保存 hash 后的 key 身份、model、token 计数与时间，不含明文 key、掩码 source、地址或正文。
+
+---
+
 ## 💾 本地数据库
 
 每秒 TPS 样本写入应用自己的 SQLite 数据库（WAL 模式）：
