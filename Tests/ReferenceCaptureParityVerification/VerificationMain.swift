@@ -2,8 +2,8 @@ import AgentPulseReporting
 import Foundation
 
 // Byte-level parity check between the Agent Pulse ingest encoder and a real
-// reference `/api/usage/ingest` request body captured from a running external
-// reference CLI. The captured body is decoded, re-projected
+// reference `/api/usage/ingest` request body captured from the running
+// reference CLI (version 1.3.299). The captured body is decoded, re-projected
 // into Agent Pulse payload structs, and re-encoded with the production
 // `UsageIngestEncoder`. We then assert, reading the *actual encoder output
 // bytes* (not an unordered dictionary), that:
