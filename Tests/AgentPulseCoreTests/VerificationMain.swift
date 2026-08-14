@@ -2029,6 +2029,28 @@ struct AgentPulseCoreVerification {
             line: "{\"type\":\"session_meta\",\"payload\":{\"id\":\"modern-session\",\"thread_source\":\"user\"}}"
         )
         try require(modernMeta?.sessionID == "modern-session", "session_meta payload.id was not accepted")
+
+        // 新版 session_meta 格式漂移：顶层判定不能只看 thread_source，需结合结构化 source 字段。
+        func topLevel(_ json: String) throws -> Bool {
+            guard let meta = CodexSessionParser.parseSessionMeta(
+                line: "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"s\"\(json)}}"
+            ) else { throw VerificationFailure.assertion("session_meta did not parse: \(json)") }
+            return meta.isTopLevel
+        }
+        // 漂移的顶层会话：source 是标量入口字符串，即便 thread_source 被标为 subagent 也是顶层。
+        let driftedTopLevel = try topLevel(",\"source\":\"vscode\",\"thread_source\":\"subagent\"")
+        try require(driftedTopLevel, "drifted top-level (source=vscode, thread_source=subagent) must be top-level")
+        // 真正的派生子 agent：source 是对象（含 subagent.thread_spawn），必须排除。
+        let spawnedSubagent = try topLevel(",\"source\":{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"p\",\"depth\":2}}},\"thread_source\":\"subagent\"")
+        try require(!spawnedSubagent, "genuine spawned sub-agent (object source) must not be top-level")
+        // 新版顶层 exec/user 入口。
+        let execTopLevel = try topLevel(",\"source\":\"exec\",\"thread_source\":\"user\"")
+        try require(execTopLevel, "exec top-level must be top-level")
+        // 旧格式兼容：无 source 字段时仅靠 thread_source。
+        let legacyUser = try topLevel(",\"thread_source\":\"user\"")
+        try require(legacyUser, "legacy top-level (thread_source=user, no source) must remain top-level")
+        let legacySubagent = try topLevel(",\"thread_source\":\"subagent\"")
+        try require(!legacySubagent, "legacy sub-agent (thread_source=subagent, no source) must remain excluded")
         try require(
             CodexProcessClassifier.isIndependentCLI(executablePath: "/private/tmp/codex"),
             "standalone native codex executable was not classified as terminal"
@@ -2648,6 +2670,33 @@ struct AgentPulseCoreVerification {
         )
         try FileManager.default.setAttributes([.modificationDate: base], ofItemAtPath: url.path)
 
+        // 新版 Codex Desktop 顶层会话:source 是标量入口("vscode"),但 thread_source 被标为 "subagent"。
+        // 旧口径(thread_source=="user")会漏判 → Desktop active 恒 0(即用户上报的现象)。
+        let driftURL = sessions.appendingPathComponent("rollout-drifted.jsonl")
+        try writeRollout(
+            to: driftURL,
+            cwd: "/tmp/project-drift",
+            events: [startedEvent()],
+            sessionID: "drifted-top-level",
+            threadSource: "subagent",
+            originator: "Codex Desktop",
+            sourceJSON: "\"vscode\""
+        )
+        try FileManager.default.setAttributes([.modificationDate: base], ofItemAtPath: driftURL.path)
+
+        // 真正的派生子 agent:source 是对象(含 thread_spawn)。不得计入 Desktop task。
+        let subagentURL = sessions.appendingPathComponent("rollout-subagent.jsonl")
+        try writeRollout(
+            to: subagentURL,
+            cwd: "/tmp/project-sub",
+            events: [startedEvent()],
+            sessionID: "spawned-subagent",
+            threadSource: "subagent",
+            originator: "Codex Desktop",
+            sourceJSON: "{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"p\",\"depth\":2}}}"
+        )
+        try FileManager.default.setAttributes([.modificationDate: base], ofItemAtPath: subagentURL.path)
+
         let configuration = CodexRuntimeMetricsConfiguration(
             sessionsDirectories: [sessions],
             automationRoots: [],
@@ -2661,13 +2710,14 @@ struct AgentPulseCoreVerification {
         )
 
         let active = try await collector.scan(at: base)
+        // generating + drifted 两个顶层 Desktop 会话计入;spawned-subagent 排除。
         try require(
-            active.taskBreakdown.codexDesktop.totalTasks == 1,
-            "generating Desktop session was not counted as a task"
+            active.taskBreakdown.codexDesktop.totalTasks == 2,
+            "top-level Desktop sessions (incl. drifted source=string) were not counted; sub-agent must be excluded"
         )
         try require(
-            active.desktopActive == 1,
-            "Desktop session generating output after task_complete must count as active"
+            active.desktopActive == 2,
+            "both the generating and drifted-top-level Desktop sessions must count as active"
         )
 
         // 同一会话在 5 分钟窗口外(无新活动)必须回落为非 active,验证放宽 guard 未破坏超时下界。
@@ -2676,7 +2726,7 @@ struct AgentPulseCoreVerification {
         )
         try require(
             afterTimeout.desktopActive == 0,
-            "session with no activity for over five minutes must fall out of active"
+            "sessions with no activity for over five minutes must fall out of active"
         )
     }
 
@@ -3109,9 +3159,13 @@ struct AgentPulseCoreVerification {
         events: [String],
         sessionID: String = "runtime-verification",
         threadSource: String = "user",
-        originator: String = "codex_exec"
+        originator: String = "codex_exec",
+        sourceJSON: String? = nil
     ) throws {
-        let meta = "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"\(sessionID)\",\"thread_source\":\"\(threadSource)\",\"originator\":\"\(originator)\",\"cwd\":\"\(cwd)\"}}"
+        // sourceJSON 为已编码的 JSON 片段（字符串如 "\"vscode\"" 或对象如 {"subagent":{...}}），
+        // 用于覆盖新版 session_meta 的 payload.source 字段；nil 时不写 source（旧格式）。
+        let sourceField = sourceJSON.map { ",\"source\":\($0)" } ?? ""
+        let meta = "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"\(sessionID)\",\"thread_source\":\"\(threadSource)\",\"originator\":\"\(originator)\",\"cwd\":\"\(cwd)\"\(sourceField)}}"
         try ([meta] + events).joined(separator: "\n").appending("\n")
             .write(to: url, atomically: true, encoding: .utf8)
     }
