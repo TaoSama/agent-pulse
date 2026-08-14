@@ -19,7 +19,7 @@ private func modelTPSColor(for model: String, in series: [ModelTPSHistory]) -> C
     return modelTPSPalette[index % modelTPSPalette.count]
 }
 
-private extension SparklineTrend {
+extension SparklineTrend {
     func color(for mode: TrendColorMode) -> Color {
         switch self {
         case .rising: mode == .risingGreen ? .green : .red

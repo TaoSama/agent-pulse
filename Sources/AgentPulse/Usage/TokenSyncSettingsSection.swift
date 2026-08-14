@@ -1,117 +1,186 @@
 import SwiftUI
 
-/// 设置页的 Token 统计 / 用量上报 / 全量同步三个 Section。
+/// 设置页的 Token 统计 / 用量上报 / 全量同步三张深色卡片。
 struct TokenSyncSettingsSection: View {
     @ObservedObject var model: ApplicationModel
 
     var body: some View {
-        Section("Token 统计") {
-            Toggle("本地长期采集", isOn: localCollectionBinding)
+        tokenStatsCard
+        reportingCard
+        fullSyncCard
+    }
 
-            LabeledContent("Canonical hostname") {
-                Text(model.tokenSyncStatus.canonicalHostname ?? "未配置")
-                    .foregroundStyle(model.tokenSyncStatus.canonicalHostname == nil ? .red : .primary)
-            }
+    // MARK: Token 统计
 
-            // 配置就绪时以 reporting.json 的 canonical hostname 为权威，不允许用户自由输入
-            // 造成双真源；仅在配置未就绪（纯本地采集）时，允许保存本地设备标识。
-            if hostnameIsAuthoritative {
-                Text("hostname 由本地上报配置提供，作为上报权威，不可在此修改。")
-                    .font(.caption)
-            } else {
-                TextField("设备标识（仅本地采集用）", text: hostnameBinding)
-                    .textFieldStyle(.roundedBorder)
-            }
+    private var tokenStatsCard: some View {
+        SettingsCard(title: "Token 统计", systemImage: "chart.bar.xaxis") {
+            VStack(alignment: .leading, spacing: 10) {
+                SettingsToggleRow(
+                    title: "本地长期采集",
+                    subtitle: "仅写入本机 SQLite，删除历史会话不影响已入库统计。",
+                    isOn: localCollectionBinding
+                )
 
-            LabeledContent("上次扫描") {
-                Text(Self.dateText(model.tokenSyncStatus.lastScanAt))
-            }
-
-            Button(model.tokenSyncStatus.scanningInProgress ? "正在扫描…" : "立即扫描") {
-                model.scanTokenUsageNow()
-            }
-            .disabled(scanDisabled)
-
-            Text("历史会话删除后，已入库的 Token 统计仍会保留。")
-                .font(.caption)
-        }
-
-        Section("用量上报") {
-            Toggle("本机上报（谁开谁报）", isOn: reportingBinding)
-                .disabled(!canEnableReporting)
-
-            if !canEnableReporting {
-                Text(reportingDisabledReason)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-
-            TextField("API 地址（留空则仅本地）", text: ingestURLBinding)
-                .textFieldStyle(.roundedBorder)
-
-            Text("仅本机使用，不随用量上报。")
-                .font(.caption)
-
-            Text(localToApiRouteText)
-
-            LabeledContent("配置状态") {
-                Text(configurationStatusText)
-                    .foregroundStyle(configurationStatusColor)
-            }
-
-            if let error = model.tokenSyncStatus.configurationError {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-
-            LabeledContent("上次上报") {
-                Text(Self.dateText(model.tokenSyncStatus.lastReportAt))
-            }
-
-            if let error = model.tokenSyncStatus.reportingError {
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-            }
-
-            if !model.tokenSyncStatus.reportingEligible {
-                Text("上报门禁：存在无法证明的潜在重复，已阻止上报。")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                ForEach(model.tokenSyncStatus.reportingBlockedReasons, id: \.self) { reason in
-                    Text("• \(reason)")
-                        .font(.caption)
+                SettingsRow(title: "Canonical hostname") {
+                    Text(model.tokenSyncStatus.canonicalHostname ?? "未配置")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(hostnameColor)
                 }
-            }
 
-            if pendingTotal > 0 {
-                LabeledContent("待上报") {
-                    Text("buckets \(model.tokenSyncStatus.pendingBuckets) · sessions \(model.tokenSyncStatus.pendingSessions)")
+                if hostnameIsAuthoritative {
+                    SettingsFootnote("hostname 由本地上报配置提供，作为上报权威，不可在此修改。")
+                } else {
+                    SettingsField(
+                        title: "设备标识（仅本地采集用）",
+                        text: hostnameBinding
+                    )
                 }
-            }
 
-            Button(model.tokenSyncStatus.reportingInProgress ? "正在上报…" : "立即上报") {
-                model.reportTokenUsageNow()
-            }
-            .disabled(!canReport)
+                SettingsRow(title: "上次扫描") {
+                    Text(Self.dateText(model.tokenSyncStatus.lastScanAt))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Color.white.opacity(0.7))
+                }
 
-            Text(reportFooterText)
-                .font(.caption)
-        }
+                actionRow(
+                    title: model.tokenSyncStatus.scanningInProgress ? "正在扫描…" : "立即扫描",
+                    systemImage: "arrow.clockwise",
+                    loading: model.tokenSyncStatus.scanningInProgress,
+                    disabled: scanDisabled
+                ) {
+                    model.scanTokenUsageNow()
+                }
 
-        Section("全量同步") {
-            LabeledContent("状态") {
-                Text(fullSyncStateText)
+                SettingsFootnote("历史会话删除后，已入库的 Token 统计仍会保留。")
             }
-            ForEach(model.tokenSyncStatus.fullSyncBlockReasons, id: \.self) { reason in
-                Text("• \(reason)")
-                    .font(.caption)
-            }
-            Button(fullSyncButtonTitle) { model.runTokenFullSync() }
-                .disabled(fullSyncDisabled)
         }
     }
+
+    // MARK: 用量上报
+
+    private var reportingCard: some View {
+        SettingsCard(title: "用量上报", systemImage: "paperplane") {
+            VStack(alignment: .leading, spacing: 10) {
+                SettingsToggleRow(
+                    title: "本机上报（谁开谁报）",
+                    isOn: reportingBinding,
+                    disabled: !canEnableReporting
+                )
+
+                if !canEnableReporting {
+                    SettingsFootnote(reportingDisabledReason, tone: .negative)
+                }
+
+                SettingsField(
+                    title: "API 地址（留空则仅本地）",
+                    text: ingestURLBinding
+                )
+
+                SettingsFootnote("仅本机使用，不随用量上报。")
+
+                HStack(spacing: 6) {
+                    Image(systemName: "point.3.connected.trianglepath.dotted")
+                        .font(.system(size: 10))
+                    Text(localToApiRouteText)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .foregroundStyle(Color.white.opacity(0.6))
+
+                SettingsRow(title: "配置状态") {
+                    SettingsStatusBadge(text: configurationStatusText, tone: configurationStatusTone)
+                }
+
+                if let error = model.tokenSyncStatus.configurationError {
+                    SettingsFootnote(error, tone: .negative)
+                }
+
+                SettingsRow(title: "上次上报") {
+                    Text(Self.dateText(model.tokenSyncStatus.lastReportAt))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Color.white.opacity(0.7))
+                }
+
+                if let error = model.tokenSyncStatus.reportingError {
+                    SettingsFootnote(error, tone: .negative)
+                }
+
+                if !model.tokenSyncStatus.reportingEligible {
+                    SettingsFootnote("上报门禁：存在无法证明的潜在重复，已阻止上报。", tone: .negative)
+                    ForEach(model.tokenSyncStatus.reportingBlockedReasons, id: \.self) { reason in
+                        SettingsFootnote("• \(reason)", tone: .negative)
+                    }
+                }
+
+                if pendingTotal > 0 {
+                    SettingsRow(title: "待上报") {
+                        Text("buckets \(model.tokenSyncStatus.pendingBuckets) · sessions \(model.tokenSyncStatus.pendingSessions)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(Color.white.opacity(0.85))
+                    }
+                }
+
+                actionRow(
+                    title: model.tokenSyncStatus.reportingInProgress ? "正在上报…" : "立即上报",
+                    systemImage: "arrow.up.circle",
+                    loading: model.tokenSyncStatus.reportingInProgress,
+                    disabled: !canReport
+                ) {
+                    model.reportTokenUsageNow()
+                }
+
+                SettingsFootnote(reportFooterText)
+            }
+        }
+    }
+
+    // MARK: 全量同步
+
+    private var fullSyncCard: some View {
+        SettingsCard(title: "全量同步", systemImage: "arrow.triangle.2.circlepath") {
+            VStack(alignment: .leading, spacing: 10) {
+                SettingsRow(title: "状态") {
+                    SettingsStatusBadge(text: fullSyncStateText, tone: fullSyncTone)
+                }
+
+                ForEach(model.tokenSyncStatus.fullSyncBlockReasons, id: \.self) { reason in
+                    SettingsFootnote("• \(reason)")
+                }
+
+                actionRow(
+                    title: fullSyncButtonTitle,
+                    systemImage: "tray.and.arrow.up",
+                    loading: model.tokenSyncStatus.fullSyncState == .running,
+                    disabled: fullSyncDisabled
+                ) {
+                    model.runTokenFullSync()
+                }
+            }
+        }
+    }
+
+    /// 右对齐的主操作按钮行。
+    private func actionRow(
+        title: String,
+        systemImage: String,
+        loading: Bool,
+        disabled: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        HStack {
+            Spacer(minLength: 0)
+            SettingsPrimaryButton(
+                title: title,
+                systemImage: systemImage,
+                loading: loading,
+                disabled: disabled,
+                action: action
+            )
+        }
+    }
+
+    // MARK: Bindings
 
     private var localCollectionBinding: Binding<Bool> {
         Binding(
@@ -139,6 +208,12 @@ struct TokenSyncSettingsSection: View {
             get: { model.tokenSyncStatus.canonicalHostname ?? "" },
             set: { model.setTokenCanonicalHostname($0) }
         )
+    }
+
+    // MARK: 状态派生
+
+    private var hostnameColor: Color {
+        model.tokenSyncStatus.canonicalHostname == nil ? .red : Color.white.opacity(0.85)
     }
 
     /// 配置就绪时 hostname 由 reporting.json 提供，属上报权威，UI 只读展示。
@@ -196,8 +271,8 @@ struct TokenSyncSettingsSection: View {
         }
     }
 
-    private var configurationStatusColor: Color {
-        model.tokenSyncStatus.configurationStatus == .ready ? .primary : .red
+    private var configurationStatusTone: SettingsStatusTone {
+        model.tokenSyncStatus.configurationStatus == .ready ? .positive : .negative
     }
 
     /// 只展示 API host，绝不展示完整 URL（路径/查询参数可能含敏感信息）。
@@ -233,6 +308,15 @@ struct TokenSyncSettingsSection: View {
         case .running: return "同步中"
         case .completed: return "已完成"
         case .failed: return "失败"
+        }
+    }
+
+    private var fullSyncTone: SettingsStatusTone {
+        switch model.tokenSyncStatus.fullSyncState {
+        case .ready, .completed: return .positive
+        case .running: return .neutral
+        case .failed: return .negative
+        case .blocked: return .warning
         }
     }
 
