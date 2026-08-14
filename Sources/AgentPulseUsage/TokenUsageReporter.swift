@@ -94,12 +94,20 @@ public struct TokenUsageReporter: Sendable {
     }
 
     public static func loadConfiguration(from url: URL) throws -> TokenReportingConfiguration {
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        guard let permissions = attributes[.posixPermissions] as? NSNumber,
-              permissions.intValue & 0o777 == 0o600 else {
+        // Read through a descriptor opened O_NOFOLLOW and fstat-validated to be a
+        // regular file owned by the current user with mode exactly 0600. This
+        // rejects a symlinked or wide-permission config and closes the
+        // check-then-read TOCTOU window that attributesOfItem + Data(contentsOf:)
+        // leaves open. A wide-permission / symlink / foreign-owner file maps to
+        // the same public invalidConfigurationPermissions error as before; a
+        // missing or otherwise unreadable file preserves the prior "throws so the
+        // caller treats it as missing" behaviour (no errno or path is surfaced).
+        let data: Data
+        do {
+            data = try OwnerOnlyFileReader.read(url: url)
+        } catch OwnerOnlyFileReader.Failure.insecure {
             throw TokenUsageReporterError.invalidConfigurationPermissions
         }
-        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
         return try JSONDecoder().decode(TokenReportingConfiguration.self, from: data)
     }
 
@@ -128,7 +136,13 @@ public struct TokenUsageReporter: Sendable {
                 || configuration.headers.contentType.isEmpty {
                 return .headersMissing
             }
-            return configuration.batch.isValid && configuration.retry.isValid ? .ready : .invalid
+            // Resolved header validity is part of readiness: an invalid runtime
+            // header template, an illegal/duplicate/protected static header name,
+            // or a CR/LF in a header value must surface as .invalid rather than
+            // .ready, so the UI never shows "ready" for a config that would
+            // fail-closed at send time. isReady folds in the batch/retry checks
+            // and the combined resolved-header guard.
+            return configuration.isReady ? .ready : .invalid
         } catch is DecodingError {
             return .invalid
         } catch TokenUsageReporterError.invalidConfigurationPermissions {
@@ -285,6 +299,9 @@ public enum UsageBucketPayloadMapper {
                 source: bucket.source,
                 model: bucket.model,
                 project: bucket.project,
+                skills: bucket.skills,
+                skillCounts: bucket.skillCounts,
+                mcpCounts: bucket.mcpCounts,
                 bucketStart: UsagePayloadDateFormatter.string(from: bucket.bucketStart),
                 hostname: bucket.hostname,
                 inputTokens: bucket.counts.input,
@@ -292,7 +309,11 @@ public enum UsageBucketPayloadMapper {
                 cachedInputTokens: bucket.counts.cachedInput,
                 cacheCreationInputTokens: bucket.counts.cacheCreationInput,
                 reasoningOutputTokens: bucket.counts.reasoningOutput,
-                totalTokens: bucket.counts.total
+                totalTokens: bucket.counts.total,
+                linesAdded: bucket.linesAdded,
+                linesDeleted: bucket.linesDeleted,
+                linesNet: bucket.linesNet,
+                codeMetricVersion: bucket.codeMetricVersion
             )
         }
     }
@@ -304,6 +325,7 @@ public enum UsageSessionPayloadMapper {
             UsageSessionPayload(
                 source: session.source,
                 project: session.project,
+                skills: session.skills,
                 sessionHash: session.sessionHash,
                 hostname: session.hostname,
                 firstMessageAt: UsagePayloadDateFormatter.string(from: session.firstActivity),

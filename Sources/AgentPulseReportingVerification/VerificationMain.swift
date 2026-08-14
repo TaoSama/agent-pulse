@@ -32,6 +32,10 @@ struct AgentPulseReportingVerification {
         try await verifyOpaqueRefreshSemantics()
         try await verifyPersistent401Fails()
         try await verifyNon401Failure()
+        try await verify413StripsAutonomyAndResendsOnce()
+        try await verify413WithoutAutonomyFailsImmediately()
+        try await verifyDegraded413Fails()
+        try await verify413RebuildsEncoding()
         try await verifyMalformedAcknowledgementResponses()
         try await verifyRetryableStatusCodes()
         try await verifyRequestNotWrittenRetry()
@@ -399,13 +403,103 @@ struct AgentPulseReportingVerification {
         catch let e as IngestClientError { try expect(e == .httpFailure(statusCode: 500), "wrong error: \(e)") }
     }
 
+    // MARK: - 413 autonomy fallback
+
+    private static func autonomyRequest() -> UsageIngestRequest {
+        let autonomy = AutonomySessionPayload(source: "codex", project: "demo", sessionHash: "auto-hash", firstEventAt: "a", lastEventAt: "b", autonomyStatus: "autonomous", confidence: "high", computedAt: "c")
+        let status = AutonomySourceStatusPayload(source: "codex", status: "ok")
+        let bucket = UsageBucketPayload(source: "codex", model: "gpt", project: "demo", bucketStart: "bucket-time", totalTokens: 1)
+        let session = UsageSessionPayload(source: "codex", project: "demo", sessionHash: "session-hash", firstMessageAt: "a", lastMessageAt: "b")
+        return UsageIngestRequest(buckets: [bucket], sessions: [session], autonomySessions: [autonomy], autonomySourceStatuses: [status], autonomyWindowStart: "w1", autonomyWindowEnd: "w2", fullSync: true, fullSyncReset: true)
+    }
+
+    private static func verify413StripsAutonomyAndResendsOnce() async throws {
+        let sender = ScriptedSender(responses: [HTTPResponse(statusCode: 413, body: Data()), ok()])
+        let supplier = ScriptedSupplier(tokens: ["t"])
+        let client = UsageIngestClient(configuration: configured(), tokenSupplier: supplier, sender: sender)
+        let result = try await client.ingest(autonomyRequest())
+        try expect(result.bucketsUpserted == 1, "recovered upsert")
+        try expect(sender.requests.count == 2, "degraded body must be resent exactly once")
+        try expect(supplier.calls == [false], "413 fallback must not refresh the token")
+
+        let firstBody = jsonString(sender.requests[0].httpBody ?? Data())
+        try expect(firstBody.contains("\"autonomySessions\":["), "first body carries autonomy sessions")
+        try expect(firstBody.contains("\"autonomySourceStatuses\":["), "first body carries autonomy statuses")
+        try expect(firstBody.contains("\"autonomyWindowStart\":\"w1\""), "first body carries window start")
+        try expect(firstBody.contains("\"autonomyWindowEnd\":\"w2\""), "first body carries window end")
+        try expect(firstBody.contains("\"bucketStart\":\"bucket-time\""), "first body carries bucket")
+        try expect(firstBody.contains("\"sessionHash\":\"session-hash\""), "first body carries session")
+
+        let second = sender.requests[1]
+        let secondBody = jsonString(second.httpBody ?? Data())
+        try expect(!secondBody.contains("autonomy"), "degraded body must carry no autonomy fields")
+        try expect(secondBody.contains("\"bucketStart\":\"bucket-time\""), "buckets must survive the fallback")
+        try expect(secondBody.contains("\"sessionHash\":\"session-hash\""), "sessions must survive the fallback")
+        try expect(secondBody.contains("\"fullSync\":true"), "fullSync flag must survive the fallback")
+        try expect(secondBody.contains("\"fullSyncReset\":true"), "fullSyncReset flag must survive the fallback")
+        // The degraded request is rebuilt from scratch, headers included.
+        try expect(second.url?.absoluteString == "https://example.com/api/usage/ingest", "degraded request rebuilt URL")
+        try expect(second.value(forHTTPHeaderField: "X-Test-Auth-Token") == "t", "degraded request rebuilt auth header")
+        try expect(second.value(forHTTPHeaderField: "Content-Type") == "application/json", "degraded request rebuilt content type")
+        try expect(second.value(forHTTPHeaderField: "Content-Encoding") == nil, "small degraded body must not be gzipped")
+    }
+
+    private static func verify413WithoutAutonomyFailsImmediately() async throws {
+        // Even when 413 is configured as retryable, it must not be treated as
+        // generic backoff: a body with no autonomy fields fails on the first
+        // response.
+        let config = IngestClientConfiguration(
+            baseURL: URL(string: "https://example.com")!,
+            path: "/api/usage/ingest",
+            hostname: "host-a",
+            headerNames: headerNames(),
+            staticHeaders: [StaticHeader(name: "X-Test-Client", value: "test")],
+            retryPolicy: RetryPolicy(maxRetries: 3, retryableStatusCodes: [413, 502, 503, 504])
+        )
+        let sender = ScriptedSender(responses: [HTTPResponse(statusCode: 413, body: Data())])
+        let supplier = ScriptedSupplier(tokens: ["t"])
+        let client = UsageIngestClient(configuration: config, tokenSupplier: supplier, sender: sender)
+        do { _ = try await client.ingest(request()); try expect(false, "expected httpFailure 413") }
+        catch let e as IngestClientError { try expect(e == .httpFailure(statusCode: 413), "wrong error: \(e)") }
+        try expect(sender.requests.count == 1, "413 without autonomy must not resend")
+        try expect(supplier.calls == [false], "413 must not refresh the token")
+    }
+
+    private static func verifyDegraded413Fails() async throws {
+        let sender = ScriptedSender(responses: [HTTPResponse(statusCode: 413, body: Data()), HTTPResponse(statusCode: 413, body: Data())])
+        let supplier = ScriptedSupplier(tokens: ["t"])
+        let client = UsageIngestClient(configuration: configured(), tokenSupplier: supplier, sender: sender)
+        do { _ = try await client.ingest(autonomyRequest()); try expect(false, "expected httpFailure 413") }
+        catch let e as IngestClientError { try expect(e == .httpFailure(statusCode: 413), "wrong error: \(e)") }
+        try expect(sender.requests.count == 2, "degraded body is resent at most once")
+        try expect(supplier.calls == [false], "413 fallback must not refresh the token")
+        let secondBody = jsonString(sender.requests[1].httpBody ?? Data())
+        try expect(!secondBody.contains("autonomy"), "degraded body must carry no autonomy fields")
+    }
+
+    private static func verify413RebuildsEncoding() async throws {
+        // An oversized autonomy section pushes the first body past the gzip
+        // threshold; the degraded body drops back below it, proving the JSON,
+        // the gzip decision, and the headers are rebuilt rather than reused.
+        let autonomy = AutonomySessionPayload(source: "codex", project: "demo", sessionHash: "h", firstEventAt: "a", lastEventAt: "b", autonomyStatus: "autonomous", confidence: "high", confidenceReasons: [String(repeating: "x", count: 2048)], computedAt: "c")
+        let request = UsageIngestRequest(buckets: [UsageBucketPayload(source: "codex", model: "gpt", project: "demo", bucketStart: "t", totalTokens: 1)], autonomySessions: [autonomy])
+        let sender = ScriptedSender(responses: [HTTPResponse(statusCode: 413, body: Data()), ok()])
+        let client = UsageIngestClient(configuration: configured(), tokenSupplier: ScriptedSupplier(tokens: ["t"]), sender: sender)
+        _ = try await client.ingest(request)
+        try expect(sender.requests[0].value(forHTTPHeaderField: "Content-Encoding") == "gzip", "first body must be gzipped")
+        try expect(sender.requests[0].httpBody?.first == 0x1f, "first body gzip magic")
+        try expect(sender.requests[1].value(forHTTPHeaderField: "Content-Encoding") == nil, "degraded body must not be gzipped")
+        let secondBody = jsonString(sender.requests[1].httpBody ?? Data())
+        try expect(!secondBody.contains("autonomy"), "degraded body must carry no autonomy fields")
+        try expect(secondBody.contains("\"bucketStart\":\"t\""), "bucket must survive the fallback")
+    }
+
     private static func verifyMalformedAcknowledgementResponses() async throws {
         let malformedBodies = [
             Data(),
             Data("{}".utf8),
             Data("{\"sessions_upserted\":0,\"autonomy_sessions_upserted\":0}".utf8),
-            Data("{\"buckets_upserted\":1,\"autonomy_sessions_upserted\":0}".utf8),
-            Data("{\"buckets_upserted\":1,\"sessions_upserted\":0}".utf8)
+            Data("{\"buckets_upserted\":1,\"autonomy_sessions_upserted\":0}".utf8)
         ]
         for body in malformedBodies {
             let sender = ScriptedSender(responses: [HTTPResponse(statusCode: 200, body: body)])
@@ -421,6 +515,20 @@ struct AgentPulseReportingVerification {
                 try expect(error == .malformedResponse, "wrong malformed acknowledgement error: \(error)")
             }
         }
+
+        // The reference ingest endpoint acknowledges only buckets and sessions;
+        // an omitted autonomy count is valid and decodes to zero. For a request
+        // carrying no autonomy rows this still confirms exact per-dimension
+        // counts, so the batch is accepted rather than treated as malformed.
+        let referenceBody = Data("{\"buckets_upserted\":1,\"sessions_upserted\":0}".utf8)
+        let referenceSender = ScriptedSender(responses: [HTTPResponse(statusCode: 200, body: referenceBody)])
+        let referenceClient = UsageIngestClient(
+            configuration: configured(),
+            tokenSupplier: ScriptedSupplier(tokens: ["t"]),
+            sender: referenceSender
+        )
+        _ = try await referenceClient.ingest(request())
+        try expect(referenceSender.requests.count == 1, "reference two-field ack must be accepted without retry")
     }
 
     // MARK: - Retry and backoff

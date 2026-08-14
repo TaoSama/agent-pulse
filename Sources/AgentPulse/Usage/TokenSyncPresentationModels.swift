@@ -1,21 +1,100 @@
 import Combine
 import Foundation
 
-/// 菜单 Token 汇总卡与设置页共用的展示模型。
-///
-/// 所有计数字段均可为 nil：nil 表示「尚未采集到」，UI 必须展示采集中状态，
-/// 不得把 0 当作真实值展示。
-struct TokenUsageSummary: Sendable, Equatable {
-    /// 全部时间、本机累计的总 Tokens。
-    var totalTokens: Int64?
-    /// 按内置价格表估算的费用（美元）。
-    var estimatedCost: Double?
-    /// 命中缓存的输入 Tokens。
-    var cachedTokens: Int64?
-    /// 非缓存输入 Tokens。
-    var newTokens: Int64?
-    /// 缓存命中率，区间 0...1。
+/// Token 汇总卡可选择的自然时间窗口。
+enum TokenUsageWindow: String, CaseIterable, Identifiable, Sendable {
+    case day
+    case month
+    case year
+    case all
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .day: return "日"
+        case .month: return "月"
+        case .year: return "年"
+        case .all: return "全部"
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .day: return "今日"
+        case .month: return "本月"
+        case .year: return "今年"
+        case .all: return "全部时间"
+        }
+    }
+}
+
+/// 单一时间窗口的 Token 汇总展示值。
+struct TokenUsageWindowSummary: Sendable, Equatable {
+    var totalTokens: Int64
+    var estimatedCost: Double
+    var cachedTokens: Int64
+    var newTokens: Int64
     var cacheHitRate: Double?
+}
+
+/// 菜单 Token 汇总卡与设置页共用的四窗口展示模型。
+///
+/// 窗口值为 nil 表示该窗口尚无派生 bucket 数据；真实的 0 仍按 0 展示。
+struct TokenUsageSummary: Sendable, Equatable {
+    var day: TokenUsageWindowSummary?
+    var month: TokenUsageWindowSummary?
+    var year: TokenUsageWindowSummary?
+    var all: TokenUsageWindowSummary?
+
+    init(
+        day: TokenUsageWindowSummary? = nil,
+        month: TokenUsageWindowSummary? = nil,
+        year: TokenUsageWindowSummary? = nil,
+        all: TokenUsageWindowSummary? = nil
+    ) {
+        self.day = day
+        self.month = month
+        self.year = year
+        self.all = all
+    }
+
+    /// 兼容旧 preview / 调用方：旧单窗口数据继续解释为「全部」。
+    init(
+        totalTokens: Int64?,
+        estimatedCost: Double?,
+        cachedTokens: Int64?,
+        newTokens: Int64?,
+        cacheHitRate: Double?
+    ) {
+        guard let totalTokens, let estimatedCost, let cachedTokens, let newTokens else {
+            self.init()
+            return
+        }
+        self.init(all: TokenUsageWindowSummary(
+            totalTokens: totalTokens,
+            estimatedCost: estimatedCost,
+            cachedTokens: cachedTokens,
+            newTokens: newTokens,
+            cacheHitRate: cacheHitRate
+        ))
+    }
+
+    subscript(window: TokenUsageWindow) -> TokenUsageWindowSummary? {
+        switch window {
+        case .day: return day
+        case .month: return month
+        case .year: return year
+        case .all: return all
+        }
+    }
+
+    // 保留旧调用读取全部时间汇总的语义。
+    var totalTokens: Int64? { all?.totalTokens }
+    var estimatedCost: Double? { all?.estimatedCost }
+    var cachedTokens: Int64? { all?.cachedTokens }
+    var newTokens: Int64? { all?.newTokens }
+    var cacheHitRate: Double? { all?.cacheHitRate }
 
     static let empty = TokenUsageSummary()
 }

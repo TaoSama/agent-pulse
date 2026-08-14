@@ -1,0 +1,4 @@
+{"timestamp":"2026-08-12T02:00:00.000Z","type":"session_meta","payload":{"id":"rollout-sm-1","session_id":"conv-sm-1","cwd":"/workspace/Workspaces/proj-sm"}}
+{"timestamp":"2026-08-12T02:00:01.000Z","type":"turn_context","payload":{"model":"codex-test-model","turn_id":"t1"}}
+{"timestamp":"2026-08-12T02:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"please use [$brainstorming](/workspace/.agents/skills/brainstorming/SKILL.md) now"}]}}
+{"timestamp":"2026-08-12T02:00:03.000Z","type":"event_msg","payload":{"type":"token_count","info":{"model":"codex-test-model","last_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150},"total_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}}}
