@@ -459,7 +459,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 try gate.throwIfCancelled()
                 // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
                 progressReporter.enterPhase(.finalizing)
-                let finalize = try ledger.finalizeDerived(hostname: hostname)
+                let finalize = try ledger.finalizeDerived(hostname: hostname) { done, total in
+                    // 重算内部子阶段回调：映射到 .finalizing 段的 fraction，让进度平滑推进。
+                    progressReporter.advanceFinalize(done: done, total: total)
+                }
                 progressReporter.completePhase(.finalizing)
                 // 只有在所有来源都完整扫描（无致命失败：任一来源枚举失败 / 单文件 I/O 失败都会
                 // 在上面抛出并终止本次扫描，不会到达此处）后，才显式清除 rebuild pending。
@@ -991,6 +994,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             scannedFiles += 1
             let fraction = totalFiles > 0 ? Double(scannedFiles) / Double(totalFiles) : 1
             send(phase: .scanning, fraction: fraction)
+        }
+
+        /// finalizing 阶段：重算派生内部按 done/total 子阶段推进，避免该段从 0 直跳 100%。
+        func advanceFinalize(done: Int, total: Int) {
+            let fraction = total > 0 ? Double(done) / Double(total) : 1
+            send(phase: .finalizing, fraction: fraction)
         }
 
         private func send(phase: TokenScanPhase, fraction: Double) {
