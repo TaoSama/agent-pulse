@@ -215,19 +215,34 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     func setLocalCollectionEnabled(_ enabled: Bool) {
         defaults.set(enabled, forKey: DefaultsKey.localCollectionEnabled)
         updateStatus { $0.localCollectionEnabled = enabled }
+        if enabled {
+            // 开启采集：按间隔周期性扫描（不依赖上报开关）。已在跑则 startAutoLoopIfNeeded 幂等不重启。
+            startAutoLoopIfNeeded()
+        } else if !statusSubject.value.reportingEnabled {
+            // 采集与上报都关：循环无事可做，停掉。
+            autoLoopTask?.cancel()
+            autoLoopTask = nil
+        }
     }
 
     func setReportingEnabled(_ enabled: Bool) {
-        // 关闭永远成功：无论配置状态如何都写盘 false，并停掉自动上报循环。
+        // 关闭永远成功：无论配置状态如何都写盘 false，并停掉自动上报意图。
         // 用户手动在途的 report 不取消（可能还想看结果）；scan 同理不动。
+        // 注意：若本地采集仍开着，自动循环需保留以继续周期性扫描（只是不再串接上报）。
         guard enabled else {
             defaults.set(false, forKey: DefaultsKey.reportingEnabled)
-            autoLoopTask?.cancel()
-            autoLoopTask = nil
             reportAfterCurrentScan = false
             updateStatus { status in
                 status.reportingEnabled = false
                 status.reportingError = nil
+            }
+            if statusSubject.value.localCollectionEnabled {
+                // 采集仍开：循环继续扫描；此前若因故未启动则补启。
+                startAutoLoopIfNeeded()
+            } else {
+                // 采集也关了：循环无事可做，停掉。
+                autoLoopTask?.cancel()
+                autoLoopTask = nil
             }
             return
         }
@@ -242,8 +257,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 status.reportingError = "配置未就绪，无法启用上报"
             }
             defaults.set(false, forKey: DefaultsKey.reportingEnabled)
-            autoLoopTask?.cancel()
-            autoLoopTask = nil
+            // 上报未就绪不影响本地采集：采集仍开则保留循环继续扫描，否则停掉。
+            if statusSubject.value.localCollectionEnabled {
+                startAutoLoopIfNeeded()
+            } else {
+                autoLoopTask?.cancel()
+                autoLoopTask = nil
+            }
             return
         }
         defaults.set(true, forKey: DefaultsKey.reportingEnabled)
@@ -704,7 +724,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     /// 应用启动：触发首轮 scan（本地采集开启时）并按需串接上报；
-    /// 若上报已启用则同时启动 30 分钟循环。多次调用幂等。
+    /// 本地采集或上报任一开启时启动自动循环（采集驱动周期扫描，不依赖上报开关）。多次调用幂等。
     func start() {
         guard !isRunning else { return }
         isRunning = true
@@ -783,11 +803,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         scanNow(chainedReport: true)
     }
 
-    /// 在 reportingEnabled=true 且未启动过时创建 30 分钟自动循环任务。
-    /// 循环内每轮先判断当前开关，一旦被关掉即退出，不再触发。
+    /// 在「本地采集或上报」任一开启且未启动过时创建自动循环任务。
+    /// 循环内每轮先判断当前开关，一旦采集与上报都被关掉即退出，不再触发。
     private func startAutoLoopIfNeeded() {
         // rebuild pending 期间不启动自动上报循环（不发网络请求）。
-        guard autoLoopTask == nil, isRunning, statusSubject.value.reportingEnabled,
+        // 采集开启即可周期性扫描（不依赖上报开关）；上报另需其自身就绪，由循环体内分支决定。
+        let status = statusSubject.value
+        guard autoLoopTask == nil, isRunning,
+              status.localCollectionEnabled || status.reportingEnabled,
               !isRebuildCompletionPending() else { return }
         autoLoopTask = Task { [weak self] in
             let interval = self?.autoReportInterval.seconds ?? TokenReportInterval.default.seconds
@@ -795,8 +818,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 do {
                     try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
                 } catch { return }
-                guard let self, self.isRunning, self.statusSubject.value.reportingEnabled else { return }
-                if self.statusSubject.value.localCollectionEnabled {
+                guard let self, self.isRunning else { return }
+                let current = self.statusSubject.value
+                // 采集或上报都关了才退出循环；否则按当前开关驱动扫描 / 上报。
+                guard current.localCollectionEnabled || current.reportingEnabled else { return }
+                if current.localCollectionEnabled {
+                    // 采集开启：扫描一轮；是否串接上报由 finishScan 按 reportingEnabled 再校验。
                     self.triggerScanThenReport()
                 } else {
                     self.reportNow()
