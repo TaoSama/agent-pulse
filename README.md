@@ -149,9 +149,9 @@ open dist/AgentPulse.app
 - 本地扫描 `~/.codex/sessions/**/*.jsonl` 与 `~/.claude/projects/**/*.jsonl`，事件追加写入独立 SQLite，并聚合为 30 分钟 bucket。
 - 菜单 Token 卡支持日 / 月 / 年 / 全部四个窗口；每个窗口展示总 Tokens、估算费用、缓存 / 新增、缓存命中率，卡片底部展示实时 TPS；无数据时不以 0 冒充。
 - 只保存统计维度、token 计数、工具名称与调用次数、编辑增删行和 hash 后的 session/source-file 标识，不保存正文、标题、完整 cwd、工具参数、补丁内容或凭证。
-- 本地长期采集默认开启（仅写本机 SQLite）；上报默认关闭。API 地址为空、canonical hostname 缺失或 `reporting.json` 不完整时都无法启用上报，也不会发起任何网络请求或外部进程。
+- 本地长期采集默认开启（仅写本机 SQLite）；上报默认关闭。API 地址（`REPORT_BASE_URL`）为空、canonical hostname（`REPORT_CANONICAL_HOSTNAME`）缺失或 `reporting.json` 协议结构不完整时都无法启用上报，也不会发起任何网络请求或外部进程。
 - 开启自动上报后会立即执行一次“扫描 → 上报”，此后每 30 分钟重复；关闭开关会停止后续周期，配置失效时会持久化关闭，不会在配置恢复后自行重新开启。
-- `reporting.json` 中的 path、header 名、静态 header、runtime header 模板、取 token 命令及 JSON key path 均由用户配置；仓库不提供环境相关默认值，token 仅在请求期间驻留内存。
+- 凭证与上报简单值统一收敛到一个合并 `.env`（见「凭证配置」）；`reporting.json` 只保留纯协议结构（path、header 名、静态 header、runtime header 模板、取 token 命令及 JSON key path），由用户配置，仓库不提供环境相关默认值，token 仅在请求期间驻留内存。
 
 如需从其他机器同步过来的 Claude-compatible JSONL 目录一并统计，可创建独立的本地来源配置：
 
@@ -178,7 +178,7 @@ open dist/AgentPulse.app
 
 - **配置权限**：`reporting.json` 必须为 `0600`（仅属主可读写），否则视为无效配置并拒绝加载。
 - **传输安全**：生产地址只接受 `https`；`http` 仅在 loopback（`localhost` / `127.0.0.1` / `::1`）时放行。base URL 不得携带用户名、密码、query 或 fragment。
-- **canonical hostname**：以配置中的 canonical hostname 作为上报身份；它必须与账本记录的 hostname 一致，不一致或未设置时要求先重建，绝不回退到系统主机名。
+- **canonical hostname**：以合并 `.env` 的 `REPORT_CANONICAL_HOSTNAME` 作为上报身份；它必须与账本记录的 hostname 一致，不一致或未设置时要求先重建，绝不回退到系统主机名。
 - **完整累计值**：普通上报发送本地账本中该设备每个 bucket 的完整累计值，而非单次增量，服务端做幂等 upsert。
 - **严格 ACK**：仅当响应逐维度精确回执（buckets / sessions 数量完全一致）时才标记已同步；`2xx {}`、字段缺失、少计或多计一律保持 pending。
 - **按 revision 精确对账**：每行携带 revision 快照，ack 时按（自然键 + revision 快照）精确匹配；上传期间被重算的行不会被误 ack，保持 dirty。
@@ -187,9 +187,9 @@ open dist/AgentPulse.app
 
 ### 谁开谁报与累计 upsert
 
-- **谁开谁报（本机 opt-in）**：本地长期采集与上报是两个相互独立的开关——采集默认开启（仅写本机 SQLite），上报默认关闭；只有在本机显式打开上报、填好 API 地址与 canonical hostname、且 `reporting.json` 校验通过时，这台设备才会以自己的 canonical hostname 作为上报身份上报自身账本。未开启上报的设备只在本地统计，不上报，也不代任何其他设备上报。
+- **谁开谁报（本机 opt-in）**：本地长期采集与上报是两个相互独立的开关——采集默认开启（仅写本机 SQLite），上报默认关闭；只有在本机显式打开上报、填好 API 地址（`REPORT_BASE_URL`）与 canonical hostname（`REPORT_CANONICAL_HOSTNAME`）、且 `reporting.json` 协议结构校验通过时，这台设备才会以自己的 canonical hostname 作为上报身份上报自身账本。未开启上报的设备只在本地统计，不上报，也不代任何其他设备上报。
 - **普通上报 = 累计值幂等 upsert**：每一轮普通上报发送本地账本中该设备**每个 bucket 的完整累计值**（并非单次增量），服务端据此做幂等 upsert。因此漏报、乱序或重试都能自愈：相同自然键重复提交只会覆盖为同一累计值，不会重复累加。
-- **API 地址仅本机配置、不随用量上传**：上报目标（base URL）只保存在本机应用偏好中，仅在发起上报时于内存中拼接请求；它既不写入账本 SQLite，也**不会作为任何字段包含在上传的用量 payload 里**。上传内容仅为聚合后的用量维度、token 计数与 hash 后的标识，不含地址、凭证、路径或会话正文。
+- **API 地址仅本机配置、不随用量上传**：上报目标（base URL）保存在本机合并 `.env` 的 `REPORT_BASE_URL`，仅在发起上报时于内存中拼接请求；它既不写入账本 SQLite，也**不会作为任何字段包含在上传的用量 payload 里**。上传内容仅为聚合后的用量维度、token 计数与 hash 后的标识，不含地址、凭证、路径或会话正文。
 
 默认配置路径（文件由用户自行创建，缺失即保持本地模式）：
 
@@ -197,11 +197,10 @@ open dist/AgentPulse.app
 ~/Library/Application Support/AgentPulse/reporting.json
 ```
 
-配置文件格式（全部为占位示例，请替换为你自己的服务端约定）：
+配置文件格式（只含纯协议结构；`canonicalHostname` 与 API 地址已下沉到合并 `.env`，此处不再出现。全部为占位示例，请替换为你自己的服务端约定）：
 
 ```json
 {
-  "canonicalHostname": "your-device-name",
   "path": "/your/ingest/path",
   "headers": {
     "authToken": "Authorization",
@@ -245,61 +244,64 @@ open dist/AgentPulse.app
 chmod 600 ~/Library/Application\ Support/AgentPulse/reporting.json
 ```
 
-base URL（API 地址）单独在设置中配置、仅保存在本机应用偏好（UserDefaults），发起上报时于内存中拼接请求，不写入账本 SQLite，也不会作为任何字段包含在上传的用量 payload 里。它按上述传输安全规则校验。取 token 命令的输出由 `statusKey` / `successStatus` / `errorKey` / `tokenKeyPath` 解析，token 不写入 SQLite、UserDefaults 或日志。
+base URL（API 地址）与 canonical hostname 在设置中配置、保存到合并 `.env` 的 `REPORT_BASE_URL` / `REPORT_CANONICAL_HOSTNAME`，发起上报时于内存中拼接请求，不写入账本 SQLite，也不会作为任何字段包含在上传的用量 payload 里。base URL 按上述传输安全规则校验。取 token 命令的输出由 `statusKey` / `successStatus` / `errorKey` / `tokenKeyPath` 解析，token 不写入 SQLite、UserDefaults 或日志。
 
 ---
 
-## 🖼 剪贴板图片上传 R2
+## 🔑 凭证配置（合并 env · 双源）
 
-在菜单栏的「设置…」→「R2 图片上传」中可修改配置文件位置，默认位于当前用户家目录：
+R2 上传、cliproxyapi 采集与上报的 base URL / canonical hostname 统一收敛到**一个** `.env` 文件，默认位于当前用户家目录：
 
 ```text
-~/.claude/.credentials/env/agent-pulse-r2.env
+~/.claude/.credentials/env/agent-pulse.env
 ```
 
 配置文件格式（全部为占位示例）：
 
 ```dotenv
+# R2 图片上传
 R2_ACCOUNT_ID=your-account-id
 R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
 R2_BUCKET=your-bucket
 R2_PUBLIC_BASE_URL=https://cdn.example.com
 R2_ACCESS_KEY_ID=your-access-key-id
 R2_SECRET_ACCESS_KEY=your-secret-access-key
-```
 
-复制剪贴板图片后按 `⌘⌥V` 即可上传，成功后悬浮球会弹出可复制的公开 URL 气泡，并在 3 秒后自动消失。
-
-应用只把 `.env` 的路径保存到 UserDefaults，配置值只在上传时读入内存。请勿把 `.env`、访问密钥、签名请求或预签名 URL 写入仓库或日志。
-
----
-
-## 🔌 cliproxyapi 用量采集
-
-在菜单栏的「设置…」→「cliproxyapi 用量采集」中可修改配置文件位置，默认位于当前用户家目录：
-
-```text
-~/.claude/.credentials/env/agent-pulse-cliproxy.env
-```
-
-配置文件格式（全部为占位示例）：
-
-```dotenv
+# cliproxyapi 用量采集
 CLIPROXY_BASE_URL=http://your-cliproxy-host:port
 CLIPROXY_MANAGEMENT_KEY=your-management-secret-key
 CLIPROXY_TARGET_API_KEY=sk-the-apikey-to-monitor
+
+# 上报简单值
+REPORT_BASE_URL=https://your-ingest-host
+REPORT_CANONICAL_HOSTNAME=your-device-name
 ```
 
-创建后请立即收紧权限：
+创建后请立即收紧权限（合并 env 必须为 `0600`，否则视为无效并禁用相关功能，不崩溃）：
 
 ```bash
-chmod 600 ~/.claude/.credentials/env/agent-pulse-cliproxy.env
+chmod 600 ~/.claude/.credentials/env/agent-pulse.env
 ```
+
+### 设置页双源与掩码
+
+在菜单栏的「设置…」中，凭证文件路径与每个配置项都可编辑：
+
+- **每项双源**：可选「从 env 读取」或「手动填写」。手填经「编辑 → 完成」提交，原子写回该 `0600` 文件（同目录临时文件 + rename，创建即 `0600`，绝不跟随 symlink）。
+- **密钥掩码**：`R2_SECRET_ACCESS_KEY`、`R2_ACCESS_KEY_ID`、`CLIPROXY_MANAGEMENT_KEY`、`CLIPROXY_TARGET_API_KEY` 一律中间星号回显（如 `abcd****wxyz`）；`R2_ACCOUNT_ID`、`R2_ENDPOINT`、`R2_BUCKET`、`R2_PUBLIC_BASE_URL`、`REPORT_BASE_URL`、`REPORT_CANONICAL_HOSTNAME` 明文回显。即便来源是 env，输入框也会回显读到的值（密钥仍掩码）。
+- **API 地址填好不自动开启上报**：`REPORT_BASE_URL` / `REPORT_CANONICAL_HOSTNAME` 就绪只是让上报可被启用，仍需你手动打开上报开关。
+- 应用只把 `.env` 的**路径**与每项**来源（env/手填）**保存到 UserDefaults；所有密钥、base URL、目标 apikey 只在使用时读入内存，绝不写入 UserDefaults、SQLite 或日志。请勿把 `.env`、访问密钥、签名请求或预签名 URL 写入仓库或日志。
+
+### R2 剪贴板上传
+
+复制剪贴板图片后按 `⌘⌥V` 即可上传，成功后悬浮球会弹出可复制的公开 URL 气泡，并在 3 秒后自动消失。R2 配置读取时强制 `0600` 属主专属常规文件。
+
+### cliproxyapi 用量采集
 
 - 采集在本地长期采集的同一节奏（应用启动一次 + 每 30 分钟）随扫描触发：拉取 cliproxyapi management 的 `GET /v0/management/usage`，在**本地**按目标 apikey 的 `SHA256` 与响应中的 `api_key_hash` 精确比对，只提取目标 key 的 token 用量。
 - 用量以来源 `cliproxy` 并入既有 usage 账本与上报链路（30 分钟 bucket、按 revision 精确对账），复用现有上报开关与协议，不新造上报通道。
 - 鉴权用 `Authorization: Bearer <management-key>`；生产地址要求 `https`，`http` 仅在 loopback 或私有内网地址放行。响应无界，设有最大字节保护，超限或拉取失败时**跳过本轮**，绝不影响本地文件采集与既有链路。
-- 配置文件必须为 `0600`，否则视为无效并禁用采集（不崩溃）。应用只把 `.env` 的**路径**保存到 UserDefaults；base URL、management key、目标 apikey 只在采集时读入内存，绝不写入 UserDefaults、SQLite 或日志。账本只保存 hash 后的 key 身份、model、token 计数与时间，不含明文 key、掩码 source、地址或正文。
+- 账本只保存 hash 后的 key 身份、model、token 计数与时间，不含明文 key、掩码 source、地址或正文。
 
 ---
 
@@ -343,6 +345,7 @@ swift run AgentPulseUsageVerification     # 账本到上报 payload 的离线组
 swift run MetricsLedgerPipelineVerification # schema 迁移与 tool/edit 指标管线
 swift run RuntimeHeaderParityVerification   # 增量上报 header 解析一致性
 swift run NaturalKeyGuardVerification       # wire 自然键碰撞门禁
+swift run SecureConfigVerification          # 合并 env 安全读写 / 0600 / 密钥掩码
 ```
 
 发布前还应在**离线副本**上执行生产数据库预检。该工具会拒绝活库及其硬链接，迁移并重扫指定副本，再检查 schema、parser、完整性、hostname、权限与指标；绝不能把活库路径传给它：
@@ -365,9 +368,10 @@ swift run AgentPulseCollectorSmoke
 
 - 默认仅本地；未显式开启或配置不完整时不发起上报。
 - 只解析统计所需的日志字段；不保存、不上传、不展示会话正文、标题或完整 cwd。
-- 不在仓库或日志中写入 credential、签名请求或预签名 URL；R2 配置值仅在上传时读入内存。
+- 不在仓库或日志中写入 credential、签名请求或预签名 URL；凭证值仅在使用时读入内存。
+- 凭证与上报简单值只落合并 `.env`（强制 `0600`，写回原子且不跟随 symlink）；密钥在设置页中间星号回显，绝不进 UserDefaults、SQLite 或日志。UserDefaults 只存 `.env` 路径与每项来源（env/手填）。
 - SQLite 仅保存聚合数值、hash 标识与不含路径/正文的快照。
-- 可选上报不内置 API 地址、环境专用 header 或取 token 命令，凭证不会写入 SQLite、UserDefaults 或日志。
+- `reporting.json` 只含纯协议结构，不含 API 地址、canonical hostname 或凭证；取 token 命令的 token 不写入 SQLite、UserDefaults 或日志。
 
 ---
 
