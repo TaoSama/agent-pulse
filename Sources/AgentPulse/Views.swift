@@ -148,8 +148,8 @@ struct MenuBarSummaryView: View {
     /// 概览尚未测得高度时，设置页回落到的默认高度（首帧或异常兜底）。
     private static let settingsFallbackHeight: CGFloat = 640
 
-    /// Token 汇总卡与分模型明细卡共用同一时间窗口选择；持久化，面板重开保留上次选择。
-    @AppStorage("menubar.tokenWindow") private var tokenWindow: TokenUsageWindow = .day
+    /// Token 汇总卡与分模型明细卡共用同一时间窗口选择；不持久化，面板每次重开默认「日」。
+    @State private var tokenWindow: TokenUsageWindow = .day
     /// 面板内是否切到设置视图（复用同一弹窗，不再弹独立窗口）。
     @State private var showingSettings = false
     /// 概览面板的实时测量高度：设置页据此锁成同高，使两页切换严格对齐、不跳动。
@@ -171,6 +171,8 @@ struct MenuBarSummaryView: View {
         .onDisappear {
             // 面板关闭后复位到默认菜单：下次打开回到概览而非停在设置界面。
             showingSettings = false
+            // Token 窗口 tab 不记忆：面板每次重开默认回到「日」。
+            tokenWindow = .day
         }
     }
 
@@ -216,6 +218,16 @@ struct MenuBarSummaryView: View {
             HStack(alignment: .center, spacing: 8) {
                 Text("Agent Pulse").font(.subheadline.weight(.semibold))
                 Spacer()
+                // 设置齿轮快捷入口：面板内切到设置页（与底部「设置」同一动作）。
+                Button {
+                    showingSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 13))
+                }
+                .buttonStyle(BackHotZoneButtonStyle())
+                .focusable(false)
+                .accessibilityLabel("设置")
                 Circle()
                     .fill(model.tps == nil ? Color.primary : trendColor)
                     .frame(width: 7, height: 7)
