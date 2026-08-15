@@ -12,6 +12,16 @@ private enum TokenSyncScanError: Error {
     case sourceRootNotEnumerable(source: String)
 }
 
+/// off-main worker 向主线程回报的一次进度快照（Sendable）。
+/// 只含聚合数（阶段、文件计数、整体百分比），不含路径或正文。
+private struct ScanProgressUpdate: Sendable {
+    let phase: TokenScanPhase
+    let scannedFiles: Int
+    let totalFiles: Int
+    /// 整体进度 0~1（跨阶段带权重累加）。
+    let overall: Double
+}
+
 /// 维护本地长期采集、普通上报开关和状态展示，并串起完整生产链：
 /// 扫描（record 原始 token + session 事件）→ 按需 rebuild → finalizeDerived → summary →
 /// 上报资格门禁 → 可选普通上报。
@@ -29,6 +39,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         static let reportingEnabled = "tokenSync.reportingEnabled"
         static let ingestBaseURL = "tokenSync.ingestBaseURL"
         static let canonicalHostname = "tokenSync.canonicalHostname"
+        static let autoReportInterval = "tokenSync.autoReportIntervalSeconds"
     }
 
     private let defaults: UserDefaults
@@ -84,9 +95,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         statusSubject.eraseToAnyPublisher()
     }
 
-    /// 自动上报循环周期：启动时执行首轮，之后每 30 分钟触发一次。
-    /// 关闭上报开关 / stop() 时立即取消。
-    private static let autoReportInterval: TimeInterval = 30 * 60
+    /// 自动上报循环周期：启动时执行首轮，之后每隔本间隔触发一次（本机行为，可在设置调整）。
+    /// 关闭上报开关 / stop() 时立即取消；改动间隔会重启循环使新值生效。
+    private var autoReportInterval: TokenReportInterval
 
     init(
         defaults: UserDefaults = .standard,
@@ -111,6 +122,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
         let localCollection = defaults.object(forKey: DefaultsKey.localCollectionEnabled) as? Bool ?? true
         let storedReporting = defaults.object(forKey: DefaultsKey.reportingEnabled) as? Bool ?? false
+        // 自动上报间隔（本机行为，不进上报身份）：缺省 30 分钟；非法值回落 30 分钟。
+        let reportInterval = TokenReportInterval.from(
+            seconds: defaults.object(forKey: DefaultsKey.autoReportInterval) as? Int ?? TokenReportInterval.default.rawValue
+        )
+        self.autoReportInterval = reportInterval
         // base URL 权威改为合并 env 的 REPORT_BASE_URL；env 缺失时回落到旧 UserDefaults 值（平滑迁移）。
         let baseURL = Self.envBaseURL(url: self.mergedEnvURL) ?? (defaults.string(forKey: DefaultsKey.ingestBaseURL) ?? "")
         var storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
@@ -179,6 +195,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             pendingSessions: pending.1,
             lastReportSucceeded: nil
         ))
+        // status literal 未显式列出的字段走默认值；间隔单独回填以回显持久化档位。
+        var initialStatus = statusSubject.value
+        initialStatus.autoReportInterval = reportInterval
+        statusSubject.send(initialStatus)
     }
 
     // MARK: - Settings
@@ -229,6 +249,19 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             reportNow()
         }
         // 启动 30 分钟自动循环；已在跑则不重启。
+        startAutoLoopIfNeeded()
+    }
+
+    /// 设置自动上报间隔（本机行为，不进上报身份）：写 defaults + 回显 status，
+    /// 并重启自动上报循环使新间隔立即生效（若循环当前活跃）。
+    func setAutoReportInterval(_ interval: TokenReportInterval) {
+        guard interval != autoReportInterval else { return }
+        autoReportInterval = interval
+        defaults.set(interval.rawValue, forKey: DefaultsKey.autoReportInterval)
+        updateStatus { $0.autoReportInterval = interval }
+        // 重启循环使新间隔生效：仅当条件仍满足时 startAutoLoopIfNeeded 才会重建。
+        autoLoopTask?.cancel()
+        autoLoopTask = nil
         startAutoLoopIfNeeded()
     }
 
@@ -318,7 +351,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             updateStatus { $0.scanningInProgress = false }
             return
         }
-        updateStatus { $0.scanningInProgress = true }
+        // 置位扫描进度：起点为 cliproxy 阶段 0%。文件计数在 scanning 阶段登记。
+        updateStatus { status in
+            status.scanningInProgress = true
+            status.scanPhase = .cliproxy
+            status.scannedFiles = 0
+            status.totalFiles = 0
+            status.scanProgress = 0
+        }
 
         let currentParserVersion = UsageJSONLParser.parserVersion
         // 在启动后台 Task 前捕获为局部常量：闭包内 self 为弱引用，不能直接访问实例存储属性。
@@ -328,12 +368,20 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let generation = scanGeneration
         let cliProxyService = self.cliProxyService
         let cliProxyConfigPath = Self.cliProxyConfigPath(defaults: defaults)
+        // 进度回调：worker 各阶段 / 逐文件回报聚合快照，跨线程回到主 actor 更新 status；
+        // 仅当仍是当前 generation 时才写，避免旧扫描回调覆盖新扫描。
+        let progressReporter = ScanProgressReporter { [weak self] update in
+            Task { @MainActor in
+                self?.applyScanProgress(update, generation: generation)
+            }
+        }
         scanTask = Task { [weak self] in
             // cliproxy 主动拉取（异步 HTTP）在进入阻塞式文件扫描之前完成；失败仅记状态、
             // 返回空事件，绝不影响本地文件采集与既有链路。
             var cliProxyEvents: [UsageEvent] = []
             var cliProxyError: String?
             let cliProxyConfigured = CliProxyUsageService.isConfigured(atPath: cliProxyConfigPath)
+            progressReporter.enterPhase(.cliproxy)
             if cliProxyConfigured {
                 do {
                     cliProxyEvents = try await cliProxyService.fetchUsageEvents(atPath: cliProxyConfigPath)
@@ -343,6 +391,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     cliProxyError = (error as? LocalizedError)?.errorDescription ?? "cliproxyapi 采集失败"
                 }
             }
+            progressReporter.completePhase(.cliproxy)
             self?.updateCliProxyStatus(configured: cliProxyConfigured, error: cliProxyError, generation: generation)
 
             // 绑定为不可变值再进入 @Sendable worker，满足 Swift 6 并发捕获约束。
@@ -361,27 +410,34 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     try ledger.beginParserRebuild(targetParserVersion: currentParserVersion)
                 }
                 try gate.throwIfCancelled()
+                // 进入 scanning 阶段：先枚举全部来源 root 的 jsonl 总数作为进度分母，
+                // 再逐文件处理并回报（已处理/总数）。totalFiles 为 0 时进度按阶段权重阶跃。
+                let localSources = Self.loadLocalCollectionSources(url: localSourcesURL)
+                var scanRoots: [URL] = [Self.codexSessionsRoot, Self.codexArchivedSessionsRoot, Self.claudeProjectsRoot]
+                scanRoots += localSources.map(\.root)
+                let totalFiles = scanRoots.reduce(0) { $0 + Self.countJSONLFiles(root: $1) }
+                progressReporter.setScanningTotal(totalFiles)
                 // 逐来源扫描并收集磁盘 present fileID；record 只处理变化文件（status!=complete 或
                 // size/mtime/parserVersion 不匹配），不触发派生重算。
                 // Codex sessions 与 archived_sessions 同为 source="codex"：必须合并两 root 的
                 // present 集合后，对 "codex" 只调用一次 markFilesMissing，否则会互相误标 missing。
                 var codexPresentFileIDs: [String] = []
-                codexPresentFileIDs += try Self.scan(root: Self.codexSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate)
+                codexPresentFileIDs += try Self.scan(root: Self.codexSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate, progress: progressReporter)
                 try gate.throwIfCancelled()
                 // 归档会话不属于运行中 task 口径，但其已产生的 token 仍属于累计用量。
-                codexPresentFileIDs += try Self.scan(root: Self.codexArchivedSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate)
+                codexPresentFileIDs += try Self.scan(root: Self.codexArchivedSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate, progress: progressReporter)
                 try gate.throwIfCancelled()
                 try ledger.markFilesMissing(source: "codex", presentFileIDs: codexPresentFileIDs)
                 try gate.throwIfCancelled()
-                let claudePresentFileIDs = try Self.scan(root: Self.claudeProjectsRoot, source: "claude-code", includeSubagents: true, ledger: ledger, hostname: hostname, cancellation: gate)
+                let claudePresentFileIDs = try Self.scan(root: Self.claudeProjectsRoot, source: "claude-code", includeSubagents: true, ledger: ledger, hostname: hostname, cancellation: gate, progress: progressReporter)
                 try gate.throwIfCancelled()
                 try ledger.markFilesMissing(source: "claude-code", presentFileIDs: claudePresentFileIDs)
                 try gate.throwIfCancelled()
                 // 可选的用户声明本地来源（Claude-compatible transcript）。配置缺失/非法不影响内建来源。
                 // 每个自定义 source 独立聚合 present 集合，再各自按 source 标 missing。
                 var localPresentBySource: [String: [String]] = [:]
-                for local in Self.loadLocalCollectionSources(url: localSourcesURL) {
-                    let present = try Self.scan(root: local.root, source: local.source, includeSubagents: local.includeSubagents, ledger: ledger, hostname: hostname, cancellation: gate)
+                for local in localSources {
+                    let present = try Self.scan(root: local.root, source: local.source, includeSubagents: local.includeSubagents, ledger: ledger, hostname: hostname, cancellation: gate, progress: progressReporter)
                     localPresentBySource[local.source, default: []] += present
                     try gate.throwIfCancelled()
                 }
@@ -389,17 +445,21 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     try ledger.markFilesMissing(source: source, presentFileIDs: present)
                     try gate.throwIfCancelled()
                 }
+                progressReporter.completePhase(.scanning)
                 // cliproxy 主动拉取事件：只写原始层，不写文件 checkpoint（网络来源无偏移语义）。
                 try ledger.recordNetworkEvents(networkEvents, source: CliProxyUsageParser.source, hostname: hostname)
                 try gate.throwIfCancelled()
                 // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
+                progressReporter.enterPhase(.finalizing)
                 let finalize = try ledger.finalizeDerived(hostname: hostname)
+                progressReporter.completePhase(.finalizing)
                 // 只有在所有来源都完整扫描（无致命失败：任一来源枚举失败 / 单文件 I/O 失败都会
                 // 在上面抛出并终止本次扫描，不会到达此处）后，才显式清除 rebuild pending。
                 // record/finalize 不会推断重扫已完成，清除是此处唯一入口。
                 if try ledger.requiresRebuildCompletion() {
                     try ledger.markRebuildCompleted()
                 }
+                progressReporter.enterPhase(.summarizing)
                 let summary = try Self.summaries(
                     from: ledger,
                     hostname: hostname,
@@ -407,6 +467,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     calendar: summaryCalendar
                 )
                 let pending = try ledger.pendingCounts(hostname: hostname)
+                progressReporter.completePhase(.summarizing)
                 return ScanOutcome(summary: summary, finalize: finalize, pending: pending)
             }
             let cancelled = Task.isCancelled
@@ -461,6 +522,17 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
     }
 
+    /// 应用一次扫描进度快照（只在当前 generation 且仍在扫描时写；旧扫描回调直接忽略）。
+    private func applyScanProgress(_ update: ScanProgressUpdate, generation: UInt64) {
+        guard generation == scanGeneration, statusSubject.value.scanningInProgress else { return }
+        updateStatus { status in
+            status.scanPhase = update.phase
+            status.scannedFiles = update.scannedFiles
+            status.totalFiles = update.totalFiles
+            status.scanProgress = update.overall
+        }
+    }
+
     private func finishScan(generation: UInt64, cancelled: Bool, chainedReport: Bool, result: Result<ScanOutcome, Error>) {
         // 只处理当前 generation 的完成回调；旧任务被取消后再回到主线程时，
         // 若新任务已启动，generation 会不同，直接忽略避免覆盖新句柄。
@@ -468,7 +540,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         scanTask = nil
         if cancelled {
             reportAfterCurrentScan = false
-            updateStatus { $0.scanningInProgress = false }
+            updateStatus { Self.clearScanProgress(&$0) }
             return
         }
         switch result {
@@ -476,7 +548,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             publish(outcome.summary)
             updateStatus { status in
                 status.lastScanAt = Date()
-                status.scanningInProgress = false
+                Self.clearScanProgress(&status)
                 status.configurationError = nil
                 status.reportingEligible = outcome.finalize.reportingEligible
                 status.reportingBlockedReasons = outcome.finalize.blockedReasons
@@ -502,16 +574,25 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             }
         case let .failure(error) where error is CancellationError:
             reportAfterCurrentScan = false
-            updateStatus { $0.scanningInProgress = false }
+            updateStatus { Self.clearScanProgress(&$0) }
         case .failure:
             reportAfterCurrentScan = false
             // 扫描失败（含来源目录枚举失败、单文件 I/O 失败）：保持 rebuild pending，
             // 绝不清除、绝不发网络请求。恢复标记保留，待下次扫描重试。
             updateStatus { status in
-                status.scanningInProgress = false
+                Self.clearScanProgress(&status)
                 status.configurationError = "本地扫描失败"
             }
         }
+    }
+
+    /// 复位扫描进度展示字段：结束扫描时把百分比 / 文件计数 / 阶段清零。
+    private static func clearScanProgress(_ status: inout TokenSyncStatus) {
+        status.scanningInProgress = false
+        status.scanPhase = nil
+        status.scannedFiles = 0
+        status.totalFiles = 0
+        status.scanProgress = nil
     }
 
     // MARK: - Report
@@ -693,7 +774,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         guard autoLoopTask == nil, isRunning, statusSubject.value.reportingEnabled,
               !isRebuildCompletionPending() else { return }
         autoLoopTask = Task { [weak self] in
-            let interval = TokenSyncCoordinator.autoReportInterval
+            let interval = self?.autoReportInterval.seconds ?? TokenReportInterval.default.seconds
             while !Task.isCancelled {
                 do {
                     try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
@@ -863,6 +944,54 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
         func throwIfCancelled() throws {
             if isCancelled { throw CancellationError() }
+        }
+    }
+
+    /// worker 内的进度累加器：把「阶段权重 + scanning 逐文件计数」折算成整体 0~1，
+    /// 并把聚合快照回调给主线程。只在 worker 队列上顺序调用，无需加锁。
+    /// 只搬运聚合数（阶段、文件计数、百分比），绝不携带路径 / 正文 / 凭证。
+    private final class ScanProgressReporter: @unchecked Sendable {
+        private let emit: @Sendable (ScanProgressUpdate) -> Void
+        private var totalFiles = 0
+        private var scannedFiles = 0
+
+        init(_ emit: @escaping @Sendable (ScanProgressUpdate) -> Void) {
+            self.emit = emit
+        }
+
+        /// 进入某阶段：先按已完成阶段权重报出阶段起点百分比（阶跃）。
+        func enterPhase(_ phase: TokenScanPhase) {
+            send(phase: phase, fraction: 0)
+        }
+
+        /// 完成某阶段：报出阶段终点（该阶段满权重）。
+        func completePhase(_ phase: TokenScanPhase) {
+            send(phase: phase, fraction: 1)
+        }
+
+        /// scanning 阶段：登记本轮待处理文件总数（多来源枚举后调用一次）。
+        func setScanningTotal(_ total: Int) {
+            totalFiles = max(0, total)
+            scannedFiles = 0
+            send(phase: .scanning, fraction: 0)
+        }
+
+        /// scanning 阶段：处理完一个文件后自增并回报（含 已扫描/总数）。
+        func advanceScannedFile() {
+            scannedFiles += 1
+            let fraction = totalFiles > 0 ? Double(scannedFiles) / Double(totalFiles) : 1
+            send(phase: .scanning, fraction: fraction)
+        }
+
+        private func send(phase: TokenScanPhase, fraction: Double) {
+            let clamped = min(max(fraction, 0), 1)
+            let overall = min(phase.baseProgress + clamped * phase.weight, 1)
+            emit(ScanProgressUpdate(
+                phase: phase,
+                scannedFiles: scannedFiles,
+                totalFiles: totalFiles,
+                overall: overall
+            ))
         }
     }
 
@@ -1047,7 +1176,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 返回本次在磁盘上实际枚举到的该来源文件 fileID 列表（present set）。调用方据此在扫描
     /// 全部 root 后按 source 聚合，交给 Ledger 标记「磁盘已消失」文件为 missing（保留 raw 历史）。
     @discardableResult
-    nonisolated private static func scan(root: URL, source: String, includeSubagents: Bool = false, ledger: UsageLedgerStore, hostname: String, cancellation: CancellationGate) throws -> [String] {
+    nonisolated private static func scan(root: URL, source: String, includeSubagents: Bool = false, ledger: UsageLedgerStore, hostname: String, cancellation: CancellationGate, progress: ScanProgressReporter) throws -> [String] {
         // 不存在的来源根目录：无需扫描，视作该来源“无内容”（非失败）。
         // 但根目录存在却无法枚举，属致命失败：绝不能当作扫描成功静默吞掉，
         // 否则会在数据缺失的情况下清除 rebuild pending / 误判“全量成功”。
@@ -1069,6 +1198,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             let modifiedAt = values.contentModificationDate ?? Date.distantPast
             let fileID = UsageJSONLParser.fileID(for: url.path)
             presentFileIDs.append(fileID)
+            // 每个枚举到的 jsonl 文件（无论跳过还是解析）都推进一格进度，与预扫总数对齐。
+            progress.advanceScannedFile()
             if let checkpoint = try ledger.checkpoint(fileID: fileID),
                checkpoint.status == "complete",
                checkpoint.size == fileSize,
@@ -1101,5 +1232,23 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     nonisolated private static func isClaudeSubagentTranscript(_ url: URL) -> Bool {
         url.deletingPathExtension().lastPathComponent.hasPrefix("agent-")
             && url.deletingLastPathComponent().lastPathComponent == "subagents"
+    }
+
+    /// 预扫某来源根目录的 jsonl 文件数，作为 scanning 阶段进度分母（best-effort）。
+    /// 目录不存在 / 无法枚举时返回 0；真实 scan 仍会在无法枚举时抛致命错误。
+    nonisolated private static func countJSONLFiles(root: URL) -> Int {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+              ) else { return 0 }
+        var count = 0
+        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
+            count += 1
+        }
+        return count
     }
 }

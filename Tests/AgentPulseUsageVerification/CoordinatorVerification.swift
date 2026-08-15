@@ -19,7 +19,103 @@ enum CoordinatorVerification {
         try verifyFullScanEvidenceGatesRebuildCompletion(source)
         try verifyHostnameMismatchPromptNotGatedByAuthority(source)
         try verifyReportingAuthorityFromEnv(source)
+        try verifyScanProgressReporting(source)
+        try verifyAutoReportIntervalIsConfigurable(source)
         print("TokenSyncCoordinator verification passed")
+    }
+
+    /// 扫描进度上报契约（E1）：
+    /// - 进入扫描时置位阶段/百分比，结束时统一 clearScanProgress 归零；
+    /// - scanning 阶段先预扫全部来源 root 的 jsonl 总数（setScanningTotal）再逐文件 advanceScannedFile；
+    /// - 进度回调只在当前 generation 且仍在扫描时写（applyScanProgress 门禁），避免旧扫描覆盖新扫描；
+    /// - 各阶段边界都通过 ScanProgressReporter 报点（cliproxy / scanning / finalizing / summarizing）。
+    private static func verifyScanProgressReporting(_ source: String) throws {
+        let scanBody = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
+        // 置位进度：scanningInProgress 与阶段/百分比一并写入。
+        try require(
+            scanBody.contains("status.scanPhase = .cliproxy")
+                && scanBody.contains("status.scanProgress = 0"),
+            "scanNow 未在启动时置位扫描进度阶段/百分比"
+        )
+        // 进度回调经 generation 门禁跨线程回主 actor。
+        try require(
+            scanBody.contains("ScanProgressReporter { [weak self] update in")
+                && scanBody.contains("self?.applyScanProgress(update, generation: generation)"),
+            "scanNow 未建立带 generation 门禁的进度回调"
+        )
+        // scanning 阶段：预扫总数在逐文件 scan 之前。
+        let totalOffset = try offset(of: "progressReporter.setScanningTotal(totalFiles)", in: scanBody)
+        let firstScanOffset = try offset(of: "Self.scan(root: Self.codexSessionsRoot", in: scanBody)
+        try require(totalOffset < firstScanOffset, "预扫文件总数必须在逐文件扫描之前登记")
+        try require(
+            scanBody.contains("Self.countJSONLFiles(root: $1)"),
+            "scanning 阶段未预扫来源 root 的 jsonl 总数作为进度分母"
+        )
+        // 各阶段边界均报点。
+        for marker in [
+            "progressReporter.completePhase(.cliproxy)",
+            "progressReporter.completePhase(.scanning)",
+            "progressReporter.enterPhase(.finalizing)",
+            "progressReporter.enterPhase(.summarizing)",
+        ] {
+            try require(scanBody.contains(marker), "scanNow 缺少阶段进度报点：\(marker)")
+        }
+
+        // scan 逐文件推进进度。
+        let scanFn = try functionBody(matching: "nonisolated private static func scan(", in: source)
+        try require(scanFn.contains("progress.advanceScannedFile()"), "scan 未逐文件推进进度")
+
+        // applyScanProgress：generation + scanningInProgress 双重门禁。
+        let apply = try functionBody(named: "applyScanProgress", in: source)
+        try require(
+            apply.contains("generation == scanGeneration, statusSubject.value.scanningInProgress"),
+            "applyScanProgress 未同时用 generation 与 scanningInProgress 做门禁"
+        )
+
+        // finishScan 各分支统一 clearScanProgress 归零。
+        let clear = try functionBody(matching: "private static func clearScanProgress(", in: source)
+        try require(
+            clear.contains("status.scanningInProgress = false")
+                && clear.contains("status.scanPhase = nil")
+                && clear.contains("status.scanProgress = nil"),
+            "clearScanProgress 未把扫描进度字段全部归零"
+        )
+    }
+
+    /// 上报间隔可配置契约（E2）：
+    /// - 间隔为实例属性、从 defaults 读取（缺省档），不再是硬编码静态常量；
+    /// - setAutoReportInterval 写 defaults + 重启自动循环使新值生效；
+    /// - 自动循环读取实例间隔（而非静态常量）。
+    private static func verifyAutoReportIntervalIsConfigurable(_ source: String) throws {
+        try require(
+            source.contains("private var autoReportInterval: TokenReportInterval"),
+            "autoReportInterval 未改为可配置的实例属性"
+        )
+        try require(
+            !source.contains("private static let autoReportInterval: TimeInterval"),
+            "autoReportInterval 仍是硬编码静态常量"
+        )
+        // init 从 defaults 读取间隔。
+        let initializer = try functionBody(matching: "init(", in: source)
+        try require(
+            initializer.contains("DefaultsKey.autoReportInterval")
+                && initializer.contains("self.autoReportInterval = reportInterval"),
+            "init 未从 defaults 读取并回填自动上报间隔"
+        )
+        // setter：写 defaults + 重启循环。
+        let setter = try functionBody(named: "setAutoReportInterval", in: source)
+        try require(
+            setter.contains("defaults.set(interval.rawValue, forKey: DefaultsKey.autoReportInterval)")
+                && setter.contains("autoLoopTask?.cancel()")
+                && setter.contains("startAutoLoopIfNeeded()"),
+            "setAutoReportInterval 未写 defaults 或未重启自动循环"
+        )
+        // 自动循环读取实例间隔。
+        let autoLoop = try functionBody(named: "startAutoLoopIfNeeded", in: source)
+        try require(
+            autoLoop.contains("self?.autoReportInterval.seconds"),
+            "自动循环未读取实例级上报间隔"
+        )
     }
 
     /// 上报权威（hostname / base URL）改由合并 env 供给，reporting.json 只留纯协议结构：
