@@ -548,6 +548,11 @@ struct OrbView: View {
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(Color.white)
+                // 今日 token 总数：至多两位有效数字 + 单位 + 至多一位小数（1.2M / 15K）。
+                Text(TokenUsageFormatting.compactTokens(model.tokenSummary.day?.totalTokens))
+                    .font(.system(size: 8, weight: .medium, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(Color.white.opacity(0.7))
             }
         }
         .contentShape(Circle())

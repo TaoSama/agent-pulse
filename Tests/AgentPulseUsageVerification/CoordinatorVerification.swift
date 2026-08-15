@@ -26,7 +26,7 @@ enum CoordinatorVerification {
 
     /// 扫描进度上报契约（E1）：
     /// - 进入扫描时置位阶段/百分比，结束时统一 clearScanProgress 归零；
-    /// - scanning 阶段先预扫全部来源 root 的 jsonl 总数（setScanningTotal）再逐文件 advanceScannedFile；
+    /// - scanning 阶段先预扫全部来源 root 的 jsonl 总数（setPhaseTotal）再逐文件 advanceItem；
     /// - 进度回调只在当前 generation 且仍在扫描时写（applyScanProgress 门禁），避免旧扫描覆盖新扫描；
     /// - 各阶段边界都通过 ScanProgressReporter 报点（cliproxy / scanning / finalizing / summarizing）。
     private static func verifyScanProgressReporting(_ source: String) throws {
@@ -44,7 +44,7 @@ enum CoordinatorVerification {
             "scanNow 未建立带 generation 门禁的进度回调"
         )
         // scanning 阶段：预扫总数在逐文件 scan 之前。
-        let totalOffset = try offset(of: "progressReporter.setScanningTotal(totalFiles)", in: scanBody)
+        let totalOffset = try offset(of: "progressReporter.setPhaseTotal(.scanning, total: totalFiles)", in: scanBody)
         let firstScanOffset = try offset(of: "Self.scan(root: Self.codexSessionsRoot", in: scanBody)
         try require(totalOffset < firstScanOffset, "预扫文件总数必须在逐文件扫描之前登记")
         try require(
@@ -56,14 +56,14 @@ enum CoordinatorVerification {
             "progressReporter.completePhase(.cliproxy)",
             "progressReporter.completePhase(.scanning)",
             "progressReporter.enterPhase(.finalizing)",
-            "progressReporter.enterPhase(.summarizing)",
+            "progressReporter.enterPhase(.summarizing",
         ] {
             try require(scanBody.contains(marker), "scanNow 缺少阶段进度报点：\(marker)")
         }
 
         // scan 逐文件推进进度。
         let scanFn = try functionBody(matching: "nonisolated private static func scan(", in: source)
-        try require(scanFn.contains("progress.advanceScannedFile()"), "scan 未逐文件推进进度")
+        try require(scanFn.contains("progress.advanceItem(.scanning)"), "scan 未逐文件推进进度")
 
         // applyScanProgress：generation + scanningInProgress 双重门禁。
         let apply = try functionBody(named: "applyScanProgress", in: source)

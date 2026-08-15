@@ -274,10 +274,10 @@ struct TokenSyncStatus: Sendable, Equatable {
 
     /// 当前扫描阶段；scanningInProgress == false 时为 nil。仅用于进度展示。
     var scanPhase: TokenScanPhase? = nil
-    /// scanning 阶段已处理文件数（仅在 .scanning 阶段有意义）。
-    var scannedFiles: Int = 0
-    /// scanning 阶段待处理文件总数（先枚举得出；0 表示未知/无文件）。
-    var totalFiles: Int = 0
+    /// 当前阶段已完成项数（量纲随阶段：文件 / 事件 / 步 / 窗口 / 行）。
+    var scanDone: Int = 0
+    /// 当前阶段总项数（0 表示未知/无项，此时不显示计数）。
+    var scanTotal: Int = 0
     /// 整体进度 0~1（跨全部阶段带权重累加）；未在扫描时为 nil。
     var scanProgress: Double? = nil
 
@@ -410,6 +410,32 @@ enum TokenUsageFormatting {
         }
     }
 
+    /// 极简 token 数（悬浮球用）：至多两位有效数字 + 单位（K/M/B）+ 至多一位小数。
+    /// 统一逻辑，无小值特例：选使尾数落在 [0.1, 100) 的最大单位，尾数达三位数即进位到更大单位。
+    /// 尾数 ≥ 10 显示整数（11B / 12M / 15K），尾数 < 10 显示一位小数（1.0B / 0.1B / 1.2M / 1.0K）。
+    /// 极小值一律用 K 兜底（如 500 → 0.5K，0 → 0.0K）。
+    static func compactTokens(_ value: Int64?) -> String {
+        guard let value else { return "—" }
+        let units: [(threshold: Double, suffix: String)] = [
+            (1_000_000_000, "B"),
+            (1_000_000, "M"),
+            (1_000, "K"),
+        ]
+        // 找到使尾数落在 [0.1, 100) 的最大单位；100M 因尾数 100 会进位到 B → 0.1B。
+        for unit in units {
+            let scaled = Double(value) / unit.threshold
+            guard abs(scaled) >= 0.1, abs(scaled) < 100 else { continue }
+            let format = abs(scaled) >= 10 ? "%.0f\(unit.suffix)" : "%.1f\(unit.suffix)"
+            return String(format: format, scaled)
+        }
+        // 尾数在所有单位下都 < 0.1（值 < 100）：用 K 兜底一位小数（0.0K / 0.1K）。
+        // 或尾数 ≥ 100 且已是最大单位 B：用整数 B（如 120B）。
+        if abs(value) >= 1_000_000_000 {
+            return String(format: "%.0fB", Double(value) / 1_000_000_000)
+        }
+        return String(format: "%.1fK", Double(value) / 1_000)
+    }
+
     static func cost(_ value: Double?) -> String {
         guard let value else { return "—" }
         if value >= 100 { return String(format: "$%.0f", value) }
@@ -422,7 +448,7 @@ enum TokenUsageFormatting {
     }
 
     /// 菜单底部详细进度行：「刷新进度：13.0% · 扫描文件 · 376/2831 文件」。
-    /// 整体百分比 + 中文阶段名 +（仅 scanning 且 totalFiles>0 时）已扫描/总数 + 单位。
+    /// 整体百分比 + 中文阶段名 +（任一阶段 scanTotal>0 时）已完成/总数 + 该阶段量词。
     /// 未在扫描/上报时返回 nil。只读展示聚合数，不含文件路径、会话正文或凭证。
     /// `percentOverride` 传入平滑后的展示值（0…1）时用它替代原始 scanProgress，
     /// 让百分比随时间缓动而非阶跃；nil 时回退原始值。
@@ -430,8 +456,8 @@ enum TokenUsageFormatting {
         guard status.scanningInProgress || status.reportingInProgress else { return nil }
         let percentText = percent(percentOverride ?? status.scanProgress)
         guard let phase = status.scanPhase else { return "刷新进度：\(percentText)" }
-        if phase == .scanning, status.totalFiles > 0 {
-            return "刷新进度：\(percentText) · \(phase.displayLabel) · \(status.scannedFiles)/\(status.totalFiles) \(phase.unit)"
+        if status.scanTotal > 0 {
+            return "刷新进度：\(percentText) · \(phase.displayLabel) · \(status.scanDone)/\(status.scanTotal) \(phase.unit)"
         }
         return "刷新进度：\(percentText) · \(phase.displayLabel)"
     }

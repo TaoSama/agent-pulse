@@ -13,11 +13,12 @@ private enum TokenSyncScanError: Error {
 }
 
 /// off-main worker 向主线程回报的一次进度快照（Sendable）。
-/// 只含聚合数（阶段、文件计数、整体百分比），不含路径或正文。
+/// 只含聚合数（阶段、已完成/总数计数、整体百分比），不含路径或正文。
 private struct ScanProgressUpdate: Sendable {
     let phase: TokenScanPhase
-    let scannedFiles: Int
-    let totalFiles: Int
+    /// 当前阶段的已完成 / 总数（量纲随阶段：文件 / 事件 / 步 / 窗口 / 行）。
+    let done: Int
+    let total: Int
     /// 整体进度 0~1（跨阶段带权重累加）。
     let overall: Double
 }
@@ -384,8 +385,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         updateStatus { status in
             status.scanningInProgress = true
             status.scanPhase = .cliproxy
-            status.scannedFiles = 0
-            status.totalFiles = 0
+            status.scanDone = 0
+            status.scanTotal = 0
             status.scanProgress = 0
         }
 
@@ -421,6 +422,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     cliProxyError = (error as? LocalizedError)?.errorDescription ?? "cliproxyapi 采集失败"
                 }
             }
+            // 登记本阶段计数：拉取到的事件数（未配置或失败时为 0，则该阶段不显示计数）。
+            progressReporter.setPhaseTotal(.cliproxy, total: cliProxyEvents.count)
             progressReporter.completePhase(.cliproxy)
             self?.updateCliProxyStatus(configured: cliProxyConfigured, error: cliProxyError, generation: generation)
 
@@ -446,7 +449,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 var scanRoots: [URL] = [Self.codexSessionsRoot, Self.codexArchivedSessionsRoot, Self.claudeProjectsRoot]
                 scanRoots += localSources.map(\.root)
                 let totalFiles = scanRoots.reduce(0) { $0 + Self.countJSONLFiles(root: $1) }
-                progressReporter.setScanningTotal(totalFiles)
+                progressReporter.setPhaseTotal(.scanning, total: totalFiles)
                 // 逐来源扫描并收集磁盘 present fileID；record 只处理变化文件（status!=complete 或
                 // size/mtime/parserVersion 不匹配），不触发派生重算。
                 // Codex sessions 与 archived_sessions 同为 source="codex"：必须合并两 root 的
@@ -482,8 +485,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
                 progressReporter.enterPhase(.finalizing)
                 let finalize = try ledger.finalizeDerived(hostname: hostname) { done, total in
-                    // 重算内部子阶段回调：映射到 .finalizing 段的 fraction，让进度平滑推进。
-                    progressReporter.advanceFinalize(done: done, total: total)
+                    // 重算内部子阶段回调：映射到 .finalizing 段的 done/total（8 步），显示「3/8 步」。
+                    progressReporter.advance(.finalizing, done: done, total: total)
                 }
                 progressReporter.completePhase(.finalizing)
                 // 只有在所有来源都完整扫描（无致命失败：任一来源枚举失败 / 单文件 I/O 失败都会
@@ -492,7 +495,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 if try ledger.requiresRebuildCompletion() {
                     try ledger.markRebuildCompleted()
                 }
-                progressReporter.enterPhase(.summarizing)
+                // summarizing 聚合日/周/月/全部四个窗口：登记总数为窗口数，显示「n/4 窗口」。
+                progressReporter.enterPhase(.summarizing, total: TokenUsageWindow.allCases.count)
                 let summary = try Self.summaries(
                     from: ledger,
                     hostname: hostname,
@@ -561,8 +565,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         guard generation == scanGeneration, statusSubject.value.scanningInProgress else { return }
         updateStatus { status in
             status.scanPhase = update.phase
-            status.scannedFiles = update.scannedFiles
-            status.totalFiles = update.totalFiles
+            status.scanDone = update.done
+            status.scanTotal = update.total
             status.scanProgress = update.overall
         }
     }
@@ -626,8 +630,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     private static func clearScanProgress(_ status: inout TokenSyncStatus) {
         status.scanningInProgress = false
         status.scanPhase = nil
-        status.scannedFiles = 0
-        status.totalFiles = 0
+        status.scanDone = 0
+        status.scanTotal = 0
         status.scanProgress = nil
     }
 
@@ -662,9 +666,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             return
         }
         let hostname = authority.hostname
+        // 上报阶段进度：展示待上报行数（buckets+sessions）作为 .reporting 阶段计数「n/m 行」。
+        // reporter.report 为不透明网络 I/O，不逐行回报，故仅在起止两端登记总数与完成。
+        let pendingRows = (try? ledger.pendingCounts(hostname: hostname)).map { $0.buckets + $0.sessions } ?? 0
         updateStatus { status in
             status.reportingInProgress = true
             status.reportingError = nil
+            status.scanPhase = .reporting
+            status.scanDone = 0
+            status.scanTotal = pendingRows
+            status.scanProgress = TokenScanPhase.reporting.baseProgress
         }
         let configurationURL = self.configurationURL
         let reporter = self.reporter
@@ -721,6 +732,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 status.reportingError = Self.errorText(error)
             }
         }
+        // 上报结束：清除 .reporting 阶段的进度字段，避免残留状态泄漏到后续读取。
+        updateStatus { Self.clearScanProgress(&$0) }
     }
 
     /// 应用启动：触发首轮 scan（本地采集开启时）并按需串接上报；
@@ -995,41 +1008,49 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 只搬运聚合数（阶段、文件计数、百分比），绝不携带路径 / 正文 / 凭证。
     private final class ScanProgressReporter: @unchecked Sendable {
         private let emit: @Sendable (ScanProgressUpdate) -> Void
-        private var totalFiles = 0
-        private var scannedFiles = 0
+        // 通用「已完成 / 总数」计数：每个阶段各自登记自己的量纲（文件 / 事件 / 步 / 窗口 / 行），
+        // 阶段切换时清零重置，供 scanDetail 统一显示「done/total 单位」。
+        private var total = 0
+        private var done = 0
 
         init(_ emit: @escaping @Sendable (ScanProgressUpdate) -> Void) {
             self.emit = emit
         }
 
-        /// 进入某阶段：先按已完成阶段权重报出阶段起点百分比（阶跃）。
-        func enterPhase(_ phase: TokenScanPhase) {
+        /// 进入某阶段：清零本阶段计数并按已完成阶段权重报出阶段起点（阶跃）。
+        /// `total` 已知时同时登记，未知（0）则本阶段先不显示计数、待后续 setPhaseTotal 补登。
+        func enterPhase(_ phase: TokenScanPhase, total: Int = 0) {
+            self.total = max(0, total)
+            self.done = 0
             send(phase: phase, fraction: 0)
         }
 
-        /// 完成某阶段：报出阶段终点（该阶段满权重）。
+        /// 完成某阶段：报出阶段终点（满权重），并把已完成计数对齐到总数。
         func completePhase(_ phase: TokenScanPhase) {
+            if total > 0 { done = total }
             send(phase: phase, fraction: 1)
         }
 
-        /// scanning 阶段：登记本轮待处理文件总数（多来源枚举后调用一次）。
-        func setScanningTotal(_ total: Int) {
-            totalFiles = max(0, total)
-            scannedFiles = 0
-            send(phase: .scanning, fraction: 0)
+        /// 登记当前阶段的总数（如 scanning 多来源枚举后一次性得到文件总数）。
+        func setPhaseTotal(_ phase: TokenScanPhase, total: Int) {
+            self.total = max(0, total)
+            self.done = 0
+            send(phase: phase, fraction: 0)
         }
 
-        /// scanning 阶段：处理完一个文件后自增并回报（含 已扫描/总数）。
-        func advanceScannedFile() {
-            scannedFiles += 1
-            let fraction = totalFiles > 0 ? Double(scannedFiles) / Double(totalFiles) : 1
-            send(phase: .scanning, fraction: fraction)
-        }
-
-        /// finalizing 阶段：重算派生内部按 done/total 子阶段推进，避免该段从 0 直跳 100%。
-        func advanceFinalize(done: Int, total: Int) {
+        /// 当前阶段完成一项：自增并按 done/total 回报（含计数）。
+        func advanceItem(_ phase: TokenScanPhase) {
+            done += 1
             let fraction = total > 0 ? Double(done) / Double(total) : 1
-            send(phase: .finalizing, fraction: fraction)
+            send(phase: phase, fraction: fraction)
+        }
+
+        /// 按外部给定的 done/total 推进当前阶段（如 finalize 的 8 子阶段）。
+        func advance(_ phase: TokenScanPhase, done: Int, total: Int) {
+            self.total = max(0, total)
+            self.done = max(0, min(done, self.total))
+            let fraction = total > 0 ? Double(done) / Double(total) : 1
+            send(phase: phase, fraction: fraction)
         }
 
         private func send(phase: TokenScanPhase, fraction: Double) {
@@ -1037,8 +1058,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             let overall = min(phase.baseProgress + clamped * phase.weight, 1)
             emit(ScanProgressUpdate(
                 phase: phase,
-                scannedFiles: scannedFiles,
-                totalFiles: totalFiles,
+                done: done,
+                total: total,
                 overall: overall
             ))
         }
@@ -1342,7 +1363,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             let fileID = UsageJSONLParser.fileID(for: url.path)
             presentFileIDs.append(fileID)
             // 每个枚举到的 jsonl 文件（无论跳过还是解析）都推进一格进度，与预扫总数对齐。
-            progress.advanceScannedFile()
+            progress.advanceItem(.scanning)
             if let checkpoint = try ledger.checkpoint(fileID: fileID),
                checkpoint.status == "complete",
                checkpoint.size == fileSize,
