@@ -1905,10 +1905,19 @@ struct AgentPulseCoreVerification {
             stepSeconds: 60,
             kernel: .gaussian(radius: 2)
         )
-        try require(gap.points.allSatisfy { !$0.isGap }, "display pipeline did not interpolate missing TPS points")
+        // 双通道语义：value 保留原始真实值（缺口 nil，看板如实绘制、断开不连线）；
+        // normalized 经插值补缺 + 平滑 + 归一化（菜单栏小图/悬浮球连续看趋势）。
         try require(
-            (gap.points[2].value ?? -1) > 0 && (gap.points[2].value ?? 11) < 10,
-            "internal gap was not smoothly interpolated between neighbors"
+            gap.points.allSatisfy { $0.normalized != nil },
+            "display pipeline did not interpolate the smoothed (normalized) channel"
+        )
+        try require(
+            gap.points[2].value == nil,
+            "raw value channel must preserve the real gap for the dashboard (no cross-gap interpolation)"
+        )
+        try require(
+            (gap.points[2].normalized ?? -1) >= 0 && (gap.points[2].normalized ?? 2) <= 1,
+            "internal gap was not smoothly interpolated in the normalized channel"
         )
 
         let edgeGaps = SparklineAnalysis.interpolateGaps([
