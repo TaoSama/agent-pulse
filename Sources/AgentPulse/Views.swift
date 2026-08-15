@@ -187,7 +187,7 @@ struct MenuBarSummaryView: View {
             .foregroundStyle(Color.white)
             .background(Color.black, in: RoundedRectangle(cornerRadius: 12))
 
-            TokenSummaryCard(summary: model.tokenSummary, tps: model.tps, selectedWindow: $tokenWindow)
+            TokenSummaryCard(summary: model.tokenSummary, tps: model.tps, syncStatus: model.tokenSyncStatus, selectedWindow: $tokenWindow)
 
             ModelTokenBreakdownCard(summary: model.tokenSummary, window: tokenWindow)
 

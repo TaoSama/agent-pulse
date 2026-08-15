@@ -88,6 +88,21 @@ struct TokenSyncSettingsSection: View {
 
                 SettingsFootnote("仅本机使用，不随用量上报。")
 
+                SettingsRow(title: "上报间隔") {
+                    Picker("上报间隔", selection: reportIntervalBinding) {
+                        ForEach(TokenReportInterval.allCases) { interval in
+                            Text(interval.title).tag(interval)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .tint(.white)
+                    .colorScheme(.dark)
+                    .frame(maxWidth: 220)
+                    .accessibilityLabel("自动上报间隔")
+                    .accessibilityValue(model.tokenSyncStatus.autoReportInterval.title)
+                }
+
                 HStack(spacing: 6) {
                     Image(systemName: "point.3.connected.trianglepath.dotted")
                         .font(.system(size: 10))
@@ -101,7 +116,6 @@ struct TokenSyncSettingsSection: View {
                 SettingsRow(title: "配置状态") {
                     SettingsStatusBadge(text: configurationStatusText, tone: configurationStatusTone)
                 }
-
                 if let error = model.tokenSyncStatus.configurationError {
                     SettingsFootnote(error, tone: configurationStatusTone)
                 }
@@ -181,6 +195,13 @@ struct TokenSyncSettingsSection: View {
         Binding(
             get: { model.tokenSyncStatus.reportingEnabled },
             set: { model.setTokenReporting($0) }
+        )
+    }
+
+    private var reportIntervalBinding: Binding<TokenReportInterval> {
+        Binding(
+            get: { model.tokenSyncStatus.autoReportInterval },
+            set: { model.setTokenAutoReportInterval($0) }
         )
     }
 
@@ -287,7 +308,8 @@ struct TokenSyncSettingsSection: View {
         if model.tokenSyncStatus.ingestBaseURL.isEmpty {
             return "未配置 API 地址：仅本地统计，不会发起任何网络请求。"
         }
-        return "启用后：应用启动时自动上报一次，之后每 30 分钟自动上报一次；也可点击「立即上报」手动触发。"
+        let interval = model.tokenSyncStatus.autoReportInterval.title
+        return "启用后：应用启动时自动上报一次，之后每 \(interval)自动上报一次；也可点击「立即上报」手动触发。"
     }
 
     private static let dateFormatter: DateFormatter = {

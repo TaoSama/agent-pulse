@@ -115,6 +115,81 @@ enum TokenConfigurationStatus: String, Sendable, Equatable {
     case invalid
 }
 
+/// 一轮「扫描 → 上报」链路的阶段。用于把整体进度分解为带权重的顺序阶段，
+/// 使进度条能跨越 cliproxy 采集、逐文件扫描、派生重算、摘要与可选上报，而不是
+/// 卡在某一档跳变。权重之和为 1；scan 是唯一能报出真实细粒度（逐文件）的阶段。
+enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
+    /// cliproxy 主动拉取（网络来源）。
+    case cliproxy
+    /// 逐文件扫描全部来源（占大头，能报 已扫描/总数）。
+    case scanning
+    /// finalizeDerived 派生重算（全局去重 + 聚合 + 门禁）。
+    case finalizing
+    /// summaries / pendingCounts 组装。
+    case summarizing
+    /// 可选普通上报（仅上报已启用且串接时）。
+    case reporting
+
+    /// 各阶段占整体进度的权重（和为 1）。冷扫时 scan 最慢、派生次之，
+    /// 因此这两档占大头，避免进度在某一档长时间停滞。
+    var weight: Double {
+        switch self {
+        case .cliproxy: return 0.05
+        case .scanning: return 0.60
+        case .finalizing: return 0.25
+        case .summarizing: return 0.05
+        case .reporting: return 0.05
+        }
+    }
+
+    /// 本阶段起点的累计权重（此前所有阶段权重之和）。
+    var baseProgress: Double {
+        var total = 0.0
+        for phase in TokenScanPhase.allCases {
+            if phase == self { break }
+            total += phase.weight
+        }
+        return total
+    }
+
+    var displayLabel: String {
+        switch self {
+        case .cliproxy: return "采集用量"
+        case .scanning: return "扫描文件"
+        case .finalizing: return "重算派生"
+        case .summarizing: return "汇总"
+        case .reporting: return "上报"
+        }
+    }
+}
+
+/// 自动上报间隔档位（本机行为，不进上报身份）。原始值为秒。
+enum TokenReportInterval: Int, Sendable, Equatable, CaseIterable, Identifiable {
+    case fifteenMinutes = 900
+    case thirtyMinutes = 1800
+    case sixtyMinutes = 3600
+
+    var id: Int { rawValue }
+
+    /// 秒数（自动循环 Task.sleep 用）。
+    var seconds: TimeInterval { TimeInterval(rawValue) }
+
+    var title: String {
+        switch self {
+        case .fifteenMinutes: return "15 分钟"
+        case .thirtyMinutes: return "30 分钟"
+        case .sixtyMinutes: return "60 分钟"
+        }
+    }
+
+    /// 从持久化的秒数还原；非法值回落 30 分钟。
+    static func from(seconds: Int) -> TokenReportInterval {
+        TokenReportInterval(rawValue: seconds) ?? .thirtyMinutes
+    }
+
+    static let `default`: TokenReportInterval = .thirtyMinutes
+}
+
 /// 权威上报状态：把分散的「能否上报 / 为什么受阻 / 上次结果」收敛成单一结论，
 /// 供 UI 顶部一句话说明。语义与优先级见 `TokenSyncStatus.authoritativeReportingState`。
 enum ReportingAuthorityState: Equatable, Sendable {
@@ -182,6 +257,18 @@ struct TokenSyncStatus: Sendable, Equatable {
     var cliProxyConfigured: Bool = false
     /// cliproxyapi 采集错误（脱敏）；nil 表示无错误或未配置。
     var cliProxyError: String? = nil
+
+    /// 当前扫描阶段；scanningInProgress == false 时为 nil。仅用于进度展示。
+    var scanPhase: TokenScanPhase? = nil
+    /// scanning 阶段已处理文件数（仅在 .scanning 阶段有意义）。
+    var scannedFiles: Int = 0
+    /// scanning 阶段待处理文件总数（先枚举得出；0 表示未知/无文件）。
+    var totalFiles: Int = 0
+    /// 整体进度 0~1（跨全部阶段带权重累加）；未在扫描时为 nil。
+    var scanProgress: Double? = nil
+
+    /// 自动上报间隔（本机行为，不进上报身份）。默认 30 分钟。
+    var autoReportInterval: TokenReportInterval = .default
 
     /// 派生「权威上报状态」：把分散在开关脚注 / 门禁脚注 / 按钮 disabled 三处的受阻语义，
     /// 按固定优先级收敛成单一结论，作为 reportingCard 顶部唯一权威说明。
@@ -278,6 +365,8 @@ protocol TokenSyncCoordinating: AnyObject {
     func setReportingEnabled(_ enabled: Bool)
     func setIngestBaseURL(_ url: String)
     func setCanonicalHostname(_ hostname: String)
+    /// 设置自动上报间隔（本机行为）：写 defaults + 重启自动循环使新间隔立即生效。
+    func setAutoReportInterval(_ interval: TokenReportInterval)
     /// 应用启动入口：完成 scan/report 首轮触发，并启动 30 分钟自动上报循环（仅在
     /// 上报已启用时活跃）。多次调用幂等。
     func start()
@@ -317,4 +406,23 @@ enum TokenUsageFormatting {
         guard let value else { return "—" }
         return String(format: "%.1f", value)
     }
+
+    /// 相对时间：刚刚 / N 分钟前 / N 小时前 / N 天前；更久回落到日期。
+    /// now 可注入以便离线验证；不注入则用当前时间。
+    static func relativeTime(_ date: Date?, now: Date = Date()) -> String {
+        guard let date else { return "—" }
+        let elapsed = now.timeIntervalSince(date)
+        if elapsed < 0 { return "刚刚" }
+        if elapsed < 60 { return "刚刚" }
+        if elapsed < 3600 { return "\(Int(elapsed / 60)) 分钟前" }
+        if elapsed < 86_400 { return "\(Int(elapsed / 3600)) 小时前" }
+        if elapsed < 86_400 * 7 { return "\(Int(elapsed / 86_400)) 天前" }
+        return relativeDateFormatter.string(from: date)
+    }
+
+    private static let relativeDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter
+    }()
 }

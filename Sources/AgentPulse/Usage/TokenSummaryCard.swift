@@ -7,30 +7,43 @@ import SwiftUI
 struct TokenSummaryCard: View {
     let summary: TokenUsageSummary
     let tps: Double?
+    let syncStatus: TokenSyncStatus
     @Binding var selectedWindow: TokenUsageWindow
 
-    init(summary: TokenUsageSummary, tps: Double?, selectedWindow: Binding<TokenUsageWindow>) {
+    init(
+        summary: TokenUsageSummary,
+        tps: Double?,
+        syncStatus: TokenSyncStatus,
+        selectedWindow: Binding<TokenUsageWindow>
+    ) {
         self.summary = summary
         self.tps = tps
+        self.syncStatus = syncStatus
         _selectedWindow = selectedWindow
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Picker("Token 统计窗口", selection: $selectedWindow) {
-                ForEach(TokenUsageWindow.allCases) { window in
-                    Text(window.title)
-                        .tag(window)
-                        .accessibilityLabel(window.accessibilityLabel)
-                        .accessibilityAddTraits(selectedWindow == window ? .isSelected : [])
+            HStack(alignment: .center, spacing: 8) {
+                Picker("Token 统计窗口", selection: $selectedWindow) {
+                    ForEach(TokenUsageWindow.allCases) { window in
+                        Text(window.title)
+                            .tag(window)
+                            .accessibilityLabel(window.accessibilityLabel)
+                            .accessibilityAddTraits(selectedWindow == window ? .isSelected : [])
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .tint(.white)
+                .colorScheme(.dark)
+                .accessibilityLabel("Token 统计窗口")
+                .accessibilityValue(selectedWindow.accessibilityLabel)
+
+                Spacer(minLength: 8)
+
+                TokenSyncUpdateStatusView(status: syncStatus)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .tint(.white)
-            .colorScheme(.dark)
-            .accessibilityLabel("Token 统计窗口")
-            .accessibilityValue(selectedWindow.accessibilityLabel)
 
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .firstTextBaseline) {
@@ -95,6 +108,50 @@ struct TokenSummaryCard: View {
         let hitRate = TokenUsageFormatting.percent(selectedSummary?.cacheHitRate)
         let tpsText = tps.map { String(format: "%.1f", $0) } ?? "不可用"
         return "\(selectedWindow.accessibilityLabel)，总 Tokens \(tokens)，估算费用 \(cost)，缓存命中率 \(hitRate)，实时 TPS \(tpsText)"
+    }
+}
+
+/// Token 卡右上角更新状态：平时显示上次更新的相对时间；扫描中显示 整体百分比 + 已扫描/总文件数。
+///
+/// 只读展示聚合数（百分比 / 文件计数 / 相对时间），不显示文件路径、会话正文或凭证。
+struct TokenSyncUpdateStatusView: View {
+    let status: TokenSyncStatus
+
+    var body: some View {
+        Group {
+            if status.scanningInProgress {
+                HStack(spacing: 5) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(.white)
+                    Text(progressText)
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                }
+            } else {
+                Text(TokenUsageFormatting.relativeTime(status.lastScanAt))
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.white.opacity(0.75))
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    /// 「10% · 12/340」：整体百分比 + 仅在 scanning 阶段附文件数。
+    private var progressText: String {
+        let percentText = TokenUsageFormatting.percent(status.scanProgress)
+        guard status.scanPhase == .scanning, status.totalFiles > 0 else {
+            return percentText
+        }
+        return "\(percentText) · \(status.scannedFiles)/\(status.totalFiles)"
+    }
+
+    private var accessibilityLabel: String {
+        if status.scanningInProgress {
+            let phase = status.scanPhase?.displayLabel ?? "更新中"
+            return "正在\(phase)，\(progressText)"
+        }
+        return "上次更新 \(TokenUsageFormatting.relativeTime(status.lastScanAt))"
     }
 }
 
