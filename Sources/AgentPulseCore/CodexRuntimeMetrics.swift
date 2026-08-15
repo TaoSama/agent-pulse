@@ -1270,6 +1270,11 @@ public actor CodexRuntimeMetricsCollector {
         var hasSeenTurnContext = cached.hasSeenTurnContext
         var messageUsage = cached.messageUsage
         var messageSequence = cached.messageSequence
+        // 内容指纹去重（对标参考实现按内容折叠 codex token_count）：codex token_count 缺稳定
+        // message id，同一 turn 会重复刷新多条除时间戳外逐字节相同的行；无 id 走增量路径时不去重
+        // 会把同一次真实 output 按刷新条数重复累加（实测约 2x）。指纹取 model + token 增量（不含
+        // 时间戳，避免 fork 改写时间戳绕过折叠），同指纹只计一次。
+        var seenIncrementalFingerprints = Set<String>()
         var tokenDiagnostics = cached.tokenDiagnostics
         let source: PulseSource = switch tokenFileProviders[file.path] {
         case .claude: .cli
@@ -1381,6 +1386,16 @@ public actor CodexRuntimeMetricsCollector {
                         lastSeen: now,
                         sequence: messageSequence
                     )
+                } else {
+                    // 无 message id：按内容指纹去重（model + token 增量，不含时间戳）。
+                    // 同一 turn 重复刷新的 token_count 行内容相同 → 指纹相同 → 只计首条。
+                    let fingerprint = "\(parsed.model ?? currentModel ?? "unknown")\u{1}\(parsed.tokens)"
+                    if seenIncrementalFingerprints.contains(fingerprint) {
+                        emittedTokens = 0
+                        tokenDiagnostics.duplicateMessageObservations += 1
+                    } else {
+                        seenIncrementalFingerprints.insert(fingerprint)
+                    }
                 }
                 if emittedTokens > 0 {
                     tokenEvents.append(TrackedTokenEvent(
