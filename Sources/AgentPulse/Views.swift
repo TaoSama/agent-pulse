@@ -216,6 +216,17 @@ struct MenuBarSummaryView: View {
             HStack(alignment: .center, spacing: 8) {
                 Text("Agent Pulse").font(.subheadline.weight(.semibold))
                 Spacer()
+                // 设置齿轮快捷入口：面板内切到设置页（与底部「设置」同一动作）。
+                Button {
+                    showingSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 13))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .focusable(false)
+                .accessibilityLabel("设置")
                 Circle()
                     .fill(model.tps == nil ? Color.primary : trendColor)
                     .frame(width: 7, height: 7)
