@@ -7,7 +7,7 @@ struct AgentPulseSettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 14) {
+            VStack(spacing: 12) {
                 header
                 trendCard
                 r2Card
@@ -37,7 +37,7 @@ struct AgentPulseSettingsView: View {
                 Text(statusText)
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
             }
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.primary)
         }
         .padding(.horizontal, 2)
     }
@@ -127,7 +127,7 @@ enum SettingsStatusTone {
 
     var color: Color {
         switch self {
-        case .neutral: return Color.white.opacity(0.6)
+        case .neutral: return Color.white
         case .positive: return .green
         case .warning: return .orange
         case .negative: return .red
@@ -135,7 +135,7 @@ enum SettingsStatusTone {
     }
 }
 
-/// 深色卡片容器：标题 + 内容，与菜单面板同一视觉语言（纯黑卡 + 细描边）。
+/// 深色卡片容器：标题 + 内容，与菜单面板同一视觉语言（纯黑卡、无描边）。
 struct SettingsCard<Content: View>: View {
     let title: String
     let systemImage: String
@@ -144,22 +144,16 @@ struct SettingsCard<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Label(title, systemImage: systemImage)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(0.6))
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.white)
             content
         }
-        .padding(14)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.black)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.white.opacity(0.1), lineWidth: 1)
-        )
-        // 卡片本身是纯黑，内部一律按深色语义渲染（白字、半透明白），
+        // 卡片本身是纯黑、无描边，内部一律按深色语义渲染（全白，靠字号/字重分层），
         // 与菜单栏展开面板的黑卡白字一致，不随系统浅/深色外观翻转。
+        .foregroundStyle(Color.white)
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .environment(\.colorScheme, .dark)
     }
 }
@@ -178,7 +172,7 @@ struct SettingsRow<Content: View>: View {
                 if let subtitle {
                     Text(subtitle)
                         .font(.system(size: 10))
-                        .foregroundStyle(Color.white.opacity(0.45))
+                        .foregroundStyle(Color.white)
                 }
             }
             .foregroundStyle(Color.white)
@@ -198,11 +192,11 @@ struct SettingsField: View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title)
                 .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(Color.white.opacity(0.5))
+                .foregroundStyle(Color.white)
             TextField(
                 "",
                 text: $text,
-                prompt: Text("未设置").foregroundColor(Color.white.opacity(0.3))
+                prompt: Text("未设置").foregroundColor(Color.white.opacity(0.4))
             )
             .textFieldStyle(.plain)
             .font(.system(size: 12, design: .monospaced))
@@ -237,7 +231,7 @@ struct SettingsToggleRow: View {
                 if let subtitle {
                     Text(subtitle)
                         .font(.system(size: 10))
-                        .foregroundStyle(Color.white.opacity(0.45))
+                        .foregroundStyle(Color.white)
                 }
             }
             .foregroundStyle(disabled ? Color.white.opacity(0.4) : Color.white)
@@ -308,7 +302,7 @@ struct SettingsRadioRow: View {
                     if let subtitle {
                         Text(subtitle)
                             .font(.system(size: 10))
-                            .foregroundStyle(Color.white.opacity(0.45))
+                            .foregroundStyle(Color.white)
                     }
                 }
                 Spacer(minLength: 8)
@@ -395,7 +389,7 @@ struct SettingsGhostButton: View {
         Button(action: action) {
             Text(title)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(disabled ? Color.white.opacity(0.35) : Color.white.opacity(0.85))
+                .foregroundStyle(disabled ? Color.white.opacity(0.35) : Color.white)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(
