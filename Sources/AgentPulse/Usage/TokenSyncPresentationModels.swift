@@ -161,6 +161,17 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
         case .reporting: return "上报"
         }
     }
+
+    /// 该阶段计数的单位量词，用于底部详细进度行的「已扫描/总数 单位」。
+    var unit: String {
+        switch self {
+        case .cliproxy: return "事件"
+        case .scanning: return "文件"
+        case .finalizing: return "行"
+        case .summarizing: return "窗口"
+        case .reporting: return "行"
+        }
+    }
 }
 
 /// 自动上报间隔档位（本机行为，不进上报身份）。原始值为秒。
@@ -400,6 +411,19 @@ enum TokenUsageFormatting {
     static func percent(_ value: Double?) -> String {
         guard let value else { return "—" }
         return String(format: "%.1f%%", value * 100)
+    }
+
+    /// 菜单底部详细进度行：「刷新进度：13.0% · 扫描文件 · 376/2831 文件」。
+    /// 整体百分比 + 中文阶段名 +（仅 scanning 且 totalFiles>0 时）已扫描/总数 + 单位。
+    /// 未在扫描/上报时返回 nil。只读展示聚合数，不含文件路径、会话正文或凭证。
+    static func scanDetail(_ status: TokenSyncStatus) -> String? {
+        guard status.scanningInProgress || status.reportingInProgress else { return nil }
+        let percentText = percent(status.scanProgress)
+        guard let phase = status.scanPhase else { return "刷新进度：\(percentText)" }
+        if phase == .scanning, status.totalFiles > 0 {
+            return "刷新进度：\(percentText) · \(phase.displayLabel) · \(status.scannedFiles)/\(status.totalFiles) \(phase.unit)"
+        }
+        return "刷新进度：\(percentText) · \(phase.displayLabel)"
     }
 
     static func tps(_ value: Double?) -> String {
