@@ -215,7 +215,9 @@ struct MenuBarSummaryView: View {
 
     private var overviewScreen: some View {
         VStack(alignment: .leading, spacing: Self.sectionSpacing) {
-            HStack(alignment: .center, spacing: 8) {
+            // 顶栏右侧一组图标：刷新 / 齿轮 / 状态点。两个按钮各自带热区 padding，
+            // 故 HStack 用 0 spacing，靠按钮内边距形成等距；状态点左侧补等量间距对齐节奏。
+            HStack(alignment: .center, spacing: 0) {
                 Text("Agent Pulse").font(.subheadline.weight(.semibold))
                 Spacer()
                 // 刷新（扫描数据）快捷入口：等价设置页「立即扫描」；扫描中转圈并禁用。
@@ -223,7 +225,7 @@ struct MenuBarSummaryView: View {
                     model.scanTokenUsageNow()
                 } label: {
                     Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 13))
+                        .font(.system(size: 14, weight: .regular))
                         .rotationEffect(.degrees(model.tokenSyncStatus.scanningInProgress ? 360 : 0))
                         .animation(
                             model.tokenSyncStatus.scanningInProgress
@@ -241,7 +243,7 @@ struct MenuBarSummaryView: View {
                     showingSettings = true
                 } label: {
                     Image(systemName: "gearshape")
-                        .font(.system(size: 13))
+                        .font(.system(size: 14, weight: .regular))
                 }
                 .buttonStyle(BackHotZoneButtonStyle())
                 .focusable(false)
@@ -249,6 +251,8 @@ struct MenuBarSummaryView: View {
                 Circle()
                     .fill(model.tps == nil ? Color.primary : trendColor)
                     .frame(width: 7, height: 7)
+                    .padding(.leading, 8)
+                    .padding(.trailing, 2)
             }
 
             VStack(alignment: .leading, spacing: 10) {
