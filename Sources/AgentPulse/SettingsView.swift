@@ -500,21 +500,32 @@ struct SettingsPrimaryButton: View {
     var systemImage: String?
     var loading: Bool = false
     var disabled: Bool = false
+    /// 内容区最小宽度：用于让并排/同类按钮（如「立即扫描」「立即上报」）尺寸一致，
+    /// 不随图标字形或文案宽度差异而变化。nil 时按内容自适应。
+    var minContentWidth: CGFloat? = nil
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
-                if loading {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(.black)
-                } else if let systemImage {
-                    Image(systemName: systemImage)
+                if loading || systemImage != nil {
+                    // 图标区固定宽度：不同字形（arrow.clockwise / arrow.up.circle）宽度不一，
+                    // 固定后按钮尺寸不随图标变化，与并排同类按钮完全一致。
+                    Group {
+                        if loading {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.black)
+                        } else if let systemImage {
+                            Image(systemName: systemImage)
+                        }
+                    }
+                    .frame(width: 14)
                 }
                 Text(title)
             }
             .font(.system(size: 12, weight: .semibold))
+            .frame(minWidth: minContentWidth)
             .foregroundStyle(disabled ? Color.white.opacity(0.35) : Color.black)
             .padding(.horizontal, 12)
             .padding(.vertical, 7)

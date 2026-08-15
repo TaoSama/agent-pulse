@@ -424,9 +424,11 @@ enum TokenUsageFormatting {
     /// 菜单底部详细进度行：「刷新进度：13.0% · 扫描文件 · 376/2831 文件」。
     /// 整体百分比 + 中文阶段名 +（仅 scanning 且 totalFiles>0 时）已扫描/总数 + 单位。
     /// 未在扫描/上报时返回 nil。只读展示聚合数，不含文件路径、会话正文或凭证。
-    static func scanDetail(_ status: TokenSyncStatus) -> String? {
+    /// `percentOverride` 传入平滑后的展示值（0…1）时用它替代原始 scanProgress，
+    /// 让百分比随时间缓动而非阶跃；nil 时回退原始值。
+    static func scanDetail(_ status: TokenSyncStatus, percentOverride: Double? = nil) -> String? {
         guard status.scanningInProgress || status.reportingInProgress else { return nil }
-        let percentText = percent(status.scanProgress)
+        let percentText = percent(percentOverride ?? status.scanProgress)
         guard let phase = status.scanPhase else { return "刷新进度：\(percentText)" }
         if phase == .scanning, status.totalFiles > 0 {
             return "刷新进度：\(percentText) · \(phase.displayLabel) · \(status.scannedFiles)/\(status.totalFiles) \(phase.unit)"

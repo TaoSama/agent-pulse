@@ -52,6 +52,45 @@ struct MenuBarPulseLabel: View {
     }
 }
 
+/// 菜单底部 Token 扫描进度块：扫描/上报进行中时展示前缀行 + 进度行，结束即隐藏。
+/// 百分比由 `ScanProgressSmoother` 缓动，避免阶跃跳变；阶段名与文件计数仍取实时状态。
+private struct TokenScanProgressFooter: View {
+    let status: TokenSyncStatus
+
+    @StateObject private var smoother = ScanProgressSmoother()
+
+    private var inProgress: Bool {
+        status.scanningInProgress || status.reportingInProgress
+    }
+
+    var body: some View {
+        Group {
+            if inProgress,
+               let scanDetail = TokenUsageFormatting.scanDetail(status, percentOverride: smoother.displayed) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label(MetricsStore.refreshingCacheNotice, systemImage: "arrow.triangle.2.circlepath")
+                    // 进度行用透明占位图标补齐图标宽度，与上方前缀行的文字左对齐。
+                    Label {
+                        Text(scanDetail)
+                    } icon: {
+                        Image(systemName: "arrow.triangle.2.circlepath").hidden()
+                    }
+                }
+                .font(.caption).foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .onAppear { smoother.setTarget(inProgress ? status.scanProgress : nil) }
+        .onChange(of: status.scanProgress) { _, newValue in
+            smoother.setTarget(inProgress ? newValue : nil)
+        }
+        .onChange(of: inProgress) { _, running in
+            smoother.setTarget(running ? status.scanProgress : nil)
+        }
+    }
+}
+
 private struct SparklineView: View {
     let points: [SparklinePoint]
     let trend: SparklineTrend
@@ -313,21 +352,9 @@ struct MenuBarSummaryView: View {
                     .font(.caption).foregroundStyle(.orange)
             }
             // Token 扫描底部块：更新中自带前缀行 + 进度行，与 Token 扫描周期同生共死，
-            // 走到 100% 结束时整块消失。只读聚合数，不含文件路径、会话正文或凭证。
-            if let scanDetail = TokenUsageFormatting.scanDetail(model.tokenSyncStatus) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Label(MetricsStore.refreshingCacheNotice, systemImage: "arrow.triangle.2.circlepath")
-                    // 进度行用透明占位图标补齐图标宽度，与上方前缀行的文字左对齐。
-                    Label {
-                        Text(scanDetail)
-                    } icon: {
-                        Image(systemName: "arrow.triangle.2.circlepath").hidden()
-                    }
-                }
-                .font(.caption).foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
+            // 走到 100% 结束时整块消失。百分比经平滑器缓动，避免阶跃卡顿。
+            // 只读聚合数，不含文件路径、会话正文或凭证。
+            TokenScanProgressFooter(status: model.tokenSyncStatus)
             Divider()
             HStack {
                 Button("打开 TPS 看板") { presentFromMenuBar(model.showDashboard) }

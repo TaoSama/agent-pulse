@@ -17,6 +17,11 @@ struct TokenSyncSettingsSection: View {
         reportingCard
     }
 
+    /// 「立即扫描」「立即上报」按钮内容区统一最小宽度：两者字形/图标宽度不同，
+    /// 固定同一最小宽度后尺寸完全一致，不随图标或「正在…」文案变化而跳变。
+    private static let primaryButtonContentWidth: CGFloat = 66
+
+
     // MARK: 扫描和上报间隔（独立一趴，夹在 Token 统计与用量上报之间）
 
     private var intervalCard: some View {
@@ -81,7 +86,8 @@ struct TokenSyncSettingsSection: View {
                         title: model.tokenSyncStatus.scanningInProgress ? "正在扫描…" : "立即扫描",
                         systemImage: "arrow.clockwise",
                         loading: model.tokenSyncStatus.scanningInProgress,
-                        disabled: scanDisabled
+                        disabled: scanDisabled,
+                        minContentWidth: Self.primaryButtonContentWidth
                     ) {
                         model.scanTokenUsageNow()
                     }
@@ -150,7 +156,8 @@ struct TokenSyncSettingsSection: View {
                         title: model.tokenSyncStatus.reportingInProgress ? "正在上报…" : "立即上报",
                         systemImage: "arrow.up.circle",
                         loading: model.tokenSyncStatus.reportingInProgress,
-                        disabled: !canReport
+                        disabled: !canReport,
+                        minContentWidth: Self.primaryButtonContentWidth
                     ) {
                         model.reportTokenUsageNow()
                     }

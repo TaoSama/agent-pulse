@@ -1,6 +1,75 @@
 import SwiftUI
 
-/// 菜单栏 Token 汇总卡：日/月/年/全部四窗口 + 实时 TPS。
+/// 刷新进度平滑器：把阶跃到达的目标百分比（0…1）在时间上缓动，
+/// 让「正在更新: xx%」与底部「刷新进度：xx%」平滑爬升而非跳变。
+///
+/// 语义：
+/// - 每帧把展示值按固定比例逼近目标（指数缓动），并保证至少有一个最小步进，
+///   使停滞的目标也会缓慢爬升（避免长时间卡在同一数字给人「卡死」错觉）。
+/// - 只增不减：目标回退（新一轮扫描重置或抖动）时不倒退展示值，除非目标显著更低（重置）。
+/// - 扫描结束（目标为 nil）时清零，供下次从 0 起步。
+@MainActor
+final class ScanProgressSmoother: ObservableObject {
+    /// 当前展示值（0…1）。
+    @Published private(set) var displayed: Double = 0
+
+    private var target: Double = 0
+    private var ticker: Timer?
+
+    /// 每帧向目标逼近的比例（指数缓动系数）。
+    private let easing = 0.18
+    /// 每帧最小推进量：即便目标停滞，也让数字极缓慢前移，消除「卡住」观感（约每秒 +0.15%）。
+    private let minStepPerTick = 0.00005
+    /// 展示帧率（秒）。30fps 足够顺滑且开销低。
+    private let tickInterval = 1.0 / 30.0
+    /// 目标显著回退阈值：低于此判定为「新一轮扫描重置」，展示值随之归零重来。
+    private let resetDropThreshold = 0.05
+
+    /// 设置目标进度。`nil` 表示未在扫描 → 停止并清零。
+    func setTarget(_ value: Double?) {
+        guard let value else {
+            stop()
+            displayed = 0
+            target = 0
+            return
+        }
+        let clamped = min(max(value, 0), 1)
+        // 目标大幅回退：视作新扫描重置，展示值归零重新爬升。
+        if clamped + resetDropThreshold < target {
+            displayed = 0
+        }
+        target = clamped
+        start()
+    }
+
+    private func start() {
+        guard ticker == nil else { return }
+        let timer = Timer(timeInterval: tickInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.step() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        ticker = timer
+    }
+
+    private func stop() {
+        ticker?.invalidate()
+        ticker = nil
+    }
+
+    private func step() {
+        // 已抵达目标：若已接近 100% 则停帧，避免空转；否则保留最小爬升。
+        let remaining = target - displayed
+        if remaining <= 0 {
+            if target >= 1 { stop() }
+            return
+        }
+        let eased = remaining * easing
+        let advance = max(eased, min(minStepPerTick, remaining))
+        displayed = min(displayed + advance, target)
+    }
+}
+
+
 ///
 /// 黑底白字，与 TPS 卡风格一致；不使用灰色承载信息。
 /// 当前窗口无数据时明确展示空状态，不把 0 冒充真实值。
@@ -119,6 +188,7 @@ struct TokenSyncUpdateStatusView: View {
     let status: TokenSyncStatus
 
     @State private var now = Date()
+    @StateObject private var smoother = ScanProgressSmoother()
     private let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     /// 扫描或上报任一进行中，右上角都展示百分比。
@@ -134,14 +204,21 @@ struct TokenSyncUpdateStatusView: View {
             .fixedSize(horizontal: true, vertical: false)
             .frame(maxWidth: .infinity, alignment: .trailing)
             .onReceive(ticker) { now = $0 }
+            .onAppear { smoother.setTarget(inProgress ? status.scanProgress : nil) }
+            .onChange(of: status.scanProgress) { _, newValue in
+                smoother.setTarget(inProgress ? newValue : nil)
+            }
+            .onChange(of: inProgress) { _, running in
+                smoother.setTarget(running ? status.scanProgress : nil)
+            }
             .accessibilityElement(children: .combine)
             .accessibilityLabel(statusText)
     }
 
-    /// 右上角文案：更新中「正在更新: xx%」；空闲「上次更新: 相对时间」。
+    /// 右上角文案：更新中「正在更新: xx%」（平滑值）；空闲「上次更新: 相对时间」。
     private var statusText: String {
         if inProgress {
-            return "正在更新: \(TokenUsageFormatting.percent(status.scanProgress))"
+            return "正在更新: \(TokenUsageFormatting.percent(smoother.displayed))"
         }
         return "上次更新: \(TokenUsageFormatting.relativeTime(status.lastScanAt, now: now))"
     }
