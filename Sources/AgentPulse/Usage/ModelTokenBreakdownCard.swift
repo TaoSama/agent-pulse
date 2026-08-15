@@ -63,13 +63,16 @@ struct ModelTokenBreakdownCard: View {
     }
 
     /// 当前窗口的分模型明细，按 token 降序；同值按模型名稳定排序。
+    /// 过滤掉 token ≤ 0 的条目（如账本占位 model `<synthetic>`），避免 0 值行混入列表。
     private var sortedModels: [TokenModelUsage] {
-        (summary[window]?.perModel ?? []).sorted {
-            if $0.totalTokens == $1.totalTokens {
-                return $0.model.localizedStandardCompare($1.model) == .orderedAscending
+        (summary[window]?.perModel ?? [])
+            .filter { $0.totalTokens > 0 }
+            .sorted {
+                if $0.totalTokens == $1.totalTokens {
+                    return $0.model.localizedStandardCompare($1.model) == .orderedAscending
+                }
+                return $0.totalTokens > $1.totalTokens
             }
-            return $0.totalTokens > $1.totalTokens
-        }
     }
 }
 

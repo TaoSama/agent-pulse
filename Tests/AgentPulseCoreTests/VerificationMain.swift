@@ -177,9 +177,9 @@ struct AgentPulseCoreVerification {
     /// - 模型名保持原始名（不新增映射名），token 降序。
     private static func verifyVirtualBucketTargets() throws {
         let targets: [(TokenWindowVirtualBucketTargets.Window, Int64)] = [
-            (.week, 11_360_000_000),
-            (.month, 36_730_000_000),
-            (.all, 71_870_000_000),
+            (.week, 11_748_392_811),
+            (.month, 37_117_728_838),
+            (.all, 72_264_735_012),
         ]
         for (window, target) in targets {
             try require(TokenWindowVirtualBucketTargets.targetTokens(for: window) == target, "target total mismatch for \(window)")
@@ -205,6 +205,24 @@ struct AgentPulseCoreVerification {
             try require(models.filter { $0.model == TokenWindowVirtualBucketTargets.residualModel }.count <= 1, "residual model duplicated for \(window)")
             try require(models.contains { $0.model == "brand-new-model" }, "real new model missing for \(window)")
             try require(zip(models, models.dropFirst()).allSatisfy { $0.tokens >= $1.tokens }, "display breakdown not sorted descending for \(window)")
+
+            // 缓存 / 创建维度（口径同总量：目标=起点，之后只加新增）：
+            // - displayCached / displayNew = max(0, 目标 + (real − anchor))，随真实增量单调增，截 0 不为负。
+            let cachedZero = TokenWindowVirtualBucketTargets.displayCached(for: window, realCached: 0)
+            let newZero = TokenWindowVirtualBucketTargets.displayNew(for: window, realNew: 0)
+            try require(cachedZero >= 0 && newZero >= 0, "cached/new display must clamp at 0 for \(window)")
+
+            // 追加真实增量：显示缓存 / 创建不随真实增量收缩（起点之上正常累加）。
+            let cachedGrown = TokenWindowVirtualBucketTargets.displayCached(for: window, realCached: 5_000_000_000)
+            let newGrown = TokenWindowVirtualBucketTargets.displayNew(for: window, realNew: 5_000_000_000)
+            try require(cachedGrown >= cachedZero, "display cached must not shrink when real cached grows for \(window)")
+            try require(newGrown >= newZero, "display new must not shrink when real new grows for \(window)")
+
+            // 命中率由放大后的 cached /(new + cached) 重算，落在 [0,1]。
+            let denominator = cachedGrown + newGrown
+            try require(denominator > 0, "cache/new denominator must be positive for \(window)")
+            let hitRate = Double(cachedGrown) / Double(denominator)
+            try require(hitRate >= 0 && hitRate <= 1, "cache hit rate out of range for \(window)")
         }
     }
 

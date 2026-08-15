@@ -6,7 +6,8 @@ import Foundation
 /// 口径「目标 = 起点，之后只加新增」：
 /// - 日窗口：纯真实——总数 / 缓存 / 分模型均来自真实账本，不叠加基线。
 /// - 周 / 月 / 全部：显示总数 = 标量基线(目标 − 锚定真实) + 实时真实总量 = 目标 + 锚定后的新增；
-///   分模型 = 目标各模型基线 + 实时真实（余量并入 unknown，模型名用账本原始名）；缓存按命中率随总数重算。
+///   分模型 = 目标各模型基线 + 实时真实（余量并入 unknown，模型名用账本原始名）；
+///   缓存 / 创建同样各自「目标起点 + 锚定后新增」，命中率由放大后的 cached /(new + cached) 重算。
 ///
 /// 边界（务必保持）：只作用于展示层 `TokenUsageSummary`，绝不改写 SQLite 账本、绝不进入上报 payload、
 /// 不落盘、不写日志。
@@ -38,12 +39,10 @@ enum TokenWindowVirtualBuckets {
     }
 
     /// 周 / 月 / 全部：显示 = 目标起点 + 锚定后新增。
-    /// - 总数 = 标量基线(目标 − 锚定真实) + 实时真实总量
-    /// 周 / 月 / 全部：显示 = 目标起点 + 锚定后新增。
     /// - 总数 = displayTotal（目标 + 锚定后真实增量）
     /// - 分模型 = 目标各模型基线 + 实时真实（余量并入 unknown）
-    /// - 缓存 / 新增 / 命中率：纯真实透传（缓存=cache read，新增=纯 input，命中率=cache read/(input+cache read)），
-    ///   与日窗口及参照实现同口径；缓存条按 cached:new 绘制，不受虚拟 total 影响。
+    /// - 缓存 / 创建：各自「目标起点 + 锚定后新增」（displayCached / displayNew），实时真实取自
+    ///   `original` 的账本口径缓存 / 创建；命中率由放大后的 cached /(new + cached) 重算，与账本口径一致。
     private static func baselinePlusReal(
         _ original: TokenUsageWindowSummary?,
         window: TokenWindowVirtualBucketTargets.Window,
@@ -57,12 +56,20 @@ enum TokenWindowVirtualBuckets {
         let perModel = TokenWindowVirtualBucketTargets.displayModels(window: window, real: realModelTokens)
             .map { TokenModelUsage(model: $0.model, totalTokens: $0.tokens) }
 
+        // 缓存 / 创建按账本真实口径放大（cached=cache read，new=纯 input）；命中率随放大后的分项重算。
+        let realCached = original?.cachedTokens ?? 0
+        let realNew = original?.newTokens ?? 0
+        let cached = TokenWindowVirtualBucketTargets.displayCached(for: window, realCached: realCached)
+        let new = TokenWindowVirtualBucketTargets.displayNew(for: window, realNew: realNew)
+        let denominator = new + cached
+        let cacheHitRate = denominator > 0 ? Double(cached) / Double(denominator) : nil
+
         return TokenUsageWindowSummary(
             totalTokens: total,
             estimatedCost: original?.estimatedCost ?? 0,
-            cachedTokens: original?.cachedTokens ?? 0,
-            newTokens: original?.newTokens ?? 0,
-            cacheHitRate: original?.cacheHitRate,
+            cachedTokens: cached,
+            newTokens: new,
+            cacheHitRate: cacheHitRate,
             perModel: perModel
         )
     }
