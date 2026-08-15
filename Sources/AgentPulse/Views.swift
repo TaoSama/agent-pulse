@@ -641,15 +641,10 @@ private struct TPSAxisChartView: View {
 
     private var bounds: (lower: Double, upper: Double) {
         let values = points.compactMap(\.value) + modelSeries.flatMap { $0.points.compactMap(\.value) }
-        guard let minimum = values.min() else { return (0, 1) }
-        // 上界对异常值稳健：稀疏大跳增（累计计数一次落盘）会制造孤立尖峰，若用绝对 max 定轴，
-        // 单个尖峰会把整条轴撑高、其余曲线被压扁贴底。改用 P95 分位定上界，尖峰顶到轴顶被裁，
-        // 其余曲线获得合理纵向展开；仍保留对真实最大值的下限保护，避免分位过低截掉正常波峰。
-        let sorted = values.sorted()
-        let robustUpper = SparklineAnalysis.quantile(sorted, 0.95)
-        let upper = max(robustUpper, minimum + 0.5)
-        let padding = max((upper - minimum) * 0.08, 0.5)
-        return (max(0, minimum - padding), upper + padding)
+        guard let minimum = values.min(), let maximum = values.max() else { return (0, 1) }
+        // 看板如实显示真实 TPS：纵轴上界用真实最大值，大值就该显示大，不做分位裁剪压峰。
+        let padding = max((maximum - minimum) * 0.08, 0.5)
+        return (max(0, minimum - padding), maximum + padding)
     }
 
     var body: some View {
@@ -687,36 +682,16 @@ private struct TPSAxisChartView: View {
                         context.stroke(vertical, with: .color(gridColor), lineWidth: 1)
                     }
 
-                    let denominator = Double(max(1, points.count - 1))
                     let span = max(scale.upper - scale.lower, 0.000_001)
-                    var curve = Path()
-                    var previousWasValid = false
-                    for (index, point) in points.enumerated() {
-                        guard let value = point.value, value.isFinite else {
-                            previousWasValid = false
-                            continue
-                        }
-                        let x = size.width * Double(index) / denominator
-                        let normalized = min(max((value - scale.lower) / span, 0), 1)
-                        let location = CGPoint(x: x, y: size.height * (1 - normalized))
-                        if previousWasValid { curve.addLine(to: location) } else { curve.move(to: location) }
-                        previousWasValid = true
-                    }
+                    // 曲线只画真实值（point.value），遇缺口断开，绝不跨缺口连线造假斜坡；
+                    // 相邻真实点之间用 Catmull-Rom 平滑连线，仅美化连线、不改点值也不新增数据点。
+                    let curve = Self.smoothedCurve(
+                        for: points, size: size, lower: scale.lower, span: span
+                    )
                     for series in modelSeries {
-                        var modelCurve = Path()
-                        var hasPrevious = false
-                        let seriesDenominator = Double(max(1, series.points.count - 1))
-                        for (index, point) in series.points.enumerated() {
-                            guard let value = point.value, value.isFinite else {
-                                hasPrevious = false
-                                continue
-                            }
-                            let x = size.width * Double(index) / seriesDenominator
-                            let normalized = min(max((value - scale.lower) / span, 0), 1)
-                            let location = CGPoint(x: x, y: size.height * (1 - normalized))
-                            if hasPrevious { modelCurve.addLine(to: location) } else { modelCurve.move(to: location) }
-                            hasPrevious = true
-                        }
+                        let modelCurve = Self.smoothedCurve(
+                            for: series.points, size: size, lower: scale.lower, span: span
+                        )
                         context.stroke(
                             modelCurve,
                             with: .color(modelTPSColor(for: series.model, in: modelSeries)),
@@ -748,6 +723,53 @@ private struct TPSAxisChartView: View {
 
     private func axisLabel(_ value: Double) -> String {
         String(format: "%.1f", value)
+    }
+
+    /// 把真实值序列转成平滑曲线 Path：遇缺口（value 为 nil/非有限）断开成独立段，
+    /// 每段内相邻真实点用 Catmull-Rom 生成三次贝塞尔平滑连线（仅美化连线，不改点 y 值、不跨缺口造点）。
+    private static func smoothedCurve(
+        for points: [SparklinePoint],
+        size: CGSize,
+        lower: Double,
+        span: Double
+    ) -> Path {
+        let denominator = Double(max(1, points.count - 1))
+        // 按缺口切分连续段，段内收集屏幕坐标点。
+        var segments: [[CGPoint]] = []
+        var current: [CGPoint] = []
+        for (index, point) in points.enumerated() {
+            guard let value = point.value, value.isFinite else {
+                if !current.isEmpty { segments.append(current); current = [] }
+                continue
+            }
+            let x = size.width * Double(index) / denominator
+            let normalized = min(max((value - lower) / span, 0), 1)
+            current.append(CGPoint(x: x, y: size.height * (1 - normalized)))
+        }
+        if !current.isEmpty { segments.append(current) }
+
+        var path = Path()
+        for pts in segments {
+            guard let first = pts.first else { continue }
+            if pts.count == 1 {
+                // 孤立真实点：画一个极短线段以可见（不与邻段相连）。
+                path.move(to: first)
+                path.addLine(to: CGPoint(x: first.x + 0.5, y: first.y))
+                continue
+            }
+            path.move(to: first)
+            // Catmull-Rom → 三次贝塞尔：控制点由相邻四点推出，曲线穿过每个真实点。
+            for i in 0..<(pts.count - 1) {
+                let p0 = pts[max(0, i - 1)]
+                let p1 = pts[i]
+                let p2 = pts[i + 1]
+                let p3 = pts[min(pts.count - 1, i + 2)]
+                let c1 = CGPoint(x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6)
+                let c2 = CGPoint(x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6)
+                path.addCurve(to: p2, control1: c1, control2: c2)
+            }
+        }
+        return path
     }
 }
 

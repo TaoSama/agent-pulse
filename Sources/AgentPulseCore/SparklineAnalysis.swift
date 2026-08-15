@@ -437,7 +437,10 @@ public enum SparklineAnalysis {
 
     /// 端到端渲染数据：重采样 → 平滑 → 归一化，并返回趋势回归。
     ///
-    /// 趋势回归基于“重采样+平滑但未归一化”的真实值，避免视觉裁剪影响趋势判定。
+    /// 双通道语义（看板要真实、菜单要平滑）：
+    /// - `SparklinePoint.value` 保留**原始重采样真实值**（缺口 nil，绝不跨缺口插值）——供看板如实绘制真实 TPS。
+    /// - `SparklinePoint.normalized` 为「插值补缺 + 高斯平滑 + 归一化」后的 0…1 值——供菜单栏小图与悬浮球看趋势。
+    /// 趋势回归基于「重采样+平滑但未归一化」的值，避免视觉裁剪影响趋势判定。
     public static func makeSparkline(
         from samples: [LiveRateSample],
         end: Date? = nil,
@@ -450,8 +453,12 @@ public enum SparklineAnalysis {
         let smoothed = smooth(interpolated, kernel: kernel)
         let originalValidCount = resampled.lazy.filter { $0.value != nil }.count
         let regressionResult = originalValidCount >= 2 ? regression(smoothed) : regression(resampled)
-        let normalized = normalize(smoothed)
-        return (normalized, regressionResult)
+        let normalizedSmoothed = normalize(smoothed)
+        // 合并双通道：value 用原始真实值（缺口 nil、不插值），normalized 用平滑归一化值。
+        let points = zip(resampled, normalizedSmoothed).map { raw, smooth in
+            SparklinePoint(time: raw.time, value: raw.value, normalized: smooth.normalized)
+        }
+        return (points, regressionResult)
     }
 
     /// 为单个模型生成与总曲线相同时间栅格、插值和平滑规则的曲线。
