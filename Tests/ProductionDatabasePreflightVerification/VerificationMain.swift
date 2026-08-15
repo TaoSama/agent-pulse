@@ -235,8 +235,18 @@ struct ProductionDatabasePreflightVerification {
         return leftDevice == rightDevice && leftInode == rightInode
     }
 
+    /// 受保护的 revision 高水位必须「单调不回退」：迁移 / reset 不得丢失或倒退它，
+    /// 全量重建会合法地推进它（重新派生的行 revision 上抬，带动 per-hostname 高水位前移）。
+    /// 因此断言 actual >= expected（数值比较），倒退才算失守——倒退会导致误 ack。
+    /// 非数值的受保护值退回严格相等。
     private static func state(_ expected: [String: String], isPreservedBy actual: [String: String]) -> Bool {
-        expected.allSatisfy { actual[$0.key] == $0.value }
+        expected.allSatisfy { key, expectedValue in
+            guard let actualValue = actual[key] else { return false }
+            if let expectedInt = Int64(expectedValue), let actualInt = Int64(actualValue) {
+                return actualInt >= expectedInt
+            }
+            return actualValue == expectedValue
+        }
     }
 
     private static func verifyDatabase(_ url: URL, expectedHostname: String) throws {
