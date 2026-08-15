@@ -1270,10 +1270,12 @@ public actor CodexRuntimeMetricsCollector {
         var hasSeenTurnContext = cached.hasSeenTurnContext
         var messageUsage = cached.messageUsage
         var messageSequence = cached.messageSequence
-        // 内容指纹去重（对标参考实现按内容折叠 codex token_count）：codex token_count 缺稳定
-        // message id，同一 turn 会重复刷新多条除时间戳外逐字节相同的行；无 id 走增量路径时不去重
-        // 会把同一次真实 output 按刷新条数重复累加（实测约 2x）。指纹取 model + token 增量（不含
-        // 时间戳，避免 fork 改写时间戳绕过折叠），同指纹只计一次。
+        // 内容指纹去重，只作用于「无 message id 的增量（incremental）路径」——主要是 Claude CLI
+        // 中缺 message.id 的逐条 usage 行：同一次真实 output 会被重复刷新成多条除时间戳外逐字节相同
+        // 的行，不去重会按刷新条数重复累加（实测约 2x）。指纹取 model + token 增量（不含时间戳，避免
+        // fork 改写时间戳绕过折叠），同指纹只计一次。
+        // 注意：codex token_count 行恒带 total_token_usage，永远走下方 cumulative 差分分支（靠文件级
+        // previousTotal 天然去重），不经过这里；此指纹对 codex 恒不命中，仅为 incremental 源兜底。
         var seenIncrementalFingerprints = Set<String>()
         var tokenDiagnostics = cached.tokenDiagnostics
         let source: PulseSource = switch tokenFileProviders[file.path] {
