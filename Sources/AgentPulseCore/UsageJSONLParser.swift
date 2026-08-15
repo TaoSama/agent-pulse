@@ -46,7 +46,11 @@ public enum UsageJSONLParser {
     /// v7：codex token 事件新增内容型去重键（codexDedupKey：model + 归一化 last 分量 +
     ///   原始 total 快照分量，不含 timestamp/path/session/rollout），供跨文件折叠
     ///   fork/subagent 回放出的重复 turn，消除历史累计的重复计数。
-    public static let parserVersion = 8
+    /// v9：Claude 用量改按 message.id（而非逐 uuid）归属并逐分量取最大。一次真实 API 响应
+    ///   会被 Claude Code 按 content block（text / tool_use）拆成多条 uuid 各异、usage 相同的行；
+    ///   逐 uuid 计入会把同一次用量按转录行数成倍高估（实测今日 opus 缓存被放大到约 1.6×，
+    ///   上游按请求计费更接近 message.id 粒度）。按 message.id 折叠后与上游计费口径对齐。
+    public static let parserVersion = 9
 
     /// 内建 rollout 来源标识。仅此来源走 Codex rollout 解析；其余一切来源按
     /// Claude transcript 处理。集中定义，避免分派处散落魔法字符串。
@@ -740,6 +744,26 @@ public enum UsageJSONLParser {
 
     private struct ClaudeCandidate { var model: String; var project: String; var timestamp: Date; var counts: UsageTokenCounts; var index: Int; var sessionHash: String; var skillCounts: [String: Int] = [:]; var mcpCounts: [String: Int] = [:] }
 
+    /// 折叠同一 message.id 的多条转录行：一次真实 API 响应会被 Claude Code 按 content block
+    /// 拆成多条 uuid 各异、usage 相同（或流式渐增）的行；按 message.id 归属、逐分量取最大，
+    /// 避免把一次用量按转录行数重复累加（上游按请求计费 ≈ message.id 粒度，uuid 粒度会成倍高估）。
+    /// 元数据保留最早出现的一条（index / timestamp 取更早，model / project 以更明确者补全）。
+    private static func mergeClaudeCandidate(_ existing: ClaudeCandidate, _ incoming: ClaudeCandidate) -> ClaudeCandidate {
+        var merged = existing.index <= incoming.index ? existing : incoming
+        let a = existing.counts, b = incoming.counts
+        merged.counts = UsageTokenCounts(
+            input: max(a.input, b.input), output: max(a.output, b.output),
+            cachedInput: max(a.cachedInput, b.cachedInput), cacheCreationInput: max(a.cacheCreationInput, b.cacheCreationInput),
+            reasoningOutput: max(a.reasoningOutput, b.reasoningOutput), reportedTotal: max(a.reportedTotal, b.reportedTotal)
+        )
+        if isUnknownModel(merged.model), !isUnknownModel(incoming.model) { merged.model = incoming.model }
+        if merged.project == "unknown", incoming.project != "unknown" { merged.project = incoming.project }
+        merged.timestamp = min(existing.timestamp, incoming.timestamp)
+        merged.skillCounts = maxCounts(existing.skillCounts, incoming.skillCounts)
+        merged.mcpCounts = maxCounts(existing.mcpCounts, incoming.mcpCounts)
+        return merged
+    }
+
     private struct ClaudeToolCandidate {
         let identity: String
         var model: String
@@ -910,13 +934,11 @@ public enum UsageJSONLParser {
             if usage.isEmpty {
                 continue
             }
-            // 参照口径（上游）：按 uuid 逐行独立计入并在 bucket 层求和——同一 assistant message
-            // 被转录重复写入的多条（uuid 各异、值相同）视为多条独立用量分别累加，而非取最大去重。
-            // uuid 缺失时回退到 message.id（同 turn 多行内容按 first-wins 折叠，避免把无 uuid 的
-            // 同一次用量误当多次累加；真实 Claude 每行都带 uuid，回退仅覆盖测试/异常数据）。
-            let id = string(object["uuid"]) ?? turnID
+            // 按 message.id 唯一归属一次真实 API 响应。带 tool_use 的响应会被拆成多条
+            // uuid 各异、usage 相同的行；按 message.id 折叠、逐分量取最大，避免按转录行数重复计。
+            // message.id 缺失时回退 uuid，再回退行号（真实 Claude 每条 assistant 行都带 message.id）。
+            let id = string(message["id"]) ?? string(object["uuid"]) ?? turnID
             // 累计该 turn 的 thinking / 其余输出字符（仅主转录需要，子代理不拆分）。
-            // 字符按 turn（message.id）归集，与逐 uuid 的用量事件解耦。
             if !isSubagent {
                 accumulateClaudeTurnChars(message: message, turnID: turnID, into: &turnChars)
             }
@@ -927,8 +949,12 @@ public enum UsageJSONLParser {
             usageToolIdentities.insert(toolIdentity)
             let counts = UsageTokenCounts(input: integer(usage["input_tokens"]), output: integer(usage["output_tokens"]), cachedInput: integer(usage["cache_read_input_tokens"]), cacheCreationInput: integer(usage["cache_creation_input_tokens"]), reasoningOutput: integer(usage["reasoning_output_tokens"]), reportedTotal: integer(usage["total_tokens"]))
             let candidate = ClaudeCandidate(model: string(message["model"]) ?? "unknown", project: string(object["cwd"]).map(component) ?? "unknown", timestamp: timestamp, counts: counts, index: index, sessionHash: sessionHash, skillCounts: recordSkillCounts, mcpCounts: recordMCPCounts)
-            // 参照口径：按 uuid 去重（重复 uuid 只计一次，first-wins），不同 uuid 各自独立累加。
-            if messages[id] == nil { messages[id] = candidate }
+            // 同 message.id 的多条转录行按分量取最大折叠为一条（流式渐增取终值）。
+            if let existing = messages[id] {
+                messages[id] = mergeClaudeCandidate(existing, candidate)
+            } else {
+                messages[id] = candidate
+            }
             candidateStableID[id] = turnID
             candidateToolIdentity[id] = toolIdentity
         }
@@ -949,8 +975,8 @@ public enum UsageJSONLParser {
                     )
                 }
             }
-            // Claude 同 msg.id 的累计增长依靠稳定 event id 在账本层 UPSERT 取最大，
-            // 因此不生成 lineage 指纹（Claude 无跨文件继承回放问题）。
+            // Claude 用量按 message.id 唯一：稳定 event id 在账本层 UPSERT 幂等，
+            // 同一响应跨文件（主转录 / subagent / resume）折叠为一条，不生成 lineage 指纹。
             let toolCandidate = candidateToolIdentity[id].flatMap { toolCandidates[$0] }
             return UsageEvent(
                 id: hash("\(source)|message:\(id)"),
@@ -958,8 +984,8 @@ public enum UsageJSONLParser {
                 sessionHash: value.sessionHash, sourceFileHash: fileHash,
                 rolloutKey: value.sessionHash, parentRolloutKey: "", inherited: false,
                 hasTotalSnapshot: false, lineageFingerprint: "",
-                // 参照口径：event id 按 uuid 唯一，每条独立。重解析同一 uuid 得同一 event id，
-                // 直接覆盖即幂等；不再 cumulativeMax（那会把独立行误折叠为取最大）。
+                // event id 按 message.id 唯一。重解析同一 message.id 得同一 event id，
+                // 直接覆盖即幂等，counts 已在解析期按分量取最大折叠。
                 mergeStrategy: .overwrite,
                 skillCounts: maxCounts(value.skillCounts, toolCandidate?.skillCounts ?? [:]),
                 mcpCounts: maxCounts(value.mcpCounts, toolCandidate?.mcpCounts ?? [:])
@@ -1135,7 +1161,7 @@ public enum UsageJSONLParser {
     private static func maximum(_ a: UsageTokenCounts, _ b: UsageTokenCounts) -> UsageTokenCounts {
         UsageTokenCounts(input: max(a.input, b.input), output: max(a.output, b.output), cachedInput: max(a.cachedInput, b.cachedInput), cacheCreationInput: max(a.cacheCreationInput, b.cacheCreationInput), reasoningOutput: max(a.reasoningOutput, b.reasoningOutput), reportedTotal: max(a.total, b.total))
     }
-    // 注：maximum 仍供 codex 累计路径复用；Claude 路径已改按 uuid 逐行独立计入。
+    // 注：maximum 供 codex 累计路径复用；Claude 路径按 message.id 折叠、逐分量取最大（见 mergeClaudeCandidate）。
 
     private static func subtract(_ current: UsageTokenCounts, _ prior: UsageTokenCounts) -> UsageTokenCounts {
         UsageTokenCounts(
