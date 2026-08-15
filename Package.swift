@@ -16,6 +16,7 @@ let package = Package(
         .library(name: "AgentPulseR2", targets: ["AgentPulseR2"]),
         .library(name: "AgentPulseReporting", targets: ["AgentPulseReporting"]),
         .library(name: "AgentPulseUsage", targets: ["AgentPulseUsage"]),
+        .library(name: "AgentPulseReconcileParity", targets: ["AgentPulseReconcileParity"]),
     ],
     targets: [
         .target(
@@ -30,6 +31,10 @@ let package = Package(
         .target(
             name: "AgentPulseUsage",
             dependencies: ["AgentPulseCore", "AgentPulseReporting"]
+        ),
+        .target(
+            name: "AgentPulseReconcileParity",
+            dependencies: ["AgentPulseCore", "AgentPulseReporting", "AgentPulseUsage"]
         ),
         .executableTarget(
             name: "AgentPulse",
@@ -123,6 +128,11 @@ let package = Package(
             name: "ReferenceCaptureParityVerification",
             dependencies: ["AgentPulseReporting"],
             path: "Tests/ReferenceCaptureParityVerification"
+        ),
+        .executableTarget(
+            name: "ReconcileParityVerification",
+            dependencies: ["AgentPulseReconcileParity"],
+            path: "Tests/ReconcileParityVerification"
         ),
     ],
     swiftLanguageModes: [.v6]
