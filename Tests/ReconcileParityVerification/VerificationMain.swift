@@ -14,7 +14,8 @@ import AgentPulseReconcileParity
 /// 脱敏：只输出字段名、聚合数与 ✓/✗；不输出 token、凭证、会话正文、完整路径。
 @main
 enum ReconcileParityVerification {
-    /// env：kaboo base URL。只从环境变量读，工具不落盘、不碰 UserDefaults。
+    /// env：kaboo base URL 覆盖开关（可选）。默认从合并 env 的 REPORT_BASE_URL 读；
+    /// 设了此环境变量则优先用它,便于临时指向测试后端。工具不落盘、不碰 UserDefaults。
     private static let baseURLEnvKey = "AGENT_PULSE_RECONCILE_BASE_URL"
 
     static func main() async throws {
@@ -237,19 +238,25 @@ enum ReconcileParityVerification {
             return
         }
 
-        // 3) base URL：仅从环境变量读；缺失 / 无效 → 跳过。
-        guard let rawBaseURL = ProcessInfo.processInfo.environment[baseURLEnvKey],
-              !rawBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let baseURL = URL(string: rawBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+        // 3) base URL 与 hostname 来自合并 env（与 app 同一来源单一真相）：
+        //    REPORT_BASE_URL / REPORT_CANONICAL_HOSTNAME。base URL 允许用环境变量覆盖
+        //    （AGENT_PULSE_RECONCILE_BASE_URL）以便临时指向测试后端。
+        let mergedEnv = (try? EnvFile.load(path: MergedEnvKeys.defaultPath)) ?? [:]
+        let envOverride = ProcessInfo.processInfo.environment[baseURLEnvKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawBase = (envOverride?.isEmpty == false ? envOverride! :
+            (mergedEnv[MergedEnvKeys.reportBaseURL] ?? "").trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !rawBase.isEmpty,
+              let baseURL = URL(string: rawBase),
               TokenUsageReporter.isValidBaseURL(baseURL) else {
-            print("跳过实拉：环境变量 \(baseURLEnvKey) 未配置或不是合法 base URL（生产要求 https）。")
+            print("跳过实拉：合并 env 的 REPORT_BASE_URL（或环境变量 \(baseURLEnvKey)）未配置或不是合法 base URL（生产要求 https）。")
             return
         }
 
-        // 4) hostname 以配置 canonical 为准。
-        let hostname = CanonicalHostname.normalize(configuration.canonicalHostname)
+        // 4) hostname 以合并 env 的 REPORT_CANONICAL_HOSTNAME 为准（与 app 上报身份一致）。
+        let hostname = CanonicalHostname.normalize(mergedEnv[MergedEnvKeys.reportCanonicalHostname] ?? "")
         guard !hostname.isEmpty else {
-            print("跳过实拉：reporting.json 缺 canonicalHostname。")
+            print("跳过实拉：合并 env 缺 REPORT_CANONICAL_HOSTNAME。")
             return
         }
 
