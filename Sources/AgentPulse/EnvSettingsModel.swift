@@ -19,7 +19,7 @@ enum EnvFieldSource: String, Sendable, Equatable, Codable {
 final class EnvSettingsModel: ObservableObject {
     /// 参与双源编辑的所有键，按 UI 分组顺序排列。
     static let allKeys: [String] = [
-        MergedEnvKeys.r2AccountID, MergedEnvKeys.r2Endpoint, MergedEnvKeys.r2Bucket,
+        MergedEnvKeys.r2AccountID, MergedEnvKeys.r2Bucket,
         MergedEnvKeys.r2PublicBaseURL, MergedEnvKeys.r2AccessKeyID, MergedEnvKeys.r2SecretAccessKey,
         MergedEnvKeys.cliProxyBaseURL, MergedEnvKeys.cliProxyManagementKey, MergedEnvKeys.cliProxyTargetAPIKey,
         MergedEnvKeys.reportBaseURL, MergedEnvKeys.reportCanonicalHostname,

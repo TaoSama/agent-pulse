@@ -337,18 +337,24 @@ struct MenuBarSummaryView: View {
     }
 }
 
-/// 返回按钮样式：给整个"返回"标签一块可点热区，悬停 / 按下时用淡色圆角背景高亮，
-/// 让用户明确知道点哪、有反馈。
+/// 返回按钮样式：给整个"返回"标签一块可点热区，悬停 / 按下时用明显的圆角高亮背景 + 描边，
+/// 让用户明确知道点哪、有反馈。标题栏是系统浅色 material，故用较深的中性填充，
+/// 保证选中态清晰可见（此前 0.08 primary 在浅背景上几乎不可见）。
 private struct BackHotZoneButtonStyle: ButtonStyle {
     @State private var isHovering = false
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
+        let active = configuration.isPressed ? 0.22 : (isHovering ? 0.14 : 0)
+        return configuration.label
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .background(
                 RoundedRectangle(cornerRadius: 6)
-                    .fill(Color.primary.opacity(configuration.isPressed ? 0.16 : (isHovering ? 0.08 : 0)))
+                    .fill(Color.gray.opacity(active))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.gray.opacity(isHovering || configuration.isPressed ? 0.35 : 0), lineWidth: 1)
             )
             .contentShape(RoundedRectangle(cornerRadius: 6))
             .onHover { isHovering = $0 }

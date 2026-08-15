@@ -1357,6 +1357,26 @@ struct AgentPulseCoreVerification {
             let outputSum = try outputTotal(ledger, hostname: "h"); try require(outputSum == 100,
                         "conflicting overwrite must keep deterministic first row, never a blended count")
         }
+
+        // 8) overwrite 同 tier 仅 timestamp 不同不阻断：claude-code 同一 message.id 跨文件
+        // （主转录 / subagent / resume）折叠出的 min-timestamp 可能不同，但 timestamp 不入计费，
+        // 不应 fail-closed。计数一致时应保持 eligible，并只计一次该事件的计数。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            _ = try UsageLedgerStore(path: db.path)
+            let handle = try open(db.path); defer { sqlite3_close(handle) }
+            try insertFile(handle, fileID: "fileA", source: "claude-code", status: "complete")
+            try insertFile(handle, fileID: "fileB", source: "claude-code", status: "complete")
+            try insertEvent(handle, eventID: "m1", source: "claude-code", ts: 1000, output: 100, fileHash: "fileA")
+            try insertEvent(handle, eventID: "m1", source: "claude-code", ts: 2000, output: 100, fileHash: "fileB")
+            sqlite3_close(handle)
+            let ledger = try UsageLedgerStore(path: db.path)
+            let result = try ledger.finalizeDerived(hostname: "h")
+            try require(result.reportingEligible && result.blockedReasons.isEmpty,
+                        "timestamp-only difference across same-tier files must not block reporting")
+            let outputSum = try outputTotal(ledger, hostname: "h"); try require(outputSum == 100,
+                        "timestamp-only merge must keep the single event's count once")
+        }
     }
 
 

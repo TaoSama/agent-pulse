@@ -4,9 +4,13 @@ public struct EnvironmentR2Configuration: Sendable, Equatable {
     public let configuration: R2Configuration
     public let credentials: R2Credentials
 
+    /// R2 S3 兼容端点的固定模板：`https://<account-id>.r2.cloudflarestorage.com`。
+    /// endpoint 不再单独配置，由 account id 拼出，避免与 account id 不一致或被手填错。
+    private static let endpointHostSuffix = ".r2.cloudflarestorage.com"
+
     public init(environment: [String: String]) throws {
         let requiredKeys = [
-            "R2_ACCOUNT_ID", "R2_ENDPOINT", "R2_BUCKET", "R2_PUBLIC_BASE_URL",
+            "R2_ACCOUNT_ID", "R2_BUCKET", "R2_PUBLIC_BASE_URL",
             "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY",
         ]
         let missing = requiredKeys.filter { environment[$0]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false }
@@ -14,17 +18,15 @@ public struct EnvironmentR2Configuration: Sendable, Equatable {
             throw R2Error.invalidConfiguration(fields: missing)
         }
 
-        let endpointValue = environment["R2_ENDPOINT"]!.trimmingCharacters(in: .whitespacesAndNewlines)
+        // endpoint 由 account id 拼出固定模板；account id 限定为不含点/斜杠等 host 边界字符的
+        // 安全字符集，避免拼进 host 后越界或注入。
+        let accountID = environment["R2_ACCOUNT_ID"]!.trimmingCharacters(in: .whitespacesAndNewlines)
         guard
-            let endpoint = URL(string: endpointValue),
-            endpoint.scheme?.lowercased() == "https",
-            endpoint.host != nil,
-            endpoint.user == nil,
-            endpoint.password == nil,
-            endpoint.query == nil,
-            endpoint.fragment == nil
+            Self.isValidAccountID(accountID),
+            let endpoint = URL(string: "https://\(accountID)\(Self.endpointHostSuffix)"),
+            endpoint.host != nil
         else {
-            throw R2Error.invalidConfiguration(fields: ["R2_ENDPOINT"])
+            throw R2Error.invalidConfiguration(fields: ["R2_ACCOUNT_ID"])
         }
         let publicURLValue = environment["R2_PUBLIC_BASE_URL"]!.trimmingCharacters(in: .whitespacesAndNewlines)
         guard
@@ -60,8 +62,16 @@ public struct EnvironmentR2Configuration: Sendable, Equatable {
         try self.init(environment: processInfo.environment)
     }
 
-    private static func isValidBucket(_ value: String) -> Bool {
-        guard
+    /// account id 只允许字母数字，长度 1...64；不含点、斜杠、@、冒号等能破坏 host 边界或注入的字符。
+    /// 拼进 `https://<id>.r2.cloudflarestorage.com` 后保证 id 是单一 host 标签。
+    private static func isValidAccountID(_ value: String) -> Bool {
+        guard (1...64).contains(value.count) else { return false }
+        return value.unicodeScalars.allSatisfy {
+            CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789").contains($0)
+        }
+    }
+
+    private static func isValidBucket(_ value: String) -> Bool {        guard
             (3...63).contains(value.count),
             value.first?.isASCII == true,
             value.first?.isLetter == true || value.first?.isNumber == true,

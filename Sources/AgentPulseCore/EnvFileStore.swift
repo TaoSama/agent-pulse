@@ -204,9 +204,9 @@ public enum EnvFile {
 
 /// 合并 env 的键 schema 与默认路径：R2 / cliproxy / 上报简单值的单一事实来源。
 public enum MergedEnvKeys {
-    // R2（键名保持不变，兼容既有 R2 解析）。
+    // R2（键名保持不变，兼容既有 R2 解析）。endpoint 不再单独配置，
+    // 由 account id 拼出固定模板 https://<account-id>.r2.cloudflarestorage.com。
     public static let r2AccountID = "R2_ACCOUNT_ID"
-    public static let r2Endpoint = "R2_ENDPOINT"
     public static let r2Bucket = "R2_BUCKET"
     public static let r2PublicBaseURL = "R2_PUBLIC_BASE_URL"
     public static let r2AccessKeyID = "R2_ACCESS_KEY_ID"
