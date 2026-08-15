@@ -317,6 +317,8 @@ public actor CodexRuntimeMetricsCollector {
         let previousTotalOutput: Int?
         let previousOutputTimestamp: Date?
         let currentModel: String?
+        /// 是否已在该文件里见过权威的 turn_context 模型；见过后不再回退 knownModelName。
+        let hasSeenTurnContext: Bool
         let initializedForLiveTracking: Bool
         let messageUsage: [String: MessageUsage]
         let messageSequence: UInt64
@@ -1074,17 +1076,30 @@ public actor CodexRuntimeMetricsCollector {
         var previousTotal: Int?
         var previousTimestamp: Date?
         var currentModel: String?
+        var hasSeenTurnContext = false
         var latestOutputSignal: Date?
         var messageUsage: [String: MessageUsage] = [:]
         var messageSequence: UInt64 = 0
         var tokenDiagnostics = TokenDiagnostics()
-        if liveTrackedPaths.contains(file.path) {
-            currentModel = latestKnownModel(in: fileData)
+        let tracksLive = liveTrackedPaths.contains(file.path)
+            && tracksLiveTokens(codexMeta: meta, isCodexFile: isCodexFile)
+        if tracksLive {
+            // 优先用最近一次 turn_context 的权威模型做种子；找不到才回退宽松匹配。
+            if let contextModel = latestTurnContextModel(in: fileData) {
+                currentModel = contextModel
+                hasSeenTurnContext = true
+            } else {
+                currentModel = latestKnownModel(in: fileData)
+            }
             let baseline = baselineData(from: fileData)
             for line in completeLines(in: baseline.data, skippingLeadingPartialLine: baseline.skipsLeadingPartialLine) {
-                if let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
-                   let model = knownModelName(object) {
-                    currentModel = model
+                if let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] {
+                    if let model = turnContextModel(object) {
+                        currentModel = model
+                        hasSeenTurnContext = true
+                    } else if !hasSeenTurnContext, let model = knownModelName(object) {
+                        currentModel = model
+                    }
                 }
                 guard let parsed = parseTokenLine(line, now: now) else { continue }
                 tokenDiagnostics.parsedOutputObservations += 1
@@ -1159,6 +1174,7 @@ public actor CodexRuntimeMetricsCollector {
             previousTotalOutput: previousTotal,
             previousOutputTimestamp: previousTimestamp,
             currentModel: currentModel,
+            hasSeenTurnContext: hasSeenTurnContext,
             initializedForLiveTracking: liveTrackedPaths.contains(file.path),
             messageUsage: messageUsage,
             messageSequence: messageSequence,
@@ -1212,6 +1228,7 @@ public actor CodexRuntimeMetricsCollector {
                 previousTotalOutput: cached.previousTotalOutput,
                 previousOutputTimestamp: cached.previousOutputTimestamp,
                 currentModel: cached.currentModel,
+                hasSeenTurnContext: cached.hasSeenTurnContext,
                 initializedForLiveTracking: cached.initializedForLiveTracking,
                 messageUsage: cached.messageUsage,
                 messageSequence: cached.messageSequence,
@@ -1234,6 +1251,7 @@ public actor CodexRuntimeMetricsCollector {
         var previousTotal = cached.previousTotalOutput
         var previousTimestamp = cached.previousOutputTimestamp
         var currentModel = cached.currentModel
+        var hasSeenTurnContext = cached.hasSeenTurnContext
         var messageUsage = cached.messageUsage
         var messageSequence = cached.messageSequence
         var tokenDiagnostics = cached.tokenDiagnostics
@@ -1247,13 +1265,27 @@ public actor CodexRuntimeMetricsCollector {
                 !CodexSessionParser.isUnderAutomation(cwd: $0, automationRoots: configuration.automationRoots)
             } == true
         } ?? false
+        // 派生子 agent / fork 线程不贡献实时 token（同一 session_id 跨文件重放，逐文件建 baseline
+        // 会把同一次真实 output 重复计入）；Claude 文件无 Codex meta，走顶层路径过滤已排除 subagents/。
+        let isCodexFile: Bool = switch tokenFileProviders[file.path] {
+        case .claude: false
+        case .codex, nil: true
+        }
+        let tracksLive = liveTrackedPaths.contains(file.path)
+            && tracksLiveTokens(codexMeta: cached.meta, isCodexFile: isCodexFile)
 
         for (lineIndex, rawLine) in text.split(whereSeparator: { $0.isNewline }).enumerated() {
             let line = String(rawLine)
             if let data = line.data(using: .utf8),
-               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-               let model = knownModelName(object) {
-                currentModel = model
+               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                // 权威 turn 模型只从 turn_context 事件取；仅当从未见过 turn_context
+                // 时才回退到宽松的 knownModelName，避免被非权威 model 字段污染。
+                if let model = turnContextModel(object) {
+                    currentModel = model
+                    hasSeenTurnContext = true
+                } else if !hasSeenTurnContext, let model = knownModelName(object) {
+                    currentModel = model
+                }
             }
             if let data = line.data(using: .utf8),
                let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
@@ -1283,7 +1315,7 @@ public actor CodexRuntimeMetricsCollector {
                 }
             }
 
-            guard liveTrackedPaths.contains(file.path),
+            guard tracksLive,
                   let parsed = parseTokenLine(Data(line.utf8), now: now) else { continue }
             tokenDiagnostics.parsedOutputObservations += 1
             var emittedTokens = 0
@@ -1412,6 +1444,7 @@ public actor CodexRuntimeMetricsCollector {
             previousTotalOutput: previousTotal,
             previousOutputTimestamp: previousTimestamp,
             currentModel: currentModel,
+            hasSeenTurnContext: hasSeenTurnContext,
             initializedForLiveTracking: true,
             messageUsage: messageUsage,
             messageSequence: messageSequence,
@@ -1484,7 +1517,22 @@ public actor CodexRuntimeMetricsCollector {
         return nil
     }
 
+    /// Codex rollout 里每一个 turn 的权威模型来自 `turn_context` 事件的 `payload.model`；
+    /// `token_count` 事件本身不带 model。只从 turn_context 取模型可避免被
+    /// session_meta / message / reasoning 等行的其它 model 字段污染成错误归属。
+    private func turnContextModel(_ object: [String: Any]) -> String? {
+        guard (object["type"] as? String) == "turn_context",
+              let payload = object["payload"] as? [String: Any],
+              let raw = payload["model"] as? String else { return nil }
+        let model = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.isEmpty ? nil : model
+    }
+
+    /// baseline 预读阶段确定“最近一次 turn 的模型”。优先反向扫描 `turn_context`
+    /// 事件的权威模型；只有在整段数据里都找不到 turn_context 时，才回退到
+    /// 宽松的 `knownModelName`，保证不丢模型也不误判成 Other。
     private func latestKnownModel(in data: Data) -> String? {
+        if let contextModel = latestTurnContextModel(in: data) { return contextModel }
         var searchEnd = data.endIndex
         let needle = Data("\"model\"".utf8)
         while searchEnd > data.startIndex,
@@ -1494,6 +1542,23 @@ public actor CodexRuntimeMetricsCollector {
             let lineEnd = data[match.upperBound..<data.endIndex].firstIndex(of: 0x0A) ?? data.endIndex
             if let object = (try? JSONSerialization.jsonObject(with: data[lineStart..<lineEnd])) as? [String: Any],
                let model = knownModelName(object) {
+                return model
+            }
+            searchEnd = match.lowerBound
+        }
+        return nil
+    }
+
+    private func latestTurnContextModel(in data: Data) -> String? {
+        var searchEnd = data.endIndex
+        let needle = Data("turn_context".utf8)
+        while searchEnd > data.startIndex,
+              let match = data[data.startIndex..<searchEnd].range(of: needle, options: .backwards) {
+            let lineStart = data[data.startIndex..<match.lowerBound].lastIndex(of: 0x0A)
+                .map { data.index(after: $0) } ?? data.startIndex
+            let lineEnd = data[match.upperBound..<data.endIndex].firstIndex(of: 0x0A) ?? data.endIndex
+            if let object = (try? JSONSerialization.jsonObject(with: data[lineStart..<lineEnd])) as? [String: Any],
+               let model = turnContextModel(object) {
                 return model
             }
             searchEnd = match.lowerBound
@@ -1664,6 +1729,15 @@ public actor CodexRuntimeMetricsCollector {
         for entry in sorted.prefix(usage.count - Self.maximumMessageIdentities) {
             usage[entry.key] = nil
         }
+    }
+
+    /// 仅顶层会话文件贡献实时 token：Codex 的派生子 agent / fork 线程会把父线程的
+    /// 累计 output 以各自文件重新落盘（同一 session_id 出现在多个文件、cumulative total 从头重放），
+    /// 若逐文件各自建 baseline 会把同一次真实 output 跨文件重复计入实时 TPS。
+    /// Claude 文件无 Codex meta（meta==nil），其顶层过滤已在路径层排除 subagents/，此处放行。
+    private func tracksLiveTokens(codexMeta meta: CodexSessionMeta?, isCodexFile: Bool) -> Bool {
+        guard isCodexFile, let meta else { return true }
+        return meta.isTopLevel
     }
 
     private func shouldTrackLiveJSONL(_ url: URL) -> Bool {
