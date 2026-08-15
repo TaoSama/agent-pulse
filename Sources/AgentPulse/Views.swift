@@ -81,12 +81,14 @@ private struct TokenScanProgressFooter: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .onAppear { smoother.setTarget(inProgress ? status.scanProgress : nil) }
+        .onAppear {
+            smoother.setTarget(inProgress ? status.scanProgress : nil, phaseCeiling: status.scanPhase?.overallCeiling)
+        }
         .onChange(of: status.scanProgress) { _, newValue in
-            smoother.setTarget(inProgress ? newValue : nil)
+            smoother.setTarget(inProgress ? newValue : nil, phaseCeiling: status.scanPhase?.overallCeiling)
         }
         .onChange(of: inProgress) { _, running in
-            smoother.setTarget(running ? status.scanProgress : nil)
+            smoother.setTarget(running ? status.scanProgress : nil, phaseCeiling: status.scanPhase?.overallCeiling)
         }
     }
 }
@@ -552,7 +554,7 @@ struct OrbView: View {
                 Text(TokenUsageFormatting.compactTokens(model.tokenSummary.day?.totalTokens))
                     .font(.system(size: 8, weight: .medium, design: .rounded))
                     .monospacedDigit()
-                    .foregroundStyle(Color.white.opacity(0.7))
+                    .foregroundStyle(Color.white)
             }
         }
         .contentShape(Circle())
@@ -691,23 +693,32 @@ struct TPSDashboardView: View {
 
     /// 分模型曲线：前三档来自每秒不重叠桶，1 天来自账本 day series。
     /// latestTPS 统一取各自曲线最右有效桶的瞬时值，与图例数字口径一致。
+    /// 过滤：窗口内全程无输出（latestTPS==0 且无任何非零桶）的模型不进图例 / 曲线；
+    /// 占位名（`<synthetic>` 归一后的 unknown 展示名）也剔除，避免图例出现无意义的 0.0 行。
     private var displayModelSeries: [ModelTPSHistory] {
         let base: [ModelTPSHistory]
         if span == .oneDay {
             let day = model.dashboardDaySeries
-            base = day.perModel.map { entry in
-                ModelTPSHistory(model: entry.key, latestTPS: 0, points: entry.value)
-            }
+            base = day.perModel
+                .filter { $0.key != Self.placeholderModelName }
+                .map { entry in
+                    ModelTPSHistory(model: entry.key, latestTPS: 0, points: entry.value)
+                }
         } else {
             base = model.dashboardModelTPSHistory
         }
         return base
             .map { ModelTPSHistory(model: $0.model, latestTPS: Self.latestValue(of: $0.points) ?? 0, points: $0.points) }
+            // 全程无输出的模型不展示（latestTPS>0 或窗口内出现过非零桶才保留）。
+            .filter { $0.latestTPS > 0 || $0.points.contains(where: { ($0.value ?? 0) > 0 }) }
             .sorted {
                 if $0.latestTPS == $1.latestTPS { return $0.model.localizedStandardCompare($1.model) == .orderedAscending }
                 return $0.latestTPS > $1.latestTPS
             }
     }
+
+    /// 未知 / 占位模型的展示名（账本合成占位归一后的名字），不进看板图例。
+    private static let placeholderModelName = "n"
 
     /// 图例分模型行：与曲线同源、latestTPS 取各自曲线最右有效桶的瞬时值。
     private var legendSeries: [ModelTPSHistory] {

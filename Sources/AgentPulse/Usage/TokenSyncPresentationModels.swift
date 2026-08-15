@@ -153,6 +153,11 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
         return total
     }
 
+    /// 本阶段的整体进度上界（起点 + 本阶段权重）；缓动最小爬升不得越过此界。
+    var overallCeiling: Double {
+        min(baseProgress + weight, 1)
+    }
+
     var displayLabel: String {
         switch self {
         case .cliproxy: return "采集 CPA"

@@ -4,9 +4,11 @@ import SwiftUI
 /// 让「正在更新: xx%」与底部「刷新进度：xx%」平滑爬升而非跳变。
 ///
 /// 语义：
-/// - 每帧把展示值按固定比例逼近目标（指数缓动），并保证至少有一个最小步进，
-///   使停滞的目标也会缓慢爬升（避免长时间卡在同一数字给人「卡死」错觉）。
-/// - 只增不减：目标回退（新一轮扫描重置或抖动）时不倒退展示值，除非目标显著更低（重置）。
+/// - 真实进度领先时：按指数缓动快速追上，封顶到真实目标。
+/// - 真实目标停滞时：以最小步（约 0.15%/s）继续极缓慢爬升，但**绝不越过当前阶段的整体上界**——
+///   封顶到「阶段上界 − stallMargin(1%)」，表示「本阶段快完了但还没进下一阶段」；
+///   只有真实进度推进（阶段前进或达 100%）才允许越过该界。消除「数字卡死」观感又不假装跨阶段。
+/// - 只增不减：目标小幅回退不倒退展示值；显著回退（新一轮扫描）时归零重来。
 /// - 扫描结束（目标为 nil）时清零，供下次从 0 起步。
 @MainActor
 final class ScanProgressSmoother: ObservableObject {
@@ -14,6 +16,8 @@ final class ScanProgressSmoother: ObservableObject {
     @Published private(set) var displayed: Double = 0
 
     private var target: Double = 0
+    /// 当前阶段的整体上界（阶段起点 + 权重）；停滞爬升不得越过此界。默认 1（无阶段约束）。
+    private var phaseCeiling: Double = 1
     private var ticker: Timer?
 
     /// 每帧向目标逼近的比例（指数缓动系数）。
@@ -24,13 +28,17 @@ final class ScanProgressSmoother: ObservableObject {
     private let tickInterval = 1.0 / 30.0
     /// 目标显著回退阈值：低于此判定为「新一轮扫描重置」，展示值随之归零重来。
     private let resetDropThreshold = 0.05
+    /// 停滞爬升与当前阶段上界之间保留的余量：展示值最多到「阶段上界 − 1%」，绝不贴到阶段边界。
+    private let stallMargin = 0.01
 
-    /// 设置目标进度。`nil` 表示未在扫描 → 停止并清零。
-    func setTarget(_ value: Double?) {
+    /// 设置目标进度与当前阶段上界。`value == nil` 表示未在扫描 → 停止并清零。
+    /// `ceiling` 为当前阶段的整体上界（`TokenScanPhase.overallCeiling`）；nil 时按无阶段约束(1)。
+    func setTarget(_ value: Double?, phaseCeiling ceiling: Double? = nil) {
         guard let value else {
             stop()
             displayed = 0
             target = 0
+            phaseCeiling = 1
             return
         }
         let clamped = min(max(value, 0), 1)
@@ -39,6 +47,7 @@ final class ScanProgressSmoother: ObservableObject {
             displayed = 0
         }
         target = clamped
+        phaseCeiling = min(max(ceiling ?? 1, 0), 1)
         start()
     }
 
@@ -57,15 +66,23 @@ final class ScanProgressSmoother: ObservableObject {
     }
 
     private func step() {
-        // 已抵达目标：若已接近 100% 则停帧，避免空转；否则保留最小爬升。
-        let remaining = target - displayed
-        if remaining <= 0 {
-            if target >= 1 { stop() }
+        // 真实目标已达 100% 且展示也追平：收顶停帧。
+        if target >= 1, displayed >= 1 {
+            displayed = 1
+            stop()
             return
         }
-        let eased = remaining * easing
-        let advance = max(eased, min(minStepPerTick, remaining))
-        displayed = min(displayed + advance, target)
+        if displayed < target {
+            // 真实进度领先：按指数缓动快速追上（至少走最小步），封顶到目标。
+            let remaining = target - displayed
+            let advance = max(remaining * easing, min(minStepPerTick, remaining))
+            displayed = min(displayed + advance, target)
+        } else {
+            // 已追平但真实目标停滞：以最小步继续极缓慢爬升，但绝不越过「当前阶段上界 − 1%」，
+            // 即「本阶段快完但没进下一阶段」；真实进度到 100% 时才允许贴顶到 1.0。
+            let stallCap = target >= 1 ? 1.0 : max(target, phaseCeiling - stallMargin)
+            displayed = min(displayed + minStepPerTick, stallCap)
+        }
     }
 }
 
@@ -204,12 +221,14 @@ struct TokenSyncUpdateStatusView: View {
             .fixedSize(horizontal: true, vertical: false)
             .frame(maxWidth: .infinity, alignment: .trailing)
             .onReceive(ticker) { now = $0 }
-            .onAppear { smoother.setTarget(inProgress ? status.scanProgress : nil) }
+            .onAppear {
+                smoother.setTarget(inProgress ? status.scanProgress : nil, phaseCeiling: status.scanPhase?.overallCeiling)
+            }
             .onChange(of: status.scanProgress) { _, newValue in
-                smoother.setTarget(inProgress ? newValue : nil)
+                smoother.setTarget(inProgress ? newValue : nil, phaseCeiling: status.scanPhase?.overallCeiling)
             }
             .onChange(of: inProgress) { _, running in
-                smoother.setTarget(running ? status.scanProgress : nil)
+                smoother.setTarget(running ? status.scanProgress : nil, phaseCeiling: status.scanPhase?.overallCeiling)
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel(statusText)

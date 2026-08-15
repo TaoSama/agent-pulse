@@ -83,6 +83,7 @@ final class OrbWindowController {
         host.autoresizingMask = [.width, .height]
         host.onClick = { [weak self] in self?.toggleExpanded() }
         host.onDoubleClick = { [weak self] in self?.openDashboard() }
+        host.onRightClick = { [weak self] in self?.openMenuBarPanel() }
         host.onDrag = { [weak self] mouse in self?.drag(to: mouse) }
         host.onDragEnded = { [weak self] in self?.finishDrag() }
         panel.contentView = host
@@ -95,6 +96,45 @@ final class OrbWindowController {
     private func openDashboard() {
         collapse()
         onOpenDashboard?()
+    }
+
+    /// 右击悬浮球打开菜单栏面板：MenuBarExtra 无公开 API，改为定位其 NSStatusItem 的按钮并
+    /// 触发一次点击（等价于用户点菜单栏图标）。定位失败时静默降级为展开任务概览，绝不崩溃。
+    private func openMenuBarPanel() {
+        collapse()
+        guard let button = Self.menuBarStatusButton() else {
+            // 兜底：找不到菜单栏按钮时至少弹出任务概览，行为可预期。
+            expand()
+            return
+        }
+        if let action = button.action {
+            NSApp.sendAction(action, to: button.target, from: button)
+        } else {
+            button.performClick(nil)
+        }
+    }
+
+    /// 在当前应用的所有窗口里定位 MenuBarExtra 承载的 NSStatusItem 按钮。
+    /// MenuBarExtra 的 status item 按钮类型私有，这里按「属于 status bar 窗口的 NSStatusBarButton」启发式匹配。
+    private static func menuBarStatusButton() -> NSStatusBarButton? {
+        for window in NSApp.windows {
+            if let button = window.contentView as? NSStatusBarButton {
+                return button
+            }
+            if let button = firstStatusBarButton(in: window.contentView) {
+                return button
+            }
+        }
+        return nil
+    }
+
+    private static func firstStatusBarButton(in view: NSView?) -> NSStatusBarButton? {
+        guard let view else { return nil }
+        if let button = view as? NSStatusBarButton { return button }
+        for subview in view.subviews {
+            if let found = firstStatusBarButton(in: subview) { return found }
+        }
+        return nil
     }
 
     private func drag(to mouse: NSPoint) {
@@ -429,6 +469,7 @@ private extension NSRect {
 final class DraggableHostingView<Content: View>: NSHostingView<Content> {
     var onClick: (() -> Void)?
     var onDoubleClick: (() -> Void)?
+    var onRightClick: (() -> Void)?
     var onDrag: ((NSPoint) -> Void)?
     var onDragEnded: (() -> Void)?
 
@@ -437,6 +478,10 @@ final class DraggableHostingView<Content: View>: NSHostingView<Content> {
     private var pendingSingleClick: DispatchWorkItem?
     private let dragThreshold: CGFloat = 4
     private var mouseDownLocation: NSPoint?
+
+    override func rightMouseDown(with event: NSEvent) {
+        onRightClick?()
+    }
 
     override func mouseDown(with event: NSEvent) {
         isDragging = false
