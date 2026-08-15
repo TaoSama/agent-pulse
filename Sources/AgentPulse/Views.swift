@@ -140,11 +140,11 @@ struct MenuBarSummaryView: View {
     /// 面板各分区之间的垂直间距。
     private static let sectionSpacing: CGFloat = 12
 
-    /// 主概览面板宽度；进入设置态时加宽以容纳凭证字段。
-    private static let overviewWidth: CGFloat = 380
-    private static let settingsWidth: CGFloat = 460
-    /// 设置面板高度：与主菜单概览观感一致（内容超出时在内部 ScrollView 滚动，不撑高面板）。
-    private static let settingsHeight: CGFloat = 640
+    /// 概览与设置共用同一面板宽度：切换时宽度不变，避免菜单栏弹窗向右伸缩显丑。
+    private static let panelWidth: CGFloat = 380
+    /// 设置内容超出该高度时才在内部 ScrollView 滚动；否则面板高度随内容自适应，
+    /// 与主菜单概览观感一致（不再硬撑固定高度）。
+    private static let settingsMaxHeight: CGFloat = 640
 
     /// Token 汇总卡与分模型明细卡共用同一时间窗口选择；持久化，面板重开保留上次选择。
     @AppStorage("menubar.tokenWindow") private var tokenWindow: TokenUsageWindow = .day
@@ -191,12 +191,13 @@ struct MenuBarSummaryView: View {
             .padding(.top, 14)
             .padding(.bottom, 6)
 
-            // 设置内容超出面板高度时可滚动；面板高度与主菜单一致，仅宽度略大。
+            // 设置内容随内容自适应高度，与主菜单一致；仅当超过上限时才在内部滚动。
             ScrollView {
                 AgentPulseSettingsView(model: model)
             }
+            .frame(maxHeight: Self.settingsMaxHeight)
         }
-        .frame(width: Self.settingsWidth, height: Self.settingsHeight)
+        .frame(width: Self.panelWidth)
     }
 
     private var overviewScreen: some View {
@@ -260,18 +261,23 @@ struct MenuBarSummaryView: View {
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(.orange)
             }
+            // collectionWarning 只承载真正的采集告警（计时器失败 / 文件不可读等）；
+            // "正在刷新缓存"这句已不再走这里，改由下方 Token 扫描块随扫描周期展示。
             if let warning = model.metricsStore.collectionWarning {
                 Label(warning, systemImage: "externaldrive.badge.exclamationmark")
                     .font(.caption).foregroundStyle(.orange)
             }
-            // Token 扫描底部行：更新中展示进度详情，与进度同生共死，走到 100% 结束时消失；
-            // 前缀提示语由上面的 collectionWarning 承载（文案一致），此处只补进度，
-            // 用透明占位图标与告警行的文字左对齐。只读聚合数，不含路径、正文或凭证。
+            // Token 扫描底部块：更新中自带前缀行 + 进度行，与 Token 扫描周期同生共死，
+            // 走到 100% 结束时整块消失。只读聚合数，不含文件路径、会话正文或凭证。
             if let scanDetail = TokenUsageFormatting.scanDetail(model.tokenSyncStatus) {
-                Label {
-                    Text(scanDetail)
-                } icon: {
-                    Image(systemName: "externaldrive.badge.exclamationmark").hidden()
+                VStack(alignment: .leading, spacing: 2) {
+                    Label(MetricsStore.refreshingCacheNotice, systemImage: "arrow.triangle.2.circlepath")
+                    // 进度行用透明占位图标补齐图标宽度，与上方前缀行的文字左对齐。
+                    Label {
+                        Text(scanDetail)
+                    } icon: {
+                        Image(systemName: "arrow.triangle.2.circlepath").hidden()
+                    }
                 }
                 .font(.caption).foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
@@ -297,7 +303,7 @@ struct MenuBarSummaryView: View {
             }
         }
         .padding(16)
-        .frame(width: Self.overviewWidth)
+        .frame(width: Self.panelWidth)
     }
 
     private var trendColor: Color {
