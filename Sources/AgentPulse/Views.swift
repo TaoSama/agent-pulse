@@ -142,8 +142,8 @@ struct MenuBarSummaryView: View {
 
     /// 概览面板宽度。
     private static let overviewWidth: CGFloat = 380
-    /// 设置面板宽度：比概览宽以容纳凭证长路径。菜单栏弹窗右边缘锚定图标不动，
-    /// 更宽的设置页自然向左延伸，右边与概览保持对齐。
+    /// 设置面板宽度：比概览宽以容纳凭证长路径。菜单栏弹窗左边缘由系统锚定图标不动、
+    /// 窗宽随内容变，故设置页比概览宽的部分向右延伸（系统默认，无法反向固定右边缘）。
     private static let settingsWidth: CGFloat = 460
     /// 设置内容超出该高度时才在内部 ScrollView 滚动；否则面板高度随内容自适应，
     /// 与主菜单概览观感一致（不再硬撑固定高度）。
@@ -204,8 +204,7 @@ struct MenuBarSummaryView: View {
             }
             .frame(maxHeight: Self.settingsMaxHeight)
         }
-        // 设置页比概览宽；弹窗右边缘锚定图标不动，靠右对齐使其向左延伸、右边对齐概览。
-        .frame(width: Self.settingsWidth, alignment: .trailing)
+        .frame(width: Self.settingsWidth)
     }
 
     private var overviewScreen: some View {
