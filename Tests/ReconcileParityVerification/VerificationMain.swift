@@ -21,7 +21,31 @@ enum ReconcileParityVerification {
         try await runOfflineSelfCheck()
         print("离线自检通过：口径剔除 cacheCreation、逐维度对齐、脱敏渲染均正确。")
         print("")
+        if ProcessInfo.processInfo.environment["AGENT_PULSE_RECONCILE_DEMO"] != nil {
+            printDemoTables()
+        }
         await runLiveReconcileIfConfigured()
+    }
+
+    /// 仅演示：用 mock kaboo 响应渲染 AP vs kaboo 对齐表（一致 + 不一致两例），
+    /// 供人工核对报告格式。env AGENT_PULSE_RECONCILE_DEMO 存在时才输出，默认不跑。
+    private static func printDemoTables() {
+        let buckets = [
+            makeBucket(hostname: "mbp-work", model: "sonnet", input: 100, output: 200, cached: 50, cacheCreation: 999, reasoning: 30, startOffset: 0),
+            makeBucket(hostname: "mbp-work", model: "opus", input: 10, output: 20, cached: 5, cacheCreation: 40, reasoning: 3, startOffset: 3600),
+        ]
+        let sessions = [makeSession(hostname: "mbp-work"), makeSession(hostname: "mbp-work"), makeSession(hostname: "mbp-work")]
+        let agg = LocalHostnameAggregate.aggregate(hostname: "mbp-work", buckets: buckets, sessions: sessions)
+        let first = iso(buckets[0].bucketStart), last = iso(buckets[1].bucketStart)
+        // 口径化 total：bucket1 max(0,100+200+50+30)=380，bucket2 max(0,10+20+5+3)=38 → 418。
+        let aligned = KabooReconcileResponse.HostnameStats(hostname: "mbp-work", bucketCount: 2, sessionCount: 3, totalTokens: 418, totalCostCents: 137, firstBucketAt: first, lastBucketAt: last, lastSyncedAt: last)
+        print("【演示·场景一：口径处理后逐项一致】")
+        print(ReconcileReportRenderer.render(ReconcileComparison.compare(local: agg, kaboo: aligned)))
+        print("")
+        let wrong = KabooReconcileResponse.HostnameStats(hostname: "mbp-work", bucketCount: 2, sessionCount: 3, totalTokens: 1457, totalCostCents: 137, firstBucketAt: first, lastBucketAt: last, lastSyncedAt: last)
+        print("【演示·场景二：total 差异（不一致被检出）】")
+        print(ReconcileReportRenderer.render(ReconcileComparison.compare(local: agg, kaboo: wrong)))
+        print("")
     }
 
     // MARK: - 离线自检（纯函数，无 I/O）
