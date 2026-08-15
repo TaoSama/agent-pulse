@@ -102,6 +102,10 @@ public final class MetricsStore: ObservableObject {
     @Published public private(set) var isShowingCachedSnapshot = false
     @Published public private(set) var collectionWarning: String?
 
+    /// 冷启动 / 后台重建期间"显示缓存值"的提示语。抽为常量供 UI 判重：
+    /// Token 扫描进度块会自带同款前缀行，此文案的 collectionWarning 不再重复展示。
+    public static let refreshingCacheNotice = "正在刷新本地 rollout，当前显示上次缓存"
+
     private let configuration: Configuration
     private let collector: CodexRuntimeMetricsCollector?
     private let initializationError: String?
@@ -272,7 +276,6 @@ public final class MetricsStore: ObservableObject {
         dashboardModelTPSHistory = makeModelTPSHistory(from: restored.history, end: snapshot.timestamp, dashboard: true)
         lastRefresh = snapshot.timestamp
         isShowingCachedSnapshot = true
-        collectionWarning = "正在刷新本地 rollout，当前显示上次缓存"
     }
 
     private func makeModelTPSHistory(
