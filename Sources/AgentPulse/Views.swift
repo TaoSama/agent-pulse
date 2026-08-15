@@ -222,9 +222,8 @@ struct MenuBarSummaryView: View {
                 } label: {
                     Image(systemName: "gearshape")
                         .font(.system(size: 13))
-                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(BackHotZoneButtonStyle())
                 .focusable(false)
                 .accessibilityLabel("设置")
                 Circle()
