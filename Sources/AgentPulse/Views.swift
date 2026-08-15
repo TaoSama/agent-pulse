@@ -218,6 +218,24 @@ struct MenuBarSummaryView: View {
             HStack(alignment: .center, spacing: 8) {
                 Text("Agent Pulse").font(.subheadline.weight(.semibold))
                 Spacer()
+                // 刷新（扫描数据）快捷入口：等价设置页「立即扫描」；扫描中转圈并禁用。
+                Button {
+                    model.scanTokenUsageNow()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 13))
+                        .rotationEffect(.degrees(model.tokenSyncStatus.scanningInProgress ? 360 : 0))
+                        .animation(
+                            model.tokenSyncStatus.scanningInProgress
+                                ? .linear(duration: 1).repeatForever(autoreverses: false)
+                                : .default,
+                            value: model.tokenSyncStatus.scanningInProgress
+                        )
+                }
+                .buttonStyle(BackHotZoneButtonStyle())
+                .focusable(false)
+                .disabled(model.tokenSyncStatus.scanningInProgress)
+                .accessibilityLabel(model.tokenSyncStatus.scanningInProgress ? "正在扫描" : "刷新数据")
                 // 设置齿轮快捷入口：面板内切到设置页（与底部「设置」同一动作）。
                 Button {
                     showingSettings = true
