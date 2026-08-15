@@ -46,12 +46,7 @@ public enum UsageJSONLParser {
     /// v7：codex token 事件新增内容型去重键（codexDedupKey：model + 归一化 last 分量 +
     ///   原始 total 快照分量，不含 timestamp/path/session/rollout），供跨文件折叠
     ///   fork/subagent 回放出的重复 turn，消除历史累计的重复计数。
-    /// v9：修正跨文件回放折叠 —— codexDedupKey 去掉累计 total 快照，只按 model + 归一化 last
-    ///   五分量成键（fork 分支从不同基线派生同一 turn 时 last 相同、累计各异，旧键因绑定累计
-    ///   而不折叠，导致重复计数）；Claude 用量改按 message.id（而非逐 uuid）归属并逐分量取最大，
-    ///   同一响应被流式 / resume / subagent 转录成多条 uuid 行时只计一次。二者共同消除今日
-    ///   cache 维度的成倍高估。
-    public static let parserVersion = 9
+    public static let parserVersion = 8
 
     /// 内建 rollout 来源标识。仅此来源走 Codex rollout 解析；其余一切来源按
     /// Claude transcript 处理。集中定义，避免分派处散落魔法字符串。
@@ -256,10 +251,10 @@ public enum UsageJSONLParser {
             codexEventOccurrences[baseEventID] = occurrence + 1
             let eventID = occurrence == 0 ? baseEventID : "\(baseEventID)#\(occurrence)"
 
-            // 仅在有完整 total 快照时生成内容型去重键（缺快照的行不足以证明是回放，
-            // 键为空，永不折叠，交由血缘层判定）；键本身只绑定 last 五分量，不含累计 total。
+            // 仅在有完整 total 快照时生成内容型去重键（与参考实现一致）；缺快照的行
+            // 键为空，永不折叠，交由血缘层判定。
             let codexDedupKey = hasTotalSnapshot
-                ? codexContentDedupKey(model: modelAtEmission, last: normalizedLast)
+                ? codexContentDedupKey(model: modelAtEmission, last: normalizedLast, rawTotal: totalUsage)
                 : ""
 
             result.append(UsageEvent(
@@ -745,24 +740,6 @@ public enum UsageJSONLParser {
 
     private struct ClaudeCandidate { var model: String; var project: String; var timestamp: Date; var counts: UsageTokenCounts; var index: Int; var sessionHash: String; var skillCounts: [String: Int] = [:]; var mcpCounts: [String: Int] = [:] }
 
-    /// 折叠同一 message.id 的多条转录行：token 逐分量取最大（流式渐增取终值，避免重复累加），
-    /// 元数据保留最早出现的一条（index / timestamp 取更早，model / project 以更明确者补全）。
-    private static func mergeClaudeCandidate(_ existing: ClaudeCandidate, _ incoming: ClaudeCandidate) -> ClaudeCandidate {
-        var merged = existing.index <= incoming.index ? existing : incoming
-        let a = existing.counts, b = incoming.counts
-        merged.counts = UsageTokenCounts(
-            input: max(a.input, b.input), output: max(a.output, b.output),
-            cachedInput: max(a.cachedInput, b.cachedInput), cacheCreationInput: max(a.cacheCreationInput, b.cacheCreationInput),
-            reasoningOutput: max(a.reasoningOutput, b.reasoningOutput), reportedTotal: max(a.reportedTotal, b.reportedTotal)
-        )
-        if isUnknownModel(merged.model), !isUnknownModel(incoming.model) { merged.model = incoming.model }
-        if merged.project == "unknown", incoming.project != "unknown" { merged.project = incoming.project }
-        merged.timestamp = min(existing.timestamp, incoming.timestamp)
-        merged.skillCounts = maxCounts(existing.skillCounts, incoming.skillCounts)
-        merged.mcpCounts = maxCounts(existing.mcpCounts, incoming.mcpCounts)
-        return merged
-    }
-
     private struct ClaudeToolCandidate {
         let identity: String
         var model: String
@@ -933,14 +910,13 @@ public enum UsageJSONLParser {
             if usage.isEmpty {
                 continue
             }
-            // 参照口径：assistant message 的用量按 message.id 唯一归属。同一次响应会被
-            // 流式 / resume / subagent 转录成多条 uuid 各异、usage 相同（或流式渐增）的行；
-            // 按 message.id 折叠、逐分量取最大，避免把一次用量按转录行数重复累加。
-            // message.id 缺失时回退 uuid，再回退行号（真实 Claude 每条 assistant 行都带 message.id，
-            // 回退仅覆盖测试 / 异常数据）。
-            let id = string(message["id"]) ?? string(object["uuid"]) ?? turnID
+            // 参照口径（上游）：按 uuid 逐行独立计入并在 bucket 层求和——同一 assistant message
+            // 被转录重复写入的多条（uuid 各异、值相同）视为多条独立用量分别累加，而非取最大去重。
+            // uuid 缺失时回退到 message.id（同 turn 多行内容按 first-wins 折叠，避免把无 uuid 的
+            // 同一次用量误当多次累加；真实 Claude 每行都带 uuid，回退仅覆盖测试/异常数据）。
+            let id = string(object["uuid"]) ?? turnID
             // 累计该 turn 的 thinking / 其余输出字符（仅主转录需要，子代理不拆分）。
-            // 字符按 turn（message.id）归集，与逐用量事件解耦。
+            // 字符按 turn（message.id）归集，与逐 uuid 的用量事件解耦。
             if !isSubagent {
                 accumulateClaudeTurnChars(message: message, turnID: turnID, into: &turnChars)
             }
@@ -951,13 +927,8 @@ public enum UsageJSONLParser {
             usageToolIdentities.insert(toolIdentity)
             let counts = UsageTokenCounts(input: integer(usage["input_tokens"]), output: integer(usage["output_tokens"]), cachedInput: integer(usage["cache_read_input_tokens"]), cacheCreationInput: integer(usage["cache_creation_input_tokens"]), reasoningOutput: integer(usage["reasoning_output_tokens"]), reportedTotal: integer(usage["total_tokens"]))
             let candidate = ClaudeCandidate(model: string(message["model"]) ?? "unknown", project: string(object["cwd"]).map(component) ?? "unknown", timestamp: timestamp, counts: counts, index: index, sessionHash: sessionHash, skillCounts: recordSkillCounts, mcpCounts: recordMCPCounts)
-            // 同 message.id 的多条转录行按分量取最大折叠为一条（流式渐增取终值），
-            // 首现保留最早 index / model / project / timestamp 语义。
-            if let existing = messages[id] {
-                messages[id] = mergeClaudeCandidate(existing, candidate)
-            } else {
-                messages[id] = candidate
-            }
+            // 参照口径：按 uuid 去重（重复 uuid 只计一次，first-wins），不同 uuid 各自独立累加。
+            if messages[id] == nil { messages[id] = candidate }
             candidateStableID[id] = turnID
             candidateToolIdentity[id] = toolIdentity
         }
@@ -978,8 +949,8 @@ public enum UsageJSONLParser {
                     )
                 }
             }
-            // Claude 用量按 message.id 唯一：稳定 event id 在账本层 UPSERT 幂等，
-            // 同一响应跨文件（主转录 / subagent / resume）折叠为一条，不生成 lineage 指纹。
+            // Claude 同 msg.id 的累计增长依靠稳定 event id 在账本层 UPSERT 取最大，
+            // 因此不生成 lineage 指纹（Claude 无跨文件继承回放问题）。
             let toolCandidate = candidateToolIdentity[id].flatMap { toolCandidates[$0] }
             return UsageEvent(
                 id: hash("\(source)|message:\(id)"),
@@ -987,8 +958,8 @@ public enum UsageJSONLParser {
                 sessionHash: value.sessionHash, sourceFileHash: fileHash,
                 rolloutKey: value.sessionHash, parentRolloutKey: "", inherited: false,
                 hasTotalSnapshot: false, lineageFingerprint: "",
-                // event id 按 message.id 唯一。重解析同一 message.id 得同一 event id，
-                // 直接覆盖即幂等，counts 已在解析期按分量取最大折叠。
+                // 参照口径：event id 按 uuid 唯一，每条独立。重解析同一 uuid 得同一 event id，
+                // 直接覆盖即幂等；不再 cumulativeMax（那会把独立行误折叠为取最大）。
                 mergeStrategy: .overwrite,
                 skillCounts: maxCounts(value.skillCounts, toolCandidate?.skillCounts ?? [:]),
                 mcpCounts: maxCounts(value.mcpCounts, toolCandidate?.mcpCounts ?? [:])
@@ -1164,7 +1135,7 @@ public enum UsageJSONLParser {
     private static func maximum(_ a: UsageTokenCounts, _ b: UsageTokenCounts) -> UsageTokenCounts {
         UsageTokenCounts(input: max(a.input, b.input), output: max(a.output, b.output), cachedInput: max(a.cachedInput, b.cachedInput), cacheCreationInput: max(a.cacheCreationInput, b.cacheCreationInput), reasoningOutput: max(a.reasoningOutput, b.reasoningOutput), reportedTotal: max(a.total, b.total))
     }
-    // 注：maximum 供 codex 累计路径复用；Claude 路径按 message.id 折叠、逐分量取最大（见 mergeClaudeCandidate）。
+    // 注：maximum 仍供 codex 累计路径复用；Claude 路径已改按 uuid 逐行独立计入。
 
     private static func subtract(_ current: UsageTokenCounts, _ prior: UsageTokenCounts) -> UsageTokenCounts {
         UsageTokenCounts(
@@ -1228,16 +1199,22 @@ public enum UsageJSONLParser {
         hash("total|\(root)|last|\(usageIdentity(last))|snapshot|\(usageIdentity(total))")
     }
 
-    /// 内容型去重键：仅由 model 与归一化后的 last（本次 turn）五分量决定，
-    /// 与 timestamp / path / session / rollout 及累计 total 快照均无关。
-    /// fork / subagent 从不同基线派生同一 turn 时，逐 turn 的 last 用量逐字节相同、
-    /// 但累计 total 因起点不同而各异；键只绑定 last，故这些回放 turn 会落到同一键上供
-    /// 跨文件折叠。last 分量取归一化值（input 已扣 cached/creation、output 已扣
-    /// reasoning，cached 合并 cached_input + cache_read_input）。
+    /// 内容型去重键：仅由 model、归一化后的 last 分量与**原始** total 快照分量决定，
+    /// 与 timestamp / path / session / rollout 无关。fork / subagent 回放出的逐字节
+    /// 相同的 token_count 事件（只改时间戳或路径）会落到同一键上，供跨文件折叠。
+    /// last 分量取归一化值（input 已扣 cached/creation、output 已扣 reasoning），
+    /// total 分量取原始累计值（不扣减），cached 合并 cached_input + cache_read_input。
     /// 键为 SHA256 前 16 字节（32 hex），带 "codex:" 命名空间前缀。
-    private static func codexContentDedupKey(model: String, last: UsageTokenCounts) -> String {
+    private static func codexContentDedupKey(model: String, last: UsageTokenCounts, rawTotal: [String: Any]) -> String {
+        let totalInput = integer(rawTotal["input_tokens"])
+        let totalOutput = integer(rawTotal["output_tokens"])
+        let totalCached = integer(rawTotal["cached_input_tokens"]) + integer(rawTotal["cache_read_input_tokens"])
+        let totalCacheCreation = integer(rawTotal["cache_creation_input_tokens"])
+        let totalReasoning = integer(rawTotal["reasoning_output_tokens"])
+        let totalTokens = integer(rawTotal["total_tokens"])
         let payload = "codex-token|\(model)"
             + "|\(last.input)|\(last.output)|\(last.cachedInput)|\(last.cacheCreationInput)|\(last.reasoningOutput)"
+            + "|\(totalInput)|\(totalOutput)|\(totalCached)|\(totalCacheCreation)|\(totalReasoning)|\(totalTokens)|\(last.reportedTotal)"
         return "codex:" + shortHash(payload, hexLength: 32)
     }
 
