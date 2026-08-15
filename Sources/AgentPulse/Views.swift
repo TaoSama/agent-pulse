@@ -224,7 +224,7 @@ struct MenuBarSummaryView: View {
                 Button {
                     model.scanTokenUsageNow()
                 } label: {
-                    Image(systemName: "arrow.clockwise")
+                    Image(systemName: "arrow.clockwise.circle")
                         .font(.system(size: 14, weight: .regular))
                         .rotationEffect(.degrees(model.tokenSyncStatus.scanningInProgress ? 360 : 0))
                         .animation(
