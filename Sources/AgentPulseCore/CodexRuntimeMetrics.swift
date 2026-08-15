@@ -580,12 +580,18 @@ public actor CodexRuntimeMetricsCollector {
         let sourceAvailable = tokenDirectoryReadable && !tokenEnumerationFailed
         let overlapTokens = window.tokensInWindow(referenceDate: sampledAt)
         let modelTokens = window.tokensInWindowByModel(referenceDate: sampledAt)
+        // 看板 5s 滑窗曲线：额外取该时刻前 5 秒的真实 output（总 + 分模型），存入样本供曲线逐点绘制。
+        let shortWindow = Double(LiveRateSample.shortWindowSeconds)
+        let shortTokens = window.tokensInShortWindow(referenceDate: sampledAt, windowSeconds: shortWindow)
+        let shortModelTokens = window.tokensInShortWindowByModel(referenceDate: sampledAt, windowSeconds: shortWindow)
         let liveRate = makeLiveRateSample(
             at: sampledAt,
             sourceAvailable: sourceAvailable,
             latestSignalAt: accumulator.latestOutputSignal,
             tokensInWindow: overlapTokens,
-            modelTokensInWindow: modelTokens
+            modelTokensInWindow: modelTokens,
+            tokensInShortWindow: shortTokens,
+            modelTokensInShortWindow: shortModelTokens
         )
         try persistLiveRate(liveRate)
         let metrics = CodexRuntimeMetrics(
@@ -1803,7 +1809,9 @@ public actor CodexRuntimeMetricsCollector {
         sourceAvailable: Bool,
         latestSignalAt: Date?,
         tokensInWindow: Double,
-        modelTokensInWindow: [String: Double] = [:]
+        modelTokensInWindow: [String: Double] = [:],
+        tokensInShortWindow: Double = 0,
+        modelTokensInShortWindow: [String: Double] = [:]
     ) -> LiveRateSample {
         guard sourceAvailable else {
             return LiveRateSample(
@@ -1835,7 +1843,9 @@ public actor CodexRuntimeMetricsCollector {
             state: state,
             tokensInWindow: tokensInWindow,
             latestSignalAt: latestSignalAt,
-            modelTokensInWindow: modelTokensInWindow
+            modelTokensInWindow: modelTokensInWindow,
+            tokensInShortWindow: tokensInShortWindow,
+            modelTokensInShortWindow: modelTokensInShortWindow
         )
     }
 

@@ -117,6 +117,52 @@ public enum SparklineAnalysis {
             }
     }
 
+    /// 看板专用：每点为该时刻前 5s 滑窗的真实速率（tokensInShortWindow / 5）。
+    /// 旧库样本无 short 值时回退用 180s 口径（tps）保底，避免历史点全空。
+    public static func shortWindowSeries(from samples: [LiveRateSample]) -> [(time: Date, value: Double?)] {
+        samples
+            .sorted { $0.timestamp < $1.timestamp }
+            .map { sample in
+                switch sample.state {
+                case .live, .zero:
+                    if let short = sample.tokensInShortWindow, short.isFinite, short >= 0 {
+                        return (sample.timestamp, short / Double(LiveRateSample.shortWindowSeconds))
+                    }
+                    // 旧库无 short：回退 180s 口径，保证历史曲线仍有值。
+                    if let tps = sample.tps, tps.isFinite, tps >= 0 {
+                        return (sample.timestamp, tps)
+                    }
+                    return (sample.timestamp, nil)
+                case .stale, .noData, .unavailable:
+                    return (sample.timestamp, nil)
+                }
+            }
+    }
+
+    /// 看板分模型专用：单模型该时刻前 5s 滑窗真实速率；旧库无 short 时回退 180s 口径。
+    public static func shortWindowSeries(
+        from samples: [LiveRateSample],
+        model: String
+    ) -> [(time: Date, value: Double?)] {
+        samples
+            .sorted { $0.timestamp < $1.timestamp }
+            .map { sample in
+                switch sample.state {
+                case .live, .zero:
+                    if sample.tokensInShortWindow != nil {
+                        let tokens = sample.modelTokensInShortWindow[model] ?? 0
+                        let tps = tokens / Double(LiveRateSample.shortWindowSeconds)
+                        return (sample.timestamp, tps.isFinite && tps >= 0 ? tps : nil)
+                    }
+                    let tokens = sample.modelTokensInWindow[model] ?? 0
+                    let tps = tokens / Double(LiveRateSample.windowSeconds)
+                    return (sample.timestamp, tps.isFinite && tps >= 0 ? tps : nil)
+                case .stale, .noData, .unavailable:
+                    return (sample.timestamp, nil)
+                }
+            }
+    }
+
     /// 从持久化的实时样本提取单个模型的 TPS 序列。
     /// 模型未出现在某个可用样本中代表该秒窗口贡献为 0；不可用状态仍保留为缺口。
     public static func numericSeries(
@@ -151,8 +197,18 @@ public enum SparklineAnalysis {
         windowSeconds: TimeInterval = defaultWindowSeconds,
         stepSeconds: TimeInterval = defaultStepSeconds
     ) -> [SparklinePoint] {
+        resampleSeries(numericSeries(from: samples), end: end, windowSeconds: windowSeconds, stepSeconds: stepSeconds)
+    }
+
+    /// 底层重采样：接受已提取的 (time, value?) 序列，按固定时间步归并到规整栅格。
+    /// 供总/分模型、180s/5s 各种口径复用（提取器不同，栅格逻辑一致）。
+    public static func resampleSeries(
+        _ series: [(time: Date, value: Double?)],
+        end: Date? = nil,
+        windowSeconds: TimeInterval = defaultWindowSeconds,
+        stepSeconds: TimeInterval = defaultStepSeconds
+    ) -> [SparklinePoint] {
         guard stepSeconds > 0, windowSeconds > 0 else { return [] }
-        let series = numericSeries(from: samples)
         guard let lastTime = end ?? series.last?.time else { return [] }
 
         let start = lastTime.addingTimeInterval(-windowSeconds)
@@ -459,6 +515,28 @@ public enum SparklineAnalysis {
             SparklinePoint(time: raw.time, value: raw.value, normalized: smooth.normalized)
         }
         return (points, regressionResult)
+    }
+
+    /// 看板专用总曲线：每点为该秒前 5s 滑窗真实速率，缺口断开，不插值/不平滑/不归一化。
+    /// 点粒度仍为每秒一点（step=1s），只是每点的值取自 5s 滑窗（形态更贴近瞬时、可加）。
+    public static func makeDashboardSparkline(
+        from samples: [LiveRateSample],
+        end: Date? = nil,
+        windowSeconds: TimeInterval = defaultWindowSeconds,
+        stepSeconds: TimeInterval = defaultStepSeconds
+    ) -> [SparklinePoint] {
+        resampleSeries(shortWindowSeries(from: samples), end: end, windowSeconds: windowSeconds, stepSeconds: stepSeconds)
+    }
+
+    /// 看板专用分模型曲线：单模型每点为该秒前 5s 滑窗真实速率，缺口断开，不插值/不平滑。
+    public static func makeDashboardModelSparkline(
+        from samples: [LiveRateSample],
+        model: String,
+        end: Date? = nil,
+        windowSeconds: TimeInterval = defaultWindowSeconds,
+        stepSeconds: TimeInterval = defaultStepSeconds
+    ) -> [SparklinePoint] {
+        resampleSeries(shortWindowSeries(from: samples, model: model), end: end, windowSeconds: windowSeconds, stepSeconds: stepSeconds)
     }
 
     /// 为单个模型生成与总曲线相同时间栅格、插值和平滑规则的曲线。

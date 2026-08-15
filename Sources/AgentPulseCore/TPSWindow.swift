@@ -16,6 +16,8 @@ public enum LiveRateState: String, Codable, Sendable, Equatable, CaseIterable {
 public struct LiveRateSample: Codable, Sendable, Equatable, Identifiable, SnapshotPersistable {
     public static let basis = "output"
     public static let windowSeconds = 180
+    /// 看板曲线用的短滑窗长度（秒）：每点显示为该时刻前 shortWindowSeconds 内的真实速率。
+    public static let shortWindowSeconds = 5
 
     public let id: UUID
     public let timestamp: Date
@@ -25,6 +27,11 @@ public struct LiveRateSample: Codable, Sendable, Equatable, Identifiable, Snapsh
     public let latestSignalAt: Date?
     /// 按模型拆分的窗口内 token 数；仅 live/zero 状态有值，其余状态为空字典。
     public let modelTokensInWindow: [String: Double]
+    /// 该时刻前 shortWindowSeconds（5s）滑窗内的 output token（看板 5s 滑窗曲线用）；
+    /// 仅 live 状态有值，旧库/其它状态为 nil。
+    public let tokensInShortWindow: Double?
+    /// 5s 短滑窗按模型拆分的 token；仅 live 有值，旧库为空字典。
+    public let modelTokensInShortWindow: [String: Double]
     public var sourceIdentifier: String? { "live-rate" }
 
     public init(
@@ -32,7 +39,9 @@ public struct LiveRateSample: Codable, Sendable, Equatable, Identifiable, Snapsh
         state: LiveRateState,
         tokensInWindow: Double?,
         latestSignalAt: Date?,
-        modelTokensInWindow: [String: Double] = [:]
+        modelTokensInWindow: [String: Double] = [:],
+        tokensInShortWindow: Double? = nil,
+        modelTokensInShortWindow: [String: Double] = [:]
     ) {
         let second = Date(timeIntervalSince1970: floor(timestamp.timeIntervalSince1970))
         self.id = Self.stableID(for: second)
@@ -45,19 +54,29 @@ public struct LiveRateSample: Codable, Sendable, Equatable, Identifiable, Snapsh
             self.tokensInWindow = normalizedTokens
             self.tps = normalizedTokens / Double(Self.windowSeconds)
             self.modelTokensInWindow = Self.normalizedModelTokens(modelTokensInWindow, total: normalizedTokens)
+            let normalizedShort = tokensInShortWindow.map { max(0, $0) }
+            self.tokensInShortWindow = normalizedShort
+            self.modelTokensInShortWindow = normalizedShort.map {
+                Self.normalizedModelTokens(modelTokensInShortWindow, total: $0)
+            } ?? [:]
         case .zero:
             self.tokensInWindow = 0
             self.tps = 0
             self.modelTokensInWindow = [:]
+            self.tokensInShortWindow = 0
+            self.modelTokensInShortWindow = [:]
         case .noData, .stale, .unavailable:
             self.tokensInWindow = nil
             self.tps = nil
             self.modelTokensInWindow = [:]
+            self.tokensInShortWindow = nil
+            self.modelTokensInShortWindow = [:]
         }
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, timestamp, state, tps, tokensInWindow, latestSignalAt, modelTokensInWindow
+        case tokensInShortWindow, modelTokensInShortWindow
     }
 
     public init(from decoder: Decoder) throws {
@@ -70,6 +89,11 @@ public struct LiveRateSample: Codable, Sendable, Equatable, Identifiable, Snapsh
         self.latestSignalAt = try container.decodeIfPresent(Date.self, forKey: .latestSignalAt)
         let decodedModels = try container.decodeIfPresent([String: Double].self, forKey: .modelTokensInWindow) ?? [:]
         self.modelTokensInWindow = Self.normalizedModelTokens(decodedModels, total: self.tokensInWindow ?? 0)
+        // 旧库无这两列：decodeIfPresent 缺省，看板会退化用 tokensInWindow 保底（见 SparklineAnalysis）。
+        let decodedShort = try container.decodeIfPresent(Double.self, forKey: .tokensInShortWindow)
+        self.tokensInShortWindow = decodedShort
+        let decodedShortModels = try container.decodeIfPresent([String: Double].self, forKey: .modelTokensInShortWindow) ?? [:]
+        self.modelTokensInShortWindow = Self.normalizedModelTokens(decodedShortModels, total: decodedShort ?? 0)
     }
 
     /// 归一化模型 token 字典：过滤非有限/负值，并将总和截断到 total 以内。
@@ -190,6 +214,34 @@ public final class TPSWindow: @unchecked Sendable {
         }
     }
 
+    /// 返回自定义短窗口内按重叠比例计入的 output token 数（供看板 5s 滑窗曲线取每秒的短窗值）。
+    /// 语义与 180s 窗口一致（同一 includedTokens 重叠摊分），只是窗口长度可变。
+    public func tokensInShortWindow(referenceDate: Date? = nil, windowSeconds: Double) -> Double {
+        let reference = referenceDate ?? now()
+        return queue.sync {
+            pruneLocked(referenceDate: reference)
+            return samples.reduce(0) { partial, sample in
+                partial + Self.includedTokens(for: sample, referenceDate: reference, windowSeconds: windowSeconds)
+            }
+        }
+    }
+
+    /// 返回自定义短窗口内按模型分组的 output token 数；model 为 nil 归入 "unknown"。
+    public func tokensInShortWindowByModel(referenceDate: Date? = nil, windowSeconds: Double) -> [String: Double] {
+        let reference = referenceDate ?? now()
+        return queue.sync {
+            pruneLocked(referenceDate: reference)
+            var result: [String: Double] = [:]
+            for sample in samples {
+                let included = Self.includedTokens(for: sample, referenceDate: reference, windowSeconds: windowSeconds)
+                guard included > 0 else { continue }
+                let key = sample.model ?? "unknown"
+                result[key, default: 0] += included
+            }
+            return result
+        }
+    }
+
     public func sampleCount(referenceDate: Date? = nil) -> Int {
         let reference = referenceDate ?? now()
         return queue.sync {
@@ -211,9 +263,13 @@ public final class TPSWindow: @unchecked Sendable {
         }
     }
 
-    static func includedTokens(for sample: TPSSample, referenceDate: Date) -> Double {
+    static func includedTokens(
+        for sample: TPSSample,
+        referenceDate: Date,
+        windowSeconds: Double = TPSWindow.windowSeconds
+    ) -> Double {
         guard sample.tokenCount > 0 else { return 0 }
-        let windowStart = referenceDate.addingTimeInterval(-Self.windowSeconds)
+        let windowStart = referenceDate.addingTimeInterval(-windowSeconds)
         let maximumEnd = referenceDate.addingTimeInterval(Self.futureTimestampToleranceSeconds)
         if sample.durationSeconds == 0 {
             guard sample.timestamp >= windowStart, sample.timestamp <= maximumEnd else { return 0 }
