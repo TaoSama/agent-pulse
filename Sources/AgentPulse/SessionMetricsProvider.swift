@@ -94,6 +94,9 @@ public final class MetricsStore: ObservableObject {
         trend: .insufficient
     )
     @Published public private(set) var modelTPSHistory: [ModelTPSHistory] = []
+    /// 看板专用曲线：每点为 5s 滑窗真实速率（不平滑不插值）。菜单/悬浮球仍用上面的平滑序列。
+    @Published public private(set) var dashboardSparklinePoints: [SparklinePoint] = []
+    @Published public private(set) var dashboardModelTPSHistory: [ModelTPSHistory] = []
     @Published public private(set) var lastRefresh: Date?
     @Published public private(set) var isRunning = false
     @Published public private(set) var isShowingCachedSnapshot = false
@@ -187,6 +190,8 @@ public final class MetricsStore: ObservableObject {
             sparklinePoints = sparkline.points
             sparklineRegression = sparkline.regression
             modelTPSHistory = makeModelTPSHistory(from: result.history, end: result.sampledAt)
+            dashboardSparklinePoints = SparklineAnalysis.makeDashboardSparkline(from: result.history, end: result.sampledAt)
+            dashboardModelTPSHistory = makeModelTPSHistory(from: result.history, end: result.sampledAt, dashboard: true)
             lastRefresh = result.sampledAt
             isShowingCachedSnapshot = false
             collectionWarning = result.unreadableFiles > 0
@@ -229,6 +234,8 @@ public final class MetricsStore: ObservableObject {
         tps = .unavailable(reason: reason)
         tpsState = .unavailable
         modelTPSHistory = []
+        dashboardSparklinePoints = []
+        dashboardModelTPSHistory = []
         collectionWarning = reason
         lastRefresh = Date()
     }
@@ -261,12 +268,18 @@ public final class MetricsStore: ObservableObject {
         sparklinePoints = sparkline.points
         sparklineRegression = sparkline.regression
         modelTPSHistory = makeModelTPSHistory(from: restored.history, end: snapshot.timestamp)
+        dashboardSparklinePoints = SparklineAnalysis.makeDashboardSparkline(from: restored.history, end: snapshot.timestamp)
+        dashboardModelTPSHistory = makeModelTPSHistory(from: restored.history, end: snapshot.timestamp, dashboard: true)
         lastRefresh = snapshot.timestamp
         isShowingCachedSnapshot = true
         collectionWarning = "正在刷新本地 rollout，当前显示上次缓存"
     }
 
-    private func makeModelTPSHistory(from history: [LiveRateSample], end: Date) -> [ModelTPSHistory] {
+    private func makeModelTPSHistory(
+        from history: [LiveRateSample],
+        end: Date,
+        dashboard: Bool = false
+    ) -> [ModelTPSHistory] {
         let models = Set(history.flatMap { sample in
             sample.modelTokensInWindow.keys
         })
@@ -274,16 +287,17 @@ public final class MetricsStore: ObservableObject {
             $0.state == .live || $0.state == .zero
         })?.modelTokensInWindow ?? [:]
         return models.compactMap { model in
+            // 图例数字（latestTPS）始终用 180s 口径，稳定且与右上角总数可加；
+            // dashboard 曲线点用 5s 滑窗（形态更贴近瞬时），菜单/悬浮球用平滑序列。
             let latestTokens = currentModels[model] ?? 0
             let latestTPS = latestTokens / Double(LiveRateSample.windowSeconds)
             guard latestTPS > 0 || history.contains(where: { ($0.modelTokensInWindow[model] ?? 0) > 0 }) else {
                 return nil
             }
-            return ModelTPSHistory(
-                model: model,
-                latestTPS: latestTPS,
-                points: SparklineAnalysis.makeModelSparkline(from: history, model: model, end: end)
-            )
+            let points = dashboard
+                ? SparklineAnalysis.makeDashboardModelSparkline(from: history, model: model, end: end)
+                : SparklineAnalysis.makeModelSparkline(from: history, model: model, end: end)
+            return ModelTPSHistory(model: model, latestTPS: latestTPS, points: points)
         }
         .sorted {
             if $0.latestTPS == $1.latestTPS { return $0.model.localizedStandardCompare($1.model) == .orderedAscending }

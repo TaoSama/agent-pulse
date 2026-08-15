@@ -1952,6 +1952,35 @@ struct AgentPulseCoreVerification {
         let normalizedOutliers = SparklineAnalysis.normalize(outlierPoints)
         try require(normalizedOutliers.allSatisfy { $0.normalized?.isFinite ?? true }, "outlier normalization produced a non-finite value")
         try require(normalizedOutliers[19].normalized == 1, "display normalization was not robust to a single outlier")
+
+        // 看板 5s 滑窗曲线：有 short 值时取 tokensInShortWindow/5（而非 180s 口径）。
+        let shortSample = LiveRateSample(
+            timestamp: end,
+            state: .live,
+            tokensInWindow: 540,                 // 180s 口径 tps = 3
+            latestSignalAt: end,
+            modelTokensInWindow: ["m": 540],
+            tokensInShortWindow: 50,             // 5s 口径 tps = 10
+            modelTokensInShortWindow: ["m": 50]
+        )
+        let dash = SparklineAnalysis.makeDashboardSparkline(
+            from: [shortSample], end: end, windowSeconds: 10, stepSeconds: 10
+        )
+        try requireApproximatelyEqual(dash.last?.value, 10, "dashboard curve must use 5s short-window rate (short/5), not 180s")
+        let dashModel = SparklineAnalysis.makeDashboardModelSparkline(
+            from: [shortSample], model: "m", end: end, windowSeconds: 10, stepSeconds: 10
+        )
+        try requireApproximatelyEqual(dashModel.last?.value, 10, "dashboard per-model curve must use 5s short-window rate")
+        // Codable 往返保留 short 字段。
+        let roundTrip = try JSONDecoder().decode(
+            LiveRateSample.self, from: JSONEncoder().encode(shortSample)
+        )
+        try requireApproximatelyEqual(roundTrip.tokensInShortWindow, 50, "tokensInShortWindow must survive JSON round-trip")
+        // 旧库无 short 字段：回退 180s 口径，历史点仍有值。
+        let legacySample = liveSample(minute: 0, tps: 4)   // tokensInShortWindow == nil
+        try require(legacySample.tokensInShortWindow == nil, "legacy sample must have no short window value")
+        let legacySeries = SparklineAnalysis.shortWindowSeries(from: [legacySample])
+        try requireApproximatelyEqual(legacySeries.first?.value ?? nil, 4, "legacy sample must fall back to 180s rate in dashboard series")
         gapSamples.removeAll()
     }
 

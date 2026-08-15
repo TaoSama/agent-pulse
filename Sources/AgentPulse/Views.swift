@@ -507,8 +507,8 @@ struct TPSDashboardView: View {
                 ModelTPSLegend(series: model.modelTPSHistory)
                     .frame(width: 190, alignment: .topLeading)
                 TPSAxisChartView(
-                    points: model.sparklinePoints,
-                    modelSeries: model.modelTPSHistory,
+                    points: model.dashboardSparklinePoints,
+                    modelSeries: model.dashboardModelTPSHistory,
                     trend: model.sparklineRegression.trend,
                     colorMode: model.trendColorMode
                 )
@@ -528,7 +528,8 @@ struct TPSDashboardView: View {
     }
 
     private var summary: String {
-        let values = model.sparklinePoints.compactMap(\.value)
+        // 峰值/平均基于看板 5s 曲线（与图形一致）；当前沿用 180s 口径（与右上角总数一致）。
+        let values = model.dashboardSparklinePoints.compactMap(\.value)
         guard !values.isEmpty else { return "暂无 TPS 数据" }
         let average = values.reduce(0, +) / Double(values.count)
         return String(format: "当前 %.1f · 峰值 %.1f · 平均 %.1f TPS", model.tps ?? 0, values.max() ?? 0, average)

@@ -43,6 +43,9 @@ final class ApplicationModel: ObservableObject {
         trend: .insufficient
     )
     @Published private(set) var modelTPSHistory: [ModelTPSHistory] = []
+    /// 看板专用 5s 滑窗曲线（真实值、不平滑）。菜单/悬浮球仍用上面的平滑序列。
+    @Published private(set) var dashboardSparklinePoints: [SparklinePoint] = []
+    @Published private(set) var dashboardModelTPSHistory: [ModelTPSHistory] = []
     @Published private(set) var tokenSummary: TokenUsageSummary
     @Published private(set) var tokenSyncStatus: TokenSyncStatus
     @Published var trendColorMode: TrendColorMode
@@ -129,6 +132,12 @@ final class ApplicationModel: ObservableObject {
         }.store(in: &cancellables)
         metricsStore.$modelTPSHistory.sink { [weak self] in
             self?.modelTPSHistory = $0
+        }.store(in: &cancellables)
+        metricsStore.$dashboardSparklinePoints.sink { [weak self] in
+            self?.dashboardSparklinePoints = $0
+        }.store(in: &cancellables)
+        metricsStore.$dashboardModelTPSHistory.sink { [weak self] in
+            self?.dashboardModelTPSHistory = $0
         }.store(in: &cancellables)
         // 合并 env 路径变化：仅同步给 UploadService（路径字符串），凭证不落盘。
         envSettings.$path
