@@ -1101,7 +1101,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 把它当不可变维度会对无计费影响的差异 fail-closed。合并时统一保留确定性首行的 timestamp。
     private func overwriteConflictReason(existing: RawEvent, incoming event: RawEvent) -> String? {
         var mismatched: [String] = []
-        if existing.counts != event.counts { mismatched.append("counts") }
+        // counts-only 差异不再 fail-closed：同一 logical event id 在自然键已锁定
+        //（source/model/project/session + 派生层 hostname/bucket）下的计数矛盾，
+        // 本质是同一次生成的截断中途快照 vs 完成态。与服务端 incremental GREATEST
+        // upsert 一致地逐列取 max（见 mergeSameTierRawEvents），不再阻断上报。
+        // 仅 session/model/project 这类身份维度不一致才视为真冲突、保持 fail-closed。
         if existing.sessionHash != event.sessionHash { mismatched.append("session") }
         // model=unknown 允许被已知 model 补齐，不算冲突；两个都非空且不同才算。
         if existing.model != event.model, existing.model != "unknown", event.model != "unknown" {
@@ -1111,7 +1115,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             mismatched.append("project")
         }
         guard !mismatched.isEmpty else { return nil }
-        return "overwrite duplicate event \(existing.source)/\(existing.id) has conflicting \(mismatched.joined(separator: ",")) across files; kept deterministic first row and blocked reporting"
+        return "overwrite duplicate event \(existing.source)/\(existing.id) has conflicting identity \(mismatched.joined(separator: ",")) across files; kept deterministic first row and blocked reporting"
     }
 
     /// 同 tier 内跨文件相同 logical id 的稳定合并（既有语义，不改）。
@@ -1128,8 +1132,17 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     reportedTotal: max(existing.counts.reportedTotal, event.counts.reportedTotal)
                 )
             } else {
-                // overwrite：保留确定性首行的计数（SQL 端已稳定排序）。
-                mergedCounts = existing.counts
+                // overwrite 同 tier 计数差异 = 同一 event 的截断中途快照 vs 完成态；
+                // 逐列取 max，与服务端 incremental GREATEST upsert 收敛到同一累计值，
+                // 重复上报（客户端 max vs 服务端 GREATEST）天然幂等自愈。
+                mergedCounts = UsageTokenCounts(
+                    input: max(existing.counts.input, event.counts.input),
+                    output: max(existing.counts.output, event.counts.output),
+                    cachedInput: max(existing.counts.cachedInput, event.counts.cachedInput),
+                    cacheCreationInput: max(existing.counts.cacheCreationInput, event.counts.cacheCreationInput),
+                    reasoningOutput: max(existing.counts.reasoningOutput, event.counts.reasoningOutput),
+                    reportedTotal: max(existing.counts.reportedTotal, event.counts.reportedTotal)
+                )
             }
             let preferKnownModel: String = {
                 if existing.model != "unknown" { return existing.model }
