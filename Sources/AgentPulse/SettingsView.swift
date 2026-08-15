@@ -15,8 +15,8 @@ struct AgentPulseSettingsView: View {
     var body: some View {
         VStack(spacing: 12) {
             trendCard
-            cliProxyCard
             TokenSyncSettingsSection(model: model)
+            cliProxyCard
             envPathCard
             r2Card
         }
