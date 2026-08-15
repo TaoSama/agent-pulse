@@ -140,8 +140,11 @@ struct MenuBarSummaryView: View {
     /// 面板各分区之间的垂直间距。
     private static let sectionSpacing: CGFloat = 12
 
-    /// 概览与设置共用同一面板宽度：切换时宽度不变，避免菜单栏弹窗向右伸缩显丑。
-    private static let panelWidth: CGFloat = 380
+    /// 概览面板宽度。
+    private static let overviewWidth: CGFloat = 380
+    /// 设置面板宽度：比概览宽以容纳凭证长路径。菜单栏弹窗右边缘锚定图标不动，
+    /// 更宽的设置页自然向左延伸，右边与概览保持对齐。
+    private static let settingsWidth: CGFloat = 460
     /// 设置内容超出该高度时才在内部 ScrollView 滚动；否则面板高度随内容自适应，
     /// 与主菜单概览观感一致（不再硬撑固定高度）。
     private static let settingsMaxHeight: CGFloat = 640
@@ -178,26 +181,31 @@ struct MenuBarSummaryView: View {
                     Label("返回", systemImage: "chevron.left")
                         .font(.system(size: 12, weight: .medium))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(BackHotZoneButtonStyle())
                 Spacer()
                 Text("设置").font(.subheadline.weight(.semibold))
                 Spacer()
-                // 占位与返回按钮等宽，保证标题视觉居中。
+                // 占位与返回按钮等宽（含热区内边距），保证标题视觉居中。
                 Label("返回", systemImage: "chevron.left")
                     .font(.system(size: 12, weight: .medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
                     .opacity(0)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 14)
+            .padding(.horizontal, 12)
+            .padding(.top, 12)
             .padding(.bottom, 6)
 
             // 设置内容随内容自适应高度，与主菜单一致；仅当超过上限时才在内部滚动。
+            // 顶部补一段留白，让首个卡片不贴住标题栏。
             ScrollView {
                 AgentPulseSettingsView(model: model)
+                    .padding(.top, 6)
             }
             .frame(maxHeight: Self.settingsMaxHeight)
         }
-        .frame(width: Self.panelWidth)
+        // 设置页比概览宽；弹窗右边缘锚定图标不动，靠右对齐使其向左延伸、右边对齐概览。
+        .frame(width: Self.settingsWidth, alignment: .trailing)
     }
 
     private var overviewScreen: some View {
@@ -303,7 +311,7 @@ struct MenuBarSummaryView: View {
             }
         }
         .padding(16)
-        .frame(width: Self.panelWidth)
+        .frame(width: Self.overviewWidth)
     }
 
     private var trendColor: Color {
@@ -318,6 +326,26 @@ struct MenuBarSummaryView: View {
 
     private func format(_ value: Int?, lowerBound: Bool = false) -> String {
         value.map { "\(lowerBound ? "≥" : "")\($0)" } ?? "—"
+    }
+}
+
+/// 返回按钮样式：给整个"返回"标签一块可点热区，悬停 / 按下时用淡色圆角背景高亮，
+/// 让用户明确知道点哪、有反馈。
+private struct BackHotZoneButtonStyle: ButtonStyle {
+    @State private var isHovering = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.primary.opacity(configuration.isPressed ? 0.16 : (isHovering ? 0.08 : 0)))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 6))
+            .onHover { isHovering = $0 }
+            .animation(.easeOut(duration: 0.12), value: isHovering)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
 
