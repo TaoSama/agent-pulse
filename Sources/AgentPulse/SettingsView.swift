@@ -13,18 +13,15 @@ struct AgentPulseSettingsView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 12) {
-                trendCard
-                envPathCard
-                r2Card
-                cliProxyCard
-                TokenSyncSettingsSection(model: model)
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 16)
+        VStack(spacing: 12) {
+            trendCard
+            envPathCard
+            r2Card
+            cliProxyCard
+            TokenSyncSettingsSection(model: model)
         }
-        .frame(maxHeight: 520)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 16)
     }
 
     private var trendCard: some View {
