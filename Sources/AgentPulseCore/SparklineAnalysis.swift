@@ -90,6 +90,10 @@ public enum SparklineAnalysis {
     public static let significantDeclineThreshold = -0.30
     /// 归一化斜率的参考基准下限，避免基准过小导致斜率被放大成噪声。
     public static let trendReferenceFloor = 0.5
+    /// 归一化斜率的展示/判定上下界（±100%）。首尾线性拟合的斜率乘以时间跨度可远超基准
+    /// （尤其锯齿末端落在断崖低位时），得到 -140% 这类越界值。相对基准的变化率超过 ±100%
+    /// 在展示上无意义，统一钳到 [-1, 1]：既消除越界，又不改动死区阈值（仍落在界内）。
+    public static let normalizedSlopeBound = 1.0
 
     // MARK: - 过滤
 
@@ -406,10 +410,12 @@ public enum SparklineAnalysis {
         let slope = numerator / denominator
         let timeSpan = xs.last! - xs.first!
         let reference = max(abs(meanY), trendReferenceFloor)
-        let normalizedSlope = (slope * timeSpan) / reference
-        guard normalizedSlope.isFinite else {
+        let rawNormalizedSlope = (slope * timeSpan) / reference
+        guard rawNormalizedSlope.isFinite else {
             return SparklineRegression(slopePerSecond: slope, normalizedSlope: nil, sampleCount: valid.count, trend: .flat)
         }
+        // 钳到 ±100%：相对基准的变化率超过整倍在展示上无意义，避免 -140% 这类越界值。
+        let normalizedSlope = min(max(rawNormalizedSlope, -normalizedSlopeBound), normalizedSlopeBound)
 
         let trend: SparklineTrend
         if normalizedSlope > 0 {
