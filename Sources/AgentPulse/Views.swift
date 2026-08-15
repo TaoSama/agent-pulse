@@ -264,15 +264,16 @@ struct MenuBarSummaryView: View {
                 Label(warning, systemImage: "externaldrive.badge.exclamationmark")
                     .font(.caption).foregroundStyle(.orange)
             }
-            // Token 扫描底部行：更新中展示两行完整进度详情，与进度同生共死，
-            // 走到 100% 结束时一并消失；只读聚合数，不含文件路径、会话正文或凭证。
+            // Token 扫描底部行：更新中展示进度详情，与进度同生共死，走到 100% 结束时消失；
+            // 前缀提示语由上面的 collectionWarning 承载（文案一致），此处只补进度，
+            // 用透明占位图标与告警行的文字左对齐。只读聚合数，不含路径、正文或凭证。
             if let scanDetail = TokenUsageFormatting.scanDetail(model.tokenSyncStatus) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Label("正在刷新本地 rollout，当前显示上次缓存", systemImage: "arrow.triangle.2.circlepath")
-                        .font(.caption).foregroundStyle(.orange)
+                Label {
                     Text(scanDetail)
-                        .font(.caption).foregroundStyle(.orange)
+                } icon: {
+                    Image(systemName: "externaldrive.badge.exclamationmark").hidden()
                 }
+                .font(.caption).foregroundStyle(.orange)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
