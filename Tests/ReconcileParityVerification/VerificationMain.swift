@@ -19,7 +19,7 @@ enum ReconcileParityVerification {
 
     static func main() async throws {
         try await runOfflineSelfCheck()
-        print("离线自检通过：口径剔除 cacheCreation、逐维度对齐、脱敏渲染均正确。")
+        print("离线自检通过：唯一 total 含 cacheCreation、差值归因 kaboo 漏计、逐维度对齐、脱敏渲染均正确。")
         print("")
         if ProcessInfo.processInfo.environment["AGENT_PULSE_RECONCILE_DEMO"] != nil {
             printDemoTables()
@@ -37,13 +37,15 @@ enum ReconcileParityVerification {
         let sessions = [makeSession(hostname: "mbp-work"), makeSession(hostname: "mbp-work"), makeSession(hostname: "mbp-work")]
         let agg = LocalHostnameAggregate.aggregate(hostname: "mbp-work", buckets: buckets, sessions: sessions)
         let first = iso(buckets[0].bucketStart), last = iso(buckets[1].bucketStart)
-        // 口径化 total：bucket1 max(0,100+200+50+30)=380，bucket2 max(0,10+20+5+3)=38 → 418。
+        // 唯一 total：bucket1=100+200+50+999+30=1379，bucket2=10+20+5+40+3=78 → 1457。
+        // cacheCreation 小计=999+40=1039。kaboo 应回值（漏计 cacheCreation）=1457−1039=418。
         let aligned = KabooReconcileResponse.HostnameStats(hostname: "mbp-work", bucketCount: 2, sessionCount: 3, totalTokens: 418, totalCostCents: 137, firstBucketAt: first, lastBucketAt: last, lastSyncedAt: last)
-        print("【演示·场景一：口径处理后逐项一致】")
+        print("【演示·场景一：对齐口径 — kaboo 回 418，差值=cacheCreation 1039，判一致】")
         print(ReconcileReportRenderer.render(ReconcileComparison.compare(local: agg, kaboo: aligned)))
         print("")
-        let wrong = KabooReconcileResponse.HostnameStats(hostname: "mbp-work", bucketCount: 2, sessionCount: 3, totalTokens: 1457, totalCostCents: 137, firstBucketAt: first, lastBucketAt: last, lastSyncedAt: last)
-        print("【演示·场景二：total 差异（不一致被检出）】")
+        // 差异既不等于 418（kaboo 应回值）也不等于 1457（完整 total），无法用 cacheCreation 解释。
+        let wrong = KabooReconcileResponse.HostnameStats(hostname: "mbp-work", bucketCount: 2, sessionCount: 3, totalTokens: 500, totalCostCents: 137, firstBucketAt: first, lastBucketAt: last, lastSyncedAt: last)
+        print("【演示·场景二：不对齐口径 — kaboo 回 500，无法用 cacheCreation 解释，判不一致】")
         print(ReconcileReportRenderer.render(ReconcileComparison.compare(local: agg, kaboo: wrong)))
         print("")
     }
@@ -51,7 +53,7 @@ enum ReconcileParityVerification {
     // MARK: - 离线自检（纯函数，无 I/O）
 
     private static func runOfflineSelfCheck() async throws {
-        try verifyKabooBasisExcludesCacheCreation()
+        try verifyTotalIncludesCacheCreation()
         try verifyAggregateSums()
         try verifyComparisonEqualAndUnequal()
         try verifyMissingHostnameIsUnequal()
@@ -66,7 +68,8 @@ enum ReconcileParityVerification {
         let buckets = [makeBucket(hostname: "dev-a", model: "m1", input: 10, output: 20, cached: 5, cacheCreation: 100, reasoning: 3, startOffset: 0)]
         let agg = LocalHostnameAggregate.aggregate(hostname: "dev-a", buckets: buckets, sessions: [makeSession(hostname: "dev-a")])
         let firstIso = iso(buckets[0].bucketStart)
-        // kaboo 原始响应 JSON（无 envelope），口径化后应与本地一致（total=38）。
+        // kaboo 原始响应 JSON（无 envelope）：本地唯一 total=138，cacheCreation=100，
+        // kaboo 应回值=138−100=38；差值恰为 cacheCreation，判一致（已解释）。
         let json = """
         {"hostnames":[{"hostname":"dev-a","bucketCount":1,"sessionCount":1,"totalTokens":38,"totalCostCents":12,"firstBucketAt":"\(firstIso)","lastBucketAt":"\(firstIso)","lastSyncedAt":null}]}
         """
@@ -111,24 +114,23 @@ enum ReconcileParityVerification {
     }
 
 
-    /// kaboo 口径 total 必须排除 cacheCreation，且遵守 max(reportedTotal, 四分量和)。
-    private static func verifyKabooBasisExcludesCacheCreation() throws {
-        // 四分量和 = 10+20+5+3 = 38；cacheCreation=100 不参与；reportedTotal=0。
+    /// 唯一 total = 五分量互斥之和（含 cacheCreation）；kaboo 口径基准 = total − cacheCreation。
+    private static func verifyTotalIncludesCacheCreation() throws {
+        // 五分量互斥之和 = 10+20+5+100+3 = 138（含 cacheCreation=100）。
         let counts = UsageTokenCounts(
             input: 10, output: 20, cachedInput: 5, cacheCreationInput: 100, reasoningOutput: 3, reportedTotal: 0
         )
-        try require(LocalHostnameAggregate.kabooBucketTotal(counts) == 38,
-                    "kaboo 口径应为 38（排除 cacheCreation），实际 \(LocalHostnameAggregate.kabooBucketTotal(counts))")
-        // 本地 counts.total 含 cacheCreation，应为 138，用于对照证明两口径确实不同。
-        try require(counts.total == 138, "本地 counts.total 应含 cacheCreation=138")
+        try require(counts.total == 138, "唯一 total 应含 cacheCreation=138，实际 \(counts.total)")
+        // kaboo 口径基准（漏计 cacheCreation）= 138 − 100 = 38。
+        try require(LocalHostnameAggregate.kabooBasisFromTotal(counts.total, cacheCreation: 100) == 38,
+                    "kaboo 应回值应为 38（total 138 − cacheCreation 100）")
 
-        // reportedTotal 更大时取 reportedTotal。
+        // reportedTotal 更大时唯一 total 取 reportedTotal。
         let reported = UsageTokenCounts(input: 1, output: 1, reportedTotal: 999)
-        try require(LocalHostnameAggregate.kabooBucketTotal(reported) == 999,
-                    "reportedTotal 更大时应取 999")
+        try require(reported.total == 999, "reportedTotal 更大时唯一 total 应取 999")
     }
 
-    /// 聚合分量小计与 kaboo 口径 total 求和正确，bucketCount/sessionCount 计数正确。
+    /// 聚合分量小计与唯一 total 求和正确，bucketCount/sessionCount 计数正确。
     private static func verifyAggregateSums() throws {
         let buckets = [
             makeBucket(hostname: "dev-a", model: "m1", input: 10, output: 20, cached: 5, cacheCreation: 100, reasoning: 3, startOffset: 0),
@@ -139,35 +141,48 @@ enum ReconcileParityVerification {
 
         try require(agg.bucketCount == 2, "bucketCount 应为 2")
         try require(agg.sessionCount == 2, "sessionCount 应为 2")
-        try require(agg.totalTokensKabooBasis == 38 + 3, "口径 total 应为 41（38+3），实际 \(agg.totalTokensKabooBasis)")
+        // bucket1 total=138, bucket2 total=1+2+0+7+0=10 → 唯一 total = 148。
+        try require(agg.totalTokens == 148, "唯一 total 应为 148（138+10），实际 \(agg.totalTokens)")
         try require(agg.inputSubtotal == 11, "input 小计应为 11")
-        try require(agg.cacheCreationInputSubtotal == 107, "cacheCreation 小计应为 107（AP-only）")
+        try require(agg.cacheCreationInputSubtotal == 107, "cacheCreation 小计应为 107")
+        // kaboo 应回值 = 148 − 107 = 41。
+        try require(LocalHostnameAggregate.kabooBasisFromTotal(agg.totalTokens, cacheCreation: agg.cacheCreationInputSubtotal) == 41,
+                    "kaboo 应回值应为 41（148−107）")
         try require(agg.firstBucketAt == buckets[0].bucketStart, "firstBucketAt 应为最早 bucket")
         try require(agg.lastBucketAt == buckets[1].bucketStart, "lastBucketAt 应为最晚 bucket")
     }
 
-    /// 对齐逻辑：相等判等、差异判不等；authoritative 维度参与判定，其余不判。
+    /// 对齐逻辑：kaboo total 差一个 cacheCreation 仍判一致（已解释）；无法解释的差异判不等。
     private static func verifyComparisonEqualAndUnequal() throws {
+        // bucket: total = 10+20+5+100+3 = 138；cacheCreation=100；kaboo 应回值 = 38。
         let buckets = [makeBucket(hostname: "dev-a", model: "m1", input: 10, output: 20, cached: 5, cacheCreation: 100, reasoning: 3, startOffset: 0)]
         let sessions = [makeSession(hostname: "dev-a")]
         let agg = LocalHostnameAggregate.aggregate(hostname: "dev-a", buckets: buckets, sessions: sessions)
-
-        // 完全一致的 kaboo 响应：bucketCount=1, sessionCount=1, totalTokens=38。
         let firstIso = iso(buckets[0].bucketStart)
-        let matching = KabooReconcileResponse.HostnameStats(
+
+        // kaboo 回 38（total−cacheCreation）：差值恰为 cacheCreation，判一致（已解释）。
+        let kabooBasis = KabooReconcileResponse.HostnameStats(
             hostname: "dev-a", bucketCount: 1, sessionCount: 1, totalTokens: 38, totalCostCents: 0,
             firstBucketAt: firstIso, lastBucketAt: firstIso, lastSyncedAt: nil
         )
-        let aligned = ReconcileComparison.compare(local: agg, kaboo: matching)
-        try require(aligned.isAligned, "口径处理后应完全一致")
+        try require(ReconcileComparison.compare(local: agg, kaboo: kabooBasis).isAligned,
+                    "kaboo 差一个 cacheCreation 应判一致（已解释）")
 
-        // totalTokens 故意差 1：应判不等。
+        // kaboo 回完整 138（若某天 kaboo 修正口径）：也判一致。
+        let kabooFull = KabooReconcileResponse.HostnameStats(
+            hostname: "dev-a", bucketCount: 1, sessionCount: 1, totalTokens: 138, totalCostCents: 0,
+            firstBucketAt: firstIso, lastBucketAt: firstIso, lastSyncedAt: nil
+        )
+        try require(ReconcileComparison.compare(local: agg, kaboo: kabooFull).isAligned,
+                    "kaboo 回完整 total 应判一致")
+
+        // kaboo 回 39（差值无法用 cacheCreation 解释）：应判不等。
         let mismatched = KabooReconcileResponse.HostnameStats(
             hostname: "dev-a", bucketCount: 1, sessionCount: 1, totalTokens: 39, totalCostCents: 0,
             firstBucketAt: firstIso, lastBucketAt: firstIso, lastSyncedAt: nil
         )
         let notAligned = ReconcileComparison.compare(local: agg, kaboo: mismatched)
-        try require(!notAligned.isAligned, "totalTokens 差异应判不一致")
+        try require(!notAligned.isAligned, "无法用 cacheCreation 解释的 total 差异应判不一致")
 
         // advisory / localOnlyDetail 维度 equal 恒为 nil，不参与判定。
         let advisory = notAligned.fields.filter { $0.kind != .authoritative }

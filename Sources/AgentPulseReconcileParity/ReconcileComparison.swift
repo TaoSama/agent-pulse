@@ -69,12 +69,40 @@ public enum ReconcileComparison {
             local: Int64(local.sessionCount),
             kaboo: kaboo.map { Int64($0.sessionCount) }
         ))
-        // 3) totalTokens（kaboo 口径）— 应逐项相等。
-        fields.append(authoritative(
-            field: "totalTokens(kaboo口径)",
-            local: local.totalTokensKabooBasis,
-            kaboo: kaboo.map { $0.totalTokens }
-        ))
+        // 3) totalTokens（唯一口径,五项含 cacheCreation）。
+        //    kaboo 的 total_tokens 漏计 cacheCreation,故直接比会差一个 cacheCreation;
+        //    这里按「kaboo 应回值 = 本地 total − cacheCreation」判定,差值如实归因给 kaboo 漏计。
+        let kabooExpected = LocalHostnameAggregate.kabooBasisFromTotal(
+            local.totalTokens, cacheCreation: local.cacheCreationInputSubtotal
+        )
+        if let kaboo {
+            let matchesKabooBasis = kaboo.totalTokens == kabooExpected
+            let matchesFullTotal = kaboo.totalTokens == local.totalTokens
+            let equal = matchesKabooBasis || matchesFullTotal
+            let note: String
+            if matchesFullTotal {
+                note = "（含 cacheCreation,两侧完全一致）"
+            } else if matchesKabooBasis {
+                note = "（差值=cacheCreation \(local.cacheCreationInputSubtotal),系 kaboo total 漏计,已解释）"
+            } else {
+                note = "（差异无法用 cacheCreation 解释）"
+            }
+            fields.append(FieldComparison(
+                field: "totalTokens",
+                localValue: "\(local.totalTokens)",
+                kabooValue: "\(kaboo.totalTokens) \(note)",
+                kind: .authoritative,
+                equal: equal
+            ))
+        } else {
+            fields.append(FieldComparison(
+                field: "totalTokens",
+                localValue: "\(local.totalTokens)",
+                kabooValue: "—（kaboo 无此设备）",
+                kind: .authoritative,
+                equal: false
+            ))
+        }
         // 4) 时间边界 — 秒级相等。
         fields.append(timeField(
             field: "firstBucketAt",
@@ -103,11 +131,11 @@ public enum ReconcileComparison {
             ))
         }
 
-        // 6) cacheCreation — AP-only，不参与 total 对齐。
+        // 6) cacheCreation — 计入本地唯一 total;正是 kaboo total 漏计的那部分。
         fields.append(FieldComparison(
-            field: "cacheCreationInput(AP-only)",
+            field: "cacheCreationInput",
             localValue: String(local.cacheCreationInputSubtotal),
-            kabooValue: "—（kaboo 不计入 total）",
+            kabooValue: "—（kaboo total 漏计此项,为两侧 total 差值来源）",
             kind: .advisory,
             equal: nil
         ))
