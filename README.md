@@ -179,7 +179,7 @@ open dist/AgentPulse.app
 - **配置权限**：`reporting.json` 必须为 `0600`（仅属主可读写），否则视为无效配置并拒绝加载。
 - **传输安全**：生产地址只接受 `https`；`http` 仅在 loopback（`localhost` / `127.0.0.1` / `::1`）时放行。base URL 不得携带用户名、密码、query 或 fragment。
 - **canonical hostname**：以合并 `.env` 的 `REPORT_CANONICAL_HOSTNAME` 作为上报身份；它必须与账本记录的 hostname 一致，不一致或未设置时要求先重建，绝不回退到系统主机名。
-- **完整累计值**：普通上报发送本地账本中该设备每个 bucket 的完整累计值，而非单次增量，服务端做幂等 upsert。
+- **完整累计值**：上报发送本地账本中该设备每个 bucket 的完整累计值，而非单次增量，服务端始终做幂等 upsert。
 - **严格 ACK**：仅当响应逐维度精确回执（buckets / sessions 数量完全一致）时才标记已同步；`2xx {}`、字段缺失、少计或多计一律保持 pending。
 - **按 revision 精确对账**：每行携带 revision 快照，ack 时按（自然键 + revision 快照）精确匹配；上传期间被重算的行不会被误 ack，保持 dirty。
 - **Runtime headers**：`runtimeHeaders` 仅支持 `platform`、`app_version`、`user_agent`、`app_id` 四个变量；未知变量、未闭合占位、CR/LF、非法 header 名或与受控 header 冲突都会让整份配置失效。增量上报按这套解析结果构造 header。
@@ -188,7 +188,7 @@ open dist/AgentPulse.app
 ### 谁开谁报与累计 upsert
 
 - **谁开谁报（本机 opt-in）**：本地长期采集与上报是两个相互独立的开关——采集默认开启（仅写本机 SQLite），上报默认关闭；只有在本机显式打开上报、填好 API 地址（`REPORT_BASE_URL`）与 canonical hostname（`REPORT_CANONICAL_HOSTNAME`）、且 `reporting.json` 协议结构校验通过时，这台设备才会以自己的 canonical hostname 作为上报身份上报自身账本。未开启上报的设备只在本地统计，不上报，也不代任何其他设备上报。
-- **普通上报 = 累计值幂等 upsert**：每一轮普通上报发送本地账本中该设备**每个 bucket 的完整累计值**（并非单次增量），服务端据此做幂等 upsert。因此漏报、乱序或重试都能自愈：相同自然键重复提交只会覆盖为同一累计值，不会重复累加。
+- **上报 = 累计值幂等 upsert**：每一轮上报发送本地账本中该设备**每个 bucket 的完整累计值**（并非单次增量），服务端始终据此做幂等 upsert。因此漏报、乱序或重试都能自愈：相同自然键重复提交只会覆盖为同一累计值，不会重复累加。
 - **API 地址仅本机配置、不随用量上传**：上报目标（base URL）保存在本机合并 `.env` 的 `REPORT_BASE_URL`，仅在发起上报时于内存中拼接请求；它既不写入账本 SQLite，也**不会作为任何字段包含在上传的用量 payload 里**。上传内容仅为聚合后的用量维度、token 计数与 hash 后的标识，不含地址、凭证、路径或会话正文。
 
 默认配置路径（文件由用户自行创建，缺失即保持本地模式）：
