@@ -346,44 +346,6 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate {
 }
 
 @MainActor
-final class SettingsWindowController: NSWindowController {
-    private let model: ApplicationModel
-
-    init(model: ApplicationModel) {
-        self.model = model
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 620),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Agent Pulse 设置"
-        window.level = WindowInteraction.foregroundWindowLevel
-        window.minSize = NSSize(width: 520, height: 480)
-        window.isReleasedWhenClosed = false
-        // 设置页为深色卡片式设计，窗口外观固定为 dark，
-        // 保证标题栏与黑色内容背景一致，不受系统外观切换影响。
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.backgroundColor = .black
-        window.contentView = NSHostingView(rootView: AgentPulseSettingsView(model: model))
-        super.init(window: window)
-        window.center()
-    }
-
-    required init?(coder: NSCoder) { nil }
-
-    /// 在 accessory（LSUIElement）App 下，系统 SettingsLink 常常无法把设置窗前置，
-    /// 因此显式激活 App 并把窗口设为 key，保证点击“设置”后窗口稳定出现在最前。
-    func show() {
-        guard let window else { return }
-        if !window.isVisible { window.center() }
-        window.makeKeyAndOrderFront(nil)
-        window.orderFrontRegardless()
-        NSApp.activate(ignoringOtherApps: true)
-    }
-}
-
-@MainActor
 final class ToastWindowController {
     private let model: ApplicationModel
     private let panel = FloatingPanel(frame: NSRect(x: 0, y: 0, width: 460, height: 86), interactive: true)

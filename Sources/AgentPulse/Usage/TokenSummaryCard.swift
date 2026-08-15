@@ -111,7 +111,8 @@ struct TokenSummaryCard: View {
     }
 }
 
-/// Token 卡右上角更新状态：平时显示上次更新的相对时间；扫描中显示 整体百分比 + 已扫描/总文件数。
+/// Token 卡右上角更新状态：平时显示上次更新的相对时间；扫描中显示两行——
+/// 第一行为当前阶段（如「正在采集用量」），第二行为「更新进度：整体百分比[· 已扫描/总文件数]」。
 ///
 /// 只读展示聚合数（百分比 / 文件计数 / 相对时间），不显示文件路径、会话正文或凭证。
 struct TokenSyncUpdateStatusView: View {
@@ -120,12 +121,17 @@ struct TokenSyncUpdateStatusView: View {
     var body: some View {
         Group {
             if status.scanningInProgress {
-                HStack(spacing: 5) {
-                    ProgressView()
-                        .controlSize(.mini)
-                        .tint(.white)
-                    Text(progressText)
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                VStack(alignment: .trailing, spacing: 2) {
+                    HStack(spacing: 5) {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(.white)
+                        Text("正在\(status.scanPhase?.displayLabel ?? "更新")")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    }
+                    Text("更新进度：\(progressText)")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Color.white.opacity(0.75))
                 }
             } else {
                 Text(TokenUsageFormatting.relativeTime(status.lastScanAt))
@@ -149,7 +155,7 @@ struct TokenSyncUpdateStatusView: View {
     private var accessibilityLabel: String {
         if status.scanningInProgress {
             let phase = status.scanPhase?.displayLabel ?? "更新中"
-            return "正在\(phase)，\(progressText)"
+            return "正在\(phase)，更新进度 \(progressText)"
         }
         return "上次更新 \(TokenUsageFormatting.relativeTime(status.lastScanAt))"
     }

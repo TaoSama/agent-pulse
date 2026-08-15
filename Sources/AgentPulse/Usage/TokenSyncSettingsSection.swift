@@ -86,8 +86,6 @@ struct TokenSyncSettingsSection: View {
                 // 手填经 coordinator 写回 env；填好但不自动开启上报。
                 dualSourceField("API 地址（留空则仅本地）", key: MergedEnvKeys.reportBaseURL)
 
-                SettingsFootnote("仅本机使用，不随用量上报。")
-
                 SettingsRow(title: "上报间隔") {
                     Picker("上报间隔", selection: reportIntervalBinding) {
                         ForEach(TokenReportInterval.allCases) { interval in
