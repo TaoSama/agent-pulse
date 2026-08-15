@@ -389,11 +389,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
     // MARK: - Finalize derived (global dedup + aggregate)
 
     @discardableResult
-    public func finalizeDerived(hostname: String) throws -> UsageFinalizeResult {
+    public func finalizeDerived(
+        hostname: String,
+        progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
+    ) throws -> UsageFinalizeResult {
         try queue.sync {
             var result = UsageFinalizeResult(reportingEligible: true, blockedReasons: [], collapsedInheritedEvents: 0)
             try transaction {
-                result = try recomputeDerivedUnlocked(hostname: hostname)
+                result = try recomputeDerivedUnlocked(hostname: hostname, progress: progress)
                 // 只有显式 finalize 表示调用方已经成功完成整轮来源扫描。其它内部重算
                 // （例如 hostname 对齐）不能清除此门禁，否则部分扫描失败后会 fail-open。
                 try deleteKeyUnlocked(Self.rawDerivationPendingKey)
@@ -452,13 +455,25 @@ public final class UsageLedgerStore: @unchecked Sendable {
     }
 
     // 全局重算派生表：读取全部原始事件 -> 血缘证明去重 -> 重算 buckets/sessions -> 差异写入并递增 revision。
-    private func recomputeDerivedUnlocked(hostname: String) throws -> UsageFinalizeResult {
+    private func recomputeDerivedUnlocked(
+        hostname: String,
+        progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
+    ) throws -> UsageFinalizeResult {
+        // 重算内部按 8 个自然阶段边界回报进度，让协调层的 .finalizing 段平滑推进而非跳变。
+        // 回调是纯计数、在本 worker 队列 + 事务体内同步调用，不触碰主线程（主线程搬运在协调层适配）。
+        let progressTotalStages = 8
+        var progressStage = 0
+        func advanceStage() {
+            progressStage += 1
+            progress?(progressStage, progressTotalStages)
+        }
         var blockedReasons: [String] = []
         // 读取时按 v8 归属优先级去重（ownedActive>ownedHistory>legacy），并收集 overwrite 同 tier 冲突；
         // 冲突不静默取其一，而是 fail-closed 阻断 reporting。
         var overwriteConflicts: [String] = []
         let raw = try readAllRawEvents(overwriteConflicts: &overwriteConflicts)
         blockedReasons.append(contentsOf: overwriteConflicts)
+        advanceStage() // 1) 读原始事件完成
 
         // 1) 血缘证明去重：同一 lineage_fingerprint（仅完整 total 快照才有）只保留一条。
         var fingerprintIndexes: [String: Int] = [:]
@@ -499,6 +514,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         if unprovable > 0 {
             blockedReasons.append("\(unprovable) inherited replay event(s) lack a complete total snapshot; cannot prove they are not duplicates")
         }
+        advanceStage() // 2) 血缘去重完成
 
         // 1.5) 内容型去重：折叠共享同一 codexDedupKey 的 codex 事件（fork / subagent
         // 回放出的逐字节相同 turn）。同键保留 5 分量之和更大的一行（与参考实现的
@@ -543,6 +559,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // 2) 重算 buckets（按 source,model,project,bucketStart 聚合）。
         // 派生全部归属到传入的当前 hostname（单一本机口径）。原始层虽存各事件采集机 hostname，
         // 但派生不做多机拆分——历史归属由 hostname 改名时的原地 UPDATE 统一维护。
+        advanceStage() // 3) 内容去重完成
         struct BucketAgg {
             var counts = UsageTokenCounts()
             var skillCounts: [String: Int] = [:]
@@ -576,6 +593,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             guard let meta = bucketMeta[key], editMetricSources.contains(meta.source) else { continue }
             buckets[key]?.codeMetricVersion = UsageEditLines.codeMetricVersion
         }
+        advanceStage() // 4) bucket 聚合完成
         for edit in try readAllRawEditEntries() {
             let start = (edit.timestampMs / Self.bucketMilliseconds) * Self.bucketMilliseconds
             let key = "\(edit.source)\u{1}\(edit.model)\u{1}\(edit.project)\u{1}\(start)"
@@ -588,6 +606,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
 
         // 3) 重算 sessions（复用聚合器，全部归属当前 hostname）。
+        advanceStage() // 5) edit 聚合完成
         let sessionEvents = try readAllSessionEvents()
         // session project 内容策略：以同一 (source, sessionHash) 下**最新有效** UsageEvent.project 为准
         // （按 timestamp 取最大，非空优先），无则回落空串。project 不参与自然键/分组/去重。
@@ -616,6 +635,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         )
 
         // 4) 差异写入：仅对内容变化的行提升 revision（变 dirty），未变行保持原 revision/synced。
+        advanceStage() // 6) session 聚合完成
         let newRevision = try nextRevisionUnlocked(hostname: hostname)
         var changed = false
 
@@ -643,6 +663,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
 
         var existingSessions = try readSessionRowsUnlocked(hostname: hostname)
+        advanceStage() // 7) bucket 差异写完成
         for session in sessions {
             let key = "\(session.source)\u{1}\(session.sessionHash)"
             let existing = existingSessions[key]
@@ -665,6 +686,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // 非对账类阻断（如无法证明的 inherited replay）持久到 per-host eligibility flag。
         let eligible = blockedReasons.isEmpty
         try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
+        advanceStage() // 8) session 差异写完成（重算结束）
         return UsageFinalizeResult(reportingEligible: eligible, blockedReasons: blockedReasons, collapsedInheritedEvents: collapsed, collapsedContentDuplicates: contentCollapsed)
     }
 

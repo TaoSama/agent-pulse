@@ -155,11 +155,11 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
 
     var displayLabel: String {
         switch self {
-        case .cliproxy: return "采集用量"
+        case .cliproxy: return "采集 CPA"
         case .scanning: return "扫描文件"
-        case .finalizing: return "重算派生"
-        case .summarizing: return "汇总"
-        case .reporting: return "上报"
+        case .finalizing: return "整理统计"
+        case .summarizing: return "聚合窗口"
+        case .reporting: return "上报用量"
         }
     }
 
@@ -168,7 +168,7 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
         switch self {
         case .cliproxy: return "事件"
         case .scanning: return "文件"
-        case .finalizing: return "行"
+        case .finalizing: return "步"
         case .summarizing: return "窗口"
         case .reporting: return "行"
         }
