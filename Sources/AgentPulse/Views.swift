@@ -143,6 +143,8 @@ struct MenuBarSummaryView: View {
     /// 主概览面板宽度；进入设置态时加宽以容纳凭证字段。
     private static let overviewWidth: CGFloat = 380
     private static let settingsWidth: CGFloat = 460
+    /// 设置面板高度：与主菜单概览观感一致（内容超出时在内部 ScrollView 滚动，不撑高面板）。
+    private static let settingsHeight: CGFloat = 640
 
     /// Token 汇总卡与分模型明细卡共用同一时间窗口选择；持久化，面板重开保留上次选择。
     @AppStorage("menubar.tokenWindow") private var tokenWindow: TokenUsageWindow = .day
@@ -160,6 +162,10 @@ struct MenuBarSummaryView: View {
         .onAppear {
             // 供 ⌘, 与"设置"入口在面板内切换，不弹独立窗口。
             model.showSettings = { showingSettings = true }
+        }
+        .onDisappear {
+            // 面板关闭后复位到默认菜单：下次打开回到概览而非停在设置界面。
+            showingSettings = false
         }
     }
 
@@ -185,9 +191,12 @@ struct MenuBarSummaryView: View {
             .padding(.top, 14)
             .padding(.bottom, 6)
 
-            AgentPulseSettingsView(model: model)
+            // 设置内容超出面板高度时可滚动；面板高度与主菜单一致，仅宽度略大。
+            ScrollView {
+                AgentPulseSettingsView(model: model)
+            }
         }
-        .frame(width: Self.settingsWidth)
+        .frame(width: Self.settingsWidth, height: Self.settingsHeight)
     }
 
     private var overviewScreen: some View {
@@ -206,7 +215,7 @@ struct MenuBarSummaryView: View {
                         Text(formatTPS(model.tps))
                             .font(.system(size: 34, weight: .semibold, design: .rounded))
                             .monospacedDigit()
-                        Text("实时 output TPS · 180 秒窗口")
+                        Text("实时 output TPS · 180 秒滑窗均值")
                             .font(.caption2)
                             .foregroundStyle(Color.white)
                     }

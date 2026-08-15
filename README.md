@@ -121,7 +121,7 @@ flowchart TB
 - **状态**：区分 `live` / `zero` / `no_data` / `stale` / `unavailable`；最后一个有效 output 信号超过 5 分钟即为 `stale`。
 - **曲线**：从内存与 SQLite 恢复最近 15 分钟、最多 900 个数值点；每秒样本同时保存总量与 `model → window tokens`，总曲线及分模型曲线独立绘制；内部缺口按相邻值插值、窗口边缘按最近值延展后再平滑。
 - **趋势着色**：对补点、平滑后的序列做线性回归，下降超过阈值才判定为下降，阈值内视为稳定，正增长判定为上升；涨跌配色可在设置中互换。
-- Claude 的子 agent JSONL 也按本地实际输出计入 TPS，但不会进入 Desktop/Codex task 或 Completed 计数。
+- Claude 的子 agent 转录（`subagents/*.jsonl`）不计入 TPS：子会话把父响应以不同 message.id / 文件路径重新落盘，跨文件无法按 message 身份折叠，若计入会把同一次真实 output 重复统计（约放大到数倍）。实时 TPS 只统计顶层会话文件，与 task / Completed 计数口径一致。
 
 ---
 

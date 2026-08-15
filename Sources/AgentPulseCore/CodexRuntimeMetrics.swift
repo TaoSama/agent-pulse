@@ -1663,6 +1663,12 @@ public actor CodexRuntimeMetricsCollector {
     private func shouldTrackLiveJSONL(_ url: URL) -> Bool {
         let name = url.lastPathComponent.lowercased()
         guard name.hasSuffix(".jsonl") else { return false }
+        // 排除 Claude 子会话转录（subagents/*.jsonl）：子会话把父响应以不同 message.id / 文件路径
+        // 重新落盘，跨文件无法按 message 身份折叠，会把同一次真实 output 重复计入实时 TPS
+        // （实测把速率放大到约 3 倍）。与任务计数扫描（discoverFiles 中排除 subagents）口径对齐，
+        // 只统计顶层会话文件。
+        guard !url.resolvingSymlinksInPath().standardizedFileURL
+            .pathComponents.contains("subagents") else { return false }
         return !["summary", "aggregate", "snapshot", "live-rate", "live_rate"].contains {
             name.contains($0)
         }
