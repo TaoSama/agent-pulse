@@ -1,11 +1,11 @@
 import Foundation
 
-/// kaboo `GET /api/usage/reconcile` 响应模型。
+/// 上游 `GET /api/usage/reconcile` 响应模型。
 ///
 /// 只映射对齐所需的 `hostnames[]` per-hostname 明细；服务端的 `overlaps` 与顶层
 /// 汇总字段不参与本地对齐（overlaps 是跨设备去重的服务端视角，与单设备账本无关）。
 /// 服务端直接序列化结构体、无 `{code,data,msg}` 包裹，故顶层即为本结构。
-public struct KabooReconcileResponse: Decodable, Sendable, Equatable {
+public struct ReconcileResponse: Decodable, Sendable, Equatable {
     public var hostnames: [HostnameStats]
 
     public init(hostnames: [HostnameStats]) {

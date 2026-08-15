@@ -910,7 +910,7 @@ public enum UsageJSONLParser {
             if usage.isEmpty {
                 continue
             }
-            // 参照口径（kaboo）：按 uuid 逐行独立计入并在 bucket 层求和——同一 assistant message
+            // 参照口径（上游）：按 uuid 逐行独立计入并在 bucket 层求和——同一 assistant message
             // 被转录重复写入的多条（uuid 各异、值相同）视为多条独立用量分别累加，而非取最大去重。
             // uuid 缺失时回退到 message.id（同 turn 多行内容按 first-wins 折叠，避免把无 uuid 的
             // 同一次用量误当多次累加；真实 Claude 每行都带 uuid，回退仅覆盖测试/异常数据）。

@@ -244,7 +244,7 @@ struct AgentPulseCoreVerification {
         {"type":"assistant","timestamp":"\(timestamp)","cwd":"/workspace/demo","uuid":"row-2","message":{"id":"message-1","model":"model-b","usage":{"input_tokens":10,"output_tokens":25,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}}
         """
         let parsedClaude = UsageJSONLParser.parse(data: Data(claude.utf8), source: "claude-code", fileIdentity: "claude-fixture")
-        // 参照口径（kaboo）：同 message.id 但 uuid 不同的两行是两次独立用量，各自成事件、bucket 层求和，
+        // 参照口径（上游）：同 message.id 但 uuid 不同的两行是两次独立用量，各自成事件、bucket 层求和，
         // 而非取最大去重。两行 → 两个 token 事件。
         try require(parsedClaude.events.count == 2, "claude distinct-uuid rows must each become an event")
         let claudeInputSum = parsedClaude.events.reduce(Int64(0)) { $0 + $1.counts.input }

@@ -4,7 +4,7 @@ import AgentPulseReporting
 import AgentPulseUsage
 import AgentPulseReconcileParity
 
-/// 离线对齐验证工具：证明本地账本聚合与 kaboo `GET /api/usage/reconcile` 逐维度一致。
+/// 离线对齐验证工具：证明本地账本聚合与 upstream `GET /api/usage/reconcile` 逐维度一致。
 ///
 /// 严格只读、绝不上报（不构造任何 POST /ingest）。分两段：
 /// 1. 离线自检（永远跑）：mock 数据喂纯函数，验证口径处理与对齐逻辑正确。
@@ -14,13 +14,13 @@ import AgentPulseReconcileParity
 /// 脱敏：只输出字段名、聚合数与 ✓/✗；不输出 token、凭证、会话正文、完整路径。
 @main
 enum ReconcileParityVerification {
-    /// env：kaboo base URL 覆盖开关（可选）。默认从合并 env 的 REPORT_BASE_URL 读；
+    /// env：upstream base URL 覆盖开关（可选）。默认从合并 env 的 REPORT_BASE_URL 读；
     /// 设了此环境变量则优先用它,便于临时指向测试后端。工具不落盘、不碰 UserDefaults。
     private static let baseURLEnvKey = "AGENT_PULSE_RECONCILE_BASE_URL"
 
     static func main() async throws {
         try await runOfflineSelfCheck()
-        print("离线自检通过：唯一 total 含 cacheCreation、差值归因 kaboo 漏计、逐维度对齐、脱敏渲染均正确。")
+        print("离线自检通过：唯一 total 含 cacheCreation、差值归因 upstream 漏计、逐维度对齐、脱敏渲染均正确。")
         print("")
         if ProcessInfo.processInfo.environment["AGENT_PULSE_RECONCILE_DEMO"] != nil {
             printDemoTables()
@@ -33,7 +33,7 @@ enum ReconcileParityVerification {
 
     /// 本机真实账本聚合（env AGENT_PULSE_RECONCILE_LOCAL 触发）：只读账本、按合并 env 的
     /// REPORT_CANONICAL_HOSTNAME 聚合，打印工具口径下的每一维数字并做口径自洽断言
-    /// （五分量相加 = total、total − cacheCreation = kaboo 应回值）。不连 kaboo、不上报、脱敏。
+    /// （五分量相加 = total、total − cacheCreation = upstream 应回值）。不连 upstream、不上报、脱敏。
     private static func printLocalAggregate() {
         let mergedEnv = (try? EnvFile.load(path: MergedEnvKeys.defaultPath)) ?? [:]
         // hostname 优先取 env 覆盖（离线库对齐用），否则合并 env 的 REPORT_CANONICAL_HOSTNAME。
@@ -66,13 +66,13 @@ enum ReconcileParityVerification {
             return
         }
         let agg = LocalHostnameAggregate.aggregate(hostname: hostname, buckets: buckets, sessions: sessions)
-        let kabooExpected = LocalHostnameAggregate.kabooBasisFromTotal(agg.totalTokens, cacheCreation: agg.cacheCreationInputSubtotal)
+        let upstreamExpected = LocalHostnameAggregate.upstreamBasisFromTotal(agg.totalTokens, cacheCreation: agg.cacheCreationInputSubtotal)
 
-        print("=== 本机真实账本聚合（hostname=\(hostname)，只读，不连 kaboo） ===")
+        print("=== 本机真实账本聚合（hostname=\(hostname)，只读，不连 upstream） ===")
         print("bucketCount                 \(agg.bucketCount)")
         print("sessionCount                \(agg.sessionCount)")
         print("唯一 total(含 cacheCreation)  \(agg.totalTokens)")
-        print("kaboo 应回值(total−cacheCr)   \(kabooExpected)")
+        print("upstream 应回值(total−cacheCr)   \(upstreamExpected)")
         print("小计.input                   \(agg.inputSubtotal)")
         print("小计.output                  \(agg.outputSubtotal)")
         print("小计.cachedInput             \(agg.cachedInputSubtotal)")
@@ -80,13 +80,13 @@ enum ReconcileParityVerification {
         print("小计.cacheCreationInput      \(agg.cacheCreationInputSubtotal)")
         if let f = agg.firstBucketAt { print("firstBucketAt               \(iso(f))") }
         if let l = agg.lastBucketAt { print("lastBucketAt                \(iso(l))") }
-        // 口径自洽断言：kaboo 应回值 = total − cacheCreation（恒等,证明差值可归因）。
-        let selfConsistent = kabooExpected == max(0, agg.totalTokens - agg.cacheCreationInputSubtotal)
-        print(selfConsistent ? "✅ 口径自洽：kaboo 应回值 = total − cacheCreation" : "❌ 口径不自洽")
+        // 口径自洽断言：upstream 应回值 = total − cacheCreation（恒等,证明差值可归因）。
+        let selfConsistent = upstreamExpected == max(0, agg.totalTokens - agg.cacheCreationInputSubtotal)
+        print(selfConsistent ? "✅ 口径自洽：upstream 应回值 = total − cacheCreation" : "❌ 口径不自洽")
         print("")
     }
 
-    /// 仅演示：用 mock kaboo 响应渲染 AP vs kaboo 对齐表（一致 + 不一致两例），
+    /// 仅演示：用 mock upstream 响应渲染 AP vs upstream 对齐表（一致 + 不一致两例），
     /// 供人工核对报告格式。env AGENT_PULSE_RECONCILE_DEMO 存在时才输出，默认不跑。
     private static func printDemoTables() {
         let buckets = [
@@ -97,15 +97,15 @@ enum ReconcileParityVerification {
         let agg = LocalHostnameAggregate.aggregate(hostname: "mbp-work", buckets: buckets, sessions: sessions)
         let first = iso(buckets[0].bucketStart), last = iso(buckets[1].bucketStart)
         // 唯一 total：bucket1=100+200+50+999+30=1379，bucket2=10+20+5+40+3=78 → 1457。
-        // cacheCreation 小计=999+40=1039。kaboo 应回值（漏计 cacheCreation）=1457−1039=418。
-        let aligned = KabooReconcileResponse.HostnameStats(hostname: "mbp-work", bucketCount: 2, sessionCount: 3, totalTokens: 418, totalCostCents: 137, firstBucketAt: first, lastBucketAt: last, lastSyncedAt: last)
-        print("【演示·场景一：对齐口径 — kaboo 回 418，差值=cacheCreation 1039，判一致】")
-        print(ReconcileReportRenderer.render(ReconcileComparison.compare(local: agg, kaboo: aligned)))
+        // cacheCreation 小计=999+40=1039。upstream 应回值（漏计 cacheCreation）=1457−1039=418。
+        let aligned = ReconcileResponse.HostnameStats(hostname: "mbp-work", bucketCount: 2, sessionCount: 3, totalTokens: 418, totalCostCents: 137, firstBucketAt: first, lastBucketAt: last, lastSyncedAt: last)
+        print("【演示·场景一：对齐口径 — upstream 回 418，差值=cacheCreation 1039，判一致】")
+        print(ReconcileReportRenderer.render(ReconcileComparison.compare(local: agg, upstream: aligned)))
         print("")
-        // 差异既不等于 418（kaboo 应回值）也不等于 1457（完整 total），无法用 cacheCreation 解释。
-        let wrong = KabooReconcileResponse.HostnameStats(hostname: "mbp-work", bucketCount: 2, sessionCount: 3, totalTokens: 500, totalCostCents: 137, firstBucketAt: first, lastBucketAt: last, lastSyncedAt: last)
-        print("【演示·场景二：不对齐口径 — kaboo 回 500，无法用 cacheCreation 解释，判不一致】")
-        print(ReconcileReportRenderer.render(ReconcileComparison.compare(local: agg, kaboo: wrong)))
+        // 差异既不等于 418（upstream 应回值）也不等于 1457（完整 total），无法用 cacheCreation 解释。
+        let wrong = ReconcileResponse.HostnameStats(hostname: "mbp-work", bucketCount: 2, sessionCount: 3, totalTokens: 500, totalCostCents: 137, firstBucketAt: first, lastBucketAt: last, lastSyncedAt: last)
+        print("【演示·场景二：不对齐口径 — upstream 回 500，无法用 cacheCreation 解释，判不一致】")
+        print(ReconcileReportRenderer.render(ReconcileComparison.compare(local: agg, upstream: wrong)))
         print("")
     }
 
@@ -121,14 +121,14 @@ enum ReconcileParityVerification {
     }
 
 
-    /// mock transport 喂一段 kaboo JSON，验证 KabooReconcileClient 能构造 GET、解码、
+    /// mock transport 喂一段 upstream JSON，验证 ReconcileClient 能构造 GET、解码、
     /// 并与本地聚合逐维度对齐——覆盖实拉整链（不依赖真实网络 / 配置）。
     private static func verifyClientDecodesAndAlignsWithMockTransport() async throws {
         let buckets = [makeBucket(hostname: "dev-a", model: "m1", input: 10, output: 20, cached: 5, cacheCreation: 100, reasoning: 3, startOffset: 0)]
         let agg = LocalHostnameAggregate.aggregate(hostname: "dev-a", buckets: buckets, sessions: [makeSession(hostname: "dev-a")])
         let firstIso = iso(buckets[0].bucketStart)
-        // kaboo 原始响应 JSON（无 envelope）：本地唯一 total=138，cacheCreation=100，
-        // kaboo 应回值=138−100=38；差值恰为 cacheCreation，判一致（已解释）。
+        // upstream 原始响应 JSON（无 envelope）：本地唯一 total=138，cacheCreation=100，
+        // upstream 应回值=138−100=38；差值恰为 cacheCreation，判一致（已解释）。
         let json = """
         {"hostnames":[{"hostname":"dev-a","bucketCount":1,"sessionCount":1,"totalTokens":38,"totalCostCents":12,"firstBucketAt":"\(firstIso)","lastBucketAt":"\(firstIso)","lastSyncedAt":null}]}
         """
@@ -136,24 +136,24 @@ enum ReconcileParityVerification {
         // 用最小合法配置：authToken=X-Jwt-Token，path 合法。
         var config = TokenReportingConfiguration()
         config.path = "/api/usage/reconcile"
-        config.headers.authToken = KabooReconcileClient.requiredJWTHeaderName
-        let baseURL = URL(string: "https://kaboo.example.com")!
-        let client = KabooReconcileClient(sender: sender)
+        config.headers.authToken = ReconcileClient.requiredJWTHeaderName
+        let baseURL = URL(string: "https://upstream.example.com")!
+        let client = ReconcileClient(sender: sender)
         let response = try await client.fetch(configuration: config, baseURL: baseURL, token: SecretToken("fake-jwt-for-test"))
 
         // 请求必须是 GET、带 auth header、URL 正确拼接。
         try require(sender.lastRequest?.httpMethod == "GET", "必须构造 GET")
-        try require(sender.lastRequest?.value(forHTTPHeaderField: KabooReconcileClient.requiredJWTHeaderName) == "fake-jwt-for-test", "必须带 JWT auth header")
-        try require(sender.lastRequest?.url?.absoluteString == "https://kaboo.example.com/api/usage/reconcile", "URL 拼接应正确")
+        try require(sender.lastRequest?.value(forHTTPHeaderField: ReconcileClient.requiredJWTHeaderName) == "fake-jwt-for-test", "必须带 JWT auth header")
+        try require(sender.lastRequest?.url?.absoluteString == "https://upstream.example.com/api/usage/reconcile", "URL 拼接应正确")
 
-        let comparison = ReconcileComparison.compare(local: agg, kaboo: response.stats(forHostname: "dev-a"))
+        let comparison = ReconcileComparison.compare(local: agg, upstream: response.stats(forHostname: "dev-a"))
         try require(comparison.isAligned, "mock 整链：口径处理后应一致")
 
         // authHeaderNotJWT：header 名不对时应报错、绝不发请求。
         var badConfig = config
         badConfig.headers.authToken = "Authorization"
         do {
-            _ = try KabooReconcileClient.makeRequest(configuration: badConfig, baseURL: baseURL, token: SecretToken("x"))
+            _ = try ReconcileClient.makeRequest(configuration: badConfig, baseURL: baseURL, token: SecretToken("x"))
             try require(false, "auth header 名不对应报错")
         } catch ReconcileFetchError.authHeaderNotJWT {
             // 期望
@@ -173,16 +173,16 @@ enum ReconcileParityVerification {
     }
 
 
-    /// 唯一 total = 五分量互斥之和（含 cacheCreation）；kaboo 口径基准 = total − cacheCreation。
+    /// 唯一 total = 五分量互斥之和（含 cacheCreation）；upstream 口径基准 = total − cacheCreation。
     private static func verifyTotalIncludesCacheCreation() throws {
         // 五分量互斥之和 = 10+20+5+100+3 = 138（含 cacheCreation=100）。
         let counts = UsageTokenCounts(
             input: 10, output: 20, cachedInput: 5, cacheCreationInput: 100, reasoningOutput: 3, reportedTotal: 0
         )
         try require(counts.total == 138, "唯一 total 应含 cacheCreation=138，实际 \(counts.total)")
-        // kaboo 口径基准（漏计 cacheCreation）= 138 − 100 = 38。
-        try require(LocalHostnameAggregate.kabooBasisFromTotal(counts.total, cacheCreation: 100) == 38,
-                    "kaboo 应回值应为 38（total 138 − cacheCreation 100）")
+        // upstream 口径基准（漏计 cacheCreation）= 138 − 100 = 38。
+        try require(LocalHostnameAggregate.upstreamBasisFromTotal(counts.total, cacheCreation: 100) == 38,
+                    "upstream 应回值应为 38（total 138 − cacheCreation 100）")
 
         // reportedTotal 更大时唯一 total 取 reportedTotal。
         let reported = UsageTokenCounts(input: 1, output: 1, reportedTotal: 999)
@@ -204,43 +204,43 @@ enum ReconcileParityVerification {
         try require(agg.totalTokens == 148, "唯一 total 应为 148（138+10），实际 \(agg.totalTokens)")
         try require(agg.inputSubtotal == 11, "input 小计应为 11")
         try require(agg.cacheCreationInputSubtotal == 107, "cacheCreation 小计应为 107")
-        // kaboo 应回值 = 148 − 107 = 41。
-        try require(LocalHostnameAggregate.kabooBasisFromTotal(agg.totalTokens, cacheCreation: agg.cacheCreationInputSubtotal) == 41,
-                    "kaboo 应回值应为 41（148−107）")
+        // upstream 应回值 = 148 − 107 = 41。
+        try require(LocalHostnameAggregate.upstreamBasisFromTotal(agg.totalTokens, cacheCreation: agg.cacheCreationInputSubtotal) == 41,
+                    "upstream 应回值应为 41（148−107）")
         try require(agg.firstBucketAt == buckets[0].bucketStart, "firstBucketAt 应为最早 bucket")
         try require(agg.lastBucketAt == buckets[1].bucketStart, "lastBucketAt 应为最晚 bucket")
     }
 
-    /// 对齐逻辑：kaboo total 差一个 cacheCreation 仍判一致（已解释）；无法解释的差异判不等。
+    /// 对齐逻辑：upstream total 差一个 cacheCreation 仍判一致（已解释）；无法解释的差异判不等。
     private static func verifyComparisonEqualAndUnequal() throws {
-        // bucket: total = 10+20+5+100+3 = 138；cacheCreation=100；kaboo 应回值 = 38。
+        // bucket: total = 10+20+5+100+3 = 138；cacheCreation=100；upstream 应回值 = 38。
         let buckets = [makeBucket(hostname: "dev-a", model: "m1", input: 10, output: 20, cached: 5, cacheCreation: 100, reasoning: 3, startOffset: 0)]
         let sessions = [makeSession(hostname: "dev-a")]
         let agg = LocalHostnameAggregate.aggregate(hostname: "dev-a", buckets: buckets, sessions: sessions)
         let firstIso = iso(buckets[0].bucketStart)
 
-        // kaboo 回 38（total−cacheCreation）：差值恰为 cacheCreation，判一致（已解释）。
-        let kabooBasis = KabooReconcileResponse.HostnameStats(
+        // upstream 回 38（total−cacheCreation）：差值恰为 cacheCreation，判一致（已解释）。
+        let upstreamBasis = ReconcileResponse.HostnameStats(
             hostname: "dev-a", bucketCount: 1, sessionCount: 1, totalTokens: 38, totalCostCents: 0,
             firstBucketAt: firstIso, lastBucketAt: firstIso, lastSyncedAt: nil
         )
-        try require(ReconcileComparison.compare(local: agg, kaboo: kabooBasis).isAligned,
-                    "kaboo 差一个 cacheCreation 应判一致（已解释）")
+        try require(ReconcileComparison.compare(local: agg, upstream: upstreamBasis).isAligned,
+                    "upstream 差一个 cacheCreation 应判一致（已解释）")
 
-        // kaboo 回完整 138（若某天 kaboo 修正口径）：也判一致。
-        let kabooFull = KabooReconcileResponse.HostnameStats(
+        // upstream 回完整 138（若某天 upstream 修正口径）：也判一致。
+        let upstreamFull = ReconcileResponse.HostnameStats(
             hostname: "dev-a", bucketCount: 1, sessionCount: 1, totalTokens: 138, totalCostCents: 0,
             firstBucketAt: firstIso, lastBucketAt: firstIso, lastSyncedAt: nil
         )
-        try require(ReconcileComparison.compare(local: agg, kaboo: kabooFull).isAligned,
-                    "kaboo 回完整 total 应判一致")
+        try require(ReconcileComparison.compare(local: agg, upstream: upstreamFull).isAligned,
+                    "upstream 回完整 total 应判一致")
 
-        // kaboo 回 39（差值无法用 cacheCreation 解释）：应判不等。
-        let mismatched = KabooReconcileResponse.HostnameStats(
+        // upstream 回 39（差值无法用 cacheCreation 解释）：应判不等。
+        let mismatched = ReconcileResponse.HostnameStats(
             hostname: "dev-a", bucketCount: 1, sessionCount: 1, totalTokens: 39, totalCostCents: 0,
             firstBucketAt: firstIso, lastBucketAt: firstIso, lastSyncedAt: nil
         )
-        let notAligned = ReconcileComparison.compare(local: agg, kaboo: mismatched)
+        let notAligned = ReconcileComparison.compare(local: agg, upstream: mismatched)
         try require(!notAligned.isAligned, "无法用 cacheCreation 解释的 total 差异应判不一致")
 
         // advisory / localOnlyDetail 维度 equal 恒为 nil，不参与判定。
@@ -248,16 +248,16 @@ enum ReconcileParityVerification {
         try require(advisory.allSatisfy { $0.equal == nil }, "非权威维度不应带 equal 判定")
     }
 
-    /// kaboo 无该 hostname 时，权威维度记不等、整体不一致。
+    /// upstream 无该 hostname 时，权威维度记不等、整体不一致。
     private static func verifyMissingHostnameIsUnequal() throws {
         let agg = LocalHostnameAggregate.aggregate(
             hostname: "ghost",
             buckets: [makeBucket(hostname: "ghost", model: "m1", input: 1, output: 1, cached: 0, cacheCreation: 0, reasoning: 0, startOffset: 0)],
             sessions: []
         )
-        let comparison = ReconcileComparison.compare(local: agg, kaboo: nil)
-        try require(!comparison.kabooPresent, "应标记 kaboo 无此设备")
-        try require(!comparison.isAligned, "kaboo 缺该 hostname 应判不一致")
+        let comparison = ReconcileComparison.compare(local: agg, upstream: nil)
+        try require(!comparison.upstreamPresent, "应标记 upstream 无此设备")
+        try require(!comparison.isAligned, "upstream 缺该 hostname 应判不一致")
     }
 
     /// 渲染输出不得包含任何机密样式内容（这里以确定性内容验证脱敏结构）。
@@ -267,11 +267,11 @@ enum ReconcileParityVerification {
             buckets: [makeBucket(hostname: "dev-a", model: "secret-model", input: 1, output: 1, cached: 0, cacheCreation: 0, reasoning: 0, startOffset: 0)],
             sessions: []
         )
-        let stats = KabooReconcileResponse.HostnameStats(
+        let stats = ReconcileResponse.HostnameStats(
             hostname: "dev-a", bucketCount: 1, sessionCount: 0, totalTokens: 2, totalCostCents: 5,
             firstBucketAt: nil, lastBucketAt: nil, lastSyncedAt: nil
         )
-        let text = ReconcileReportRenderer.render(ReconcileComparison.compare(local: agg, kaboo: stats))
+        let text = ReconcileReportRenderer.render(ReconcileComparison.compare(local: agg, upstream: stats))
         // 渲染只含聚合维度名与数字；不含 model 明细（model 不是对齐维度，不进报告）。
         try require(!text.contains("secret-model"), "渲染不应泄露逐 bucket 的 model 明细")
         try require(text.contains("bucketCount"), "渲染应含权威维度名")
@@ -290,9 +290,9 @@ enum ReconcileParityVerification {
             return
         }
 
-        // 2) authToken header 名必须是 kaboo 认可的 JWT header。
-        guard configuration.headers.authToken.caseInsensitiveCompare(KabooReconcileClient.requiredJWTHeaderName) == .orderedSame else {
-            print("跳过实拉：reporting.json 的 headers.authToken 需设为 \"\(KabooReconcileClient.requiredJWTHeaderName)\" 才能打通 kaboo。")
+        // 2) authToken header 名必须是 upstream 认可的 JWT header。
+        guard configuration.headers.authToken.caseInsensitiveCompare(ReconcileClient.requiredJWTHeaderName) == .orderedSame else {
+            print("跳过实拉：reporting.json 的 headers.authToken 需设为 \"\(ReconcileClient.requiredJWTHeaderName)\" 才能打通 upstream。")
             return
         }
 
@@ -328,14 +328,14 @@ enum ReconcileParityVerification {
         }
 
         // 6) GET reconcile。
-        let response: KabooReconcileResponse
+        let response: ReconcileResponse
         do {
-            response = try await KabooReconcileClient().fetch(configuration: configuration, baseURL: baseURL, token: token)
+            response = try await ReconcileClient().fetch(configuration: configuration, baseURL: baseURL, token: token)
         } catch let error as ReconcileFetchError {
-            print("跳过实拉：拉取 kaboo reconcile 失败（\(desensitize(error))）。")
+            print("跳过实拉：拉取 upstream reconcile 失败（\(desensitize(error))）。")
             return
         } catch {
-            print("跳过实拉：拉取 kaboo reconcile 失败（网络异常）。")
+            print("跳过实拉：拉取 upstream reconcile 失败（网络异常）。")
             return
         }
 
@@ -356,8 +356,8 @@ enum ReconcileParityVerification {
         let aggregate = LocalHostnameAggregate.aggregate(hostname: hostname, buckets: localBuckets, sessions: localSessions)
 
         // 8) 逐维度对齐 + 渲染。
-        let comparison = ReconcileComparison.compare(local: aggregate, kaboo: response.stats(forHostname: hostname))
-        print("=== AP vs kaboo 逐维度对齐 ===")
+        let comparison = ReconcileComparison.compare(local: aggregate, upstream: response.stats(forHostname: hostname))
+        print("=== AP vs upstream 逐维度对齐 ===")
         print(ReconcileReportRenderer.render(comparison))
     }
 

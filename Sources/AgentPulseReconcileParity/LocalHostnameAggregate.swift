@@ -1,7 +1,7 @@
 import Foundation
 import AgentPulseCore
 
-/// 从本地账本 bucket / session 明细聚合出用于与 kaboo per-hostname 对齐的统计。
+/// 从本地账本 bucket / session 明细聚合出用于与上游 per-hostname 对齐的统计。
 ///
 /// 纯值类型 + 纯静态函数,不含任何 I/O,因此离线可用 mock 数据完整验证聚合逻辑。
 ///
@@ -11,9 +11,9 @@ import AgentPulseCore
 /// `total = input+output+cachedInput+cacheCreationInput+reasoningOutput` 相加**不重复**,
 /// cacheCreation 本就是总量的一部分。这里直接用 `UsageTokenCounts.total`,不另造第二口径。
 ///
-/// 与 kaboo 的差异:kaboo 的 total_tokens 少算了 cacheCreation(只用四项),属 kaboo 侧
-/// 口径缺陷。对齐时把差值如实归因,而不是在本地迁就一个"kaboo 口径 total"。
-/// cost 不在此计算,AP 与 kaboo 各自独立实现,不作一致性判据。
+/// 与上游的差异:上游的 total_tokens 少算了 cacheCreation(只用四项),属上游侧
+/// 口径缺陷。对齐时把差值如实归因,而不是在本地迁就一个"上游口径 total"。
+/// cost 不在此计算,AP 与上游各自独立实现,不作一致性判据。
 public struct LocalHostnameAggregate: Sendable, Equatable {
     public var hostname: String
     /// distinct bucket 行数(本地 bucket 已按自然键去重,直接计数即可)。
@@ -22,12 +22,12 @@ public struct LocalHostnameAggregate: Sendable, Equatable {
     public var sessionCount: Int
     /// 唯一 total:五分量互斥之和(含 cacheCreation)。
     public var totalTokens: Int64
-    /// 分量小计,用于对齐时解释 total 差异(kaboo per-hostname 不回分量)。
+    /// 分量小计,用于对齐时解释 total 差异(上游 per-hostname 不回分量)。
     public var inputSubtotal: Int64
     public var outputSubtotal: Int64
     public var cachedInputSubtotal: Int64
     public var reasoningOutputSubtotal: Int64
-    /// cacheCreation 小计:kaboo 的 total 漏计了这部分,正是两侧 total 差值的来源。
+    /// cacheCreation 小计:上游的 total 漏计了这部分,正是两侧 total 差值的来源。
     public var cacheCreationInputSubtotal: Int64
     /// 最早 / 最晚 bucketStart,用于时间边界对齐(秒级)。nil 表示无 bucket。
     public var firstBucketAt: Date?
@@ -59,9 +59,9 @@ public struct LocalHostnameAggregate: Sendable, Equatable {
         self.lastBucketAt = lastBucketAt
     }
 
-    /// kaboo total_tokens 的口径:四项(input+output+cached+reasoning),**漏计 cacheCreation**。
-    /// 仅用于对齐时"从唯一 total 推出 kaboo 应回的值"以解释差值,不作为本地 total。
-    public static func kabooBasisFromTotal(_ total: Int64, cacheCreation: Int64) -> Int64 {
+    /// 上游 total_tokens 的口径:四项(input+output+cached+reasoning),**漏计 cacheCreation**。
+    /// 仅用于对齐时"从唯一 total 推出上游应回的值"以解释差值,不作为本地 total。
+    public static func upstreamBasisFromTotal(_ total: Int64, cacheCreation: Int64) -> Int64 {
         max(0, total - cacheCreation)
     }
 
