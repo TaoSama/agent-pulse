@@ -1145,6 +1145,17 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
     }
 
+    /// 账本里非真实模型的占位名（合成锚点事件的 model），无真实 output，恒 0 TPS。
+    nonisolated private static let syntheticModelPlaceholder = "<synthetic>"
+    /// 未知 / 占位模型统一归入的展示名，与账本缺省口径一致。
+    nonisolated private static let unknownModelName = "n"
+
+    /// 把账本 model 归一为展示用名：合成占位与空串收敛到 unknown，其余原样返回。
+    /// 由此 `<synthetic>` 等占位不再单独成行，而是并入 unknown。
+    nonisolated private static func displayModelName(_ model: String) -> String {
+        model.isEmpty || model == syntheticModelPlaceholder ? unknownModelName : model
+    }
+
     /// off-main：从账本读 [now-24h, now) 的 30min output bucket，换算成 48 桶平均 TPS 曲线（总 + 分模型）。
     nonisolated private static func buildDaySeries(
         from ledger: UsageLedgerStore,
@@ -1160,8 +1171,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         var byModel: [String: [(bucketStart: Date, outputTokens: Int64)]] = [:]
         var modelOutputSum: [String: Int64] = [:]
         for row in modelBuckets {
-            byModel[row.model, default: []].append((row.bucketStart, row.outputTokens))
-            modelOutputSum[row.model, default: 0] += row.outputTokens
+            // 归一后 `<synthetic>` 等占位并入 unknown，同名跨 bucket 累加，不再单独成行。
+            let model = displayModelName(row.model)
+            byModel[model, default: []].append((row.bucketStart, row.outputTokens))
+            modelOutputSum[model, default: 0] += row.outputTokens
         }
         var perModel: [String: [SparklinePoint]] = [:]
         for (model, buckets) in byModel {
