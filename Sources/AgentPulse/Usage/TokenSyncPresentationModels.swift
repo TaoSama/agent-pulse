@@ -115,6 +115,33 @@ enum TokenConfigurationStatus: String, Sendable, Equatable {
     case invalid
 }
 
+/// 权威上报状态：把分散的「能否上报 / 为什么受阻 / 上次结果」收敛成单一结论，
+/// 供 UI 顶部一句话说明。语义与优先级见 `TokenSyncStatus.authoritativeReportingState`。
+enum ReportingAuthorityState: Equatable, Sendable {
+    /// 没配好：配置未就绪 / API 地址空 / hostname 缺失。
+    case notConfigured
+    /// 配好但被门禁挡（存在无法证明的潜在重复）。
+    case blocked
+    /// 配置就绪、可开启，但用户未开上报。
+    case disabled
+    /// 已开、可上报，但有待上报（dirty）行。
+    case pending(total: Int)
+    /// 已开、可上报，尚未上报过。
+    case idle
+    /// 上次上报完全成功。
+    case reportedOK
+    /// 上次上报未完全成功（部分失败 / 仍有 pending）。
+    case reportedFailed
+}
+
+/// 权威上报状态的展示三元组：标题、可选详情、语义色。
+struct ReportingAuthorityPresentation: Equatable, Sendable {
+    var state: ReportingAuthorityState
+    var title: String
+    var detail: String?
+    var tone: SettingsStatusTone
+}
+
 /// 设置页「Token 统计 / 用量上报」两块的状态快照。
 struct TokenSyncStatus: Sendable, Equatable {
     /// 本地长期采集开关（历史会话删除后数据仍保留）。
@@ -155,6 +182,66 @@ struct TokenSyncStatus: Sendable, Equatable {
     var cliProxyConfigured: Bool = false
     /// cliproxyapi 采集错误（脱敏）；nil 表示无错误或未配置。
     var cliProxyError: String? = nil
+
+    /// 派生「权威上报状态」：把分散在开关脚注 / 门禁脚注 / 按钮 disabled 三处的受阻语义，
+    /// 按固定优先级收敛成单一结论，作为 reportingCard 顶部唯一权威说明。
+    ///
+    /// 优先级（高→低）：没配好 → 被门禁挡 → 未开 → 有待上报 → 上次结果。
+    /// 只读派生，不新增存储字段，也不改变任何上报判定逻辑。
+    var authoritativeReportingState: ReportingAuthorityPresentation {
+        // 1) 没配好：配置未就绪 / API 地址空 / hostname 缺失。
+        if configurationStatus != .ready || ingestBaseURL.isEmpty || canonicalHostname == nil {
+            let detail: String
+            if configurationStatus != .ready {
+                detail = configurationError ?? "本地上报配置未就绪"
+            } else if ingestBaseURL.isEmpty {
+                detail = "请先配置 API 地址"
+            } else {
+                detail = "请先配置 hostname"
+            }
+            return ReportingAuthorityPresentation(
+                state: .notConfigured, title: "未配置上报", detail: detail, tone: .warning
+            )
+        }
+        // 2) 配好但被门禁挡。
+        if !reportingEligible {
+            let detail = reportingBlockedReasons.first ?? "存在无法证明的潜在重复，已阻止上报"
+            return ReportingAuthorityPresentation(
+                state: .blocked, title: "上报被门禁阻止", detail: detail, tone: .negative
+            )
+        }
+        // 3) 配置就绪但未开启上报。
+        if !reportingEnabled {
+            return ReportingAuthorityPresentation(
+                state: .disabled, title: "上报已关闭", detail: "配置就绪，可随时开启本机上报。", tone: .neutral
+            )
+        }
+        // 4) 上次上报未完全成功（含部分失败 / 仍有 pending）。
+        if lastReportSucceeded == false {
+            return ReportingAuthorityPresentation(
+                state: .reportedFailed, title: "上次上报未完全成功",
+                detail: reportingError, tone: .negative
+            )
+        }
+        // 5) 有待上报（dirty）行。
+        let pending = pendingBuckets + pendingSessions
+        if pending > 0 {
+            return ReportingAuthorityPresentation(
+                state: .pending(total: pending), title: "有 \(pending) 项待上报",
+                detail: "buckets \(pendingBuckets) · sessions \(pendingSessions)", tone: .warning
+            )
+        }
+        // 6) 上次上报成功。
+        if lastReportSucceeded == true {
+            return ReportingAuthorityPresentation(
+                state: .reportedOK, title: "上次上报成功", detail: nil, tone: .positive
+            )
+        }
+        // 7) 已开、可上报、尚未上报过。
+        return ReportingAuthorityPresentation(
+            state: .idle, title: "已启用，等待首次上报", detail: nil, tone: .neutral
+        )
+    }
 
     static let localOnly = TokenSyncStatus(
         localCollectionEnabled: true,

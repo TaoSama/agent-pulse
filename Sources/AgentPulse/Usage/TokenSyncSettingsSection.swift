@@ -60,15 +60,20 @@ struct TokenSyncSettingsSection: View {
     private var reportingCard: some View {
         SettingsCard(title: "用量上报", systemImage: "paperplane") {
             VStack(alignment: .leading, spacing: 10) {
+                // 权威状态行：一句话说清当前能不能上报、为什么。其余项降为详情。
+                let authority = model.tokenSyncStatus.authoritativeReportingState
+                SettingsRow(title: "上报状态") {
+                    SettingsStatusBadge(text: authority.title, tone: authority.tone)
+                }
+                if let detail = authority.detail {
+                    SettingsFootnote(detail, tone: authority.tone)
+                }
+
                 SettingsToggleRow(
                     title: "本机上报（谁开谁报）",
                     isOn: reportingBinding,
                     disabled: !canEnableReporting
                 )
-
-                if !canEnableReporting {
-                    SettingsFootnote(reportingDisabledReason, tone: .negative)
-                }
 
                 SettingsField(
                     title: "API 地址（留空则仅本地）",
@@ -92,23 +97,15 @@ struct TokenSyncSettingsSection: View {
                 }
 
                 if let error = model.tokenSyncStatus.configurationError {
-                    SettingsFootnote(error, tone: .negative)
+                    SettingsFootnote(error, tone: configurationStatusTone)
                 }
 
                 SettingsRow(title: "上次上报") {
-                    Text(Self.dateText(model.tokenSyncStatus.lastReportAt))
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(Color.white)
-                }
-
-                if let error = model.tokenSyncStatus.reportingError {
-                    SettingsFootnote(error, tone: .negative)
-                }
-
-                if !model.tokenSyncStatus.reportingEligible {
-                    SettingsFootnote("上报门禁：存在无法证明的潜在重复，已阻止上报。", tone: .negative)
-                    ForEach(model.tokenSyncStatus.reportingBlockedReasons, id: \.self) { reason in
-                        SettingsFootnote("• \(reason)", tone: .negative)
+                    HStack(spacing: 6) {
+                        Text(Self.dateText(model.tokenSyncStatus.lastReportAt))
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(Color.white)
+                        SettingsStatusBadge(text: lastReportOutcomeText, tone: lastReportOutcomeTone)
                     }
                 }
 
@@ -211,19 +208,6 @@ struct TokenSyncSettingsSection: View {
         && model.tokenSyncStatus.configurationStatus == .ready
     }
 
-    private var reportingDisabledReason: String {
-        if model.tokenSyncStatus.ingestBaseURL.isEmpty {
-            return "请先配置 API 地址"
-        }
-        if model.tokenSyncStatus.canonicalHostname == nil {
-            return "请先配置 hostname"
-        }
-        if model.tokenSyncStatus.configurationStatus != .ready {
-            return "本地凭证配置未就绪"
-        }
-        return ""
-    }
-
     private var canReport: Bool {
         model.tokenSyncStatus.reportingEnabled
         && !anySyncInProgress
@@ -245,7 +229,28 @@ struct TokenSyncSettingsSection: View {
     }
 
     private var configurationStatusTone: SettingsStatusTone {
-        model.tokenSyncStatus.configurationStatus == .ready ? .positive : .negative
+        switch model.tokenSyncStatus.configurationStatus {
+        case .ready: return .positive
+        case .missing: return .warning   // 没配好：橙
+        case .invalid: return .negative  // 配错了：红
+        }
+    }
+
+    /// 上次上报结果小徽章：成功 / 未完全 / 未上报过。
+    private var lastReportOutcomeText: String {
+        switch model.tokenSyncStatus.lastReportSucceeded {
+        case .some(true): return "成功"
+        case .some(false): return "未完全"
+        case .none: return "—"
+        }
+    }
+
+    private var lastReportOutcomeTone: SettingsStatusTone {
+        switch model.tokenSyncStatus.lastReportSucceeded {
+        case .some(true): return .positive
+        case .some(false): return .negative
+        case .none: return .neutral
+        }
     }
 
     /// 只展示 API host，绝不展示完整 URL（路径/查询参数可能含敏感信息）。

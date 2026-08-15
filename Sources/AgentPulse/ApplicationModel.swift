@@ -168,8 +168,22 @@ final class ApplicationModel: ObservableObject {
     }
 
     func start() {
+        seedIngestBaseURLFromEnvironmentIfEmpty()
         metricsStore.start()
         tokenSyncCoordinator.start()
+    }
+
+    /// 对齐验证工具从环境变量 `AGENT_PULSE_RECONCILE_BASE_URL` 读 上游 base URL；
+    /// 为让设置页「API 地址」与之一致，app 启动时若该字段为空且环境变量是合法 base URL，
+    /// 则把同一值回填到本机偏好。已有值不覆盖，避免踩掉用户手填；不合法则忽略。
+    private func seedIngestBaseURLFromEnvironmentIfEmpty() {
+        guard tokenSyncStatus.ingestBaseURL.isEmpty else { return }
+        guard let raw = ProcessInfo.processInfo.environment["AGENT_PULSE_RECONCILE_BASE_URL"] else { return }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              TokenUsageReporter.isValidBaseURL(url) else { return }
+        setTokenIngestBaseURL(trimmed)
     }
     func stop() {
         metricsStore.stop()
