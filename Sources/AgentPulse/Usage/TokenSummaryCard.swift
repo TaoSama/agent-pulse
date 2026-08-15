@@ -111,53 +111,39 @@ struct TokenSummaryCard: View {
     }
 }
 
-/// Token 卡右上角更新状态：平时显示上次更新的相对时间；扫描中显示两行——
-/// 第一行为当前阶段（如「正在采集用量」），第二行为「更新进度：整体百分比[· 已扫描/总文件数]」。
+/// Token 卡右上角更新状态：平时显示「上次更新: 相对时间」（随计时器自动刷新）；
+/// 扫描/上报中显示「正在更新: 整体百分比」。阶段名、文件计数等完整详情移到菜单底部状态行。
 ///
-/// 只读展示聚合数（百分比 / 文件计数 / 相对时间），不显示文件路径、会话正文或凭证。
+/// 只读展示聚合数（百分比 / 相对时间），不显示文件路径、会话正文或凭证。
 struct TokenSyncUpdateStatusView: View {
     let status: TokenSyncStatus
 
+    @State private var now = Date()
+    private let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
+
+    /// 扫描或上报任一进行中，右上角都展示百分比。
+    private var inProgress: Bool {
+        status.scanningInProgress || status.reportingInProgress
+    }
+
     var body: some View {
-        Group {
-            if status.scanningInProgress {
-                VStack(alignment: .trailing, spacing: 2) {
-                    HStack(spacing: 5) {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(.white)
-                        Text("正在\(status.scanPhase?.displayLabel ?? "更新")")
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    }
-                    Text("更新进度：\(progressText)")
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Color.white.opacity(0.75))
-                }
-            } else {
-                Text(TokenUsageFormatting.relativeTime(status.lastScanAt))
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color.white.opacity(0.75))
-            }
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel)
+        Text(statusText)
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .foregroundStyle(Color.white)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .onReceive(ticker) { now = $0 }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(statusText)
     }
 
-    /// 「10% · 12/340」：整体百分比 + 仅在 scanning 阶段附文件数。
-    private var progressText: String {
-        let percentText = TokenUsageFormatting.percent(status.scanProgress)
-        guard status.scanPhase == .scanning, status.totalFiles > 0 else {
-            return percentText
+    /// 右上角文案：更新中「正在更新: xx%」；空闲「上次更新: 相对时间」。
+    private var statusText: String {
+        if inProgress {
+            return "正在更新: \(TokenUsageFormatting.percent(status.scanProgress))"
         }
-        return "\(percentText) · \(status.scannedFiles)/\(status.totalFiles)"
-    }
-
-    private var accessibilityLabel: String {
-        if status.scanningInProgress {
-            let phase = status.scanPhase?.displayLabel ?? "更新中"
-            return "正在\(phase)，更新进度 \(progressText)"
-        }
-        return "上次更新 \(TokenUsageFormatting.relativeTime(status.lastScanAt))"
+        return "上次更新: \(TokenUsageFormatting.relativeTime(status.lastScanAt, now: now))"
     }
 }
 
