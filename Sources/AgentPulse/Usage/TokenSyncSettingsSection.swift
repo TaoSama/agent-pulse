@@ -25,7 +25,7 @@ struct TokenSyncSettingsSection: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(Color.white)
                 .fixedSize(horizontal: true, vertical: false)
-            Spacer(minLength: 8)
+            Spacer(minLength: 12)
             Picker("扫描和上报间隔", selection: reportIntervalBinding) {
                 ForEach(TokenReportInterval.allCases) { interval in
                     Text(interval.title).tag(interval)
@@ -35,7 +35,7 @@ struct TokenSyncSettingsSection: View {
             .labelsHidden()
             .tint(.white)
             .colorScheme(.dark)
-            .frame(maxWidth: 300)
+            .frame(maxWidth: 300, alignment: .trailing)
             .accessibilityLabel("扫描和上报间隔")
             .accessibilityValue(model.tokenSyncStatus.autoReportInterval.title)
         }
