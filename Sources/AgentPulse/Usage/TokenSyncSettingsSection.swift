@@ -1,8 +1,15 @@
 import SwiftUI
+import AgentPulseCore
 
 /// 设置页的 Token 统计 / 用量上报两张深色卡片。
 struct TokenSyncSettingsSection: View {
     @ObservedObject var model: ApplicationModel
+    @ObservedObject var envSettings: EnvSettingsModel
+
+    init(model: ApplicationModel) {
+        self.model = model
+        self.envSettings = model.envSettings
+    }
 
     var body: some View {
         tokenStatsCard
@@ -26,14 +33,10 @@ struct TokenSyncSettingsSection: View {
                         .foregroundStyle(hostnameColor)
                 }
 
-                if hostnameIsAuthoritative {
-                    SettingsFootnote("hostname 由本地上报配置提供，作为上报权威，不可在此修改。")
-                } else {
-                    SettingsField(
-                        title: "设备标识（仅本地采集用）",
-                        text: hostnameBinding
-                    )
-                }
+                // hostname 权威来自合并 env 的 REPORT_CANONICAL_HOSTNAME：双源可读可填，
+                // 手填经 coordinator 写回 env 并刷新上报状态（非密钥，明文回显）。
+                dualSourceField("设备标识（canonical hostname）", key: MergedEnvKeys.reportCanonicalHostname)
+                SettingsFootnote("hostname 存于合并 env，作为上报身份；改名会触发历史归属确认。")
 
                 SettingsRow(title: "上次扫描") {
                     Text(Self.dateText(model.tokenSyncStatus.lastScanAt))
@@ -75,10 +78,13 @@ struct TokenSyncSettingsSection: View {
                     disabled: !canEnableReporting
                 )
 
-                SettingsField(
-                    title: "API 地址（留空则仅本地）",
-                    text: ingestURLBinding
-                )
+                if !canEnableReporting {
+                    SettingsFootnote(reportingDisabledReason, tone: .negative)
+                }
+
+                // API 地址权威来自合并 env 的 REPORT_BASE_URL：双源可读可填（非密钥明文），
+                // 手填经 coordinator 写回 env；填好但不自动开启上报。
+                dualSourceField("API 地址（留空则仅本地）", key: MergedEnvKeys.reportBaseURL)
 
                 SettingsFootnote("仅本机使用，不随用量上报。")
 
@@ -151,6 +157,17 @@ struct TokenSyncSettingsSection: View {
         }
     }
 
+    /// 构造双源字段（REPORT_* 简单值，非密钥明文；手填经 coordinator 写回 env）。
+    private func dualSourceField(_ title: String, key: String) -> some View {
+        SettingsDualSourceField(
+            title: title,
+            isSecret: envSettings.isSecret(key),
+            source: envSettings.sourceBinding(for: key),
+            rawValue: envSettings.valueBinding(for: key),
+            displayValue: envSettings.displayValue(for: key)
+        )
+    }
+
     // MARK: Bindings
 
     private var localCollectionBinding: Binding<Bool> {
@@ -167,29 +184,10 @@ struct TokenSyncSettingsSection: View {
         )
     }
 
-    private var ingestURLBinding: Binding<String> {
-        Binding(
-            get: { model.tokenSyncStatus.ingestBaseURL },
-            set: { model.setTokenIngestBaseURL($0) }
-        )
-    }
-
-    private var hostnameBinding: Binding<String> {
-        Binding(
-            get: { model.tokenSyncStatus.canonicalHostname ?? "" },
-            set: { model.setTokenCanonicalHostname($0) }
-        )
-    }
-
     // MARK: 状态派生
 
     private var hostnameColor: Color {
         model.tokenSyncStatus.canonicalHostname == nil ? .red : Color.white
-    }
-
-    /// 配置就绪时 hostname 由 reporting.json 提供，属上报权威，UI 只读展示。
-    private var hostnameIsAuthoritative: Bool {
-        model.tokenSyncStatus.configurationStatus == .ready
     }
 
     /// scan / report 任一在途时，互斥动作一律禁用，避免并发写账。
@@ -206,6 +204,19 @@ struct TokenSyncSettingsSection: View {
         !model.tokenSyncStatus.ingestBaseURL.isEmpty
         && model.tokenSyncStatus.canonicalHostname != nil
         && model.tokenSyncStatus.configurationStatus == .ready
+    }
+
+    private var reportingDisabledReason: String {
+        if model.tokenSyncStatus.ingestBaseURL.isEmpty {
+            return "请先配置 API 地址"
+        }
+        if model.tokenSyncStatus.canonicalHostname == nil {
+            return "请先配置 hostname"
+        }
+        if model.tokenSyncStatus.configurationStatus != .ready {
+            return "本地凭证配置未就绪"
+        }
+        return ""
     }
 
     private var canReport: Bool {

@@ -1,12 +1,14 @@
 import Foundation
+import AgentPulseCore
 import AgentPulseR2
 
-/// App 层上传服务：负责从可编辑的 .env 配置文件读取 R2 凭证/配置，
+/// App 层上传服务：负责从统一的合并 `.env` 配置文件读取 R2 凭证/配置，
 /// 组装 AgentPulseR2 的上传管线，将剪贴板图片上传到 R2。
 ///
 /// 安全约定：
 /// - 只在内存中解析配置值，绝不打印、写日志或持久化任何 KEY/VALUE。
 /// - 仅配置文件“路径”可由 UI/UserDefaults 保存；凭证本身永不落盘。
+/// - 配置文件必须为 0600 属主专属常规文件（复用 ``EnvFile/load(url:maxBytes:)`` 的 fd 校验）。
 /// - 对外暴露的错误消息经过脱敏，只描述失败类别，不含任何配置值。
 @MainActor
 public final class UploadService: ObservableObject {
@@ -20,29 +22,21 @@ public final class UploadService: ObservableObject {
 
     // MARK: - 常量
 
-    /// 默认配置文件路径：当前用户家目录下的凭证文件（不硬编码用户名）。
-    /// 该文件由 `R2_PUBLIC_BASE_URL` 决定对外 URL（例如 https://cdn.example.com）。
-    public static let defaultConfigPath: String = {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/.credentials/env/agent-pulse-r2.env")
-            .path
-    }()
+    /// 默认配置文件路径：合并后的统一凭证文件（R2 / cliproxy / 上报简单值共用）。
+    public static let defaultConfigPath: String = MergedEnvKeys.defaultPath
 
-    /// UserDefaults 中保存“配置路径”的键（仅保存路径字符串，绝不保存凭证）。
-    private static let configPathDefaultsKey = "com.agentpulse.upload.configPath"
+    /// UserDefaults 中保存“合并 env 路径”的键（仅保存路径字符串，绝不保存凭证）。
+    static let configPathDefaultsKey = MergedEnvPreferences.pathDefaultsKey
 
     /// 解析实际生效的配置路径：为空/未设置时回退到默认路径，否则原样使用保存值。
     /// - Parameter saved: UserDefaults 中读到的路径（可为空）。
     /// - Returns: 实际应生效的配置路径。
     public static func resolveConfigPath(saved: String?) -> String {
-        guard let saved else { return defaultConfigPath }
-        let trimmed = saved.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return defaultConfigPath }
-        return trimmed
+        MergedEnvKeys.resolvePath(saved: saved)
     }
 
     /// 单个配置文件允许的最大字节数，避免误读超大文件。
-    nonisolated private static let maxConfigFileBytes = 64 * 1024
+    nonisolated private static let maxConfigFileBytes = EnvFile.defaultMaxBytes
 
     // MARK: - 可观察状态
 
@@ -182,67 +176,22 @@ public final class UploadService: ObservableObject {
 
     // MARK: - 配置文件解析
 
-    /// 从磁盘读取并安全解析 .env 文件为环境字典。
+    /// 从磁盘安全读取并解析合并 `.env` 文件为环境字典。
     ///
-    /// 安全：本方法只将值放入内存字典返回给调用方使用，
-    /// 不会打印、记录或写入任何键值。
+    /// 复用 ``EnvFile/load(path:maxBytes:)``：fd + `O_NOFOLLOW` + fstat 强制 0600 属主常规文件，
+    /// 只将值放入内存字典返回，不打印/记录/落盘任何键值。
     ///
     /// - Parameter path: 配置路径，支持前导 ~ 展开。
     nonisolated static func loadEnvironment(atPath path: String) throws -> [String: String] {
-        let expanded = (path as NSString).expandingTildeInPath
-        let trimmedPath = expanded.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedPath.isEmpty else { throw UploadServiceError.configFileMissing }
-
-        let fileManager = FileManager.default
-        var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: trimmedPath, isDirectory: &isDirectory), !isDirectory.boolValue else {
-            throw UploadServiceError.configFileMissing
-        }
-
-        let url = URL(fileURLWithPath: trimmedPath)
-        let data: Data
         do {
-            data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            return try EnvFile.load(path: path, maxBytes: maxConfigFileBytes)
+        } catch EnvFile.Error.notFound {
+            throw UploadServiceError.configFileMissing
+        } catch EnvFile.Error.insecurePermissions {
+            throw UploadServiceError.insecurePermissions
         } catch {
             throw UploadServiceError.configFileUnreadable
         }
-        guard data.count <= maxConfigFileBytes else {
-            throw UploadServiceError.configFileUnreadable
-        }
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw UploadServiceError.configFileUnreadable
-        }
-
-        return parseEnvironment(text)
-    }
-
-    /// 解析 KEY=VALUE 形式的 .env 文本。
-    /// 支持：# 注释、空行、可选前缀 export、单/双引号包裹的值。
-    nonisolated static func parseEnvironment(_ text: String) -> [String: String] {
-        var result: [String: String] = [:]
-        text.enumerateLines { line, _ in
-            var trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { return }
-            if trimmed.hasPrefix("export ") {
-                trimmed = String(trimmed.dropFirst("export ".count)).trimmingCharacters(in: .whitespaces)
-            }
-            guard let separatorIndex = trimmed.firstIndex(of: "=") else { return }
-            let rawKey = String(trimmed[trimmed.startIndex..<separatorIndex]).trimmingCharacters(in: .whitespaces)
-            guard !rawKey.isEmpty else { return }
-            var rawValue = String(trimmed[trimmed.index(after: separatorIndex)...]).trimmingCharacters(in: .whitespaces)
-            rawValue = Self.unquote(rawValue)
-            result[rawKey] = rawValue
-        }
-        return result
-    }
-
-    /// 去除首尾成对的单/双引号。
-    nonisolated private static func unquote(_ value: String) -> String {
-        guard value.count >= 2, let first = value.first, let last = value.last else { return value }
-        if (first == "\"" && last == "\"") || (first == "'" && last == "'") {
-            return String(value.dropFirst().dropLast())
-        }
-        return value
     }
 }
 
@@ -250,6 +199,7 @@ public final class UploadService: ObservableObject {
 public enum UploadServiceError: Error, Sendable, Equatable {
     case configFileMissing
     case configFileUnreadable
+    case insecurePermissions
     case invalidConfiguration
     case credentialUnavailable
     case clipboardEmpty
@@ -291,6 +241,7 @@ extension UploadServiceError: LocalizedError {
         switch self {
         case .configFileMissing: return "未找到配置文件，请检查配置路径。"
         case .configFileUnreadable: return "无法读取配置文件，请检查文件权限或格式。"
+        case .insecurePermissions: return "配置文件权限不安全（需 0600）。"
         case .invalidConfiguration: return "配置不完整或格式有误，请检查配置文件内容。"
         case .credentialUnavailable: return "无法获取上传凭证，请检查配置文件。"
         case .clipboardEmpty: return "剪贴板中没有可上传的图片。"

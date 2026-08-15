@@ -34,6 +34,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     private let defaults: UserDefaults
     private let ledger: UsageLedgerStore?
     private let configurationURL: URL
+    /// 合并 env 文件（凭证 + 上报简单值 REPORT_BASE_URL / REPORT_CANONICAL_HOSTNAME 的单一来源）。
+    private let mergedEnvURL: URL
     private let reporter: TokenUsageReporter
     /// cliproxyapi 主动拉取采集服务；配置缺失/失败时跳过，不影响本地文件采集。
     private let cliProxyService: CliProxyUsageService
@@ -89,13 +91,19 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     init(
         defaults: UserDefaults = .standard,
         configurationURL: URL = TokenSyncCoordinator.defaultConfigurationURL(),
-        reporter: TokenUsageReporter = TokenUsageReporter(),
+        reporter: TokenUsageReporter? = nil,
         cliProxyService: CliProxyUsageService = CliProxyUsageService(),
         usageSummaryCalendar: Calendar = .autoupdatingCurrent
     ) {
         self.defaults = defaults
         self.configurationURL = configurationURL
-        self.reporter = reporter
+        // 合并 env 路径：上报的 hostname / base URL 等简单值收敛到此文件（凭证同源）。
+        let mergedEnvPath = MergedEnvKeys.resolvePath(saved: defaults.string(forKey: MergedEnvPreferences.pathDefaultsKey))
+        self.mergedEnvURL = URL(fileURLWithPath: (mergedEnvPath as NSString).expandingTildeInPath)
+        // reporter 默认注入「合成 loader」：解码 reporting.json 纯协议结构后，把 canonicalHostname
+        // 覆盖为合并 env 的值——reporting.json 只留协议结构，hostname 权威来自 env。测试可显式注入 reporter。
+        let effectiveReporter = reporter ?? TokenSyncCoordinator.makeEnvBackedReporter(envURL: self.mergedEnvURL)
+        self.reporter = effectiveReporter
         self.cliProxyService = cliProxyService
         self.usageSummaryCalendar = usageSummaryCalendar
         self.localCollectionURL = TokenSyncCoordinator.defaultLocalCollectionURL()
@@ -103,11 +111,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
         let localCollection = defaults.object(forKey: DefaultsKey.localCollectionEnabled) as? Bool ?? true
         let storedReporting = defaults.object(forKey: DefaultsKey.reportingEnabled) as? Bool ?? false
-        let baseURL = defaults.string(forKey: DefaultsKey.ingestBaseURL) ?? ""
+        // base URL 权威改为合并 env 的 REPORT_BASE_URL；env 缺失时回落到旧 UserDefaults 值（平滑迁移）。
+        let baseURL = Self.envBaseURL(url: self.mergedEnvURL) ?? (defaults.string(forKey: DefaultsKey.ingestBaseURL) ?? "")
         var storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
 
-        // 配置权威：以 reporting.json 的 canonical hostname 为准；配置未就绪时为空。
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
+        // 配置权威：hostname 以合并 env 的 REPORT_CANONICAL_HOSTNAME 为准；配置未就绪时为空。
+        let authority = Self.configurationAuthority(reporter: effectiveReporter, url: configurationURL, envURL: self.mergedEnvURL)
         // 旧版数据库已经把 hostname 持久化在派生表，却没有写 UserDefaults。仅当配置和
         // 用户保存值都为空、且账本能证明恰好一个非空 hostname 时，采纳并持久化该值，
         // 让冷启动摘要立即恢复。多 hostname / 空库一律不猜；配置权威始终优先。
@@ -223,9 +232,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         startAutoLoopIfNeeded()
     }
 
+    /// 保存上报 base URL：权威落在合并 env 的 REPORT_BASE_URL（0600 写回），不写 UserDefaults。
     func setIngestBaseURL(_ url: String) {
         let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        defaults.set(trimmed, forKey: DefaultsKey.ingestBaseURL)
+        // 写回合并 env（空串表示清除该键）；写回失败仅记状态，不阻断 UI。
+        try? EnvFile.writeBack([MergedEnvKeys.reportBaseURL: trimmed], to: mergedEnvURL)
         var stopAutoLoop = false
         updateStatus { status in
             status.ingestBaseURL = trimmed
@@ -242,14 +253,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
     }
 
-    /// 保存用户 hostname：仅用于“配置权威缺失时”的本地采集标识；
-    /// 若配置就绪，则以配置为权威（保存值不会覆盖权威）。
+    /// 保存上报 canonical hostname：权威落在合并 env 的 REPORT_CANONICAL_HOSTNAME（0600 写回），
+    /// 不写 UserDefaults。写回后以 env 权威刷新状态。
     func setCanonicalHostname(_ hostname: String) {
         let trimmed = Self.normalize(hostname)
-        defaults.set(trimmed, forKey: DefaultsKey.canonicalHostname)
+        try? EnvFile.writeBack([MergedEnvKeys.reportCanonicalHostname: trimmed], to: mergedEnvURL)
         refreshConfigurationAuthority()
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
-        // 配置就绪时权威优先；否则采用用户保存值。
+        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL, envURL: mergedEnvURL)
+        // env 权威优先；env 缺失时采用刚写入的值（trim 归一化后一致）。
         let effective = authority.hostname.isEmpty ? trimmed : authority.hostname
         var stopAutoLoop = false
         updateStatus { status in
@@ -282,7 +293,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         refreshConfigurationAuthority()
 
         // 解析有效 hostname：配置权威优先，否则用户保存的本地 hostname。绝不 fallback Host.current。
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
+        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL, envURL: mergedEnvURL)
         let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
         let hostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
         guard !hostname.isEmpty else {
@@ -524,7 +535,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             return
         }
         // 上报 hostname 以配置权威为准。
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
+        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL, envURL: mergedEnvURL)
         guard !authority.hostname.isEmpty else {
             updateStatus { $0.reportingError = "hostname 未配置，禁止上报" }
             return
@@ -711,32 +722,58 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let pending: (buckets: Int, sessions: Int)
     }
 
-    /// 读取 0600 reporting.json 的 canonical hostname 与配置状态，作为上报权威。
-    /// 配置缺失 / 无效时 hostname 为空，但仍允许纯本地采集。
+    /// 读取上报权威：hostname 来自合并 env 的 REPORT_CANONICAL_HOSTNAME；配置就绪状态走注入了
+    /// env-hostname 的 reporter.configurationStatus（reporting.json 只提供纯协议结构）。
+    /// 配置缺失 / env-hostname 空时 hostname 为空，但仍允许纯本地采集。
     private static func configurationAuthority(
         reporter: TokenUsageReporter,
-        url: URL
+        url: URL,
+        envURL: URL
     ) -> ConfigurationAuthority {
         let status = reporter.configurationStatus(for: url)
-        let hostname: String
-        if let configuration = try? TokenUsageReporter.loadConfiguration(from: url) {
-            hostname = CanonicalHostname.normalize(configuration.canonicalHostname)
-        } else {
-            hostname = ""
-        }
+        let hostname = envCanonicalHostname(url: envURL)
         return ConfigurationAuthority(hostname: hostname, status: status, errorText: errorText(for: status))
     }
 
-    /// 刷新配置状态与权威 hostname 到 UI；配置就绪但 baseURL/hostname 缺失时禁用上报。
+    /// 构造 env 支撑的 reporter：注入 configurationLoader，把 reporting.json 解码为纯协议结构后，
+    /// 用合并 env 的 REPORT_CANONICAL_HOSTNAME 覆盖 canonicalHostname，使 reporter 内部围栏/就绪判定
+    /// 均以 env hostname 为准，reporting.json 无需再携带 hostname 权威。
+    private static func makeEnvBackedReporter(envURL: URL) -> TokenUsageReporter {
+        TokenUsageReporter(configurationLoader: { configURL in
+            var configuration = try TokenUsageReporter.loadConfiguration(from: configURL)
+            configuration.canonicalHostname = envCanonicalHostname(url: envURL)
+            return configuration
+        })
+    }
+
+    /// 从合并 env 读取并归一化 REPORT_CANONICAL_HOSTNAME；文件缺失/非法/键缺失时返回空串。
+    nonisolated private static func envCanonicalHostname(url: URL) -> String {
+        guard let environment = try? EnvFile.load(url: url),
+              let raw = environment[MergedEnvKeys.reportCanonicalHostname] else { return "" }
+        return CanonicalHostname.normalize(raw)
+    }
+
+    /// 从合并 env 读取 REPORT_BASE_URL（trim）；缺失/非法时返回 nil，调用方回落旧值。
+    nonisolated private static func envBaseURL(url: URL) -> String? {
+        guard let environment = try? EnvFile.load(url: url),
+              let raw = environment[MergedEnvKeys.reportBaseURL]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return nil }
+        return raw
+    }
+
+    /// 刷新配置状态与权威 hostname / base URL 到 UI；配置就绪但 baseURL/hostname 缺失时禁用上报。
     private func refreshConfigurationAuthority() {
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL)
+        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL, envURL: mergedEnvURL)
         let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
         let effective = authority.hostname.isEmpty ? storedHostname : authority.hostname
+        // base URL 权威同为合并 env；env 缺失时保留当前 status（可能来自旧 UserDefaults 迁移值）。
+        let envBaseURL = Self.envBaseURL(url: mergedEnvURL)
         var stopAutoLoop = false
         updateStatus { status in
             status.configurationStatus = Self.presentationStatus(authority.status)
             status.configurationError = authority.errorText
             status.canonicalHostname = effective.isEmpty ? nil : effective
+            if let envBaseURL { status.ingestBaseURL = envBaseURL }
             let canReport = !status.ingestBaseURL.isEmpty && !effective.isEmpty && authority.status == .ready
             if !canReport && status.reportingEnabled {
                 status.reportingEnabled = false

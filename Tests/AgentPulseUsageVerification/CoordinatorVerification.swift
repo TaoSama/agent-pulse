@@ -18,7 +18,62 @@ enum CoordinatorVerification {
         try verifyRebuildPendingBlocksNetworkUntilFullScan(source)
         try verifyFullScanEvidenceGatesRebuildCompletion(source)
         try verifyHostnameMismatchPromptNotGatedByAuthority(source)
+        try verifyReportingAuthorityFromEnv(source)
         print("TokenSyncCoordinator verification passed")
+    }
+
+    /// 上报权威（hostname / base URL）改由合并 env 供给，reporting.json 只留纯协议结构：
+    /// - `makeEnvBackedReporter` 注入 configurationLoader，用 env 的 REPORT_CANONICAL_HOSTNAME 覆盖 canonicalHostname；
+    /// - `configurationAuthority` 的 hostname 来自 `envCanonicalHostname`，不再从 reporting.json 读；
+    /// - `setIngestBaseURL` / `setCanonicalHostname` 写回 env（EnvFile.writeBack），绝不把值写进 UserDefaults；
+    /// - 隐私：base URL / hostname 的写入路径不含 `defaults.set(...forKey: DefaultsKey.ingestBaseURL)` 之类的值落盘。
+    private static func verifyReportingAuthorityFromEnv(_ source: String) throws {
+        // reporter 合成 loader：以 env hostname 覆盖协议结构里的 canonicalHostname。
+        let makeReporter = try functionBody(matching: "private static func makeEnvBackedReporter(", in: source)
+        try require(
+            makeReporter.contains("TokenUsageReporter.loadConfiguration(from: configURL)")
+                && makeReporter.contains("configuration.canonicalHostname = envCanonicalHostname(url: envURL)"),
+            "makeEnvBackedReporter 未用 env hostname 覆盖 reporting.json 的 canonicalHostname"
+        )
+
+        // configurationAuthority 的 hostname 来自 env，不再读 reporting.json 的字段。
+        let authorityBody = try functionBody(matching: "private static func configurationAuthority(", in: source)
+        try require(
+            authorityBody.contains("envCanonicalHostname(url: envURL)"),
+            "configurationAuthority 未从合并 env 读取 hostname"
+        )
+        try require(
+            !authorityBody.contains("configuration.canonicalHostname"),
+            "configurationAuthority 仍从 reporting.json 读取 hostname 权威"
+        )
+
+        // base URL 权威来自 env；env helper 读 REPORT_BASE_URL / REPORT_CANONICAL_HOSTNAME。
+        let envHostname = try functionBody(matching: "nonisolated private static func envCanonicalHostname(", in: source)
+        try require(envHostname.contains("MergedEnvKeys.reportCanonicalHostname"), "envCanonicalHostname 未读取 REPORT_CANONICAL_HOSTNAME")
+        let envBase = try functionBody(matching: "nonisolated private static func envBaseURL(", in: source)
+        try require(envBase.contains("MergedEnvKeys.reportBaseURL"), "envBaseURL 未读取 REPORT_BASE_URL")
+
+        // setIngestBaseURL：写回 env，不把值写进 UserDefaults。
+        let setBase = try functionBody(named: "setIngestBaseURL", in: source)
+        try require(
+            setBase.contains("EnvFile.writeBack([MergedEnvKeys.reportBaseURL: trimmed], to: mergedEnvURL)"),
+            "setIngestBaseURL 未写回合并 env"
+        )
+        try require(
+            !setBase.contains("defaults.set(trimmed, forKey: DefaultsKey.ingestBaseURL)"),
+            "setIngestBaseURL 仍把 base URL 值写入 UserDefaults"
+        )
+
+        // setCanonicalHostname：写回 env，不把值写进 UserDefaults。
+        let setHost = try functionBody(named: "setCanonicalHostname", in: source)
+        try require(
+            setHost.contains("EnvFile.writeBack([MergedEnvKeys.reportCanonicalHostname: trimmed], to: mergedEnvURL)"),
+            "setCanonicalHostname 未写回合并 env"
+        )
+        try require(
+            !setHost.contains("defaults.set(trimmed, forKey: DefaultsKey.canonicalHostname)"),
+            "setCanonicalHostname 仍把 hostname 值写入 UserDefaults"
+        )
     }
 
     /// 设备标识改名弹窗必须只依赖 effectiveHostname（权威或本地），不得挂在 configReady/
@@ -40,7 +95,7 @@ enum CoordinatorVerification {
 
     private static func verifyLegacyHostnameRecoveryPrecedence(_ source: String) throws {
         let initializer = try functionBody(matching: "init(", in: source)
-        let authority = try offset(of: "configurationAuthority(reporter: reporter, url: configurationURL)", in: initializer)
+        let authority = try offset(of: "configurationAuthority(reporter: effectiveReporter, url: configurationURL, envURL: self.mergedEnvURL)", in: initializer)
         let candidate = try offset(of: "uniqueLegacyHostnameCandidate()", in: initializer)
         let effective = try offset(of: "let effectiveHostname = authority.hostname.isEmpty ? storedHostname : authority.hostname", in: initializer)
         try require(authority < candidate && candidate < effective, "legacy hostname recovery precedence is not config > defaults > unique ledger candidate")

@@ -1,15 +1,23 @@
 import SwiftUI
+import AgentPulseCore
 
 /// 设置窗口：深色卡片式，与菜单栏面板、悬浮球共用同一套黑底白字语言。
-/// 包含趋势配色、R2 上传、cliproxyapi 采集，以及 Token 统计/上报/全量同步状态。
+/// 包含趋势配色、合并 env 凭证（R2 / cliproxy 双源）、以及 Token 统计/上报/全量同步状态。
 struct AgentPulseSettingsView: View {
     @ObservedObject var model: ApplicationModel
+    @ObservedObject var envSettings: EnvSettingsModel
+
+    init(model: ApplicationModel) {
+        self.model = model
+        self.envSettings = model.envSettings
+    }
 
     var body: some View {
         ScrollView {
             VStack(spacing: 12) {
                 header
                 trendCard
+                envPathCard
                 r2Card
                 cliProxyCard
                 TokenSyncSettingsSection(model: model)
@@ -58,40 +66,46 @@ struct AgentPulseSettingsView: View {
         }
     }
 
-    private var r2Card: some View {
-        SettingsCard(title: "R2 图片上传", systemImage: "photo.on.rectangle.angled") {
+    /// 合并 env 文件路径卡片：R2 / cliproxy / 上报简单值统一存放，只保存路径，凭证不写入 App 设置。
+    private var envPathCard: some View {
+        SettingsCard(title: "凭证文件（合并 env）", systemImage: "key.horizontal") {
             VStack(alignment: .leading, spacing: 10) {
                 SettingsField(
                     title: ".env 路径",
-                    text: $model.configPath,
-                    accessibilityLabel: "R2 配置文件路径"
+                    text: $envSettings.path,
+                    accessibilityLabel: "合并 env 配置文件路径"
                 )
                 HStack(alignment: .center, spacing: 8) {
-                    SettingsFootnote("只保存文件路径；凭证不会显示或写入 App 设置。")
+                    SettingsFootnote("只保存文件路径；密钥仅在内存与该 0600 文件中，不写入 App 设置。")
                     Spacer(minLength: 8)
                     SettingsGhostButton("恢复默认路径") {
-                        model.configPath = UploadService.defaultConfigPath
+                        envSettings.path = MergedEnvKeys.defaultPath
                     }
                 }
             }
         }
     }
 
+    private var r2Card: some View {
+        SettingsCard(title: "R2 图片上传", systemImage: "photo.on.rectangle.angled") {
+            VStack(alignment: .leading, spacing: 12) {
+                dualSourceField("Account ID", key: MergedEnvKeys.r2AccountID)
+                dualSourceField("Endpoint", key: MergedEnvKeys.r2Endpoint)
+                dualSourceField("Bucket", key: MergedEnvKeys.r2Bucket)
+                dualSourceField("Public Base URL", key: MergedEnvKeys.r2PublicBaseURL)
+                dualSourceField("Access Key ID", key: MergedEnvKeys.r2AccessKeyID)
+                dualSourceField("Secret Access Key", key: MergedEnvKeys.r2SecretAccessKey)
+                SettingsFootnote("密钥以中间星号回显；手动填写会写回上方 0600 env 文件。")
+            }
+        }
+    }
+
     private var cliProxyCard: some View {
         SettingsCard(title: "cliproxyapi 用量采集", systemImage: "antenna.radiowaves.left.and.right") {
-            VStack(alignment: .leading, spacing: 10) {
-                SettingsField(
-                    title: ".env 路径",
-                    text: $model.cliProxyConfigPath,
-                    accessibilityLabel: "cliproxyapi 配置文件路径"
-                )
-                HStack(alignment: .center, spacing: 8) {
-                    SettingsFootnote("只保存文件路径；base URL、management key 与目标 apikey 不会显示或写入 App 设置。")
-                    Spacer(minLength: 8)
-                    SettingsGhostButton("恢复默认路径") {
-                        model.cliProxyConfigPath = CliProxyUsageService.defaultConfigPath
-                    }
-                }
+            VStack(alignment: .leading, spacing: 12) {
+                dualSourceField("Base URL", key: MergedEnvKeys.cliProxyBaseURL)
+                dualSourceField("Management Key", key: MergedEnvKeys.cliProxyManagementKey)
+                dualSourceField("Target API Key", key: MergedEnvKeys.cliProxyTargetAPIKey)
                 SettingsRow(title: "采集状态") {
                     SettingsStatusBadge(
                         text: model.tokenSyncStatus.cliProxyConfigured ? "已配置" : "未配置",
@@ -103,6 +117,17 @@ struct AgentPulseSettingsView: View {
                 }
             }
         }
+    }
+
+    /// 构造一个双源字段：env 读取 / 手动填写；密钥掩码，非密钥明文。
+    private func dualSourceField(_ title: String, key: String) -> some View {
+        SettingsDualSourceField(
+            title: title,
+            isSecret: envSettings.isSecret(key),
+            source: envSettings.sourceBinding(for: key),
+            rawValue: envSettings.valueBinding(for: key),
+            displayValue: envSettings.displayValue(for: key)
+        )
     }
 
     private var statusColor: Color {
@@ -213,6 +238,133 @@ struct SettingsField: View {
             )
             .accessibilityLabel(accessibilityLabel ?? title)
         }
+    }
+}
+
+/// 双源字段：一个来源开关（从 env 读取 / 手动填写）+ 值输入/回显。
+/// - env 源：只读回显文件读到的值（密钥中间星号掩码，非密钥明文）。
+/// - manual 源：可编辑；密钥默认掩码显示，点「编辑」展开明文输入，提交即写回 0600 env。
+struct SettingsDualSourceField: View {
+    let title: String
+    let isSecret: Bool
+    @Binding var source: EnvFieldSource
+    /// 原始值绑定（set 只在 manual 源生效，会写回 env）。
+    @Binding var rawValue: String
+    /// UI 展示值（密钥已掩码、非密钥明文）；用于 env 只读回显与 manual 未展开时。
+    let displayValue: String
+
+    @State private var isEditing = false
+    @State private var draft = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.5))
+                Spacer(minLength: 8)
+                sourcePicker
+            }
+            valueField
+        }
+    }
+
+    /// 两段来源切换：env / 手动。
+    private var sourcePicker: some View {
+        HStack(spacing: 4) {
+            sourceChip("env", value: .env)
+            sourceChip("手动", value: .manual)
+        }
+    }
+
+    private func sourceChip(_ label: String, value: EnvFieldSource) -> some View {
+        let selected = source == value
+        return Button {
+            source = value
+            isEditing = false
+        } label: {
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(selected ? Color.black : Color.white.opacity(0.7))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(
+                    Capsule().fill(selected ? Color.white : Color.white.opacity(0.1))
+                )
+        }
+        .buttonStyle(.plain)
+        .focusable(false)
+        .accessibilityLabel("\(title) 来源 \(label)")
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+    }
+
+    @ViewBuilder
+    private var valueField: some View {
+        if source == .env {
+            // env 源：只读回显（密钥掩码）。
+            readOnlyBox(displayValue.isEmpty ? "未设置" : displayValue, placeholder: displayValue.isEmpty)
+        } else if !isEditing {
+            // manual 未展开：回显当前值（密钥掩码、非密钥明文）+ 编辑按钮；避免逐键写盘。
+            HStack(spacing: 8) {
+                readOnlyBox(displayValue.isEmpty ? "未设置" : displayValue, placeholder: displayValue.isEmpty)
+                SettingsGhostButton("编辑") {
+                    draft = rawValue
+                    isEditing = true
+                }
+            }
+        } else {
+            // manual 编辑：草稿输入，点「完成」或回车提交后写回 env（密钥重新收起为掩码）。
+            HStack(spacing: 8) {
+                editableBox
+                SettingsGhostButton("完成") { commitDraft() }
+            }
+        }
+    }
+
+    private func commitDraft() {
+        rawValue = draft
+        isEditing = false
+    }
+
+    private func readOnlyBox(_ text: String, placeholder: Bool) -> some View {
+        Text(text)
+            .font(.system(size: 12, design: .monospaced))
+            .foregroundStyle(placeholder ? Color.white.opacity(0.3) : Color.white)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Color.white.opacity(0.05))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(Color.white.opacity(0.1), lineWidth: 1)
+            )
+            .accessibilityLabel("\(title)（只读）")
+    }
+
+    private var editableBox: some View {
+        TextField(
+            "",
+            text: $draft,
+            prompt: Text("输入后点完成").foregroundColor(Color.white.opacity(0.3))
+        )
+        .textFieldStyle(.plain)
+        .font(.system(size: 12, design: .monospaced))
+        .foregroundStyle(Color.white)
+        .onSubmit { commitDraft() }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .stroke(Color.white.opacity(0.14), lineWidth: 1)
+        )
+        .accessibilityLabel(title)
     }
 }
 
