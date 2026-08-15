@@ -25,7 +25,65 @@ enum ReconcileParityVerification {
         if ProcessInfo.processInfo.environment["AGENT_PULSE_RECONCILE_DEMO"] != nil {
             printDemoTables()
         }
+        if ProcessInfo.processInfo.environment["AGENT_PULSE_RECONCILE_LOCAL"] != nil {
+            printLocalAggregate()
+        }
         await runLiveReconcileIfConfigured()
+    }
+
+    /// 本机真实账本聚合（env AGENT_PULSE_RECONCILE_LOCAL 触发）：只读账本、按合并 env 的
+    /// REPORT_CANONICAL_HOSTNAME 聚合，打印工具口径下的每一维数字并做口径自洽断言
+    /// （五分量相加 = total、total − cacheCreation = 上游 应回值）。不连 上游、不上报、脱敏。
+    private static func printLocalAggregate() {
+        let mergedEnv = (try? EnvFile.load(path: MergedEnvKeys.defaultPath)) ?? [:]
+        // hostname 优先取 env 覆盖（离线库对齐用），否则合并 env 的 REPORT_CANONICAL_HOSTNAME。
+        let hostname = CanonicalHostname.normalize(
+            ProcessInfo.processInfo.environment["AGENT_PULSE_RECONCILE_HOSTNAME"]
+                ?? mergedEnv[MergedEnvKeys.reportCanonicalHostname] ?? ""
+        )
+        guard !hostname.isEmpty else {
+            print("跳过本地聚合：未提供 hostname（AGENT_PULSE_RECONCILE_HOSTNAME 或合并 env 的 REPORT_CANONICAL_HOSTNAME）。")
+            return
+        }
+        // 库路径：优先 env 指定的离线副本（绝不传活库），否则默认 appSupport 库。
+        let ledger: UsageLedgerStore?
+        if let offline = ProcessInfo.processInfo.environment["AGENT_PULSE_RECONCILE_DB"], !offline.isEmpty {
+            ledger = try? UsageLedgerStore(path: offline)
+        } else {
+            ledger = openLedger()
+        }
+        guard let ledger else {
+            print("跳过本地聚合：无法打开账本。")
+            return
+        }
+        let buckets: [UsageBucket]
+        let sessions: [UsageSession]
+        do {
+            buckets = try ledger.buckets(hostname: hostname)
+            sessions = try ledger.sessions(hostname: hostname)
+        } catch {
+            print("跳过本地聚合：读取账本失败。")
+            return
+        }
+        let agg = LocalHostnameAggregate.aggregate(hostname: hostname, buckets: buckets, sessions: sessions)
+        let 上游Expected = LocalHostnameAggregate.上游BasisFromTotal(agg.totalTokens, cacheCreation: agg.cacheCreationInputSubtotal)
+
+        print("=== 本机真实账本聚合（hostname=\(hostname)，只读，不连 上游） ===")
+        print("bucketCount                 \(agg.bucketCount)")
+        print("sessionCount                \(agg.sessionCount)")
+        print("唯一 total(含 cacheCreation)  \(agg.totalTokens)")
+        print("上游 应回值(total−cacheCr)   \(上游Expected)")
+        print("小计.input                   \(agg.inputSubtotal)")
+        print("小计.output                  \(agg.outputSubtotal)")
+        print("小计.cachedInput             \(agg.cachedInputSubtotal)")
+        print("小计.reasoningOutput         \(agg.reasoningOutputSubtotal)")
+        print("小计.cacheCreationInput      \(agg.cacheCreationInputSubtotal)")
+        if let f = agg.firstBucketAt { print("firstBucketAt               \(iso(f))") }
+        if let l = agg.lastBucketAt { print("lastBucketAt                \(iso(l))") }
+        // 口径自洽断言：上游 应回值 = total − cacheCreation（恒等,证明差值可归因）。
+        let selfConsistent = 上游Expected == max(0, agg.totalTokens - agg.cacheCreationInputSubtotal)
+        print(selfConsistent ? "✅ 口径自洽：上游 应回值 = total − cacheCreation" : "❌ 口径不自洽")
+        print("")
     }
 
     /// 仅演示：用 mock 上游 响应渲染 AP vs 上游 对齐表（一致 + 不一致两例），
