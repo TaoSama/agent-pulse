@@ -176,6 +176,7 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
 
 /// 自动上报间隔档位（本机行为，不进上报身份）。原始值为秒。
 enum TokenReportInterval: Int, Sendable, Equatable, CaseIterable, Identifiable {
+    case fiveMinutes = 300
     case fifteenMinutes = 900
     case thirtyMinutes = 1800
     case sixtyMinutes = 3600
@@ -187,6 +188,7 @@ enum TokenReportInterval: Int, Sendable, Equatable, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .fiveMinutes: return "5 分钟"
         case .fifteenMinutes: return "15 分钟"
         case .thirtyMinutes: return "30 分钟"
         case .sixtyMinutes: return "60 分钟"

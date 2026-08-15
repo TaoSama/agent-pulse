@@ -27,13 +27,17 @@ struct AgentPulseSettingsView: View {
     private var trendCard: some View {
         SettingsCard(title: "趋势配色", systemImage: "paintpalette") {
             VStack(alignment: .leading, spacing: 8) {
-                ForEach(TrendColorMode.allCases) { mode in
-                    SettingsRadioRow(
-                        title: mode.title,
-                        isSelected: model.trendColorMode == mode
-                    ) {
-                        model.trendColorMode = mode
+                HStack(spacing: 16) {
+                    ForEach(TrendColorMode.allCases) { mode in
+                        SettingsRadioRow(
+                            title: mode.title,
+                            isSelected: model.trendColorMode == mode
+                        ) {
+                            model.trendColorMode = mode
+                        }
+                        .fixedSize(horizontal: true, vertical: false)
                     }
+                    Spacer(minLength: 0)
                 }
                 SettingsFootnote("菜单栏、悬浮球和看板会同步使用这套颜色。")
             }
@@ -64,7 +68,6 @@ struct AgentPulseSettingsView: View {
         SettingsCard(title: "R2 图片上传", systemImage: "photo.on.rectangle.angled") {
             VStack(alignment: .leading, spacing: 12) {
                 dualSourceField("Account ID", key: MergedEnvKeys.r2AccountID)
-                dualSourceField("Endpoint", key: MergedEnvKeys.r2Endpoint)
                 dualSourceField("Bucket", key: MergedEnvKeys.r2Bucket)
                 dualSourceField("Public Base URL", key: MergedEnvKeys.r2PublicBaseURL)
                 dualSourceField("Access Key ID", key: MergedEnvKeys.r2AccessKeyID)
@@ -215,16 +218,30 @@ struct SettingsDualSourceField: View {
     @Binding var rawValue: String
     /// UI 展示值（密钥已掩码、非密钥明文）；只读回显与未展开时用。
     let displayValue: String
+    /// 值单行显示、不折行（长值中间省略）；默认允许换行以完整展示长路径。
+    var singleLine: Bool = false
+    /// 非空时在标题右侧加一个「?」图标，悬浮展示该说明文字（替代下方常驻小字）。
+    var help: String? = nil
 
     @State private var isEditing = false
     @State private var draft = ""
 
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
-            Text(title)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(Color.white.opacity(0.5))
-                .frame(width: 132, alignment: .leading)
+            HStack(spacing: 4) {
+                Text(title)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.white)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let help {
+                    Image(systemName: "questionmark.circle")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.white)
+                        .help(help)
+                }
+                Spacer(minLength: 0)
+            }
+            .frame(width: 132, alignment: .leading)
             if isEditing {
                 editableBox
                 SettingsGhostButton("完成") { commitDraft() }
@@ -249,6 +266,8 @@ struct SettingsDualSourceField: View {
         Text(text)
             .font(.system(size: 12, design: .monospaced))
             .foregroundStyle(placeholder ? Color.white.opacity(0.3) : Color.white)
+            .lineLimit(singleLine ? 1 : nil)
+            .truncationMode(.middle)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10)
             .padding(.vertical, 7)

@@ -7,6 +7,7 @@ struct AgentPulseR2Verification {
         try verifySignatureV4()
         try verifyObjectKeyAndURLs()
         try verifyRedactedConfigurationErrors()
+        try verifyEndpointDerivedFromAccountID()
         try verifyHTTPStatusMapping()
         try await verifyPlainPUTTransport()
         print("AgentPulseR2 verification passed")
@@ -88,10 +89,11 @@ struct AgentPulseR2Verification {
     }
 
     private static func verifyRedactedConfigurationErrors() throws {
-        let sensitiveValue = "secret-value-that-must-not-appear"
+        // endpoint 已由 account id 拼出，不再单独配置；用非法 account id（含 host 边界字符）
+        // 触发 invalidConfiguration，断言字段名为 R2_ACCOUNT_ID 且不回显值。
+        let sensitiveValue = "bad/account@evil.example"
         let environment = [
-            "R2_ACCOUNT_ID": "account",
-            "R2_ENDPOINT": sensitiveValue,
+            "R2_ACCOUNT_ID": sensitiveValue,
             "R2_BUCKET": "image-bucket",
             "R2_PUBLIC_BASE_URL": "https://images.example.test",
             "R2_ACCESS_KEY_ID": "test-access",
@@ -101,9 +103,25 @@ struct AgentPulseR2Verification {
             _ = try EnvironmentR2Configuration(environment: environment)
             throw VerificationFailure("invalid configuration was accepted")
         } catch let error as R2Error {
-            try expect(error == .invalidConfiguration(fields: ["R2_ENDPOINT"]), "configuration error mapping mismatch")
+            try expect(error == .invalidConfiguration(fields: ["R2_ACCOUNT_ID"]), "configuration error mapping mismatch")
             try expect(!error.localizedDescription.contains(sensitiveValue), "configuration error leaked a value")
         }
+    }
+
+    /// endpoint 由 account id 拼出固定模板：https://<account-id>.r2.cloudflarestorage.com。
+    private static func verifyEndpointDerivedFromAccountID() throws {
+        let environment = [
+            "R2_ACCOUNT_ID": "acc0unt123",
+            "R2_BUCKET": "image-bucket",
+            "R2_PUBLIC_BASE_URL": "https://images.example.test",
+            "R2_ACCESS_KEY_ID": "test-access",
+            "R2_SECRET_ACCESS_KEY": "test-secret",
+        ]
+        let resolved = try EnvironmentR2Configuration(environment: environment)
+        try expect(
+            resolved.configuration.endpoint.absoluteString == "https://acc0unt123.r2.cloudflarestorage.com",
+            "endpoint not derived from account id"
+        )
     }
 
     private static func verifyHTTPStatusMapping() throws {

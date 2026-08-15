@@ -1014,10 +1014,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     /// overwrite 同 tier 重复行的确定性冲突检测：event_id 稳定且应携带一致的独立计数与不可变维度，
     /// 若不一致说明两份文件对同一 logical event 观测矛盾，需 fail-closed 而非静默取其一。
+    ///
+    /// timestamp 不参与冲突判定：它只是展示字段、不入计费口径，且 claude-code 同一 message.id
+    /// 跨文件（主转录 / subagent / resume 续写）折叠时按各文件行集合取 min，min 结果天然可能不同，
+    /// 把它当不可变维度会对无计费影响的差异 fail-closed。合并时统一保留确定性首行的 timestamp。
     private func overwriteConflictReason(existing: RawEvent, incoming event: RawEvent) -> String? {
         var mismatched: [String] = []
         if existing.counts != event.counts { mismatched.append("counts") }
-        if existing.timestampMs != event.timestampMs { mismatched.append("timestamp") }
         if existing.sessionHash != event.sessionHash { mismatched.append("session") }
         // model=unknown 允许被已知 model 补齐，不算冲突；两个都非空且不同才算。
         if existing.model != event.model, existing.model != "unknown", event.model != "unknown" {

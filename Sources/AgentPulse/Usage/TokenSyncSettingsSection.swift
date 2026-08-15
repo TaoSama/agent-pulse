@@ -27,16 +27,14 @@ struct TokenSyncSettingsSection: View {
                     isOn: localCollectionBinding
                 )
 
-                SettingsRow(title: "Canonical hostname") {
-                    Text(model.tokenSyncStatus.canonicalHostname ?? "未配置")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(hostnameColor)
-                }
-
                 // hostname 权威来自合并 env 的 REPORT_CANONICAL_HOSTNAME：双源可读可填，
                 // 手填经 coordinator 写回 env 并刷新上报状态（非密钥，明文回显）。
-                dualSourceField("设备标识（canonical hostname）", key: MergedEnvKeys.reportCanonicalHostname)
-                SettingsFootnote("hostname 存于合并 env，作为上报身份；改名会触发历史归属确认。")
+                // 说明文字收进标题旁的 ? 悬浮，不再常驻占行。
+                dualSourceField(
+                    "设备标识",
+                    key: MergedEnvKeys.reportCanonicalHostname,
+                    help: "canonical hostname，存于合并 env，作为上报身份；改名会触发历史归属确认。"
+                )
 
                 SettingsRow(title: "上次扫描") {
                     Text(Self.dateText(model.tokenSyncStatus.lastScanAt))
@@ -83,8 +81,8 @@ struct TokenSyncSettingsSection: View {
                 }
 
                 // API 地址权威来自合并 env 的 REPORT_BASE_URL：双源可读可填（非密钥明文），
-                // 手填经 coordinator 写回 env；填好但不自动开启上报。
-                dualSourceField("API 地址（留空则仅本地）", key: MergedEnvKeys.reportBaseURL)
+                // 手填经 coordinator 写回 env；填好但不自动开启上报。单行显示不折行，与其它输入框一致。
+                dualSourceField("API 地址（留空则仅本地）", key: MergedEnvKeys.reportBaseURL, singleLine: true)
 
                 SettingsRow(title: "上报间隔") {
                     Picker("上报间隔", selection: reportIntervalBinding) {
@@ -96,7 +94,7 @@ struct TokenSyncSettingsSection: View {
                     .labelsHidden()
                     .tint(.white)
                     .colorScheme(.dark)
-                    .frame(maxWidth: 220)
+                    .frame(maxWidth: 300)
                     .accessibilityLabel("自动上报间隔")
                     .accessibilityValue(model.tokenSyncStatus.autoReportInterval.title)
                 }
@@ -170,13 +168,15 @@ struct TokenSyncSettingsSection: View {
     }
 
     /// 构造双源字段（REPORT_* 简单值，非密钥明文；手填经 coordinator 写回 env）。
-    private func dualSourceField(_ title: String, key: String) -> some View {
+    private func dualSourceField(_ title: String, key: String, singleLine: Bool = false, help: String? = nil) -> some View {
         SettingsDualSourceField(
             title: title,
             isSecret: envSettings.isSecret(key),
             source: envSettings.sourceBinding(for: key),
             rawValue: envSettings.valueBinding(for: key),
-            displayValue: envSettings.displayValue(for: key)
+            displayValue: envSettings.displayValue(for: key),
+            singleLine: singleLine,
+            help: help
         )
     }
 
@@ -204,10 +204,6 @@ struct TokenSyncSettingsSection: View {
     }
 
     // MARK: 状态派生
-
-    private var hostnameColor: Color {
-        model.tokenSyncStatus.canonicalHostname == nil ? .red : Color.white
-    }
 
     /// scan / report 任一在途时，互斥动作一律禁用，避免并发写账。
     private var anySyncInProgress: Bool {
