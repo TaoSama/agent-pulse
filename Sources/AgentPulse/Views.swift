@@ -577,7 +577,8 @@ private struct OrbTaskListRow: View {
 
 struct TPSDashboardView: View {
     @ObservedObject var model: ApplicationModel
-    @AppStorage("dashboard.tpsSpan") private var span: DashboardTPSSpan = .fifteenMinutes
+    // 时间跨度不记忆：每次打开看板默认「15 分钟」，不持久化上次选择。
+    @State private var span: DashboardTPSSpan = .fifteenMinutes
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {

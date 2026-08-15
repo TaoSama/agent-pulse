@@ -290,6 +290,9 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate {
 
     func show(anchoredTo frame: NSRect? = nil) {
         guard let window else { return }
+        // 每次打开都重建根视图，让 TPSDashboardView 的 @State（时间跨度）复位到默认，
+        // 不记忆上次选择。
+        window.contentView = NSHostingView(rootView: TPSDashboardView(model: model))
         let targetPoint = frame?.center ?? NSEvent.mouseLocation
         let screen = ScreenPlacement.screen(containing: targetPoint)
         window.setFrame(ScreenPlacement.centered(window.frame.size, on: screen), display: false)
