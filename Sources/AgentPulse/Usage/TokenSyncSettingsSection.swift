@@ -38,7 +38,7 @@ struct TokenSyncSettingsSection: View {
                 SettingsRow(title: "上次扫描") {
                     Text(Self.dateText(model.tokenSyncStatus.lastScanAt))
                         .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(Color.white.opacity(0.7))
+                        .foregroundStyle(Color.white)
                 }
 
                 actionRow(
@@ -85,7 +85,7 @@ struct TokenSyncSettingsSection: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
-                .foregroundStyle(Color.white.opacity(0.6))
+                .foregroundStyle(Color.white)
 
                 SettingsRow(title: "配置状态") {
                     SettingsStatusBadge(text: configurationStatusText, tone: configurationStatusTone)
@@ -98,7 +98,7 @@ struct TokenSyncSettingsSection: View {
                 SettingsRow(title: "上次上报") {
                     Text(Self.dateText(model.tokenSyncStatus.lastReportAt))
                         .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(Color.white.opacity(0.7))
+                        .foregroundStyle(Color.white)
                 }
 
                 if let error = model.tokenSyncStatus.reportingError {
@@ -116,7 +116,7 @@ struct TokenSyncSettingsSection: View {
                     SettingsRow(title: "待上报") {
                         Text("buckets \(model.tokenSyncStatus.pendingBuckets) · sessions \(model.tokenSyncStatus.pendingSessions)")
                             .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(Color.white.opacity(0.85))
+                            .foregroundStyle(Color.white)
                     }
                 }
 
@@ -187,7 +187,7 @@ struct TokenSyncSettingsSection: View {
     // MARK: 状态派生
 
     private var hostnameColor: Color {
-        model.tokenSyncStatus.canonicalHostname == nil ? .red : Color.white.opacity(0.85)
+        model.tokenSyncStatus.canonicalHostname == nil ? .red : Color.white
     }
 
     /// 配置就绪时 hostname 由 reporting.json 提供，属上报权威，UI 只读展示。
