@@ -859,6 +859,59 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
+    /// 指定 hostname 在 [start,end) 内、按 30min bucket_start 聚合的 output_tokens 时间序列。
+    /// 用于看板 1 天 TPS 曲线（每个 30min bucket 的 output 之和 → /1800 = 平均 TPS）。
+    /// 按 bucketStart 升序返回；无数据返回空数组。queue.sync 阻塞，勿在主线程调用。
+    public func outputTokenBuckets(
+        hostname: String,
+        start: Date,
+        end: Date
+    ) throws -> [(bucketStart: Date, outputTokens: Int64)] {
+        try queue.sync {
+            let sql = "SELECT bucket_start_ms,SUM(output_tokens) FROM usage_buckets "
+                + "WHERE hostname=? AND bucket_start_ms>=? AND bucket_start_ms<? "
+                + "GROUP BY bucket_start_ms ORDER BY bucket_start_ms;"
+            let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            try bind(statement, 2, millis(start))
+            try bind(statement, 3, millis(end))
+            var rows: [(bucketStart: Date, outputTokens: Int64)] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let bucketStartMs = sqlite3_column_int64(statement, 0)
+                let output = sqlite3_column_int64(statement, 1)
+                rows.append((Date(timeIntervalSince1970: Double(bucketStartMs) / 1000), output))
+            }
+            if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
+            return rows
+        }
+    }
+
+    /// 同上，但按 (bucket_start, model) 分组，供看板 1 天分模型曲线。
+    public func outputTokenBucketsByModel(
+        hostname: String,
+        start: Date,
+        end: Date
+    ) throws -> [(bucketStart: Date, model: String, outputTokens: Int64)] {
+        try queue.sync {
+            let sql = "SELECT bucket_start_ms,model,SUM(output_tokens) FROM usage_buckets "
+                + "WHERE hostname=? AND bucket_start_ms>=? AND bucket_start_ms<? "
+                + "GROUP BY bucket_start_ms,model ORDER BY bucket_start_ms;"
+            let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            try bind(statement, 2, millis(start))
+            try bind(statement, 3, millis(end))
+            var rows: [(bucketStart: Date, model: String, outputTokens: Int64)] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let bucketStartMs = sqlite3_column_int64(statement, 0)
+                let model = text(statement, 1)
+                let output = sqlite3_column_int64(statement, 2)
+                rows.append((Date(timeIntervalSince1970: Double(bucketStartMs) / 1000), model, output))
+            }
+            if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
+            return rows
+        }
+    }
+
     private func summarizeBucketRows(_ statement: OpaquePointer?, prices: [UsageModelPrice]) throws -> UsageSummary? {
         var total = UsageTokenCounts(); var cost = 0.0; var newest: Int64?
         var found = false

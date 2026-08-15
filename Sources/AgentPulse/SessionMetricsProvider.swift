@@ -94,7 +94,8 @@ public final class MetricsStore: ObservableObject {
         trend: .insufficient
     )
     @Published public private(set) var modelTPSHistory: [ModelTPSHistory] = []
-    /// 看板专用曲线：每点为 5s 滑窗真实速率（不平滑不插值）。菜单/悬浮球仍用上面的平滑序列。
+    /// 看板专用曲线：不重叠桶（按当前跨度）的平均 TPS，前三档来自每秒逐秒净增量。
+    /// 1 天跨度不走这里（改用 coordinator 的 day series）。
     @Published public private(set) var dashboardSparklinePoints: [SparklinePoint] = []
     @Published public private(set) var dashboardModelTPSHistory: [ModelTPSHistory] = []
     @Published public private(set) var lastRefresh: Date?
@@ -110,6 +111,11 @@ public final class MetricsStore: ObservableObject {
     private let collector: CodexRuntimeMetricsCollector?
     private let initializationError: String?
     private var refreshTask: Task<Void, Never>?
+    /// 看板当前选中的时间跨度（前三档从每秒样本按不重叠桶算；1 天由 coordinator 账本 series 接管）。
+    private var dashboardSpan: DashboardTPSSpan = .fifteenMinutes
+    /// 最近一次刷新/恢复得到的看板用较长历史（最多 3600s）与其参考时刻，供跨度切换时即时重算。
+    private var dashboardSampleCache: [LiveRateSample] = []
+    private var dashboardSampleEnd: Date = .init(timeIntervalSince1970: 0)
 
     public init(configuration: Configuration = .init()) {
         self.configuration = configuration
@@ -194,8 +200,10 @@ public final class MetricsStore: ObservableObject {
             sparklinePoints = sparkline.points
             sparklineRegression = sparkline.regression
             modelTPSHistory = makeModelTPSHistory(from: result.history, end: result.sampledAt)
-            dashboardSparklinePoints = SparklineAnalysis.makeDashboardSparkline(from: result.history, end: result.sampledAt)
-            dashboardModelTPSHistory = makeModelTPSHistory(from: result.history, end: result.sampledAt, dashboard: true)
+            // 看板不重叠桶：用较长历史（最多 3600s）按当前跨度重算，并缓存供跨度切换即时重算。
+            dashboardSampleCache = result.dashboardHistory
+            dashboardSampleEnd = result.sampledAt
+            recomputeDashboardSeries()
             lastRefresh = result.sampledAt
             isShowingCachedSnapshot = false
             collectionWarning = result.unreadableFiles > 0
@@ -272,16 +280,17 @@ public final class MetricsStore: ObservableObject {
         sparklinePoints = sparkline.points
         sparklineRegression = sparkline.regression
         modelTPSHistory = makeModelTPSHistory(from: restored.history, end: snapshot.timestamp)
-        dashboardSparklinePoints = SparklineAnalysis.makeDashboardSparkline(from: restored.history, end: snapshot.timestamp)
-        dashboardModelTPSHistory = makeModelTPSHistory(from: restored.history, end: snapshot.timestamp, dashboard: true)
+        // 看板不重叠桶：用恢复的较长历史（最多 3600s）按当前跨度重算并缓存。
+        dashboardSampleCache = restored.dashboardHistory
+        dashboardSampleEnd = snapshot.timestamp
+        recomputeDashboardSeries()
         lastRefresh = snapshot.timestamp
         isShowingCachedSnapshot = true
     }
 
     private func makeModelTPSHistory(
         from history: [LiveRateSample],
-        end: Date,
-        dashboard: Bool = false
+        end: Date
     ) -> [ModelTPSHistory] {
         let models = Set(history.flatMap { sample in
             sample.modelTokensInWindow.keys
@@ -290,16 +299,64 @@ public final class MetricsStore: ObservableObject {
             $0.state == .live || $0.state == .zero
         })?.modelTokensInWindow ?? [:]
         return models.compactMap { model in
-            // 图例数字（latestTPS）始终用 180s 口径，稳定且与右上角总数可加；
-            // dashboard 曲线点用 5s 滑窗（形态更贴近瞬时），菜单/悬浮球用平滑序列。
+            // 图例数字（latestTPS）始终用 180s 口径，稳定且与右上角总数可加。
             let latestTokens = currentModels[model] ?? 0
             let latestTPS = latestTokens / Double(LiveRateSample.windowSeconds)
             guard latestTPS > 0 || history.contains(where: { ($0.modelTokensInWindow[model] ?? 0) > 0 }) else {
                 return nil
             }
-            let points = dashboard
-                ? SparklineAnalysis.makeDashboardModelSparkline(from: history, model: model, end: end)
-                : SparklineAnalysis.makeModelSparkline(from: history, model: model, end: end)
+            let points = SparklineAnalysis.makeModelSparkline(from: history, model: model, end: end)
+            return ModelTPSHistory(model: model, latestTPS: latestTPS, points: points)
+        }
+        .sorted {
+            if $0.latestTPS == $1.latestTPS { return $0.model.localizedStandardCompare($1.model) == .orderedAscending }
+            return $0.latestTPS > $1.latestTPS
+        }
+    }
+
+    /// 看板当前跨度切换：更新状态并用缓存样本即时重算前三档曲线（1 天由 view 改用账本 series）。
+    public func setDashboardSpan(_ span: DashboardTPSSpan) {
+        guard span != dashboardSpan else { return }
+        dashboardSpan = span
+        recomputeDashboardSeries()
+    }
+
+    /// 用缓存的较长历史按当前跨度重算看板不重叠桶曲线（总 + 分模型）。
+    /// 1 天跨度不在此计算（改用 coordinator 账本 day series），这两个 @Published 置空。
+    private func recomputeDashboardSeries() {
+        guard dashboardSpan.source == .perSecondSamples else {
+            dashboardSparklinePoints = []
+            dashboardModelTPSHistory = []
+            return
+        }
+        let samples = dashboardSampleCache
+        let end = dashboardSampleEnd == Date(timeIntervalSince1970: 0) ? Date() : dashboardSampleEnd
+        dashboardSparklinePoints = SparklineAnalysis.makeBucketedDashboardSparkline(
+            from: samples, end: end, span: dashboardSpan
+        )
+        dashboardModelTPSHistory = makeDashboardModelTPSHistory(from: samples, end: end, span: dashboardSpan)
+    }
+
+    /// 看板分模型不重叠桶曲线：与总曲线同栅格；latestTPS 仍 180s 口径（图例数字不变）。
+    private func makeDashboardModelTPSHistory(
+        from history: [LiveRateSample],
+        end: Date,
+        span: DashboardTPSSpan
+    ) -> [ModelTPSHistory] {
+        let models = Set(history.flatMap { $0.modelTokensInLastSecond.keys }
+            .filter { !$0.isEmpty })
+            .union(history.flatMap { $0.modelTokensInWindow.keys })
+        let currentModels = history.reversed().first(where: {
+            $0.state == .live || $0.state == .zero
+        })?.modelTokensInWindow ?? [:]
+        return models.compactMap { model in
+            let latestTokens = currentModels[model] ?? 0
+            let latestTPS = latestTokens / Double(LiveRateSample.windowSeconds)
+            let points = SparklineAnalysis.makeBucketedDashboardModelSparkline(
+                from: history, model: model, end: end, span: span
+            )
+            // 该跨度内完全无产出的模型不列（曲线全缺口且 latestTPS=0）。
+            guard latestTPS > 0 || points.contains(where: { ($0.value ?? 0) > 0 }) else { return nil }
             return ModelTPSHistory(model: model, latestTPS: latestTPS, points: points)
         }
         .sorted {

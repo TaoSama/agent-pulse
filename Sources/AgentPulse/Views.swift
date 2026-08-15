@@ -547,13 +547,14 @@ private struct OrbTaskListRow: View {
 
 struct TPSDashboardView: View {
     @ObservedObject var model: ApplicationModel
+    @AppStorage("dashboard.tpsSpan") private var span: DashboardTPSSpan = .fifteenMinutes
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading) {
                     Text("TPS 趋势").font(.largeTitle.bold())
-                    Text("最近 15 分钟 · SQLite 恢复 · 5 秒滑窗均值曲线").foregroundStyle(.secondary)
+                    Text(span.subtitle).foregroundStyle(.secondary)
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
@@ -563,17 +564,27 @@ struct TPSDashboardView: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(model.sparklineRegression.trend.color(for: model.trendColorMode))
                 }
+                .help("最新一桶的瞬时 TPS，与曲线最右点一致")
             }
+            Picker("时间跨度", selection: $span) {
+                ForEach(DashboardTPSSpan.allCases) { option in
+                    Text(option.title).tag(option)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 320, alignment: .leading)
             HStack(alignment: .top, spacing: 18) {
                 ModelTPSLegend(
-                    series: model.modelTPSHistory,
+                    series: legendSeries,
                     totalColor: model.sparklineRegression.trend.color(for: model.trendColorMode),
-                    totalTPS: model.tps ?? 0
+                    totalTPS: latestTotalTPS
                 )
                     .frame(width: 190, alignment: .topLeading)
                 TPSAxisChartView(
-                    points: model.dashboardSparklinePoints,
-                    modelSeries: model.dashboardModelTPSHistory,
+                    points: displayPoints,
+                    modelSeries: displayModelSeries,
+                    span: span,
                     trend: model.sparklineRegression.trend,
                     colorMode: model.trendColorMode
                 )
@@ -583,21 +594,65 @@ struct TPSDashboardView: View {
             .frame(minHeight: 320)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("TPS 趋势图")
-            .accessibilityValue("最近十五分钟，\(model.sparklineRegression.trend.accessibilityText)，\(summary)")
+            .accessibilityValue("\(span.accessibilityText())，\(model.sparklineRegression.trend.accessibilityText)，\(summary)")
             Text(summary)
                 .font(.caption).foregroundStyle(.secondary)
                 .accessibilityLabel("TPS 文本摘要")
         }
         .padding(24)
         .frame(minWidth: 720, minHeight: 460)
+        .onAppear { model.setDashboardSpan(span) }
+        .onChange(of: span) { _, newValue in model.setDashboardSpan(newValue) }
+    }
+
+    /// 曲线总点集：前三档来自每秒不重叠桶，1 天来自账本 day series。
+    private var displayPoints: [SparklinePoint] {
+        span == .oneDay ? model.dashboardDaySeries.total : model.dashboardSparklinePoints
+    }
+
+    /// 看板统一「当前值」口径：当前跨度总曲线最右一个有效桶的瞬时 TPS。
+    /// 与曲线最右点严格一致（前三档=最后一个 5s 桶，1 天=最后一个 30min 桶）。
+    /// 短窗天然会抖、模型停顿时归零，这是所选「真正瞬时」口径的预期表现。
+    private var latestTotalTPS: Double {
+        Self.latestValue(of: displayPoints) ?? 0
+    }
+
+    /// 取点集里最后一个非缺口的值；全缺口返回 nil。
+    static func latestValue(of points: [SparklinePoint]) -> Double? {
+        points.last(where: { ($0.value?.isFinite ?? false) })?.value
+    }
+
+    /// 分模型曲线：前三档来自每秒不重叠桶，1 天来自账本 day series。
+    /// latestTPS 统一取各自曲线最右有效桶的瞬时值，与图例数字口径一致。
+    private var displayModelSeries: [ModelTPSHistory] {
+        let base: [ModelTPSHistory]
+        if span == .oneDay {
+            let day = model.dashboardDaySeries
+            base = day.perModel.map { entry in
+                ModelTPSHistory(model: entry.key, latestTPS: 0, points: entry.value)
+            }
+        } else {
+            base = model.dashboardModelTPSHistory
+        }
+        return base
+            .map { ModelTPSHistory(model: $0.model, latestTPS: Self.latestValue(of: $0.points) ?? 0, points: $0.points) }
+            .sorted {
+                if $0.latestTPS == $1.latestTPS { return $0.model.localizedStandardCompare($1.model) == .orderedAscending }
+                return $0.latestTPS > $1.latestTPS
+            }
+    }
+
+    /// 图例分模型行：与曲线同源、latestTPS 取各自曲线最右有效桶的瞬时值。
+    private var legendSeries: [ModelTPSHistory] {
+        displayModelSeries
     }
 
     private var summary: String {
-        // 峰值/平均基于看板 5s 曲线（与图形一致）；当前沿用 180s 口径（与右上角总数一致）。
-        let values = model.dashboardSparklinePoints.compactMap(\.value)
+        // 峰值/平均基于当前跨度曲线（与图形一致）；当前值取曲线最右点（与右上角总数一致）。
+        let values = displayPoints.compactMap(\.value)
         guard !values.isEmpty else { return "暂无 TPS 数据" }
         let average = values.reduce(0, +) / Double(values.count)
-        return String(format: "当前 %.1f · 峰值 %.1f · 平均 %.1f TPS", model.tps ?? 0, values.max() ?? 0, average)
+        return String(format: "当前 %.1f · 峰值 %.1f · 平均 %.1f TPS", latestTotalTPS, values.max() ?? 0, average)
     }
 
     private var trendRateText: String {
@@ -613,11 +668,17 @@ struct TPSDashboardView: View {
 
     private var tpsStatusText: String {
         switch model.tpsState {
-        case .live: model.tps.map { String(format: "%.1f TPS", $0) } ?? "—"
-        case .zero: "0.0 TPS · zero"
-        case .noData: "no data"
-        case .stale: "stale"
-        case .unavailable: "unavailable"
+        case .live:
+            // 右上角大数字 = 当前跨度曲线最右有效桶的瞬时 TPS（与曲线最右点一致）。
+            // 曲线全缺口时回落到 180s 口径，避免 live 状态下显示 0/—。
+            if let latest = Self.latestValue(of: displayPoints) {
+                return String(format: "%.1f TPS", latest)
+            }
+            return model.tps.map { String(format: "%.1f TPS", $0) } ?? "—"
+        case .zero: return "0.0 TPS · zero"
+        case .noData: return "no data"
+        case .stale: return "stale"
+        case .unavailable: return "unavailable"
         }
     }
 }
@@ -727,6 +788,7 @@ private struct ModelTPSSparkline: View {
 private struct TPSAxisChartView: View {
     let points: [SparklinePoint]
     let modelSeries: [ModelTPSHistory]
+    let span: DashboardTPSSpan
     let trend: SparklineTrend
     let colorMode: TrendColorMode
 
@@ -798,13 +860,11 @@ private struct TPSAxisChartView: View {
             }
 
             HStack {
-                Text("15 分钟前")
-                Spacer()
-                Text("10 分钟")
-                Spacer()
-                Text("5 分钟")
-                Spacer()
-                Text("现在")
+                let ticks = span.axisTicks()
+                ForEach(Array(ticks.enumerated()), id: \.offset) { index, tick in
+                    Text(tick.label)
+                    if index < ticks.count - 1 { Spacer() }
+                }
             }
             .padding(.leading, 48)
             .font(.caption2.monospacedDigit())

@@ -43,9 +43,11 @@ final class ApplicationModel: ObservableObject {
         trend: .insufficient
     )
     @Published private(set) var modelTPSHistory: [ModelTPSHistory] = []
-    /// 看板专用 5s 滑窗曲线（真实值、不平滑）。菜单/悬浮球仍用上面的平滑序列。
+    /// 看板不重叠桶曲线（前三档跨度，来自每秒样本）。1 天跨度改用 dashboardDaySeries。
     @Published private(set) var dashboardSparklinePoints: [SparklinePoint] = []
     @Published private(set) var dashboardModelTPSHistory: [ModelTPSHistory] = []
+    /// 看板 1 天曲线（长期账本 30min bucket → 平均 TPS）。
+    @Published private(set) var dashboardDaySeries: DashboardDaySeries = .empty
     @Published private(set) var tokenSummary: TokenUsageSummary
     @Published private(set) var tokenSyncStatus: TokenSyncStatus
     @Published var trendColorMode: TrendColorMode
@@ -88,6 +90,9 @@ final class ApplicationModel: ObservableObject {
         }.store(in: &cancellables)
         tokenCoordinator.statusPublisher.sink { [weak self] value in
             self?.tokenSyncStatus = value
+        }.store(in: &cancellables)
+        tokenCoordinator.dashboardDaySeriesPublisher.sink { [weak self] value in
+            self?.dashboardDaySeries = value
         }.store(in: &cancellables)
         metricsStore.$desktopActive.sink { [weak self] value in
             self?.desktopActive = value.displayValue
@@ -221,6 +226,17 @@ final class ApplicationModel: ObservableObject {
     func setTokenIngestBaseURL(_ url: String) { tokenSyncCoordinator.setIngestBaseURL(url) }
     func scanTokenUsageNow() { tokenSyncCoordinator.scanNow() }
     func reportTokenUsageNow() { tokenSyncCoordinator.reportNow() }
+
+    /// 看板时间跨度切换：前三档下沉到 MetricsStore 按不重叠桶重算；1 天让 coordinator 刷新账本曲线
+    /// 并开启随扫描自动刷新，离开 1 天时停止自动刷新。
+    func setDashboardSpan(_ span: DashboardTPSSpan) {
+        metricsStore.setDashboardSpan(span)
+        if span == .oneDay {
+            tokenSyncCoordinator.refreshDashboardDaySeries(active: true, now: Date())
+        } else {
+            tokenSyncCoordinator.refreshDashboardDaySeries(active: false, now: Date())
+        }
+    }
 
     private func format(_ value: Int?) -> String { value.map(String.init) ?? "—" }
     private func format(_ value: Double?) -> String { value.map { String(format: "%.1f", $0) } ?? "—" }

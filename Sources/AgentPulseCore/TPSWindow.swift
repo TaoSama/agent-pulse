@@ -32,6 +32,12 @@ public struct LiveRateSample: Codable, Sendable, Equatable, Identifiable, Snapsh
     public let tokensInShortWindow: Double?
     /// 5s 短滑窗按模型拆分的 token；仅 live 有值，旧库为空字典。
     public let modelTokensInShortWindow: [String: Double]
+    /// 该 1 秒内真实新产出的 output token（逐秒净增量，相邻秒不重叠）；看板不重叠桶曲线的底层量。
+    /// 与 tokensInShortWindow（5s 重叠口径）语义不同：后者相邻秒重叠、不能按秒求和。
+    /// 仅 live 状态有值，旧库/其它状态为 nil。
+    public let tokensInLastSecond: Double?
+    /// 逐秒净增量按模型拆分；仅 live 有值，旧库为空字典。
+    public let modelTokensInLastSecond: [String: Double]
     public var sourceIdentifier: String? { "live-rate" }
 
     public init(
@@ -41,7 +47,9 @@ public struct LiveRateSample: Codable, Sendable, Equatable, Identifiable, Snapsh
         latestSignalAt: Date?,
         modelTokensInWindow: [String: Double] = [:],
         tokensInShortWindow: Double? = nil,
-        modelTokensInShortWindow: [String: Double] = [:]
+        modelTokensInShortWindow: [String: Double] = [:],
+        tokensInLastSecond: Double? = nil,
+        modelTokensInLastSecond: [String: Double] = [:]
     ) {
         let second = Date(timeIntervalSince1970: floor(timestamp.timeIntervalSince1970))
         self.id = Self.stableID(for: second)
@@ -59,24 +67,34 @@ public struct LiveRateSample: Codable, Sendable, Equatable, Identifiable, Snapsh
             self.modelTokensInShortWindow = normalizedShort.map {
                 Self.normalizedModelTokens(modelTokensInShortWindow, total: $0)
             } ?? [:]
+            let normalizedLast = tokensInLastSecond.map { max(0, $0) }
+            self.tokensInLastSecond = normalizedLast
+            self.modelTokensInLastSecond = normalizedLast.map {
+                Self.normalizedModelTokens(modelTokensInLastSecond, total: $0)
+            } ?? [:]
         case .zero:
             self.tokensInWindow = 0
             self.tps = 0
             self.modelTokensInWindow = [:]
             self.tokensInShortWindow = 0
             self.modelTokensInShortWindow = [:]
+            self.tokensInLastSecond = 0
+            self.modelTokensInLastSecond = [:]
         case .noData, .stale, .unavailable:
             self.tokensInWindow = nil
             self.tps = nil
             self.modelTokensInWindow = [:]
             self.tokensInShortWindow = nil
             self.modelTokensInShortWindow = [:]
+            self.tokensInLastSecond = nil
+            self.modelTokensInLastSecond = [:]
         }
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, timestamp, state, tps, tokensInWindow, latestSignalAt, modelTokensInWindow
         case tokensInShortWindow, modelTokensInShortWindow
+        case tokensInLastSecond, modelTokensInLastSecond
     }
 
     public init(from decoder: Decoder) throws {
@@ -94,6 +112,12 @@ public struct LiveRateSample: Codable, Sendable, Equatable, Identifiable, Snapsh
         self.tokensInShortWindow = decodedShort
         let decodedShortModels = try container.decodeIfPresent([String: Double].self, forKey: .modelTokensInShortWindow) ?? [:]
         self.modelTokensInShortWindow = Self.normalizedModelTokens(decodedShortModels, total: decodedShort ?? 0)
+        // 旧库无逐秒净增量列：decodeIfPresent 缺省 nil。看板不重叠桶对该秒标缺口（不回退），
+        // 避免把 5s 重叠量误当逐秒净增量而算错量级。
+        let decodedLast = try container.decodeIfPresent(Double.self, forKey: .tokensInLastSecond)
+        self.tokensInLastSecond = decodedLast
+        let decodedLastModels = try container.decodeIfPresent([String: Double].self, forKey: .modelTokensInLastSecond) ?? [:]
+        self.modelTokensInLastSecond = Self.normalizedModelTokens(decodedLastModels, total: decodedLast ?? 0)
     }
 
     /// 归一化模型 token 字典：过滤非有限/负值，并将总和截断到 total 以内。
@@ -248,6 +272,50 @@ public final class TPSWindow: @unchecked Sendable {
             pruneLocked(referenceDate: reference)
             return samples.count
         }
+    }
+
+    /// 严格的"该 1 秒净增量"：只把 token 摊到 (referenceDate-1, referenceDate] 这个精确 1 秒窗口。
+    /// 与 tokensInShortWindow(windowSeconds:1) 不同——后者右边界带 5s 未来容差，长跨度事件会重复计入
+    /// 相邻秒；这里右边界严格取 referenceDate，保证相邻秒不重叠、逐秒求和 = 事件总量。
+    /// 供看板不重叠桶曲线做底层量。
+    public func tokensInLastSecond(referenceDate: Date? = nil) -> Double {
+        let reference = referenceDate ?? now()
+        return queue.sync {
+            pruneLocked(referenceDate: reference)
+            return samples.reduce(0) { $0 + Self.strictSecondTokens(for: $1, referenceDate: reference) }
+        }
+    }
+
+    /// 逐秒净增量按模型拆分（严格 1 秒窗口，右边界不含未来容差）。
+    public func tokensInLastSecondByModel(referenceDate: Date? = nil) -> [String: Double] {
+        let reference = referenceDate ?? now()
+        return queue.sync {
+            pruneLocked(referenceDate: reference)
+            var result: [String: Double] = [:]
+            for sample in samples {
+                let included = Self.strictSecondTokens(for: sample, referenceDate: reference)
+                guard included > 0 else { continue }
+                result[sample.model ?? "unknown", default: 0] += included
+            }
+            return result
+        }
+    }
+
+    /// 把一个 sample 摊到精确的 (referenceDate-1, referenceDate] 秒窗内（不含未来容差）。
+    /// 瞬时事件（durationSeconds==0）只在其时间戳落入该秒时整额计入；持续事件按与该秒的重叠比例摊分。
+    static func strictSecondTokens(for sample: TPSSample, referenceDate: Date) -> Double {
+        guard sample.tokenCount > 0 else { return 0 }
+        let windowStart = referenceDate.addingTimeInterval(-1)
+        if sample.durationSeconds == 0 {
+            return (sample.timestamp > windowStart && sample.timestamp <= referenceDate) ? Double(sample.tokenCount) : 0
+        }
+        let eventEnd = sample.timestamp
+        let eventStart = eventEnd.addingTimeInterval(-sample.durationSeconds)
+        let overlapStart = max(eventStart, windowStart)
+        let overlapEnd = min(eventEnd, referenceDate)
+        let overlap = overlapEnd.timeIntervalSince(overlapStart)
+        guard overlap > 0 else { return 0 }
+        return Double(sample.tokenCount) * min(1, overlap / sample.durationSeconds)
     }
 
     public func reset() {
