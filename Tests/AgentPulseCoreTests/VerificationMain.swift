@@ -2962,7 +2962,9 @@ struct AgentPulseCoreVerification {
                 tokenEvent(at: base.addingTimeInterval(-10), totalOutput: 0),
                 tokenEvent(at: base, totalOutput: 2_048),
             ]
-            if index == 1 {
+            // 消息身份去重契约挂在顶层文件 index 2 上（子 agent 现在整体不贡献实时 token，
+            // 该契约必须在被追踪的顶层会话上验证）。
+            if index == 2 {
                 events.append(messageEvent(at: base, messageID: "message-1", output: 100))
             }
             try writeRollout(
@@ -3007,13 +3009,22 @@ struct AgentPulseCoreVerification {
         try require(cold.diagnostics.excludedEmptyFiles == 1, "empty JSONL was not excluded")
         try require(cold.diagnostics.excludedStaleFiles == 1, "15-minute mtime filter mismatch")
         try require(cold.diagnostics.emittedTokenEvents == 0, "cold baseline emitted token events")
-        try require(cold.diagnostics.baselineObservations == 193, "tail baseline observation count mismatch")
+        // index 1 是子 agent：不贡献实时 token，其 2 条基线 token 观测不计入
+        // baselineObservations（96 顶层文件×2 + index 2 的 1 条 message = 191，扣掉子 agent 2 条）。
+        try require(cold.diagnostics.baselineObservations == 191, "tail baseline observation count mismatch")
         try require(cold.diagnostics.subagentFiles == 1, "subagent provider classification mismatch")
 
-        try appendLine(messageEvent(at: base.addingTimeInterval(1), messageID: "message-1", output: 100), to: trackedFiles[1])
+        // 子 agent 文件（index 1）重放父线程累计 output，绝不能进入实时 TPS：
+        // 追加一条巨大的累计增量，断言 TPS 仍为 0（root cause 2 回归护栏）。
+        try appendLine(tokenEvent(at: base.addingTimeInterval(1), totalOutput: 999_999), to: trackedFiles[1])
+        let subagentReplay = try await collector.scan(at: base.addingTimeInterval(1))
+        try require(subagentReplay.liveRate.tps == 0, "subagent replayed cumulative output leaked into live TPS")
+
+        // 消息身份去重契约在顶层文件 index 2 上验证：重复的同一 message.id 不应重复计数。
+        try appendLine(messageEvent(at: base.addingTimeInterval(1), messageID: "message-1", output: 100), to: trackedFiles[2])
         let repeatedMessage = try await collector.scan(at: base.addingTimeInterval(1))
         try require(repeatedMessage.liveRate.tps == 0, "repeated message usage was double-counted")
-        try appendLine(messageEvent(at: base.addingTimeInterval(2), messageID: "message-1", output: 140), to: trackedFiles[1])
+        try appendLine(messageEvent(at: base.addingTimeInterval(2), messageID: "message-1", output: 140), to: trackedFiles[2])
         let messageDelta = try await collector.scan(at: base.addingTimeInterval(2))
         try requireApproximatelyEqual(
             messageDelta.liveRate.tps,
