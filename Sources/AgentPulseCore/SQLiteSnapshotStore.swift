@@ -103,6 +103,10 @@ public final class SQLiteSnapshotStore: @unchecked Sendable {
         do {
             try execute("PRAGMA journal_mode=WAL;")
             try execute("PRAGMA foreign_keys=ON;")
+            // TPS 库每秒写入、频繁读窗口：WAL 下 synchronous=NORMAL 降低每次提交的 fsync 开销
+            // （崩溃至多丢最后一个未 checkpoint 样本，可接受）；busy_timeout 避免瞬时锁竞争报错。
+            try execute("PRAGMA synchronous=NORMAL;")
+            try execute("PRAGMA busy_timeout=5000;")
             try execute(
                 "CREATE TABLE IF NOT EXISTS \(Self.tableName) (" +
                 "id TEXT PRIMARY KEY NOT NULL, " +

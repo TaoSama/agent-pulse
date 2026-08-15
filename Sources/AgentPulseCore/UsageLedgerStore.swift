@@ -119,6 +119,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try exec("PRAGMA journal_mode=WAL;")
             try exec("PRAGMA busy_timeout=5000;")
             try exec("PRAGMA foreign_keys=ON;")
+            // 批量写入 / 全表重读调优：WAL 下 synchronous=NORMAL 崩溃至多丢最后一个未 checkpoint
+            // 事务（本账本可重扫恢复，可接受）；32MiB 页缓存吃下全库 raw 重读；派生重算的
+            // ORDER BY 临时排序走内存，减少落盘。
+            try exec("PRAGMA synchronous=NORMAL;")
+            try exec("PRAGMA cache_size=-32768;")
+            try exec("PRAGMA temp_store=MEMORY;")
             try migrate()
             // WAL 模式与迁移都会创建/触碰 db、-wal、-shm；统一在此收紧到 0600，
             // 不放宽已更严格的权限（best-effort：文件不存在则跳过）。
