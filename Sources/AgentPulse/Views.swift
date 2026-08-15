@@ -594,9 +594,15 @@ private struct TPSAxisChartView: View {
 
     private var bounds: (lower: Double, upper: Double) {
         let values = points.compactMap(\.value) + modelSeries.flatMap { $0.points.compactMap(\.value) }
-        guard let minimum = values.min(), let maximum = values.max() else { return (0, 1) }
-        let padding = max((maximum - minimum) * 0.08, 0.5)
-        return (max(0, minimum - padding), maximum + padding)
+        guard let minimum = values.min() else { return (0, 1) }
+        // 上界对异常值稳健：稀疏大跳增（累计计数一次落盘）会制造孤立尖峰，若用绝对 max 定轴，
+        // 单个尖峰会把整条轴撑高、其余曲线被压扁贴底。改用 P95 分位定上界，尖峰顶到轴顶被裁，
+        // 其余曲线获得合理纵向展开；仍保留对真实最大值的下限保护，避免分位过低截掉正常波峰。
+        let sorted = values.sorted()
+        let robustUpper = SparklineAnalysis.quantile(sorted, 0.95)
+        let upper = max(robustUpper, minimum + 0.5)
+        let padding = max((upper - minimum) * 0.08, 0.5)
+        return (max(0, minimum - padding), upper + padding)
     }
 
     var body: some View {
