@@ -1,7 +1,7 @@
 import SwiftUI
 import AgentPulseCore
 
-/// 设置窗口：深色卡片式，与菜单栏面板、悬浮球共用同一套黑底白字语言。
+/// 设置视图：嵌入 menubar 面板内的深色卡片式设置，与主面板、悬浮球共用黑底白字语言。
 /// 包含趋势配色、合并 env 凭证（R2 / cliproxy 双源）、以及 Token 统计/上报/全量同步状态。
 struct AgentPulseSettingsView: View {
     @ObservedObject var model: ApplicationModel
@@ -15,39 +15,16 @@ struct AgentPulseSettingsView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 12) {
-                header
                 trendCard
                 envPathCard
                 r2Card
                 cliProxyCard
                 TokenSyncSettingsSection(model: model)
             }
-            .padding(16)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
         }
-        .background(Self.windowBackground)
-        .preferredColorScheme(.light)
-        .frame(minWidth: 580, minHeight: 540)
-    }
-
-    /// 窗口底色：接近白的浅灰，与菜单栏展开面板的浅色系统材质一致；纯黑卡浮于其上。
-    private static let windowBackground = Color(red: 0.94, green: 0.94, blue: 0.95)
-
-    private var header: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Text("Agent Pulse")
-                .font(.system(size: 17, weight: .semibold, design: .rounded))
-                .foregroundStyle(.primary)
-            Spacer()
-            HStack(spacing: 7) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 7, height: 7)
-                Text(statusText)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-            }
-            .foregroundStyle(.primary)
-        }
-        .padding(.horizontal, 2)
+        .frame(maxHeight: 520)
     }
 
     private var trendCard: some View {
@@ -95,7 +72,6 @@ struct AgentPulseSettingsView: View {
                 dualSourceField("Public Base URL", key: MergedEnvKeys.r2PublicBaseURL)
                 dualSourceField("Access Key ID", key: MergedEnvKeys.r2AccessKeyID)
                 dualSourceField("Secret Access Key", key: MergedEnvKeys.r2SecretAccessKey)
-                SettingsFootnote("密钥以中间星号回显；手动填写会写回上方 0600 env 文件。")
             }
         }
     }
@@ -128,16 +104,6 @@ struct AgentPulseSettingsView: View {
             rawValue: envSettings.valueBinding(for: key),
             displayValue: envSettings.displayValue(for: key)
         )
-    }
-
-    private var statusColor: Color {
-        if model.tps == nil { return Color.secondary }
-        return model.sparklineRegression.trend.color(for: model.trendColorMode)
-    }
-
-    private var statusText: String {
-        guard let tps = model.tps else { return "—" }
-        return String(format: "%.1f TPS", tps)
     }
 }
 
@@ -241,87 +207,43 @@ struct SettingsField: View {
     }
 }
 
-/// 双源字段：一个来源开关（从 env 读取 / 手动填写）+ 值输入/回显。
-/// - env 源：只读回显文件读到的值（密钥中间星号掩码，非密钥明文）。
-/// - manual 源：可编辑；密钥默认掩码显示，点「编辑」展开明文输入，提交即写回 0600 env。
+/// 凭证字段：单行「标题 · 值回显 · 编辑」。默认只读回显合并 env 读到的值
+/// （密钥中间星号掩码，非密钥明文）；点「编辑」展开明文输入，「完成」或回车即写回 0600 env。
+/// 写回时自动把该键来源置为 manual，保留手填→写回能力，无需显式来源切换。
 struct SettingsDualSourceField: View {
     let title: String
     let isSecret: Bool
     @Binding var source: EnvFieldSource
     /// 原始值绑定（set 只在 manual 源生效，会写回 env）。
     @Binding var rawValue: String
-    /// UI 展示值（密钥已掩码、非密钥明文）；用于 env 只读回显与 manual 未展开时。
+    /// UI 展示值（密钥已掩码、非密钥明文）；只读回显与未展开时用。
     let displayValue: String
 
     @State private var isEditing = false
     @State private var draft = ""
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 8) {
-                Text(title)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(Color.white.opacity(0.5))
-                Spacer(minLength: 8)
-                sourcePicker
-            }
-            valueField
-        }
-    }
-
-    /// 两段来源切换：env / 手动。
-    private var sourcePicker: some View {
-        HStack(spacing: 4) {
-            sourceChip("env", value: .env)
-            sourceChip("手动", value: .manual)
-        }
-    }
-
-    private func sourceChip(_ label: String, value: EnvFieldSource) -> some View {
-        let selected = source == value
-        return Button {
-            source = value
-            isEditing = false
-        } label: {
-            Text(label)
+        HStack(alignment: .center, spacing: 8) {
+            Text(title)
                 .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(selected ? Color.black : Color.white.opacity(0.7))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(
-                    Capsule().fill(selected ? Color.white : Color.white.opacity(0.1))
-                )
-        }
-        .buttonStyle(.plain)
-        .focusable(false)
-        .accessibilityLabel("\(title) 来源 \(label)")
-        .accessibilityAddTraits(selected ? [.isSelected] : [])
-    }
-
-    @ViewBuilder
-    private var valueField: some View {
-        if source == .env {
-            // env 源：只读回显（密钥掩码）。
-            readOnlyBox(displayValue.isEmpty ? "未设置" : displayValue, placeholder: displayValue.isEmpty)
-        } else if !isEditing {
-            // manual 未展开：回显当前值（密钥掩码、非密钥明文）+ 编辑按钮；避免逐键写盘。
-            HStack(spacing: 8) {
+                .foregroundStyle(Color.white.opacity(0.5))
+                .frame(width: 132, alignment: .leading)
+            if isEditing {
+                editableBox
+                SettingsGhostButton("完成") { commitDraft() }
+            } else {
                 readOnlyBox(displayValue.isEmpty ? "未设置" : displayValue, placeholder: displayValue.isEmpty)
                 SettingsGhostButton("编辑") {
                     draft = rawValue
                     isEditing = true
                 }
             }
-        } else {
-            // manual 编辑：草稿输入，点「完成」或回车提交后写回 env（密钥重新收起为掩码）。
-            HStack(spacing: 8) {
-                editableBox
-                SettingsGhostButton("完成") { commitDraft() }
-            }
         }
     }
 
     private func commitDraft() {
+        // 手填即切到 manual 源再写回，让值绑定的写回逻辑生效。
+        if source != .manual { source = .manual }
         rawValue = draft
         isEditing = false
     }

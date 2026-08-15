@@ -7,7 +7,6 @@ final class AppShellController {
     private let orbController: OrbWindowController
     private let dashboardController: DashboardWindowController
     private let toastController: ToastWindowController
-    private let settingsController: SettingsWindowController
     private let screenCoordinator = ScreenCoordinator()
     private let hotKey = HotKeyService()
 
@@ -16,14 +15,13 @@ final class AppShellController {
         orbController = OrbWindowController(model: model)
         dashboardController = DashboardWindowController(model: model)
         toastController = ToastWindowController(model: model)
-        settingsController = SettingsWindowController(model: model)
         model.showDashboard = { [weak self] in self?.showDashboard() }
         model.showOrb = { [weak orbController] visible in orbController?.setVisible(visible) }
         model.showToast = { [weak self] state in
             guard let self else { return }
             toastController.show(state, anchoredTo: orbAnchor)
         }
-        model.showSettings = { [weak settingsController] in settingsController?.show() }
+        // 设置页复用 menubar 面板（面板内切换），showSettings 由 MenuBarSummaryView 装配。
         orbController.onOpenDashboard = { [weak self] in self?.showDashboard() }
     }
 

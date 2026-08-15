@@ -356,7 +356,7 @@ public enum SparklineAnalysis {
     }
 
     /// 线性插值分位数；sorted 必须已升序且非空。
-    static func quantile(_ sorted: [Double], _ q: Double) -> Double {
+    public static func quantile(_ sorted: [Double], _ q: Double) -> Double {
         guard let first = sorted.first else { return 0 }
         if sorted.count == 1 { return first }
         let clamped = min(max(q, 0), 1)

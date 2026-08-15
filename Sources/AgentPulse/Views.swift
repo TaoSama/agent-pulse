@@ -140,10 +140,57 @@ struct MenuBarSummaryView: View {
     /// 面板各分区之间的垂直间距。
     private static let sectionSpacing: CGFloat = 12
 
-    /// Token 汇总卡与分模型明细卡共用同一时间窗口选择。
-    @State private var tokenWindow: TokenUsageWindow = .day
+    /// 主概览面板宽度；进入设置态时加宽以容纳凭证字段。
+    private static let overviewWidth: CGFloat = 380
+    private static let settingsWidth: CGFloat = 460
+
+    /// Token 汇总卡与分模型明细卡共用同一时间窗口选择；持久化，面板重开保留上次选择。
+    @AppStorage("menubar.tokenWindow") private var tokenWindow: TokenUsageWindow = .day
+    /// 面板内是否切到设置视图（复用同一弹窗，不再弹独立窗口）。
+    @State private var showingSettings = false
 
     var body: some View {
+        Group {
+            if showingSettings {
+                settingsScreen
+            } else {
+                overviewScreen
+            }
+        }
+        .onAppear {
+            // 供 ⌘, 与"设置"入口在面板内切换，不弹独立窗口。
+            model.showSettings = { showingSettings = true }
+        }
+    }
+
+    private var settingsScreen: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button {
+                    showingSettings = false
+                } label: {
+                    Label("返回", systemImage: "chevron.left")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Text("设置").font(.subheadline.weight(.semibold))
+                Spacer()
+                // 占位与返回按钮等宽，保证标题视觉居中。
+                Label("返回", systemImage: "chevron.left")
+                    .font(.system(size: 12, weight: .medium))
+                    .opacity(0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 6)
+
+            AgentPulseSettingsView(model: model)
+        }
+        .frame(width: Self.settingsWidth)
+    }
+
+    private var overviewScreen: some View {
         VStack(alignment: .leading, spacing: Self.sectionSpacing) {
             HStack(alignment: .center, spacing: 8) {
                 Text("Agent Pulse").font(.subheadline.weight(.semibold))
@@ -220,7 +267,7 @@ struct MenuBarSummaryView: View {
                 Button(model.isOrbVisible ? "隐藏悬浮球" : "显示悬浮球") { model.toggleOrb() }
                 Spacer()
                 Button {
-                    presentFromMenuBar(model.showSettings)
+                    showingSettings = true
                 } label: {
                     Label("设置", systemImage: "gearshape")
                 }
@@ -228,7 +275,7 @@ struct MenuBarSummaryView: View {
             }
         }
         .padding(16)
-        .frame(width: 380)
+        .frame(width: Self.overviewWidth)
     }
 
     private var trendColor: Color {
