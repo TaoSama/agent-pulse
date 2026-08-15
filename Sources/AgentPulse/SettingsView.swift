@@ -15,10 +15,10 @@ struct AgentPulseSettingsView: View {
     var body: some View {
         VStack(spacing: 12) {
             trendCard
+            TokenSyncSettingsSection(model: model)
+            cliProxyCard
             envPathCard
             r2Card
-            cliProxyCard
-            TokenSyncSettingsSection(model: model)
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 16)
@@ -26,20 +26,21 @@ struct AgentPulseSettingsView: View {
 
     private var trendCard: some View {
         SettingsCard(title: "趋势配色", systemImage: "paintpalette") {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 16) {
-                    ForEach(TrendColorMode.allCases) { mode in
-                        SettingsRadioRow(
-                            title: mode.title,
-                            isSelected: model.trendColorMode == mode
-                        ) {
-                            model.trendColorMode = mode
-                        }
-                        .fixedSize(horizontal: true, vertical: false)
+            HStack(spacing: 12) {
+                ForEach(TrendColorMode.allCases) { mode in
+                    SettingsRadioRow(
+                        title: mode.title,
+                        isSelected: model.trendColorMode == mode
+                    ) {
+                        model.trendColorMode = mode
                     }
-                    Spacer(minLength: 0)
+                    .fixedSize(horizontal: true, vertical: false)
                 }
-                SettingsFootnote("菜单栏、悬浮球和看板会同步使用这套颜色。")
+                Spacer(minLength: 8)
+                Text("菜单栏、悬浮球和看板同步")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.white)
+                    .fixedSize(horizontal: true, vertical: false)
             }
         }
     }
@@ -47,27 +48,17 @@ struct AgentPulseSettingsView: View {
     /// 合并 env 文件路径卡片：R2 / cliproxy / 上报简单值统一存放，只保存路径，凭证不写入 App 设置。
     private var envPathCard: some View {
         SettingsCard(title: "凭证文件（合并 env）", systemImage: "key.horizontal") {
-            VStack(alignment: .leading, spacing: 10) {
-                SettingsField(
-                    title: ".env 路径",
-                    text: $envSettings.path,
-                    accessibilityLabel: "合并 env 配置文件路径"
-                )
-                HStack(alignment: .center, spacing: 8) {
-                    SettingsFootnote("只保存文件路径；密钥仅在内存与该 0600 文件中，不写入 App 设置。")
-                    Spacer(minLength: 8)
-                    SettingsGhostButton("恢复默认路径") {
-                        envSettings.path = MergedEnvKeys.defaultPath
-                    }
-                }
-            }
+            EnvPathRow(
+                path: $envSettings.path,
+                help: "只保存文件路径；密钥仅在内存与该 0600 文件中，不写入 App 设置。留空「编辑 → 完成」即恢复默认路径。"
+            )
         }
     }
 
     private var r2Card: some View {
         SettingsCard(title: "R2 图片上传", systemImage: "photo.on.rectangle.angled") {
             VStack(alignment: .leading, spacing: 12) {
-                dualSourceField("Account ID", key: MergedEnvKeys.r2AccountID)
+                dualSourceField("Account ID", key: MergedEnvKeys.r2AccountID, singleLine: true)
                 dualSourceField("Bucket", key: MergedEnvKeys.r2Bucket)
                 dualSourceField("Public Base URL", key: MergedEnvKeys.r2PublicBaseURL)
                 dualSourceField("Access Key ID", key: MergedEnvKeys.r2AccessKeyID)
@@ -96,13 +87,14 @@ struct AgentPulseSettingsView: View {
     }
 
     /// 构造一个双源字段：env 读取 / 手动填写；密钥掩码，非密钥明文。
-    private func dualSourceField(_ title: String, key: String) -> some View {
+    private func dualSourceField(_ title: String, key: String, singleLine: Bool = false) -> some View {
         SettingsDualSourceField(
             title: title,
             isSecret: envSettings.isSecret(key),
             source: envSettings.sourceBinding(for: key),
             rawValue: envSettings.valueBinding(for: key),
-            displayValue: envSettings.displayValue(for: key)
+            displayValue: envSettings.displayValue(for: key),
+            singleLine: singleLine
         )
     }
 }
@@ -222,35 +214,50 @@ struct SettingsDualSourceField: View {
     var singleLine: Bool = false
     /// 非空时在标题右侧加一个「?」图标，悬浮展示该说明文字（替代下方常驻小字）。
     var help: String? = nil
+    /// 两行布局：标题（+?）单独一行，值框与编辑按钮在下一行占满整宽。
+    /// 用于设备标识这类需要完整展示值的字段；默认单行「标题 · 值 · 编辑」。
+    var stacked: Bool = false
 
     @State private var isEditing = false
     @State private var draft = ""
 
     var body: some View {
-        HStack(alignment: .center, spacing: 8) {
-            HStack(spacing: 4) {
-                Text(title)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(Color.white)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let help {
-                    Image(systemName: "questionmark.circle")
-                        .font(.system(size: 10))
-                        .foregroundStyle(Color.white)
-                        .help(help)
-                }
-                Spacer(minLength: 0)
+        if stacked {
+            VStack(alignment: .leading, spacing: 6) {
+                labelRow
+                HStack(alignment: .center, spacing: 8) { valueAndEdit }
             }
-            .frame(width: 132, alignment: .leading)
-            if isEditing {
-                editableBox
-                SettingsGhostButton("完成") { commitDraft() }
-            } else {
-                readOnlyBox(displayValue.isEmpty ? "未设置" : displayValue, placeholder: displayValue.isEmpty)
-                SettingsGhostButton("编辑") {
-                    draft = rawValue
-                    isEditing = true
-                }
+        } else {
+            HStack(alignment: .center, spacing: 8) {
+                labelRow.frame(width: 132, alignment: .leading)
+                valueAndEdit
+            }
+        }
+    }
+
+    private var labelRow: some View {
+        HStack(spacing: 4) {
+            Text(title)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Color.white)
+                .fixedSize(horizontal: false, vertical: true)
+            if let help {
+                HelpBadge(text: help)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    @ViewBuilder
+    private var valueAndEdit: some View {
+        if isEditing {
+            editableBox
+            SettingsGhostButton("完成") { commitDraft() }
+        } else {
+            readOnlyBox(displayValue.isEmpty ? "未设置" : displayValue, placeholder: displayValue.isEmpty)
+            SettingsGhostButton("编辑") {
+                draft = rawValue
+                isEditing = true
             }
         }
     }
@@ -303,6 +310,64 @@ struct SettingsDualSourceField: View {
                 .stroke(Color.white.opacity(0.14), lineWidth: 1)
         )
         .accessibilityLabel(title)
+    }
+}
+
+/// 合并 env 路径行：单行「.env 路径 · ? · 值 · 编辑」，与凭证字段同一视觉。
+/// 值单行不折行；点「编辑」展开输入，「完成」/回车写回；留空提交即恢复默认路径。
+struct EnvPathRow: View {
+    @Binding var path: String
+    let help: String
+
+    @State private var isEditing = false
+    @State private var draft = ""
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            HStack(spacing: 4) {
+                Text(".env 路径")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(Color.white)
+                HelpBadge(text: help)
+                Spacer(minLength: 0)
+            }
+            .frame(width: 132, alignment: .leading)
+            if isEditing {
+                TextField("", text: $draft, prompt: Text("留空恢复默认").foregroundColor(Color.white.opacity(0.3)))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Color.white)
+                    .onSubmit { commit() }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.white.opacity(0.08)))
+                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 1))
+                    .accessibilityLabel("合并 env 配置文件路径")
+                SettingsGhostButton("完成") { commit() }
+            } else {
+                Text(path.isEmpty ? MergedEnvKeys.defaultPath : path)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Color.white)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.white.opacity(0.05)))
+                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.white.opacity(0.1), lineWidth: 1))
+                    .accessibilityLabel(".env 路径（只读）")
+                SettingsGhostButton("编辑") {
+                    draft = path
+                    isEditing = true
+                }
+            }
+        }
+    }
+
+    private func commit() {
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        path = trimmed.isEmpty ? MergedEnvKeys.defaultPath : trimmed
+        isEditing = false
     }
 }
 
@@ -507,5 +572,62 @@ struct SettingsFootnote: View {
             .font(.system(size: 11))
             .foregroundStyle(tone.color)
             .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// 「?」说明徽章：鼠标悬停即弹出说明气泡（popover）。
+/// 不用 `.help()`——在 MenuBarExtra 弹窗里它的 hover tooltip 不触发；改用 `.onHover`
+/// 驱动 popover，hover 立即出现；移开后延迟收起，给用户时间把鼠标移进气泡，
+/// 期间指针进入图标或气泡任一区域都保活，避免"移向气泡途中经过别处就消失"。
+struct HelpBadge: View {
+    let text: String
+    @State private var showing = false
+    /// 最近一次"离开"的代次；延迟关闭时比对，若期间又进入则代次改变、取消关闭。
+    @State private var leaveToken = 0
+
+    var body: some View {
+        Image(systemName: "questionmark.circle")
+            .font(.system(size: 11))
+            .foregroundStyle(Color.white)
+            .contentShape(Circle())
+            .onHover { inside in
+                if inside {
+                    leaveToken &+= 1
+                    showing = true
+                } else {
+                    scheduleClose()
+                }
+            }
+            .popover(isPresented: $showing, arrowEdge: .bottom) {
+                Text(text)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.white)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: 240, alignment: .leading)
+                    .padding(12)
+                    // 明确黑底白字，别依赖系统浅色 material（此前白字铺在浅底上看不清）。
+                    .background(Color.black)
+                    .presentationCompactAdaptation(.popover)
+                    // 指针进入气泡内容即保活；离开再延迟收起。
+                    .onHover { inside in
+                        if inside {
+                            leaveToken &+= 1
+                        } else {
+                            scheduleClose()
+                        }
+                    }
+            }
+            .accessibilityLabel("说明")
+            .accessibilityHint(text)
+    }
+
+    /// 延迟收起：记下当前代次，0.6s 后若代次未变（期间没再进入图标/气泡）才真正关闭。
+    private func scheduleClose() {
+        leaveToken &+= 1
+        let token = leaveToken
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            if token == leaveToken { showing = false }
+        }
     }
 }

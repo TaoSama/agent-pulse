@@ -29,29 +29,33 @@ struct TokenSyncSettingsSection: View {
 
                 // hostname 权威来自合并 env 的 REPORT_CANONICAL_HOSTNAME：双源可读可填，
                 // 手填经 coordinator 写回 env 并刷新上报状态（非密钥，明文回显）。
-                // 说明文字收进标题旁的 ? 悬浮，不再常驻占行。
+                // 单行「标题 · ? · 值 · 编辑」，值不折行；说明进 ? 悬浮。
                 dualSourceField(
                     "设备标识",
                     key: MergedEnvKeys.reportCanonicalHostname,
+                    singleLine: true,
                     help: "canonical hostname，存于合并 env，作为上报身份；改名会触发历史归属确认。"
                 )
 
-                SettingsRow(title: "上次扫描") {
+                // 上次扫描合成一行：标题 + ?（历史保留说明）+ 时间 + 立即扫描按钮。
+                HStack(alignment: .center, spacing: 8) {
+                    HStack(spacing: 4) {
+                        Text("上次扫描").font(.system(size: 12)).foregroundStyle(Color.white)
+                        HelpBadge(text: "历史会话删除后，已入库的 Token 统计仍会保留。")
+                    }
                     Text(Self.dateText(model.tokenSyncStatus.lastScanAt))
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(Color.white)
+                    Spacer(minLength: 8)
+                    SettingsPrimaryButton(
+                        title: model.tokenSyncStatus.scanningInProgress ? "正在扫描…" : "立即扫描",
+                        systemImage: "arrow.clockwise",
+                        loading: model.tokenSyncStatus.scanningInProgress,
+                        disabled: scanDisabled
+                    ) {
+                        model.scanTokenUsageNow()
+                    }
                 }
-
-                actionRow(
-                    title: model.tokenSyncStatus.scanningInProgress ? "正在扫描…" : "立即扫描",
-                    systemImage: "arrow.clockwise",
-                    loading: model.tokenSyncStatus.scanningInProgress,
-                    disabled: scanDisabled
-                ) {
-                    model.scanTokenUsageNow()
-                }
-
-                SettingsFootnote("历史会话删除后，已入库的 Token 统计仍会保留。")
             }
         }
     }
@@ -116,12 +120,24 @@ struct TokenSyncSettingsSection: View {
                     SettingsFootnote(error, tone: configurationStatusTone)
                 }
 
-                SettingsRow(title: "上次上报") {
-                    HStack(spacing: 6) {
-                        Text(Self.dateText(model.tokenSyncStatus.lastReportAt))
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(Color.white)
-                        SettingsStatusBadge(text: lastReportOutcomeText, tone: lastReportOutcomeTone)
+                // 上次上报合成一行：标题 + ?（启用行为说明）+ 时间 + 结果徽章 + 立即上报按钮。
+                HStack(alignment: .center, spacing: 8) {
+                    HStack(spacing: 4) {
+                        Text("上次上报").font(.system(size: 12)).foregroundStyle(Color.white)
+                        HelpBadge(text: reportFooterText)
+                    }
+                    Text(Self.dateText(model.tokenSyncStatus.lastReportAt))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Color.white)
+                    SettingsStatusBadge(text: lastReportOutcomeText, tone: lastReportOutcomeTone)
+                    Spacer(minLength: 8)
+                    SettingsPrimaryButton(
+                        title: model.tokenSyncStatus.reportingInProgress ? "正在上报…" : "立即上报",
+                        systemImage: "arrow.up.circle",
+                        loading: model.tokenSyncStatus.reportingInProgress,
+                        disabled: !canReport
+                    ) {
+                        model.reportTokenUsageNow()
                     }
                 }
 
@@ -132,17 +148,6 @@ struct TokenSyncSettingsSection: View {
                             .foregroundStyle(Color.white)
                     }
                 }
-
-                actionRow(
-                    title: model.tokenSyncStatus.reportingInProgress ? "正在上报…" : "立即上报",
-                    systemImage: "arrow.up.circle",
-                    loading: model.tokenSyncStatus.reportingInProgress,
-                    disabled: !canReport
-                ) {
-                    model.reportTokenUsageNow()
-                }
-
-                SettingsFootnote(reportFooterText)
             }
         }
     }
@@ -168,7 +173,7 @@ struct TokenSyncSettingsSection: View {
     }
 
     /// 构造双源字段（REPORT_* 简单值，非密钥明文；手填经 coordinator 写回 env）。
-    private func dualSourceField(_ title: String, key: String, singleLine: Bool = false, help: String? = nil) -> some View {
+    private func dualSourceField(_ title: String, key: String, singleLine: Bool = false, stacked: Bool = false, help: String? = nil) -> some View {
         SettingsDualSourceField(
             title: title,
             isSecret: envSettings.isSecret(key),
@@ -176,7 +181,8 @@ struct TokenSyncSettingsSection: View {
             rawValue: envSettings.valueBinding(for: key),
             displayValue: envSettings.displayValue(for: key),
             singleLine: singleLine,
-            help: help
+            help: help,
+            stacked: stacked
         )
     }
 
