@@ -82,7 +82,10 @@ public enum SparklineAnalysis {
     public static let defaultStepSeconds: TimeInterval = 1
     /// 允许的最小/最大平滑窗口（点数），对应“3-7 点”。
     public static let minSmoothingWindow = 3
-    public static let maxSmoothingWindow = 7
+    public static let maxSmoothingWindow = 13
+    /// 看板大图专用平滑半径：点粒度仍是每秒一点，但用更宽的高斯核（±radius 秒）压掉
+    /// 5s 滑窗速率固有的高频毛刺；分段平滑遇缺口断开、不跨缺口借值/插值。
+    public static let dashboardSmoothingRadius = 4
     /// 归一化时的分位裁剪比例（两端各裁掉这一比例的极值以抗异常值）。
     public static let normalizationClipQuantile = 0.10
     /// 显著下降阈值：平滑回归后的端到端变化低于 -30% 才判为下降。
@@ -517,18 +520,20 @@ public enum SparklineAnalysis {
         return (points, regressionResult)
     }
 
-    /// 看板专用总曲线：每点为该秒前 5s 滑窗真实速率，缺口断开，不插值/不平滑/不归一化。
-    /// 点粒度仍为每秒一点（step=1s），只是每点的值取自 5s 滑窗（形态更贴近瞬时、可加）。
+    /// 看板专用总曲线：每点为该秒前 5s 滑窗真实速率，点粒度仍每秒一点；
+    /// 再叠加一层更宽的高斯平滑（分段、遇缺口断开、绝不跨缺口插值）压掉高频毛刺。
+    /// 峰值/平均直接取这些绘制点的 value，与图形完全一致。
     public static func makeDashboardSparkline(
         from samples: [LiveRateSample],
         end: Date? = nil,
         windowSeconds: TimeInterval = defaultWindowSeconds,
         stepSeconds: TimeInterval = defaultStepSeconds
     ) -> [SparklinePoint] {
-        resampleSeries(shortWindowSeries(from: samples), end: end, windowSeconds: windowSeconds, stepSeconds: stepSeconds)
+        let resampled = resampleSeries(shortWindowSeries(from: samples), end: end, windowSeconds: windowSeconds, stepSeconds: stepSeconds)
+        return smooth(resampled, kernel: .gaussian(radius: dashboardSmoothingRadius))
     }
 
-    /// 看板专用分模型曲线：单模型每点为该秒前 5s 滑窗真实速率，缺口断开，不插值/不平滑。
+    /// 看板专用分模型曲线：单模型每点为该秒前 5s 滑窗真实速率，再叠加与总曲线同规格的分段高斯平滑。
     public static func makeDashboardModelSparkline(
         from samples: [LiveRateSample],
         model: String,
@@ -536,7 +541,8 @@ public enum SparklineAnalysis {
         windowSeconds: TimeInterval = defaultWindowSeconds,
         stepSeconds: TimeInterval = defaultStepSeconds
     ) -> [SparklinePoint] {
-        resampleSeries(shortWindowSeries(from: samples, model: model), end: end, windowSeconds: windowSeconds, stepSeconds: stepSeconds)
+        let resampled = resampleSeries(shortWindowSeries(from: samples, model: model), end: end, windowSeconds: windowSeconds, stepSeconds: stepSeconds)
+        return smooth(resampled, kernel: .gaussian(radius: dashboardSmoothingRadius))
     }
 
     /// 为单个模型生成与总曲线相同时间栅格、插值和平滑规则的曲线。
