@@ -29,11 +29,11 @@ struct TokenSyncSettingsSection: View {
 
                 // hostname 权威来自合并 env 的 REPORT_CANONICAL_HOSTNAME：双源可读可填，
                 // 手填经 coordinator 写回 env 并刷新上报状态（非密钥，明文回显）。
-                // 两行布局：标题（+?）一行，canonical name 值框在下一行占满整宽；说明进 ? 悬浮。
+                // 单行「标题 · ? · 值 · 编辑」，值不折行；说明进 ? 悬浮。
                 dualSourceField(
                     "设备标识",
                     key: MergedEnvKeys.reportCanonicalHostname,
-                    stacked: true,
+                    singleLine: true,
                     help: "canonical hostname，存于合并 env，作为上报身份；改名会触发历史归属确认。"
                 )
 

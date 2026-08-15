@@ -15,10 +15,10 @@ struct AgentPulseSettingsView: View {
     var body: some View {
         VStack(spacing: 12) {
             trendCard
-            envPathCard
-            r2Card
             cliProxyCard
             TokenSyncSettingsSection(model: model)
+            envPathCard
+            r2Card
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 16)
@@ -600,11 +600,14 @@ struct HelpBadge: View {
             }
             .popover(isPresented: $showing, arrowEdge: .bottom) {
                 Text(text)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Color.primary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.white)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(width: 220, alignment: .leading)
+                    .frame(width: 240, alignment: .leading)
                     .padding(12)
+                    // 明确黑底白字，别依赖系统浅色 material（此前白字铺在浅底上看不清）。
+                    .background(Color.black)
+                    .presentationCompactAdaptation(.popover)
                     // 指针进入气泡内容即保活；离开再延迟收起。
                     .onHover { inside in
                         if inside {
