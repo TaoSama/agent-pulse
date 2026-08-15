@@ -244,13 +244,12 @@ struct AgentPulseCoreVerification {
         {"type":"assistant","timestamp":"\(timestamp)","cwd":"/workspace/demo","uuid":"row-2","message":{"id":"message-1","model":"model-b","usage":{"input_tokens":10,"output_tokens":25,"cache_read_input_tokens":30,"cache_creation_input_tokens":40}}}
         """
         let parsedClaude = UsageJSONLParser.parse(data: Data(claude.utf8), source: "claude-code", fileIdentity: "claude-fixture")
-        // 参照口径（上游）：同 message.id 但 uuid 不同的两行是两次独立用量，各自成事件、bucket 层求和，
-        // 而非取最大去重。两行 → 两个 token 事件。
-        try require(parsedClaude.events.count == 2, "claude distinct-uuid rows must each become an event")
-        let claudeInputSum = parsedClaude.events.reduce(Int64(0)) { $0 + $1.counts.input }
-        let claudeOutputSum = parsedClaude.events.reduce(Int64(0)) { $0 + $1.counts.output }
-        let claudeCacheCreationSum = parsedClaude.events.reduce(Int64(0)) { $0 + $1.counts.cacheCreationInput }
-        try require(claudeInputSum == 20 && claudeOutputSum == 45 && claudeCacheCreationSum == 80, "claude distinct-uuid usage must sum per row")
+        // 参照口径：同一 message.id 的多条转录行（uuid 各异、usage 相同或流式渐增）是同一次响应，
+        // 折叠为一条事件、逐分量取最大，而非按转录行数重复累加。两行同 message.id → 一个事件。
+        try require(parsedClaude.events.count == 1, "claude same-message.id rows fold to one event")
+        let claudeEvent = parsedClaude.events[0].counts
+        try require(claudeEvent.input == 10 && claudeEvent.cachedInput == 30 && claudeEvent.cacheCreationInput == 40, "claude folded input/cache take max")
+        try require(claudeEvent.output == 25, "claude folded output takes max across streamed lines")
 
         let database = FileManager.default.temporaryDirectory.appending(path: "usage-ledger-\(UUID().uuidString).sqlite")
         defer { for suffix in ["", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: database.path + suffix) } }
@@ -265,7 +264,7 @@ struct AgentPulseCoreVerification {
         let eventCount = try ledger.eventCount()
         let buckets = try ledger.buckets(hostname: "test-host")
         let summary = try ledger.summary()
-        try require(eventCount == 3, "ledger idempotent event insert (codex 1 + claude 2 distinct-uuid)")
+        try require(eventCount == 2, "ledger idempotent event insert (codex 1 + claude 1 folded)")
         try require(buckets.count == 2, "half-hour bucket dimensions")
         let claudeTotal = parsedClaude.events.reduce(Int64(0)) { $0 + $1.counts.total }
         try require(summary?.counts.total == codexCounts.total + claudeTotal, "ledger summary total")
@@ -2144,7 +2143,7 @@ struct AgentPulseCoreVerification {
         }
 
         // 解析器版本已提升到 6（稳定 count-only 身份、MCP output gate 与边界修复）。
-        try require(UsageJSONLParser.parserVersion == 8, "parserVersion must advance to 8 for Claude per-uuid summing (reference parity)")
+        try require(UsageJSONLParser.parserVersion == 9, "parserVersion must advance to 9 for Claude message.id dedup + codex last-only content key")
 
         // 1) 技能计数：同名累加，键并入排序去重列表。
         let skill = try parse("claude_skill_tool_use.jsonl", source: "claude-code")
