@@ -2,11 +2,11 @@ import Foundation
 import AgentPulseReporting
 import AgentPulseUsage
 
-/// 拉取 上游 reconcile 的错误分类（脱敏，不含 URL / token / 正文）。
+/// 拉取上游 reconcile 的错误分类（脱敏，不含 URL / token / 正文）。
 public enum ReconcileFetchError: Error, Equatable, Sendable {
     case invalidBaseURL
     case invalidPath
-    /// reporting.json 的 authToken header 名必须是 上游 认可的 JWT header，否则打不通。
+    /// reporting.json 的 authToken header 名必须是上游认可的 JWT header，否则打不通。
     case authHeaderNotJWT
     case tokenUnavailable
     case httpFailure(statusCode: Int)
@@ -20,7 +20,7 @@ public enum ReconcileFetchError: Error, Equatable, Sendable {
 /// 复用现有 token provider 取 token、复用 reporting.json 的 header 名与静态 header，
 /// 保证与真实上报同一鉴权身份。base URL 由调用方从环境变量提供（不落盘）。
 public struct ReconcileClient: Sendable {
-    /// 上游 组内 combinedAuth 仅当此 header 存在才触发 JWT 校验。
+    /// 上游组内 combinedAuth 仅当此 header 存在才触发 JWT 校验。
     public static let requiredJWTHeaderName = "X-Jwt-Token"
 
     private let sender: HTTPRequestSending
@@ -54,7 +54,7 @@ public struct ReconcileClient: Sendable {
     }
 
     /// 构造 GET 请求：路径拼接与 header 装配对齐既有上报请求，但只用 GET、无 body、无
-    /// content-type / content-encoding。auth header 名必须是 上游 认可的 JWT header。
+    /// content-type / content-encoding。auth header 名必须是上游认可的 JWT header。
     /// public 以便离线验证直接校验 auth-header 门禁与 URL 拼接。
     public static func makeRequest(
         configuration: TokenReportingConfiguration,
@@ -71,7 +71,7 @@ public struct ReconcileClient: Sendable {
 
         var request = URLRequest(url: try endpointURL(baseURL: baseURL, path: configuration.path))
         request.httpMethod = "GET"
-        // 只读 GET 到 上游 reconcile 只依赖 JWT auth header 打通 combinedAuth；
+        // 只读 GET 到上游 reconcile 只依赖 JWT auth header 打通 combinedAuth；
         // 上报专用的静态 / runtime header 与 content-type / encoding 对 GET 无意义，
         // 故此处只装 auth header，保持与真实上报同一鉴权身份即可。
         request.setValue(token.reveal(), forHTTPHeaderField: authHeaderName)

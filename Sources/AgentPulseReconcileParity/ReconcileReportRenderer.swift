@@ -7,7 +7,7 @@ public enum ReconcileReportRenderer {
     /// 渲染单个 hostname 的对齐报告。
     public static func render(_ comparison: HostnameComparison) -> String {
         var lines: [String] = []
-        let header = "hostname=\(comparison.hostname) · 上游=\(comparison.上游Present ? "有数据" : "无此设备数据")"
+        let header = "hostname=\(comparison.hostname) · 上游=\(comparison.upstreamPresent ? "有数据" : "无此设备数据")"
         lines.append(header)
         lines.append(String(repeating: "-", count: max(header.count, 40)))
 
@@ -45,6 +45,6 @@ public enum ReconcileReportRenderer {
             marker = "~"
         }
         let name = field.field.padding(toLength: 30, withPad: " ", startingAt: 0)
-        return "\(marker) \(name) AP=\(field.localValue) | 上游=\(field.上游Value)"
+        return "\(marker) \(name) AP=\(field.localValue) | 上游=\(field.upstreamValue)"
     }
 }
