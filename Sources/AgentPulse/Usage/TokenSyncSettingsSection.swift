@@ -20,25 +20,30 @@ struct TokenSyncSettingsSection: View {
     // MARK: 扫描和上报间隔（独立一趴，夹在 Token 统计与用量上报之间）
 
     private var intervalCard: some View {
-        SettingsCard(title: "扫描和上报间隔", systemImage: "timer") {
-            HStack(alignment: .center, spacing: 8) {
-                Text("每隔")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Color.white)
-                Picker("扫描和上报间隔", selection: reportIntervalBinding) {
-                    ForEach(TokenReportInterval.allCases) { interval in
-                        Text(interval.title).tag(interval)
-                    }
+        HStack(alignment: .center, spacing: 8) {
+            Label("扫描和上报间隔", systemImage: "timer")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.white)
+                .fixedSize(horizontal: true, vertical: false)
+            Spacer(minLength: 8)
+            Picker("扫描和上报间隔", selection: reportIntervalBinding) {
+                ForEach(TokenReportInterval.allCases) { interval in
+                    Text(interval.title).tag(interval)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .tint(.white)
-                .colorScheme(.dark)
-                .frame(maxWidth: 300)
-                .accessibilityLabel("扫描和上报间隔")
-                .accessibilityValue(model.tokenSyncStatus.autoReportInterval.title)
             }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .tint(.white)
+            .colorScheme(.dark)
+            .frame(maxWidth: 300)
+            .accessibilityLabel("扫描和上报间隔")
+            .accessibilityValue(model.tokenSyncStatus.autoReportInterval.title)
         }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .foregroundStyle(Color.white)
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .environment(\.colorScheme, .dark)
     }
 
     // MARK: Token 统计
