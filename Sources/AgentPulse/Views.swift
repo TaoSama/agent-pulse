@@ -215,15 +215,35 @@ struct MenuBarSummaryView: View {
 
     private var overviewScreen: some View {
         VStack(alignment: .leading, spacing: Self.sectionSpacing) {
-            HStack(alignment: .center, spacing: 8) {
+            // 顶栏右侧一组图标：刷新 / 齿轮 / 状态点。两个按钮各自带热区 padding，
+            // 故 HStack 用 0 spacing，靠按钮内边距形成等距；状态点左侧补等量间距对齐节奏。
+            HStack(alignment: .center, spacing: 0) {
                 Text("Agent Pulse").font(.subheadline.weight(.semibold))
                 Spacer()
+                // 刷新（扫描数据）快捷入口：等价设置页「立即扫描」；扫描中转圈并禁用。
+                Button {
+                    model.scanTokenUsageNow()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 14, weight: .regular))
+                        .rotationEffect(.degrees(model.tokenSyncStatus.scanningInProgress ? 360 : 0))
+                        .animation(
+                            model.tokenSyncStatus.scanningInProgress
+                                ? .linear(duration: 1).repeatForever(autoreverses: false)
+                                : .default,
+                            value: model.tokenSyncStatus.scanningInProgress
+                        )
+                }
+                .buttonStyle(BackHotZoneButtonStyle())
+                .focusable(false)
+                .disabled(model.tokenSyncStatus.scanningInProgress)
+                .accessibilityLabel(model.tokenSyncStatus.scanningInProgress ? "正在扫描" : "刷新数据")
                 // 设置齿轮快捷入口：面板内切到设置页（与底部「设置」同一动作）。
                 Button {
                     showingSettings = true
                 } label: {
                     Image(systemName: "gearshape")
-                        .font(.system(size: 13))
+                        .font(.system(size: 14, weight: .regular))
                 }
                 .buttonStyle(BackHotZoneButtonStyle())
                 .focusable(false)
@@ -231,6 +251,8 @@ struct MenuBarSummaryView: View {
                 Circle()
                     .fill(model.tps == nil ? Color.primary : trendColor)
                     .frame(width: 7, height: 7)
+                    .padding(.leading, 8)
+                    .padding(.trailing, 2)
             }
 
             VStack(alignment: .leading, spacing: 10) {
@@ -559,7 +581,8 @@ private struct OrbTaskListRow: View {
 
 struct TPSDashboardView: View {
     @ObservedObject var model: ApplicationModel
-    @AppStorage("dashboard.tpsSpan") private var span: DashboardTPSSpan = .fifteenMinutes
+    // 时间跨度不记忆：每次打开看板默认「15 分钟」，不持久化上次选择。
+    @State private var span: DashboardTPSSpan = .fifteenMinutes
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {

@@ -13,7 +13,37 @@ struct TokenSyncSettingsSection: View {
 
     var body: some View {
         tokenStatsCard
+        intervalCard
         reportingCard
+    }
+
+    // MARK: 扫描和上报间隔（独立一趴，夹在 Token 统计与用量上报之间）
+
+    private var intervalCard: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Label("扫描和上报间隔", systemImage: "timer")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.white)
+                .fixedSize(horizontal: true, vertical: false)
+            Spacer(minLength: 12)
+            Picker("扫描和上报间隔", selection: reportIntervalBinding) {
+                ForEach(TokenReportInterval.allCases) { interval in
+                    Text(interval.title).tag(interval)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .tint(.white)
+            .colorScheme(.dark)
+            .frame(maxWidth: 300, alignment: .trailing)
+            .accessibilityLabel("扫描和上报间隔")
+            .accessibilityValue(model.tokenSyncStatus.autoReportInterval.title)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .foregroundStyle(Color.white)
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .environment(\.colorScheme, .dark)
     }
 
     // MARK: Token 统计
@@ -87,21 +117,6 @@ struct TokenSyncSettingsSection: View {
                 // API 地址权威来自合并 env 的 REPORT_BASE_URL：双源可读可填（非密钥明文），
                 // 手填经 coordinator 写回 env；填好但不自动开启上报。单行显示不折行，与其它输入框一致。
                 dualSourceField("API 地址（留空则仅本地）", key: MergedEnvKeys.reportBaseURL, singleLine: true)
-
-                SettingsRow(title: "上报间隔") {
-                    Picker("上报间隔", selection: reportIntervalBinding) {
-                        ForEach(TokenReportInterval.allCases) { interval in
-                            Text(interval.title).tag(interval)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .tint(.white)
-                    .colorScheme(.dark)
-                    .frame(maxWidth: 300)
-                    .accessibilityLabel("自动上报间隔")
-                    .accessibilityValue(model.tokenSyncStatus.autoReportInterval.title)
-                }
 
                 HStack(spacing: 6) {
                     Image(systemName: "point.3.connected.trianglepath.dotted")

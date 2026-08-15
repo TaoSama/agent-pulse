@@ -1339,7 +1339,10 @@ struct AgentPulseCoreVerification {
                         "edit history retained after file marked missing")
         }
 
-        // 7) overwrite 同 tier 计数冲突 fail-closed：两个 active 文件对同一 event 观测到不同计数。
+        // 7) overwrite 同 tier 计数冲突取 max、不阻断：两个 active 文件对同一 event 观测到不同计数
+        //    （同一次生成的截断中途快照 vs 完成态）。与服务端 incremental GREATEST upsert 一致地
+        //    逐列取 max（完成态 250 胜出），不再 fail-closed。身份维度（session/model/project）
+        //    不一致才 fail-closed，见块 7b。
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             _ = try UsageLedgerStore(path: db.path)
@@ -1351,11 +1354,28 @@ struct AgentPulseCoreVerification {
             sqlite3_close(handle)
             let ledger = try UsageLedgerStore(path: db.path)
             let result = try ledger.finalizeDerived(hostname: "h")
+            try require(result.reportingEligible && result.blockedReasons.isEmpty,
+                        "counts-only overwrite conflict must NOT block reporting (take max, match server GREATEST)")
+            // 逐列取 max：完成态 output=250 胜出，绝不保留截断态 100，也绝不相加成 350。
+            let outputSum = try outputTotal(ledger, hostname: "h"); try require(outputSum == 250,
+                        "counts-only overwrite conflict must converge to the max (completed) count, not first row or sum")
+        }
+
+        // 7b) overwrite 同 tier 身份冲突仍 fail-closed：同一 event 在两文件观测到不同 session，
+        //     属真正的身份矛盾（非截断态差异），必须阻断上报，绝不静默取一。
+        do {
+            let db = tempUsageDB(); defer { cleanupDB(db) }
+            _ = try UsageLedgerStore(path: db.path)
+            let handle = try open(db.path); defer { sqlite3_close(handle) }
+            try insertFile(handle, fileID: "fileA", status: "complete")
+            try insertFile(handle, fileID: "fileB", status: "complete")
+            try insertEvent(handle, eventID: "e2", output: 100, session: "sessA", fileHash: "fileA")
+            try insertEvent(handle, eventID: "e2", output: 100, session: "sessB", fileHash: "fileB")
+            sqlite3_close(handle)
+            let ledger = try UsageLedgerStore(path: db.path)
+            let result = try ledger.finalizeDerived(hostname: "h")
             try require(!result.reportingEligible && !result.blockedReasons.isEmpty,
-                        "conflicting overwrite counts across same-tier files must fail-closed")
-            // 确定性不制造混合事件：保留稳定排序首行计数（source_file_hash 'fileA' < 'fileB'）。
-            let outputSum = try outputTotal(ledger, hostname: "h"); try require(outputSum == 100,
-                        "conflicting overwrite must keep deterministic first row, never a blended count")
+                        "identity (session) conflict across same-tier files must still fail-closed")
         }
 
         // 8) overwrite 同 tier 仅 timestamp 不同不阻断：claude-code 同一 message.id 跨文件
