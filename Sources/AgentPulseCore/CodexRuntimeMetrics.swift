@@ -1081,9 +1081,7 @@ public actor CodexRuntimeMetricsCollector {
         var messageUsage: [String: MessageUsage] = [:]
         var messageSequence: UInt64 = 0
         var tokenDiagnostics = TokenDiagnostics()
-        let tracksLive = liveTrackedPaths.contains(file.path)
-            && tracksLiveTokens(codexMeta: meta, isCodexFile: isCodexFile)
-        if tracksLive {
+        if liveTrackedPaths.contains(file.path) {
             // 优先用最近一次 turn_context 的权威模型做种子；找不到才回退宽松匹配。
             if let contextModel = latestTurnContextModel(in: fileData) {
                 currentModel = contextModel
@@ -1265,14 +1263,6 @@ public actor CodexRuntimeMetricsCollector {
                 !CodexSessionParser.isUnderAutomation(cwd: $0, automationRoots: configuration.automationRoots)
             } == true
         } ?? false
-        // 派生子 agent / fork 线程不贡献实时 token（同一 session_id 跨文件重放，逐文件建 baseline
-        // 会把同一次真实 output 重复计入）；Claude 文件无 Codex meta，走顶层路径过滤已排除 subagents/。
-        let isCodexFile: Bool = switch tokenFileProviders[file.path] {
-        case .claude: false
-        case .codex, nil: true
-        }
-        let tracksLive = liveTrackedPaths.contains(file.path)
-            && tracksLiveTokens(codexMeta: cached.meta, isCodexFile: isCodexFile)
 
         for (lineIndex, rawLine) in text.split(whereSeparator: { $0.isNewline }).enumerated() {
             let line = String(rawLine)
@@ -1315,7 +1305,7 @@ public actor CodexRuntimeMetricsCollector {
                 }
             }
 
-            guard tracksLive,
+            guard liveTrackedPaths.contains(file.path),
                   let parsed = parseTokenLine(Data(line.utf8), now: now) else { continue }
             tokenDiagnostics.parsedOutputObservations += 1
             var emittedTokens = 0
@@ -1729,15 +1719,6 @@ public actor CodexRuntimeMetricsCollector {
         for entry in sorted.prefix(usage.count - Self.maximumMessageIdentities) {
             usage[entry.key] = nil
         }
-    }
-
-    /// 仅顶层会话文件贡献实时 token：Codex 的派生子 agent / fork 线程会把父线程的
-    /// 累计 output 以各自文件重新落盘（同一 session_id 出现在多个文件、cumulative total 从头重放），
-    /// 若逐文件各自建 baseline 会把同一次真实 output 跨文件重复计入实时 TPS。
-    /// Claude 文件无 Codex meta（meta==nil），其顶层过滤已在路径层排除 subagents/，此处放行。
-    private func tracksLiveTokens(codexMeta meta: CodexSessionMeta?, isCodexFile: Bool) -> Bool {
-        guard isCodexFile, let meta else { return true }
-        return meta.isTopLevel
     }
 
     private func shouldTrackLiveJSONL(_ url: URL) -> Bool {
