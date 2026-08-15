@@ -144,11 +144,13 @@ public enum DashboardTPSSpan: String, Sendable, Equatable, CaseIterable, Identif
         }
     }
 
-    /// 1 小时 720 点偏密，叠更宽高斯平滑压毛刺；点数少的跨度用小半径；1 天 48 点不平滑。
+    /// 数据层不做削峰高斯：桶均值即真实峰，平滑交给渲染层 Catmull-Rom 连线（对齐 上游：
+    /// 数据保峰、仅连线平滑）。15 分档桶少，完全不平滑靠曲线连线即可平滑且保峰；
+    /// 1 小时 720 点偏密，仅用最轻 3 点窗（radius=1）压高频毛刺、基本不削峰；1 天 48 点不平滑。
     public var smoothingRadius: Int {
         switch self {
-        case .fifteenMinutes: 2
-        case .oneHour: 4
+        case .fifteenMinutes: 0
+        case .oneHour: 1
         case .oneDay: 0
         }
     }
