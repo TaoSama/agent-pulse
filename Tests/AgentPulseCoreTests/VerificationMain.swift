@@ -2045,6 +2045,96 @@ struct AgentPulseCoreVerification {
         let smoothedMean = smoothedSpike.compactMap(\.value).reduce(0, +) / Double(max(1, smoothedSpike.compactMap(\.value).count))
         try requireApproximatelyEqual(smoothedMean, rawMean, accuracy: rawMean * 0.15, "smoothing must roughly conserve overall level")
 
+        // ── 不重叠桶曲线（看板可选跨度）──────────────────────────────
+
+        // 逐秒净增量字段 round-trip：live 样本带 tokensInLastSecond + 分模型，JSON 往返保留。
+        let lastSecondSample = LiveRateSample(
+            timestamp: base,
+            state: .live,
+            tokensInWindow: 540,
+            latestSignalAt: base,
+            modelTokensInWindow: ["m": 540],
+            tokensInShortWindow: 50,
+            modelTokensInShortWindow: ["m": 50],
+            tokensInLastSecond: 12,
+            modelTokensInLastSecond: ["m": 12]
+        )
+        let lastSecondRoundTrip = try JSONDecoder().decode(
+            LiveRateSample.self, from: JSONEncoder().encode(lastSecondSample)
+        )
+        try requireApproximatelyEqual(lastSecondRoundTrip.tokensInLastSecond, 12, "tokensInLastSecond must survive JSON round-trip")
+        try requireApproximatelyEqual(lastSecondRoundTrip.modelTokensInLastSecond["m"], 12, "modelTokensInLastSecond must survive round-trip")
+
+        // legacy 无逐秒净增量字段：decode → nil；perSecondIncrementSeries 对该样本 → 缺口（不回退）。
+        let legacyNoLast = liveSample(minute: 0, tps: 4)
+        try require(legacyNoLast.tokensInLastSecond == nil, "legacy sample must have no per-second increment")
+        try require(
+            SparklineAnalysis.perSecondIncrementSeries(from: [legacyNoLast]).first?.value == nil,
+            "per-second increment must be a gap for legacy samples (no fallback)"
+        )
+
+        // 桶聚合正确性：5s 桶内逐秒净增量 [10,20,30,0,40]=100 → 桶值 100/5 = 20；空桶 → nil；桶中点。
+        let bucketBase = base
+        let incrementSeries: [(time: Date, value: Double?)] = [10.0, 20, 30, 0, 40].enumerated().map {
+            (bucketBase.addingTimeInterval(Double($0.offset)), $0.element)
+        }
+        let oneBucket = SparklineAnalysis.bucketedSeries(
+            incrementSeries, end: bucketBase.addingTimeInterval(5), totalSeconds: 5, bucketSeconds: 5
+        )
+        try require(oneBucket.count == 1, "one 5s bucket over 5s window")
+        try requireApproximatelyEqual(oneBucket.first?.value, 20, "bucket value = sum(increments)/bucketSeconds")
+        try requireApproximatelyEqual(
+            oneBucket.first?.time.timeIntervalSince(bucketBase), 2.5, "bucket point at bucket midpoint"
+        )
+        // 空桶 → nil：把窗口拉到 10s（2 桶），第二桶无数据。
+        let twoBuckets = SparklineAnalysis.bucketedSeries(
+            incrementSeries, end: bucketBase.addingTimeInterval(10), totalSeconds: 10, bucketSeconds: 5
+        )
+        try require(twoBuckets.count == 2, "two 5s buckets over 10s window")
+
+        // durationSeconds=5 的持续事件：严格逐秒净增量分摊后，5 个桶秒之和 = 事件总 token（不重复计）。
+        let contWindow = TPSWindow(now: { bucketBase.addingTimeInterval(5) })
+        _ = contWindow.record(TPSSample(
+            timestamp: bucketBase.addingTimeInterval(5), tokenCount: 100, durationSeconds: 5, source: .cli, model: "m"
+        ))
+        let perSecondSum = (0..<5).reduce(0.0) { acc, sec in
+            acc + contWindow.tokensInLastSecond(referenceDate: bucketBase.addingTimeInterval(Double(sec) + 1))
+        }
+        try requireApproximatelyEqual(perSecondSum, 100, accuracy: 0.001, "5 non-overlapping 1s windows must sum to the 5s event's tokens")
+
+        // 各跨度桶数 == span.bucketCount（180/720/48，定长）。
+        for span in DashboardTPSSpan.allCases where span.source == .perSecondSamples {
+            let dense: [LiveRateSample] = stride(from: 0, to: Int(span.totalSeconds), by: 1).map { sec in
+                let ts = bucketBase.addingTimeInterval(Double(sec))
+                return LiveRateSample(
+                    timestamp: ts, state: .live, tokensInWindow: 10, latestSignalAt: ts,
+                    modelTokensInWindow: ["m": 10], tokensInLastSecond: 10, modelTokensInLastSecond: ["m": 10]
+                )
+            }
+            let end = bucketBase.addingTimeInterval(span.totalSeconds)
+            let totalPts = SparklineAnalysis.makeBucketedDashboardSparkline(from: dense, end: end, span: span)
+            let modelPts = SparklineAnalysis.makeBucketedDashboardModelSparkline(from: dense, model: "m", end: end, span: span)
+            try require(totalPts.count == span.bucketCount, "\(span.rawValue): total bucket count must equal span.bucketCount")
+            try require(modelPts.count == span.bucketCount, "\(span.rawValue): model series must match total count (no misalignment)")
+        }
+
+        // makeSparkline（菜单/悬浮球）仍 15min/1s，未被不重叠桶污染。
+        let menuSpark = SparklineAnalysis.makeSparkline(from: spikeSamples, end: spikeEnd, stepSeconds: 1)
+        try require(menuSpark.points.count == Int(SparklineAnalysis.defaultWindowSeconds) + 1, "makeSparkline must stay 15min/1s grid")
+
+        // 1 天账本转换：30min bucket → output/1800；48 桶；空桶缺口。
+        let dayEnd = Date(timeIntervalSince1970: 1_700_000_000)
+        let ledgerBuckets: [(bucketStart: Date, outputTokens: Int64)] = [
+            (dayEnd.addingTimeInterval(-1800), 1800),   // 最近一个 30min 桶：1800 output → 1.0 TPS
+            (dayEnd.addingTimeInterval(-3600), 900),    // 前一个：0.5 TPS
+        ]
+        let dayPoints = SparklineAnalysis.makeUsageLedgerTPSPoints(buckets: ledgerBuckets, end: dayEnd)
+        try require(dayPoints.count == DashboardTPSSpan.oneDay.bucketCount, "1-day curve must be 48 buckets")
+        let dayValues = dayPoints.compactMap(\.value)
+        try require(dayValues.contains { abs($0 - 1.0) < 0.001 }, "30min bucket 1800 output → 1.0 TPS (÷1800)")
+        try require(dayValues.contains { abs($0 - 0.5) < 0.001 }, "30min bucket 900 output → 0.5 TPS")
+        try require(dayPoints.contains { $0.value == nil }, "empty 30min buckets must be gaps")
+
         gapSamples.removeAll()
     }
 

@@ -83,6 +83,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     private let summarySubject: CurrentValueSubject<TokenUsageSummary, Never>
     private let statusSubject: CurrentValueSubject<TokenSyncStatus, Never>
+    /// 看板 1 天曲线（账本 30min bucket → 平均 TPS）；仅看板选中 1 天时刷新。
+    private let daySeriesSubject = CurrentValueSubject<DashboardDaySeries, Never>(.empty)
+    /// 看板当前是否停在 1 天视图：为 true 时每轮 scan 完成顺带刷新 day series，否则不做无谓账本查询。
+    private var dashboardDayActive = false
 
     var summary: TokenUsageSummary { summarySubject.value }
     var status: TokenSyncStatus { statusSubject.value }
@@ -93,6 +97,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     var statusPublisher: AnyPublisher<TokenSyncStatus, Never> {
         statusSubject.eraseToAnyPublisher()
+    }
+
+    var dashboardDaySeriesPublisher: AnyPublisher<DashboardDaySeries, Never> {
+        daySeriesSubject.eraseToAnyPublisher()
     }
 
     /// 自动上报循环周期：启动时执行首轮，之后每隔本间隔触发一次（本机行为，可在设置调整）。
@@ -546,6 +554,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         switch result {
         case let .success(outcome):
             publish(outcome.summary)
+            // 看板停在 1 天视图时，随本轮扫描顺带刷新账本曲线（30min 粒度，实时性要求低）。
+            if dashboardDayActive { refreshDashboardDaySeries(active: true) }
             updateStatus { status in
                 status.lastScanAt = Date()
                 Self.clearScanProgress(&status)
@@ -1092,6 +1102,73 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     private func publish(_ summary: TokenUsageSummary) {
         summarySubject.send(summary)
+    }
+
+    /// 刷新看板 1 天曲线：解析有效 hostname → off-main 读账本 30min bucket → 换算平均 TPS →
+    /// 回主线程 send。仅在看板选中 1 天时由 App 触发（span 切换 + 每轮 scan 完成）。
+    /// hostname 缺失或账本不可用时发空序列（视图显示无数据），绝不阻塞主线程。
+    /// `active` 标记看板是否停在 1 天视图：true 时后续每轮 scan 完成会自动刷新。
+    func refreshDashboardDaySeries(active: Bool = true, now: Date = Date()) {
+        dashboardDayActive = active
+        guard active else { return }
+        guard let ledger else {
+            daySeriesSubject.send(.empty)
+            return
+        }
+        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL, envURL: mergedEnvURL)
+        let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
+        let hostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
+        guard !hostname.isEmpty else {
+            daySeriesSubject.send(.empty)
+            return
+        }
+        Task { [weak self] in
+            let result = await Self.runOffMain { _ in
+                try Self.buildDaySeries(from: ledger, hostname: hostname, now: now)
+            }
+            await MainActor.run {
+                guard let self else { return }
+                if case let .success(series) = result {
+                    self.daySeriesSubject.send(series)
+                }
+                // 失败保持上次值（不覆盖为空，避免闪烁）。
+            }
+        }
+    }
+
+    /// off-main：从账本读 [now-24h, now) 的 30min output bucket，换算成 48 桶平均 TPS 曲线（总 + 分模型）。
+    nonisolated private static func buildDaySeries(
+        from ledger: UsageLedgerStore,
+        hostname: String,
+        now: Date
+    ) throws -> DashboardDaySeries {
+        let span = DashboardTPSSpan.oneDay
+        let start = now.addingTimeInterval(-span.totalSeconds)
+        let totalBuckets = try ledger.outputTokenBuckets(hostname: hostname, start: start, end: now)
+        let modelBuckets = try ledger.outputTokenBucketsByModel(hostname: hostname, start: start, end: now)
+        let total = SparklineAnalysis.makeUsageLedgerTPSPoints(buckets: totalBuckets, end: now)
+
+        var byModel: [String: [(bucketStart: Date, outputTokens: Int64)]] = [:]
+        var modelOutputSum: [String: Int64] = [:]
+        for row in modelBuckets {
+            byModel[row.model, default: []].append((row.bucketStart, row.outputTokens))
+            modelOutputSum[row.model, default: 0] += row.outputTokens
+        }
+        var perModel: [String: [SparklinePoint]] = [:]
+        for (model, buckets) in byModel {
+            perModel[model] = SparklineAnalysis.makeUsageLedgerTPSPoints(buckets: buckets, end: now)
+        }
+        // 图例 latestTPS（1天口径）：窗口内该模型 output 之和 ÷ 窗口秒数。
+        var modelLatestTPS: [String: Double] = [:]
+        for (model, sum) in modelOutputSum where sum > 0 {
+            modelLatestTPS[model] = Double(sum) / span.totalSeconds
+        }
+        return DashboardDaySeries(
+            total: total,
+            perModel: perModel,
+            modelLatestTPS: modelLatestTPS,
+            computedAt: now
+        )
     }
 
     /// 四个窗口共享同一参考时刻、时区与 hostname，并且全部从 derived bucket 查询。

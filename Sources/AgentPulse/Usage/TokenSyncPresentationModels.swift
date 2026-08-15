@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import AgentPulseCore
 
 /// Token 汇总卡可选择的时间窗口。
 enum TokenUsageWindow: String, CaseIterable, Identifiable, Sendable {
@@ -373,6 +374,8 @@ protocol TokenSyncCoordinating: AnyObject {
     var status: TokenSyncStatus { get }
     var summaryPublisher: AnyPublisher<TokenUsageSummary, Never> { get }
     var statusPublisher: AnyPublisher<TokenSyncStatus, Never> { get }
+    /// 看板 1 天曲线（账本 30min bucket → 平均 TPS）发布流。
+    var dashboardDaySeriesPublisher: AnyPublisher<DashboardDaySeries, Never> { get }
 
     func setLocalCollectionEnabled(_ enabled: Bool)
     func setReportingEnabled(_ enabled: Bool)
@@ -386,6 +389,9 @@ protocol TokenSyncCoordinating: AnyObject {
     func scanNow()
     func reportNow()
     func stop()
+    /// 看板 1 天曲线刷新。active=true 表示看板停在 1 天视图（后续每轮 scan 自动刷新）；
+    /// active=false 表示离开 1 天视图（停止自动刷新）。
+    func refreshDashboardDaySeries(active: Bool, now: Date)
 }
 
 /// Token 数字的统一格式化：紧凑计数、货币、百分比。

@@ -33,6 +33,32 @@ public struct SparklinePoint: Sendable, Equatable {
     public var isGap: Bool { value == nil }
 }
 
+/// 看板 1 天曲线数据（来自长期账本 30min bucket，换算成平均 TPS）。
+/// total 为总曲线点集，perModel 为分模型曲线（model → 点集，与 total 同栅格同长度）。
+public struct DashboardDaySeries: Sendable, Equatable {
+    public let total: [SparklinePoint]
+    public let perModel: [String: [SparklinePoint]]
+    /// 各模型在窗口内的合计 output TPS（图例数字用，1天口径 = 窗口内 output 之和 ÷ 窗口秒）。
+    public let modelLatestTPS: [String: Double]
+    public let computedAt: Date
+
+    public init(
+        total: [SparklinePoint],
+        perModel: [String: [SparklinePoint]],
+        modelLatestTPS: [String: Double],
+        computedAt: Date
+    ) {
+        self.total = total
+        self.perModel = perModel
+        self.modelLatestTPS = modelLatestTPS
+        self.computedAt = computedAt
+    }
+
+    public static let empty = DashboardDaySeries(
+        total: [], perModel: [:], modelLatestTPS: [:], computedAt: Date(timeIntervalSince1970: 0)
+    )
+}
+
 /// 趋势方向分类。
 public enum SparklineTrend: String, Sendable, Equatable, CaseIterable {
     /// 显著上升（绿色）。
@@ -51,6 +77,106 @@ public enum SparklineSmoothingKernel: Sendable, Equatable {
     case gaussian(radius: Int)
     /// 指数移动平均，`alpha` 为 0<alpha<=1 的平滑系数。
     case exponentialMovingAverage(alpha: Double)
+}
+
+/// 看板大图可选的时间跨度。曲线用不重叠桶：前三档桶宽 5s（从每秒逐秒净增量聚合），
+/// 1 天用长期账本 30min bucket（output ÷ 1800 = 平均 TPS）。四档 y 轴统一为 TPS。
+public enum DashboardTPSSpan: String, Sendable, Equatable, CaseIterable, Identifiable {
+    case fifteenMinutes
+    case oneHour
+    case oneDay
+
+    public var id: String { rawValue }
+
+    /// 曲线数据来源：前两档来自每秒样本，1 天来自长期 usage 账本。
+    public enum Source: Sendable, Equatable {
+        case perSecondSamples
+        case usageLedger
+    }
+
+    /// 该跨度覆盖的总秒数。
+    public var totalSeconds: TimeInterval {
+        switch self {
+        case .fifteenMinutes: 15 * 60
+        case .oneHour: 60 * 60
+        case .oneDay: 24 * 60 * 60
+        }
+    }
+
+    /// 不重叠桶的桶宽（秒）。前两档 5s；1 天 30min（与账本 bucket 对齐）。
+    public var bucketSeconds: TimeInterval {
+        switch self {
+        case .fifteenMinutes, .oneHour: 5
+        case .oneDay: 30 * 60
+        }
+    }
+
+    /// 桶数 = totalSeconds / bucketSeconds：180 / 720 / 48。
+    public var bucketCount: Int { Int((totalSeconds / bucketSeconds).rounded()) }
+
+    public var source: Source {
+        self == .oneDay ? .usageLedger : .perSecondSamples
+    }
+
+    /// segmented picker 标签。
+    public var title: String {
+        switch self {
+        case .fifteenMinutes: "15 分钟"
+        case .oneHour: "1 小时"
+        case .oneDay: "1 天"
+        }
+    }
+
+    /// 副标题（含桶宽口径说明）。
+    public var subtitle: String {
+        switch self {
+        case .fifteenMinutes: "最近 15 分钟 · 5 秒桶平均"
+        case .oneHour: "最近 1 小时 · 5 秒桶平均"
+        case .oneDay: "最近 24 小时 · 30 分钟桶平均 · 长期账本"
+        }
+    }
+
+    public func accessibilityText() -> String {
+        switch self {
+        case .fifteenMinutes: "最近十五分钟"
+        case .oneHour: "最近一小时"
+        case .oneDay: "最近二十四小时"
+        }
+    }
+
+    /// 1 小时 720 点偏密，叠更宽高斯平滑压毛刺；点数少的跨度用小半径；1 天 48 点不平滑。
+    public var smoothingRadius: Int {
+        switch self {
+        case .fifteenMinutes: 2
+        case .oneHour: 4
+        case .oneDay: 0
+        }
+    }
+
+    /// x 轴四档等距刻度（fraction 0 / ⅓ / ⅔ / 1，label 按 totalSeconds 换算的"距现在"文案）。
+    public func axisTicks() -> [(fraction: Double, label: String)] {
+        let fractions = [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
+        return fractions.map { fraction in
+            let secondsAgo = totalSeconds * (1 - fraction)
+            return (fraction, Self.agoLabel(secondsAgo: secondsAgo))
+        }
+    }
+
+    private static func agoLabel(secondsAgo: TimeInterval) -> String {
+        if secondsAgo < 1 { return "现在" }
+        if secondsAgo < 60 {
+            return "\(Int(secondsAgo.rounded())) 秒前"
+        }
+        if secondsAgo < 60 * 60 {
+            return "\(Int((secondsAgo / 60).rounded())) 分前"
+        }
+        let hours = secondsAgo / 3600
+        // 整点显示整数小时，否则一位小数。
+        if abs(hours - hours.rounded()) < 0.05 {
+            return "\(Int(hours.rounded())) 时前"
+        }
+        return String(format: "%.1f 时前", hours)
+    }
 }
 
 /// 趋势回归结果。
@@ -543,6 +669,141 @@ public enum SparklineAnalysis {
     ) -> [SparklinePoint] {
         let resampled = resampleSeries(shortWindowSeries(from: samples, model: model), end: end, windowSeconds: windowSeconds, stepSeconds: stepSeconds)
         return smooth(resampled, kernel: .gaussian(radius: dashboardSmoothingRadius))
+    }
+
+    // MARK: - 不重叠桶曲线（看板可选跨度）
+
+    /// 逐秒净增量序列（总）：取 sample.tokensInLastSecond（live/zero）。
+    /// 旧库无该字段 → 该秒缺口（不回退到 5s/180s 口径，避免把重叠量误当净增量算错量级）。
+    public static func perSecondIncrementSeries(from samples: [LiveRateSample]) -> [(time: Date, value: Double?)] {
+        samples
+            .sorted { $0.timestamp < $1.timestamp }
+            .map { sample in
+                switch sample.state {
+                case .live, .zero:
+                    if let last = sample.tokensInLastSecond, last.isFinite, last >= 0 {
+                        return (sample.timestamp, last)
+                    }
+                    return (sample.timestamp, nil)
+                case .stale, .noData, .unavailable:
+                    return (sample.timestamp, nil)
+                }
+            }
+    }
+
+    /// 逐秒净增量序列（单模型）：取 modelTokensInLastSecond[model]；旧库无字段 → 缺口。
+    public static func perSecondIncrementSeries(
+        from samples: [LiveRateSample],
+        model: String
+    ) -> [(time: Date, value: Double?)] {
+        samples
+            .sorted { $0.timestamp < $1.timestamp }
+            .map { sample in
+                switch sample.state {
+                case .live, .zero:
+                    guard sample.tokensInLastSecond != nil else { return (sample.timestamp, nil) }
+                    let tokens = sample.modelTokensInLastSecond[model] ?? 0
+                    return (sample.timestamp, tokens.isFinite && tokens >= 0 ? tokens : nil)
+                case .stale, .noData, .unavailable:
+                    return (sample.timestamp, nil)
+                }
+            }
+    }
+
+    /// 不重叠桶聚合：把逐秒"新增 token"序列按 bucketSeconds 分桶。
+    /// - 桶值 = 桶内各秒新增量之和 ÷ bucketSeconds（= 该桶平均 TPS，分母恒为桶宽）。
+    /// - 空桶（无任何有效秒）→ nil 缺口。
+    /// - 桶时间定位在桶中点。
+    /// - **定长输出**：恒返回 bucketCount 个点（缺口也占位），保证与分模型曲线同栅格、
+    ///   且 TPSAxisChartView 按索引均匀铺 x 时不错位。
+    public static func bucketedSeries(
+        _ series: [(time: Date, value: Double?)],
+        end: Date,
+        totalSeconds: TimeInterval,
+        bucketSeconds: TimeInterval
+    ) -> [SparklinePoint] {
+        guard bucketSeconds > 0, totalSeconds > 0 else { return [] }
+        let bucketCount = Int((totalSeconds / bucketSeconds).rounded())
+        guard bucketCount > 0 else { return [] }
+        let start = end.addingTimeInterval(-totalSeconds)
+        var sums = [Double](repeating: 0, count: bucketCount)
+        var hasData = [Bool](repeating: false, count: bucketCount)
+        for point in series {
+            guard let value = point.value, value.isFinite, value >= 0 else { continue }
+            let offset = point.time.timeIntervalSince(start)
+            guard offset >= 0, offset < totalSeconds else { continue }
+            let index = min(bucketCount - 1, Int(offset / bucketSeconds))
+            sums[index] += value
+            hasData[index] = true
+        }
+        return (0..<bucketCount).map { index in
+            let center = start.addingTimeInterval((Double(index) + 0.5) * bucketSeconds)
+            let value = hasData[index] ? sums[index] / bucketSeconds : nil
+            return SparklinePoint(time: center, value: value, normalized: nil)
+        }
+    }
+
+    /// 看板不重叠桶总曲线：逐秒净增量 → 按 span 分桶 → 按 span.smoothingRadius 分段高斯平滑。
+    public static func makeBucketedDashboardSparkline(
+        from samples: [LiveRateSample],
+        end: Date,
+        span: DashboardTPSSpan
+    ) -> [SparklinePoint] {
+        let bucketed = bucketedSeries(
+            perSecondIncrementSeries(from: samples),
+            end: end,
+            totalSeconds: span.totalSeconds,
+            bucketSeconds: span.bucketSeconds
+        )
+        guard span.smoothingRadius > 0 else { return bucketed }
+        return smooth(bucketed, kernel: .gaussian(radius: span.smoothingRadius))
+    }
+
+    /// 看板不重叠桶分模型曲线：与总曲线同 end/同栅格/同桶数，保证对齐。
+    public static func makeBucketedDashboardModelSparkline(
+        from samples: [LiveRateSample],
+        model: String,
+        end: Date,
+        span: DashboardTPSSpan
+    ) -> [SparklinePoint] {
+        let bucketed = bucketedSeries(
+            perSecondIncrementSeries(from: samples, model: model),
+            end: end,
+            totalSeconds: span.totalSeconds,
+            bucketSeconds: span.bucketSeconds
+        )
+        guard span.smoothingRadius > 0 else { return bucketed }
+        return smooth(bucketed, kernel: .gaussian(radius: span.smoothingRadius))
+    }
+
+    /// 长期账本 30min bucket → 看板 1 天曲线（48 桶）：每桶 output_tokens ÷ 1800s = 平均 TPS。
+    /// 栅格对齐到 30 分钟边界（与账本 bucketStart 同边界），每个账本 bucket 精确落入一个槽；
+    /// 空槽 nil；点定位桶中点。1 天不平滑。
+    public static func makeUsageLedgerTPSPoints(
+        buckets: [(bucketStart: Date, outputTokens: Int64)],
+        end: Date
+    ) -> [SparklinePoint] {
+        let bucketSeconds = DashboardTPSSpan.oneDay.bucketSeconds
+        let bucketCount = DashboardTPSSpan.oneDay.bucketCount
+        // 把栅格终点向上取整到下一个 30min 边界，使每个 30min 账本 bucket 恰好对齐一个槽。
+        let endEpoch = end.timeIntervalSince1970
+        let alignedEndEpoch = (endEpoch / bucketSeconds).rounded(.up) * bucketSeconds
+        let alignedEnd = Date(timeIntervalSince1970: alignedEndEpoch)
+        let start = alignedEnd.addingTimeInterval(-Double(bucketCount) * bucketSeconds)
+        var values = [Int64](repeating: 0, count: bucketCount)
+        var hasData = [Bool](repeating: false, count: bucketCount)
+        for bucket in buckets {
+            let offset = bucket.bucketStart.timeIntervalSince(start)
+            guard offset >= 0, offset < Double(bucketCount) * bucketSeconds else { continue }
+            let index = min(bucketCount - 1, Int(offset / bucketSeconds))
+            values[index] += bucket.outputTokens
+            hasData[index] = true
+        }
+        return (0..<bucketCount).map { index in
+            let center = start.addingTimeInterval((Double(index) + 0.5) * bucketSeconds)
+            let value = hasData[index] ? Double(values[index]) / bucketSeconds : nil
+            return SparklinePoint(time: center, value: value, normalized: nil)
+        }
     }
 
     /// 为单个模型生成与总曲线相同时间栅格、插值和平滑规则的曲线。

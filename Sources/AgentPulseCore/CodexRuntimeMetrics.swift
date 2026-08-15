@@ -94,6 +94,8 @@ public struct CodexRuntimeMetrics: Sendable, Equatable {
     public let completed: CompletedTaskMetric
     public let liveRate: LiveRateSample
     public let history: [LiveRateSample]
+    /// 看板可选跨度用的较长历史（最多 3600s）；菜单/悬浮球仍用 history（900s）。
+    public let dashboardHistory: [LiveRateSample]
     public let filesScanned: Int
     public let unreadableFiles: Int
     public let filesReusedFromCache: Int
@@ -131,6 +133,9 @@ public struct CodexRuntimeMetricsDiagnostics: Sendable, Equatable {
 
 public struct CodexRuntimeMetricsConfiguration: Sendable, Equatable {
     public static let historyPointLimit = 900
+    /// 看板曲线可选跨度最长到 1 小时，需要最近 3600 秒每秒样本（memoryHistory 已留 6h，足够）。
+    /// 与 historyPointLimit（服务菜单/悬浮球 15min 曲线）分开，互不影响语义。
+    public static let dashboardHistoryPointLimit = 3600
     public static let retainedSampleLimit = 21_600
     public static let retentionSeconds: TimeInterval = 6 * 60 * 60
     public static let staleAfterSeconds: TimeInterval = 5 * 60
@@ -586,6 +591,10 @@ public actor CodexRuntimeMetricsCollector {
         let shortWindow = Double(LiveRateSample.shortWindowSeconds)
         let shortTokens = window.tokensInShortWindow(referenceDate: sampledAt, windowSeconds: shortWindow)
         let shortModelTokens = window.tokensInShortWindowByModel(referenceDate: sampledAt, windowSeconds: shortWindow)
+        // 看板不重叠桶曲线：额外取该 1 秒的逐秒净增量（总 + 分模型），严格 (t-1, t] 窗口、
+        // 右边界不含未来容差，相邻秒不重叠，可按桶求和不重复计。与 5s 重叠口径分开存。
+        let lastSecondTokens = window.tokensInLastSecond(referenceDate: sampledAt)
+        let lastSecondModelTokens = window.tokensInLastSecondByModel(referenceDate: sampledAt)
         let liveRate = makeLiveRateSample(
             at: sampledAt,
             sourceAvailable: sourceAvailable,
@@ -593,7 +602,9 @@ public actor CodexRuntimeMetricsCollector {
             tokensInWindow: overlapTokens,
             modelTokensInWindow: modelTokens,
             tokensInShortWindow: shortTokens,
-            modelTokensInShortWindow: shortModelTokens
+            modelTokensInShortWindow: shortModelTokens,
+            tokensInLastSecond: lastSecondTokens,
+            modelTokensInLastSecond: lastSecondModelTokens
         )
         try persistLiveRate(liveRate)
         let metrics = CodexRuntimeMetrics(
@@ -612,6 +623,7 @@ public actor CodexRuntimeMetricsCollector {
             ),
             liveRate: liveRate,
             history: recentHistory(at: sampledAt),
+            dashboardHistory: dashboardHistory(at: sampledAt),
             filesScanned: accumulator.filesScanned,
             unreadableFiles: accumulator.unreadableFiles,
             filesReusedFromCache: accumulator.filesReusedFromCache,
@@ -628,8 +640,14 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     /// 不触发 rollout 扫描，立即返回 SQLite 中上次完整展示快照和 TPS 历史。
-    public func restoredDisplayState() -> (snapshot: CachedRuntimeMetricsSnapshot?, history: [LiveRateSample]) {
-        (restoredDisplaySnapshot, recentHistory(at: restoredDisplaySnapshot?.timestamp ?? Date()))
+    /// history 为菜单/悬浮球用的 900s；dashboardHistory 为看板可选跨度用的 3600s。
+    public func restoredDisplayState() -> (
+        snapshot: CachedRuntimeMetricsSnapshot?,
+        history: [LiveRateSample],
+        dashboardHistory: [LiveRateSample]
+    ) {
+        let end = restoredDisplaySnapshot?.timestamp ?? Date()
+        return (restoredDisplaySnapshot, recentHistory(at: end), dashboardHistory(at: end))
     }
 
     private func sumAvailable(_ values: [Int?]) -> Int? {
@@ -1866,7 +1884,9 @@ public actor CodexRuntimeMetricsCollector {
         tokensInWindow: Double,
         modelTokensInWindow: [String: Double] = [:],
         tokensInShortWindow: Double = 0,
-        modelTokensInShortWindow: [String: Double] = [:]
+        modelTokensInShortWindow: [String: Double] = [:],
+        tokensInLastSecond: Double = 0,
+        modelTokensInLastSecond: [String: Double] = [:]
     ) -> LiveRateSample {
         guard sourceAvailable else {
             return LiveRateSample(
@@ -1900,7 +1920,9 @@ public actor CodexRuntimeMetricsCollector {
             latestSignalAt: latestSignalAt,
             modelTokensInWindow: modelTokensInWindow,
             tokensInShortWindow: tokensInShortWindow,
-            modelTokensInShortWindow: modelTokensInShortWindow
+            modelTokensInShortWindow: modelTokensInShortWindow,
+            tokensInLastSecond: tokensInLastSecond,
+            modelTokensInLastSecond: modelTokensInLastSecond
         )
     }
 
@@ -1926,11 +1948,21 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     private func recentHistory(at now: Date) -> [LiveRateSample] {
-        let cutoff = now.addingTimeInterval(-Double(CodexRuntimeMetricsConfiguration.historyPointLimit - 1))
+        historySlice(at: now, pointLimit: CodexRuntimeMetricsConfiguration.historyPointLimit)
+    }
+
+    /// 看板专用较长历史（最多 3600 秒），供 1 小时及以内跨度的不重叠桶曲线截取。
+    /// 不改 recentHistory（900s，服务菜单/悬浮球 15min 曲线）。
+    private func dashboardHistory(at now: Date) -> [LiveRateSample] {
+        historySlice(at: now, pointLimit: CodexRuntimeMetricsConfiguration.dashboardHistoryPointLimit)
+    }
+
+    private func historySlice(at now: Date, pointLimit: Int) -> [LiveRateSample] {
+        let cutoff = now.addingTimeInterval(-Double(pointLimit - 1))
         return memoryHistory.values
             .filter { $0.timestamp >= cutoff && $0.timestamp <= now }
             .sorted { $0.timestamp < $1.timestamp }
-            .suffix(CodexRuntimeMetricsConfiguration.historyPointLimit)
+            .suffix(pointLimit)
             .map { $0 }
     }
 
