@@ -1,33 +1,29 @@
 import Foundation
 import AgentPulseCore
 
-/// App 层 cliproxyapi 采集服务：从可编辑的 `.env` 配置文件读取 base URL、management key
+/// App 层 cliproxyapi 采集服务：从统一的合并 `.env` 配置文件读取 base URL、management key
 /// 与目标 apikey，主动拉取 `/v0/management/usage`，本地按目标 apikey 的 SHA256 过滤，
 /// 映射为账本可 record 的 `UsageEvent`。
 ///
 /// 安全约定（对齐 `UploadService`）：
 /// - 只在内存中解析配置值，绝不打印、写日志或持久化任何 URL / KEY / VALUE。
 /// - 仅配置文件「路径」可由 UI/UserDefaults 保存；凭证与目标 key 永不落盘。
-/// - 配置文件必须为 0600；否则视为无效并禁用采集（不崩溃）。
+/// - 配置文件必须为 0600 属主专属常规文件（复用 ``EnvFile/load(path:maxBytes:)`` 的 fd 校验）；否则视为无效并禁用采集。
 /// - 缺配置 / 拉取失败时返回空事件并抛出脱敏错误，绝不影响本地文件采集链路。
 public struct CliProxyUsageService: Sendable {
     // MARK: - 常量
 
-    /// 默认配置文件路径：当前用户家目录下的凭证文件（不硬编码用户名）。
-    public static let defaultConfigPath: String = {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/.credentials/env/agent-pulse-cliproxy.env")
-            .path
-    }()
+    /// 默认配置文件路径：合并后的统一凭证文件（R2 / cliproxy / 上报简单值共用）。
+    public static let defaultConfigPath: String = MergedEnvKeys.defaultPath
 
-    /// UserDefaults 中保存「配置路径」的键（仅保存路径字符串，绝不保存凭证）。
-    public static let configPathDefaultsKey = "com.agentpulse.cliproxy.configPath"
+    /// UserDefaults 中保存「合并 env 路径」的键（仅保存路径字符串，绝不保存凭证）。
+    public static let configPathDefaultsKey = MergedEnvPreferences.pathDefaultsKey
 
     /// .env 键名（由用户在配置文件中提供实际值）。
     private enum EnvKey {
-        static let baseURL = "CLIPROXY_BASE_URL"
-        static let managementKey = "CLIPROXY_MANAGEMENT_KEY"
-        static let targetAPIKey = "CLIPROXY_TARGET_API_KEY"
+        static let baseURL = MergedEnvKeys.cliProxyBaseURL
+        static let managementKey = MergedEnvKeys.cliProxyManagementKey
+        static let targetAPIKey = MergedEnvKeys.cliProxyTargetAPIKey
     }
 
     /// management API 用量端点路径（相对 base URL）。
@@ -38,7 +34,7 @@ public struct CliProxyUsageService: Sendable {
     private static let authorizationScheme = "Bearer"
 
     /// 单个配置文件允许的最大字节数，避免误读超大文件。
-    private static let maxConfigFileBytes = 64 * 1024
+    private static let maxConfigFileBytes = EnvFile.defaultMaxBytes
 
     /// usage 响应最大字节数保护（端点无界，可达数十 MB 且持续增长）。
     private static let maxResponseBytes = 128 * 1024 * 1024
@@ -62,9 +58,7 @@ public struct CliProxyUsageService: Sendable {
 
     /// 解析实际生效的配置路径：为空/未设置时回退到默认路径。
     public static func resolveConfigPath(saved: String?) -> String {
-        guard let saved else { return defaultConfigPath }
-        let trimmed = saved.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? defaultConfigPath : trimmed
+        MergedEnvKeys.resolvePath(saved: saved)
     }
 
     /// 配置文件是否存在且 0600、字段齐全 —— 用于 UI 展示可用性，不读取用量。
@@ -120,40 +114,20 @@ public struct CliProxyUsageService: Sendable {
         let targetAPIKey: String
     }
 
-    /// 从 0600 的 `.env` 读取并校验配置。
+    /// 从 0600 的合并 `.env` 读取并校验配置。复用 ``EnvFile/load(path:maxBytes:)`` 的 fd 级 0600 校验，
+    /// 消除 check-then-read 的 TOCTOU 窗口。
     static func loadConfiguration(atPath path: String) throws -> Configuration {
-        let expanded = (path as NSString).expandingTildeInPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !expanded.isEmpty else { throw CliProxyUsageError.configFileMissing }
-
-        let fileManager = FileManager.default
-        var isDirectory: ObjCBool = false
-        guard fileManager.fileExists(atPath: expanded, isDirectory: &isDirectory), !isDirectory.boolValue else {
+        let environment: [String: String]
+        do {
+            environment = try EnvFile.load(path: path, maxBytes: maxConfigFileBytes)
+        } catch EnvFile.Error.notFound {
             throw CliProxyUsageError.configFileMissing
-        }
-
-        let attributes: [FileAttributeKey: Any]
-        do {
-            attributes = try fileManager.attributesOfItem(atPath: expanded)
-        } catch {
-            throw CliProxyUsageError.configFileUnreadable
-        }
-        guard let permissions = attributes[.posixPermissions] as? NSNumber,
-              permissions.intValue & 0o777 == 0o600 else {
+        } catch EnvFile.Error.insecurePermissions {
             throw CliProxyUsageError.insecurePermissions
-        }
-
-        let url = URL(fileURLWithPath: expanded)
-        let data: Data
-        do {
-            data = try Data(contentsOf: url, options: [.mappedIfSafe])
         } catch {
             throw CliProxyUsageError.configFileUnreadable
         }
-        guard data.count <= maxConfigFileBytes, let text = String(data: data, encoding: .utf8) else {
-            throw CliProxyUsageError.configFileUnreadable
-        }
 
-        let environment = parseEnvironment(text)
         let baseURLValue = environment[EnvKey.baseURL]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let managementKey = environment[EnvKey.managementKey]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let targetAPIKey = environment[EnvKey.targetAPIKey]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -195,32 +169,6 @@ public struct CliProxyUsageService: Sendable {
         if parts[0] == 172, (16...31).contains(parts[1]) { return true }
         if parts[0] == 127 { return true }
         return false
-    }
-
-    /// 解析 KEY=VALUE 形式的 `.env` 文本：支持 `#` 注释、空行、可选 `export`、单/双引号包裹值。
-    static func parseEnvironment(_ text: String) -> [String: String] {
-        var result: [String: String] = [:]
-        text.enumerateLines { line, _ in
-            var trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { return }
-            if trimmed.hasPrefix("export ") {
-                trimmed = String(trimmed.dropFirst("export ".count)).trimmingCharacters(in: .whitespaces)
-            }
-            guard let separatorIndex = trimmed.firstIndex(of: "=") else { return }
-            let rawKey = String(trimmed[trimmed.startIndex..<separatorIndex]).trimmingCharacters(in: .whitespaces)
-            guard !rawKey.isEmpty else { return }
-            let rawValue = String(trimmed[trimmed.index(after: separatorIndex)...]).trimmingCharacters(in: .whitespaces)
-            result[rawKey] = unquote(rawValue)
-        }
-        return result
-    }
-
-    private static func unquote(_ value: String) -> String {
-        guard value.count >= 2, let first = value.first, let last = value.last else { return value }
-        if (first == "\"" && last == "\"") || (first == "'" && last == "'") {
-            return String(value.dropFirst().dropLast())
-        }
-        return value
     }
 }
 

@@ -45,14 +45,14 @@ final class ApplicationModel: ObservableObject {
     @Published private(set) var modelTPSHistory: [ModelTPSHistory] = []
     @Published private(set) var tokenSummary: TokenUsageSummary
     @Published private(set) var tokenSyncStatus: TokenSyncStatus
-    @Published var configPath: String
-    @Published var cliProxyConfigPath: String
     @Published var trendColorMode: TrendColorMode
     @Published private(set) var hotKeyWarning: String?
     @Published private(set) var toast: ToastState?
     @Published var isOrbVisible = true
     @Published private(set) var isOrbExpanded = false
 
+    /// 合并 env 的双源字段状态与写回（R2 / cliproxy / 上报简单值同源）。
+    let envSettings = EnvSettingsModel()
     let metricsStore = MetricsStore()
     let uploadService: UploadService
     private let tokenSyncCoordinator: TokenSyncCoordinating
@@ -64,17 +64,9 @@ final class ApplicationModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
 
     private init() {
-        // 兼容旧值：历史默认路径迁移到新默认（家目录凭证文件），
-        // 用户显式选择过的路径保持不变。迁移结果需回写以固化。
-        let savedPath = UserDefaults.standard.string(forKey: "r2ConfigPath")
-        let path = UploadService.resolveConfigPath(saved: savedPath)
-        if path != savedPath {
-            UserDefaults.standard.set(path, forKey: "r2ConfigPath")
-        }
-        configPath = path
-        // cliproxyapi 采集：仅保存配置文件路径到 UserDefaults；凭证与目标 key 永不落盘。
-        let savedCliProxyPath = UserDefaults.standard.string(forKey: CliProxyUsageService.configPathDefaultsKey)
-        cliProxyConfigPath = CliProxyUsageService.resolveConfigPath(saved: savedCliProxyPath)
+        // 合并 env 路径：R2 / cliproxy / 上报简单值统一收敛到一个 0600 文件；
+        // 历史遗留路径键平滑迁移到规范键（见 MergedEnvPreferences）。
+        let path = MergedEnvPreferences.resolvePath()
         let savedColorMode = UserDefaults.standard.string(forKey: "trendColorMode")
         trendColorMode = TrendColorMode(rawValue: savedColorMode ?? "") ?? .risingGreen
         uploadService = UploadService(configPath: path)
@@ -138,22 +130,22 @@ final class ApplicationModel: ObservableObject {
         metricsStore.$modelTPSHistory.sink { [weak self] in
             self?.modelTPSHistory = $0
         }.store(in: &cancellables)
-        $configPath
+        // 合并 env 路径变化：仅同步给 UploadService（路径字符串），凭证不落盘。
+        envSettings.$path
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] path in
-                UserDefaults.standard.set(path, forKey: "r2ConfigPath")
                 self?.uploadService.configPath = path
             }
             .store(in: &cancellables)
-        $cliProxyConfigPath
-            .dropFirst()
-            .removeDuplicates()
-            .sink { path in
-                // 仅持久化路径字符串；凭证与目标 key 绝不写入 UserDefaults。
-                UserDefaults.standard.set(path, forKey: CliProxyUsageService.configPathDefaultsKey)
-            }
-            .store(in: &cancellables)
+        // REPORT_* 简单值由 TokenSyncCoordinator 统一写回 env 并刷新上报状态（单一写者），
+        // EnvSettingsModel 只负责回显；此处把这两个键的写回委托给 coordinator。
+        envSettings.setExternalWriter({ [weak self] value in
+            self?.setTokenIngestBaseURL(value)
+        }, for: MergedEnvKeys.reportBaseURL)
+        envSettings.setExternalWriter({ [weak self] value in
+            self?.setTokenCanonicalHostname(value)
+        }, for: MergedEnvKeys.reportCanonicalHostname)
         $trendColorMode
             .dropFirst()
             .removeDuplicates()
