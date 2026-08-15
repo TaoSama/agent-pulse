@@ -168,7 +168,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 from: ledger,
                 hostname: effectiveHostname,
                 containing: Date(),
-                calendar: usageSummaryCalendar
+                calendar: usageSummaryCalendar,
+                mergedEnvURL: self.mergedEnvURL
             )) ?? .empty
         } else {
             initialSummary = .empty
@@ -372,6 +373,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         // 在启动后台 Task 前捕获为局部常量：闭包内 self 为弱引用，不能直接访问实例存储属性。
         let localSourcesURL = localCollectionURL
         let summaryCalendar = usageSummaryCalendar
+        let summaryEnvURL = self.mergedEnvURL
         scanGeneration &+= 1
         let generation = scanGeneration
         let cliProxyService = self.cliProxyService
@@ -475,7 +477,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     from: ledger,
                     hostname: hostname,
                     containing: Date(),
-                    calendar: summaryCalendar
+                    calendar: summaryCalendar,
+                    mergedEnvURL: summaryEnvURL
                 )
                 let pending = try ledger.pendingCounts(hostname: hostname)
                 progressReporter.completePhase(.summarizing)
@@ -1194,11 +1197,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     /// 四个窗口共享同一参考时刻、时区与 hostname，并且全部从 derived bucket 查询。
+    /// `mergedEnvURL` 仅用于按身份 gate 展示层虚拟基线（读 0600 env 的 USER 哨兵），不写库、不上报。
     nonisolated private static func summaries(
         from ledger: UsageLedgerStore,
         hostname: String,
         containing date: Date,
-        calendar: Calendar
+        calendar: Calendar,
+        mergedEnvURL: URL
     ) throws -> TokenUsageSummary {
         // 四窗口真实按模型 token（原始名）：日为纯真实明细；周/月/全部作为叠加到虚拟基线上的真实增量。
         let realModels: [TokenUsageWindow: [UsageModelTokenSummary]] = [
@@ -1234,8 +1239,20 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     calendar: calendar
                 ).map(windowSummary(from:))
             ),
-            realModels: realModels
+            realModels: realModels,
+            enabled: isVirtualBaselineUser(mergedEnvURL: mergedEnvURL)
         )
+    }
+
+    /// 虚拟基线身份哨兵：仅当合并 env 的 USER 等于此值时，才对 week/month/all 套展示层基线。
+    nonisolated private static let virtualBaselineUserSentinel = "me"
+
+    /// 是否为「本人身份」——只读 0600 合并 env 的 USER，与哨兵大小写/首尾空白归一后精确比较。
+    /// 判据随用即弃：不落 UserDefaults / SQLite / 日志，也不进任何上传字段；他人环境无此标记即走纯真实。
+    nonisolated private static func isVirtualBaselineUser(mergedEnvURL: URL) -> Bool {
+        guard let env = try? EnvFile.load(url: mergedEnvURL) else { return false }
+        let user = (env["USER"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !user.isEmpty && user == virtualBaselineUserSentinel
     }
 
     nonisolated private static func windowSummary(from summary: UsageSummary) -> TokenUsageWindowSummary {

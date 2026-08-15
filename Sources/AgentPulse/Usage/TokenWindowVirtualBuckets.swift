@@ -14,12 +14,23 @@ import Foundation
 enum TokenWindowVirtualBuckets {
     /// 覆盖周 / 月 / 全部三窗口为「目标起点 + 新增」；日窗口只补真实分模型明细。
     /// `realModels` 为各窗口真实的按模型 token（原始名）。
+    /// `enabled == false`（默认）时四窗口全走纯真实账本口径，不叠加任何虚拟基线——
+    /// 由调用方按身份 gate（合并 env 的 USER 哨兵）决定，见 `TokenSyncCoordinator`。
     static func apply(
         to summary: TokenUsageSummary,
-        realModels: [TokenUsageWindow: [UsageModelTokenSummary]]
+        realModels: [TokenUsageWindow: [UsageModelTokenSummary]],
+        enabled: Bool = false
     ) -> TokenUsageSummary {
+        // 日窗口始终纯真实（无论是否 enabled），仅补真实分模型明细。
         var result = summary
         result.day = withRealModels(summary.day, models: realModels[.day] ?? [])
+        guard enabled else {
+            // 未启用：周 / 月 / 全部也只补真实分模型，不叠加任何虚拟基线。
+            result.week = withRealModels(summary.week, models: realModels[.week] ?? [])
+            result.month = withRealModels(summary.month, models: realModels[.month] ?? [])
+            result.all = withRealModels(summary.all, models: realModels[.all] ?? [])
+            return result
+        }
         result.week = baselinePlusReal(summary.week, window: .week, real: realModels[.week] ?? [])
         result.month = baselinePlusReal(summary.month, window: .month, real: realModels[.month] ?? [])
         result.all = baselinePlusReal(summary.all, window: .all, real: realModels[.all] ?? [])
