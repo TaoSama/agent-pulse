@@ -145,14 +145,16 @@ struct MenuBarSummaryView: View {
     /// 设置面板宽度：比概览宽以容纳凭证长路径。菜单栏弹窗左边缘由系统锚定图标不动、
     /// 窗宽随内容变，故设置页比概览宽的部分向右延伸（系统默认，无法反向固定右边缘）。
     private static let settingsWidth: CGFloat = 460
-    /// 设置内容超出该高度时才在内部 ScrollView 滚动；否则面板高度随内容自适应，
-    /// 与主菜单概览观感一致（不再硬撑固定高度）。
-    private static let settingsMaxHeight: CGFloat = 640
+    /// 概览尚未测得高度时，设置页回落到的默认高度（首帧或异常兜底）。
+    private static let settingsFallbackHeight: CGFloat = 640
 
     /// Token 汇总卡与分模型明细卡共用同一时间窗口选择；持久化，面板重开保留上次选择。
     @AppStorage("menubar.tokenWindow") private var tokenWindow: TokenUsageWindow = .day
     /// 面板内是否切到设置视图（复用同一弹窗，不再弹独立窗口）。
     @State private var showingSettings = false
+    /// 概览面板的实时测量高度：设置页据此锁成同高，使两页切换严格对齐、不跳动。
+    /// 概览高度随模型明细浮动，故实时测量而非写死；nil 表示尚未测得。
+    @State private var overviewHeight: CGFloat?
 
     var body: some View {
         Group {
@@ -196,15 +198,17 @@ struct MenuBarSummaryView: View {
             .padding(.top, 12)
             .padding(.bottom, 6)
 
-            // 设置内容随内容自适应高度，与主菜单一致；仅当超过上限时才在内部滚动。
-            // 顶部补一段留白，让首个卡片不贴住标题栏。
+            // 设置内容撑满面板剩余高度：面板总高锁成概览同高（见下方 .frame(height:)），
+            // 内容不足时下方留白，超出则内部滚动。顶部补一段留白，让首个卡片不贴住标题栏。
             ScrollView {
                 AgentPulseSettingsView(model: model)
                     .padding(.top, 6)
             }
-            .frame(maxHeight: Self.settingsMaxHeight)
+            .frame(maxHeight: .infinity)
         }
         .frame(width: Self.settingsWidth)
+        // 高度锁成概览实时测得的高度，两页切换严格对齐、不跳动；未测得时回落默认高。
+        .frame(height: overviewHeight ?? Self.settingsFallbackHeight)
     }
 
     private var overviewScreen: some View {
@@ -311,6 +315,11 @@ struct MenuBarSummaryView: View {
         }
         .padding(16)
         .frame(width: Self.overviewWidth)
+        // 实时测量概览渲染高度，供设置页锁成同高（两页严格对齐）。概览高度随模型明细
+        // 浮动，故用 onGeometryChange 持续跟踪而非写死。
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+            if height > 0 { overviewHeight = height }
+        }
     }
 
     private var trendColor: Color {
