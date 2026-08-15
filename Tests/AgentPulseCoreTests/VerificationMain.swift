@@ -2000,6 +2000,51 @@ struct AgentPulseCoreVerification {
         try require(legacySample.tokensInShortWindow == nil, "legacy sample must have no short window value")
         let legacySeries = SparklineAnalysis.shortWindowSeries(from: [legacySample])
         try requireApproximatelyEqual(legacySeries.first?.value ?? nil, 4, "legacy sample must fall back to 180s rate in dashboard series")
+
+        // 看板加大平滑：每秒一点的口径不变，但更宽的高斯核显著压掉相邻点毛刺。
+        // 构造一段每秒交替 0/100 的尖刺 5s 序列，断言平滑后相邻差分总量明显下降、
+        // 点数不变、非负、且整体量级（均值）基本守恒（平滑不凭空放大/缩小总量）。
+        let spikeStep = 1.0
+        let spikeEnd = base.addingTimeInterval(60)
+        let spikeSamples: [LiveRateSample] = (0..<60).map { second in
+            let ts = base.addingTimeInterval(Double(second) * spikeStep)
+            let short: Double = second % 2 == 0 ? 0 : 500   // 5s 口径 tps 交替 0/100
+            return LiveRateSample(
+                timestamp: ts,
+                state: .live,
+                tokensInWindow: short,
+                latestSignalAt: ts,
+                tokensInShortWindow: short
+            )
+        }
+        let rawSpike = SparklineAnalysis.resampleSeries(
+            SparklineAnalysis.shortWindowSeries(from: spikeSamples),
+            end: spikeEnd, windowSeconds: 60, stepSeconds: spikeStep
+        )
+        let smoothedSpike = SparklineAnalysis.makeDashboardSparkline(
+            from: spikeSamples, end: spikeEnd, windowSeconds: 60, stepSeconds: spikeStep
+        )
+        try require(smoothedSpike.count == rawSpike.count, "dashboard smoothing must preserve 1s point density")
+        func adjacentVariation(_ pts: [SparklinePoint]) -> Double {
+            let vals = pts.compactMap(\.value)
+            guard vals.count >= 2 else { return 0 }
+            return zip(vals, vals.dropFirst()).reduce(0) { $0 + abs($1.0 - $1.1) }
+        }
+        let rawVariation = adjacentVariation(rawSpike)
+        let smoothedVariation = adjacentVariation(smoothedSpike)
+        try require(rawVariation > 0, "spike fixture must actually be spiky")
+        try require(
+            smoothedVariation < rawVariation * 0.5,
+            "dashboard smoothing must cut adjacent-point variation by at least half (raw=\(rawVariation), smoothed=\(smoothedVariation))"
+        )
+        try require(
+            smoothedSpike.compactMap(\.value).allSatisfy { $0 >= 0 && $0.isFinite },
+            "dashboard smoothing must stay non-negative and finite"
+        )
+        let rawMean = rawSpike.compactMap(\.value).reduce(0, +) / Double(max(1, rawSpike.compactMap(\.value).count))
+        let smoothedMean = smoothedSpike.compactMap(\.value).reduce(0, +) / Double(max(1, smoothedSpike.compactMap(\.value).count))
+        try requireApproximatelyEqual(smoothedMean, rawMean, accuracy: rawMean * 0.15, "smoothing must roughly conserve overall level")
+
         gapSamples.removeAll()
     }
 

@@ -553,7 +553,7 @@ struct TPSDashboardView: View {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading) {
                     Text("TPS 趋势").font(.largeTitle.bold())
-                    Text("最近 15 分钟 · SQLite 恢复 · 180 秒固定窗口").foregroundStyle(.secondary)
+                    Text("最近 15 分钟 · SQLite 恢复 · 5 秒滑窗均值曲线").foregroundStyle(.secondary)
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
@@ -565,7 +565,11 @@ struct TPSDashboardView: View {
                 }
             }
             HStack(alignment: .top, spacing: 18) {
-                ModelTPSLegend(series: model.modelTPSHistory)
+                ModelTPSLegend(
+                    series: model.modelTPSHistory,
+                    totalColor: model.sparklineRegression.trend.color(for: model.trendColorMode),
+                    totalTPS: model.tps ?? 0
+                )
                     .frame(width: 190, alignment: .topLeading)
                 TPSAxisChartView(
                     points: model.dashboardSparklinePoints,
@@ -620,9 +624,25 @@ struct TPSDashboardView: View {
 
 private struct ModelTPSLegend: View {
     let series: [ModelTPSHistory]
+    /// 总曲线（图中最粗的那条）的颜色与当前值，作为图例首行，避免主曲线在图例里缺席。
+    var totalColor: Color? = nil
+    var totalTPS: Double? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if let totalColor {
+                HStack(spacing: 8) {
+                    Capsule()
+                        .fill(totalColor)
+                        .frame(width: 26, height: 4)
+                    Text("总计")
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(String(format: "%.1f", totalTPS ?? 0))
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                }
+            }
             ForEach(series) { item in
                 HStack(spacing: 8) {
                     Capsule()
