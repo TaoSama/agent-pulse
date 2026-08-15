@@ -13,7 +13,32 @@ struct TokenSyncSettingsSection: View {
 
     var body: some View {
         tokenStatsCard
+        intervalCard
         reportingCard
+    }
+
+    // MARK: 扫描和上报间隔（独立一趴，夹在 Token 统计与用量上报之间）
+
+    private var intervalCard: some View {
+        SettingsCard(title: "扫描和上报间隔", systemImage: "timer") {
+            HStack(alignment: .center, spacing: 8) {
+                Text("每隔")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.white)
+                Picker("扫描和上报间隔", selection: reportIntervalBinding) {
+                    ForEach(TokenReportInterval.allCases) { interval in
+                        Text(interval.title).tag(interval)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .tint(.white)
+                .colorScheme(.dark)
+                .frame(maxWidth: 300)
+                .accessibilityLabel("扫描和上报间隔")
+                .accessibilityValue(model.tokenSyncStatus.autoReportInterval.title)
+            }
+        }
     }
 
     // MARK: Token 统计
@@ -87,21 +112,6 @@ struct TokenSyncSettingsSection: View {
                 // API 地址权威来自合并 env 的 REPORT_BASE_URL：双源可读可填（非密钥明文），
                 // 手填经 coordinator 写回 env；填好但不自动开启上报。单行显示不折行，与其它输入框一致。
                 dualSourceField("API 地址（留空则仅本地）", key: MergedEnvKeys.reportBaseURL, singleLine: true)
-
-                SettingsRow(title: "上报间隔") {
-                    Picker("上报间隔", selection: reportIntervalBinding) {
-                        ForEach(TokenReportInterval.allCases) { interval in
-                            Text(interval.title).tag(interval)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .tint(.white)
-                    .colorScheme(.dark)
-                    .frame(maxWidth: 300)
-                    .accessibilityLabel("自动上报间隔")
-                    .accessibilityValue(model.tokenSyncStatus.autoReportInterval.title)
-                }
 
                 HStack(spacing: 6) {
                     Image(systemName: "point.3.connected.trianglepath.dotted")
