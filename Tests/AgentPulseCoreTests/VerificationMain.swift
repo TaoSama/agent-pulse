@@ -106,6 +106,7 @@ struct AgentPulseCoreVerification {
         try await verifyActiveCountingRules()
         try await verifyClaudeDesktopCounting()
         try await verifyRuntimeCollectorAndPersistence()
+        try await verifyColdStartModelSeeding()
         try verifySparklineAnalysis()
         try verifyCliProxyUsageParser()
         print("AgentPulseCoreVerification: PASS")
@@ -3207,6 +3208,74 @@ struct AgentPulseCoreVerification {
             print("swift_regression_warm_active_sessions=\(warm.diagnostics.activeSessions)")
             print("swift_regression_warm_tps=\(String(format: "%.6f", warm.liveRate.tps ?? 0))")
         }
+    }
+
+    private static func turnContextEvent(at date: Date, model: String) -> String {
+        let formatter = ISO8601DateFormatter()
+        return "{\"timestamp\":\"\(formatter.string(from: date))\",\"type\":\"turn_context\",\"payload\":{\"model\":\"\(model)\"}}"
+    }
+
+    /// 冷启动时序竞争回归：codex 新会话先写 session_meta + 前几个 token_count，turn_context 稍后
+    /// append。首次全量解析在此瞬间把 currentModel 播种成 nil；若随后同一增量批次里 turn_context
+    /// 排在 token_count 之后，这些更早的行会被归成 "unknown"。修复应在增量前对本批次前瞻反查
+    /// turn_context model，使其归到真实模型。
+    private static func verifyColdStartModelSeeding() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agentpulse-coldstart-model-\(UUID().uuidString)", isDirectory: true)
+        let sessions = root.appendingPathComponent("sessions", isDirectory: true)
+        let database = root.appendingPathComponent("Application Support/AgentPulse/agent-pulse.sqlite")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        defer {
+            do { try FileManager.default.removeItem(at: root) }
+            catch { fputs("coldstart model verification cleanup failed: \(error)\n", stderr) }
+        }
+        let base = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970))
+
+        // 场景 1：冷扫时文件无 turn_context（currentModel 播种为 nil），随后同一增量批次里
+        // turn_context 排在 token_count 之后。修复后早于 turn_context 的 delta 应归 seed-code。
+        let rolloutA = sessions.appendingPathComponent("rollout-coldstart-same-batch.jsonl")
+        try writeRollout(to: rolloutA, cwd: "/tmp/project", events: [
+            tokenEvent(at: base, totalOutput: 100)
+        ])
+        let collectorA = try CodexRuntimeMetricsCollector(configuration: CodexRuntimeMetricsConfiguration(
+            sessionsDirectories: [sessions],
+            automationRoots: [],
+            databaseURL: database,
+            claudeProjectsDirectory: root.appendingPathComponent("missing-claude-projects")
+        ))
+        _ = try await collectorA.scan(at: base)  // 冷扫：seed currentModel = nil
+        // 同一批次：token_count(早，200) → turn_context(seed-code) → token_count(晚，280)
+        try appendLine(tokenEvent(at: base.addingTimeInterval(1), totalOutput: 200), to: rolloutA)
+        try appendLine(turnContextEvent(at: base.addingTimeInterval(1), model: "seed-code"), to: rolloutA)
+        try appendLine(tokenEvent(at: base.addingTimeInterval(2), totalOutput: 280), to: rolloutA)
+        let sameBatch = try await collectorA.scan(at: base.addingTimeInterval(2))
+        try require(
+            sameBatch.liveRate.modelTokensInWindow["unknown"] == nil,
+            "cold-start delta earlier than turn_context in the same batch fell into unknown: \(sameBatch.liveRate.modelTokensInWindow)"
+        )
+        try require(
+            (sameBatch.liveRate.modelTokensInWindow["seed-code"] ?? 0) > 0,
+            "look-ahead seed did not attribute cold-start delta to seed-code: \(sameBatch.liveRate.modelTokensInWindow)"
+        )
+
+        // 场景 2：全程无 turn_context 且无任何 model 字段 → 维持既有 unknown 行为，不误判成某模型。
+        let rolloutB = sessions.appendingPathComponent("rollout-no-model.jsonl")
+        try writeRollout(to: rolloutB, cwd: "/tmp/project-b", events: [
+            tokenEvent(at: base, totalOutput: 100)
+        ], sessionID: "no-model-session")
+        let collectorB = try CodexRuntimeMetricsCollector(configuration: CodexRuntimeMetricsConfiguration(
+            sessionsDirectories: [sessions],
+            automationRoots: [],
+            databaseURL: root.appendingPathComponent("Application Support/AgentPulse/agent-pulse-b.sqlite"),
+            claudeProjectsDirectory: root.appendingPathComponent("missing-claude-projects")
+        ))
+        _ = try await collectorB.scan(at: base)
+        try appendLine(tokenEvent(at: base.addingTimeInterval(1), totalOutput: 260), to: rolloutB)
+        let noModel = try await collectorB.scan(at: base.addingTimeInterval(1))
+        try require(
+            (noModel.liveRate.modelTokensInWindow["unknown"] ?? 0) > 0,
+            "delta from a session that genuinely has no model must remain unknown, not be misattributed: \(noModel.liveRate.modelTokensInWindow)"
+        )
     }
 
     private static func verifyRuntimeCollectorAndPersistence() async throws {

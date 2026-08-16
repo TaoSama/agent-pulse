@@ -1268,6 +1268,19 @@ public actor CodexRuntimeMetricsCollector {
         var previousTimestamp = cached.previousOutputTimestamp
         var currentModel = cached.currentModel
         var hasSeenTurnContext = cached.hasSeenTurnContext
+        // 前瞻 seed：冷启动时 codex 先写 session_meta + 前几个 token_count，turn_context 稍后才
+        // append，导致首次全量解析把 currentModel 播种成 nil。若本批次里 turn_context 排在若干
+        // token_count 之后，这些更早的 token_count 逐行处理时 currentModel 仍是 nil，会被归成
+        // "unknown"。这里在逐行循环前，对本批次已裁好的完整行（≤512KB，仅本文件）反查一次权威
+        // turn_context model，让批次内早于 turn_context 的行也能拿到 model。仅在 currentModel 为
+        // nil 时触发，稳态零开销；per-file 数据反查，不会跨会话误判。
+        if currentModel == nil {
+            let batch = Data(appendedData.prefix(completeLength))
+            if let seeded = latestTurnContextModel(in: batch) {
+                currentModel = seeded
+                hasSeenTurnContext = true
+            }
+        }
         var messageUsage = cached.messageUsage
         var messageSequence = cached.messageSequence
         // 内容指纹去重，只作用于「无 message id 的增量（incremental）路径」——主要是 Claude CLI
