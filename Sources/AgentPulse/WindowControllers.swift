@@ -242,9 +242,16 @@ final class OrbWindowController {
     private func layoutBubbles() {
         guard let screen = panel.screen ?? NSScreen.main,
               let detailPanel = bubblePanels.first else { return }
-        // 气泡在悬浮球所在屏幕居中（与 TPS 看板一致），不再贴悬浮球一侧展开——
-        // 多卡堆叠较高，居中更稳定、不易被推出屏幕。
-        detailPanel.setFrame(ScreenPlacement.centered(detailPanel.frame.size, on: screen), display: true)
+        // 气泡以悬浮球为中心居中：气泡中心对齐悬浮球中心，再 clamp 收进屏幕可视区。
+        let size = detailPanel.frame.size
+        let center = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+        let proposed = NSRect(
+            x: center.x - size.width / 2,
+            y: center.y - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
+        detailPanel.setFrame(ScreenPlacement.clamped(proposed, to: screen), display: true)
     }
 
     private func restorePosition() {
