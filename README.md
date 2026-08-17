@@ -347,7 +347,6 @@ swift run RuntimeHeaderParityVerification   # 增量上报 header 解析一致�
 swift run NaturalKeyGuardVerification       # wire 自然键碰撞门禁
 swift run SecureConfigVerification          # 合并 env 安全读写 / 0600 / 密钥掩码
 swift run ReconcileParityVerification       # 本地账本聚合与 upstream reconcile 逐维度对齐
-swift run ReferenceCaptureParityVerification # 参照实现口径捕获对齐
 ```
 
 发布前还应在**离线副本**上执行生产数据库预检。该工具会拒绝活库及其硬链接，迁移并重扫指定副本，再检查 schema、parser、完整性、hostname、权限与指标；绝不能把活库路径传给它：

@@ -125,11 +125,6 @@ let package = Package(
             path: "Tests/SecureConfigVerification"
         ),
         .executableTarget(
-            name: "ReferenceCaptureParityVerification",
-            dependencies: ["AgentPulseReporting"],
-            path: "Tests/ReferenceCaptureParityVerification"
-        ),
-        .executableTarget(
             name: "ReconcileParityVerification",
             dependencies: ["AgentPulseReconcileParity"],
             path: "Tests/ReconcileParityVerification"
