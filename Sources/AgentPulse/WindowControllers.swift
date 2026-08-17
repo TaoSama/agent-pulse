@@ -38,7 +38,6 @@ final class OrbWindowController {
         static let orbSize = CGSize(width: 48, height: 48)
         static let taskListWidth: CGFloat = 260
         static let taskRowHeight: CGFloat = 38
-        static let taskListGap: CGFloat = 8
     }
 
     private let model: ApplicationModel
@@ -243,15 +242,9 @@ final class OrbWindowController {
     private func layoutBubbles() {
         guard let screen = panel.screen ?? NSScreen.main,
               let detailPanel = bubblePanels.first else { return }
-        let visible = screen.visibleFrame.insetBy(dx: ScreenPlacement.safeInset, dy: ScreenPlacement.safeInset)
-        let size = detailPanel.frame.size
-        let opensRight = panel.frame.midX < visible.midX
-        let x = opensRight
-            ? panel.frame.maxX + Constants.taskListGap
-            : panel.frame.minX - Constants.taskListGap - size.width
-        let y = min(max(panel.frame.midY - size.height / 2, visible.minY), visible.maxY - size.height)
-        let proposed = NSRect(origin: NSPoint(x: x, y: y), size: size)
-        detailPanel.setFrame(ScreenPlacement.clamped(proposed, to: screen), display: true)
+        // 气泡在悬浮球所在屏幕居中（与 TPS 看板一致），不再贴悬浮球一侧展开——
+        // 多卡堆叠较高，居中更稳定、不易被推出屏幕。
+        detailPanel.setFrame(ScreenPlacement.centered(detailPanel.frame.size, on: screen), display: true)
     }
 
     private func restorePosition() {
