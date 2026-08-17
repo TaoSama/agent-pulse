@@ -296,3 +296,43 @@ private struct TokenCacheRatioBar: View {
         return (cachedWidth, min(newWidth, max(0, total - cachedWidth)))
     }
 }
+
+/// 悬浮球气泡用的今日 Token 概览卡：与 `TokenSummaryCard` 同款视觉，但去掉顶部窗口切换器
+/// 与右下角 TPS 展示，固定「日」窗口（今日）。只读展示聚合数，不含路径/正文/凭证。
+struct OrbTokenOverviewCard: View {
+    let summary: TokenUsageSummary
+
+    private var day: TokenUsageWindowSummary? { summary[.day] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(TokenUsageFormatting.tokens(day?.totalTokens))
+                    .font(.system(size: 26, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                Spacer(minLength: 8)
+                Text(TokenUsageFormatting.cost(day?.estimatedCost))
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
+
+            TokenCacheRatioBar(cached: day?.cachedTokens, new: day?.newTokens)
+
+            HStack(spacing: 6) {
+                TokenFooterMetric(title: "缓存", value: TokenUsageFormatting.tokens(day?.cachedTokens))
+                TokenFooterMetric(title: "新增", value: TokenUsageFormatting.tokens(day?.newTokens))
+                TokenFooterMetric(title: "命中率", value: TokenUsageFormatting.percent(day?.cacheHitRate))
+                Spacer(minLength: 4)
+            }
+
+            if day == nil {
+                Text("今日暂无数据")
+                    .font(.system(size: 10))
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .foregroundStyle(Color.white)
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 12))
+    }
+}

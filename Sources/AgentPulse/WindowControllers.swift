@@ -38,8 +38,6 @@ final class OrbWindowController {
         static let orbSize = CGSize(width: 48, height: 48)
         static let taskListWidth: CGFloat = 260
         static let taskRowHeight: CGFloat = 38
-        static let taskListPadding: CGFloat = 8
-        static let taskRowSpacing: CGFloat = 6
         static let taskListGap: CGFloat = 8
     }
 
@@ -228,16 +226,14 @@ final class OrbWindowController {
                 return left.2 < right.2
             }
             .map { OrbTaskListItem(title: $0.0, value: CategoryFormatting.value(for: $0.1)) }
-        let rowCount = 1 + items.count
-        let size = CGSize(
-            width: Constants.taskListWidth,
-            height: Constants.taskListPadding * 2
-                + CGFloat(rowCount) * Constants.taskRowHeight
-                + CGFloat(max(0, rowCount - 1)) * Constants.taskRowSpacing
-        )
-        let detailPanel = FloatingPanel(frame: NSRect(origin: .zero, size: size))
-        let host = NSHostingView(rootView: OrbTaskListView(allTasksValue: allTasksValue, items: items))
+        // 气泡内容自测量高度：固定宽 260，渲染完整详情视图后用 fittingSize 取内容高度，
+        // 不再按任务行数硬算（因为现在还叠加了 TPS / Token / Top3 三张卡）。
+        let host = NSHostingView(rootView: OrbDetailView(model: model, allTasksValue: allTasksValue, items: items))
         host.sizingOptions = []
+        host.frame = NSRect(origin: .zero, size: CGSize(width: Constants.taskListWidth, height: 10))
+        let fittingHeight = host.fittingSize.height
+        let size = CGSize(width: Constants.taskListWidth, height: max(fittingHeight, Constants.taskRowHeight))
+        let detailPanel = FloatingPanel(frame: NSRect(origin: .zero, size: size))
         host.frame = NSRect(origin: .zero, size: size)
         host.autoresizingMask = [.width, .height]
         detailPanel.contentView = host
@@ -477,6 +473,9 @@ final class DraggableHostingView<Content: View>: NSHostingView<Content> {
     private var pendingClickCount = 0
     private var pendingSingleClick: DispatchWorkItem?
     private let dragThreshold: CGFloat = 4
+    /// 单击判定延迟：等待此时长内若无第二次点击则视为单击。
+    /// 固定 150ms（不用系统 doubleClickInterval，那个偏长导致单击响应迟钝）。
+    private let clickResolutionDelay: TimeInterval = 0.15
     private var mouseDownLocation: NSPoint?
 
     override func rightMouseDown(with event: NSEvent) {
@@ -527,7 +526,7 @@ final class DraggableHostingView<Content: View>: NSHostingView<Content> {
             }
             pendingSingleClick = work
             DispatchQueue.main.asyncAfter(
-                deadline: .now() + NSEvent.doubleClickInterval,
+                deadline: .now() + clickResolutionDelay,
                 execute: work
             )
         }

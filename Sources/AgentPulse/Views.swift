@@ -578,14 +578,148 @@ struct OrbTaskListView: View {
     let items: [OrbTaskListItem]
 
     var body: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 2) {
             OrbTaskListRow(title: "All tasks", value: allTasksValue, emphasized: true)
             ForEach(items) { item in
                 OrbTaskListRow(title: item.title, value: item.value)
             }
         }
-        .padding(8)
-        .background(Color.white, in: RoundedRectangle(cornerRadius: 16))
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// 单击悬浮球弹出的完整气泡内容：任务概览 + TPS 曲线 + 今日 Token 概览 + Top3 模型。
+/// 宽度固定与任务概览一致；黑底卡与白底任务列表垂直堆叠。
+struct OrbDetailView: View {
+    @ObservedObject var model: ApplicationModel
+    let allTasksValue: String
+    let items: [OrbTaskListItem]
+    /// 与 `OrbWindowController.Constants.taskListWidth` 对齐。
+    static let width: CGFloat = 260
+
+    var body: some View {
+        VStack(spacing: 8) {
+            OrbTPSCard(model: model)
+            OrbTokenOverviewCard(summary: model.tokenSummary)
+            OrbTaskListView(allTasksValue: allTasksValue, items: items)
+            ModelTokenBreakdownCard(summary: model.tokenSummary, window: .day, showsTitle: false, expandable: false)
+        }
+        .frame(width: Self.width)
+    }
+}
+
+/// 气泡里的实时 TPS 卡：左上 TPS 数值 + 右侧小曲线（总曲线与各模型曲线叠画在同一张小图、
+/// 共享纵轴），下方配全部模型图例（含总计行）。与菜单同源的 15 分钟 sparkline。
+private struct OrbTPSCard: View {
+    @ObservedObject var model: ApplicationModel
+
+    private var trendColor: Color { model.sparklineRegression.trend.color(for: model.trendColorMode) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                Text(formatTPS(model.tps))
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                Spacer(minLength: 8)
+                // 总曲线 + 各模型曲线叠画在同一张小图（共享纵轴，无坐标轴）。
+                OrbCombinedSparkline(
+                    total: model.sparklinePoints,
+                    models: model.modelTPSHistory,
+                    totalColor: trendColor
+                )
+                .frame(width: 120, height: 40)
+            }
+
+            // 全部模型图例集中一处：色条 + 模型名 + 当前 TPS；含总计行。
+            VStack(alignment: .leading, spacing: 6) {
+                OrbTPSLegendRow(color: trendColor, name: "总计", value: model.tps ?? 0, bold: true)
+                ForEach(model.modelTPSHistory) { item in
+                    OrbTPSLegendRow(
+                        color: modelTPSColor(for: item.model, in: model.modelTPSHistory),
+                        name: item.model,
+                        value: item.latestTPS,
+                        bold: false
+                    )
+                }
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .foregroundStyle(Color.white)
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// 紧凑组合曲线：总曲线（粗）+ 各模型曲线（细）叠画在一张小图，所有线共享同一纵轴上界，
+/// 遇缺口断开、不跨缺口连线。无坐标轴，仅供气泡内小图使用。
+private struct OrbCombinedSparkline: View {
+    let total: [SparklinePoint]
+    let models: [ModelTPSHistory]
+    let totalColor: Color
+
+    var body: some View {
+        Canvas { context, size in
+            // 共享纵轴上界：总曲线与所有模型曲线的真实最大值（总曲线通常最大）。
+            let totalValues = total.compactMap(\.value)
+            let modelValues = models.flatMap { $0.points.compactMap(\.value) }
+            let upper = max((totalValues + modelValues).max() ?? 1, 1)
+
+            // 先画各模型细线，总曲线最后画在最上层。
+            for item in models {
+                context.stroke(
+                    Self.path(for: item.points, size: size, upper: upper),
+                    with: .color(modelTPSColor(for: item.model, in: models)),
+                    style: StrokeStyle(lineWidth: 1.2, lineCap: .round, lineJoin: .round)
+                )
+            }
+            context.stroke(
+                Self.path(for: total, size: size, upper: upper),
+                with: .color(totalColor),
+                style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round)
+            )
+        }
+        .accessibilityHidden(true)
+    }
+
+    /// 把点集映射为屏幕路径；遇缺口（nil）断开，不跨缺口连线造假。
+    private static func path(for points: [SparklinePoint], size: CGSize, upper: Double) -> Path {
+        var path = Path()
+        let denominator = Double(max(1, points.count - 1))
+        var hasPrevious = false
+        for (index, point) in points.enumerated() {
+            guard let value = point.value, value.isFinite else { hasPrevious = false; continue }
+            let location = CGPoint(
+                x: size.width * Double(index) / denominator,
+                y: size.height * (1 - min(max(value / upper, 0), 1))
+            )
+            if hasPrevious { path.addLine(to: location) } else { path.move(to: location) }
+            hasPrevious = true
+        }
+        return path
+    }
+}
+
+/// 气泡 TPS 图例单行：色条 + 名称 + 一位小数 TPS。
+private struct OrbTPSLegendRow: View {
+    let color: Color
+    let name: String
+    let value: Double
+    let bold: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Capsule().fill(color).frame(width: 22, height: bold ? 4 : 3)
+            Text(name)
+                .font(.system(size: 11, weight: bold ? .semibold : .medium))
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            Text(String(format: "%.1f", value))
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+        }
+        .foregroundStyle(Color.white)
     }
 }
 
@@ -604,9 +738,8 @@ private struct OrbTaskListRow: View {
                 .monospacedDigit()
         }
         .foregroundStyle(Color.white)
-        .padding(.horizontal, 12)
-        .frame(height: 38)
-        .background(Color.black, in: RoundedRectangle(cornerRadius: 11))
+        .padding(.horizontal, 4)
+        .frame(height: 26)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(title)
         .accessibilityValue(value)

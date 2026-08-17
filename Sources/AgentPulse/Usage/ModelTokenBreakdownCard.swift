@@ -8,6 +8,10 @@ import SwiftUI
 struct ModelTokenBreakdownCard: View {
     let summary: TokenUsageSummary
     let window: TokenUsageWindow
+    /// 是否显示「TOP 3 · 按模型 TOKENS」标题行。悬浮球气泡里传 false 隐藏标题。
+    var showsTitle: Bool = true
+    /// 是否支持「+N 更多」展开。悬浮球气泡里传 false：硬截 Top3、不足则显示实际数、无展开按钮。
+    var expandable: Bool = true
 
     /// 默认折叠时展示的模型条目数。
     private static let collapsedLimit = 3
@@ -19,13 +23,16 @@ struct ModelTokenBreakdownCard: View {
         let models = sortedModels
         if !models.isEmpty {
             let total = max(1, models.reduce(Int64(0)) { $0 + max(0, $1.totalTokens) })
-            let visible = expanded ? models : Array(models.prefix(Self.collapsedLimit))
+            // 不可展开时永远只取 Top3（不足则实际数）；可展开时随 expanded 决定。
+            let visible = (expandable && expanded) ? models : Array(models.prefix(Self.collapsedLimit))
             let hiddenCount = models.count - visible.count
 
             VStack(alignment: .leading, spacing: 10) {
-                Text("TOP 3 · 按模型 TOKENS")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(Color.white.opacity(0.6))
+                if showsTitle {
+                    Text("TOP 3 · 按模型 TOKENS")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.6))
+                }
 
                 VStack(spacing: 8) {
                     ForEach(visible, id: \.model) { item in
@@ -38,7 +45,7 @@ struct ModelTokenBreakdownCard: View {
                     }
                 }
 
-                if hiddenCount > 0 || expanded {
+                if expandable, hiddenCount > 0 || expanded {
                     Button {
                         withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
                     } label: {
