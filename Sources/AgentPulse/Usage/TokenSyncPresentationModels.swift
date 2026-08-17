@@ -485,6 +485,17 @@ enum TokenUsageFormatting {
         return relativeDateFormatter.string(from: date)
     }
 
+    /// 与 `relativeTime` 同逻辑的英文相对时间：just now / Nm ago / Nh ago / Nd ago / 日期。
+    static func relativeTimeEnglish(_ date: Date?, now: Date = Date()) -> String {
+        guard let date else { return "—" }
+        let elapsed = now.timeIntervalSince(date)
+        if elapsed < 60 { return "just now" }
+        if elapsed < 3600 { return "\(Int(elapsed / 60))m ago" }
+        if elapsed < 86_400 { return "\(Int(elapsed / 3600))h ago" }
+        if elapsed < 86_400 * 7 { return "\(Int(elapsed / 86_400))d ago" }
+        return relativeDateFormatter.string(from: date)
+    }
+
     private static let relativeDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "MM-dd HH:mm"

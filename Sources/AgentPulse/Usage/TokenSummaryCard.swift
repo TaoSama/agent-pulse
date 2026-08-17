@@ -243,6 +243,37 @@ struct TokenSyncUpdateStatusView: View {
     }
 }
 
+/// 白色刷新图标：`spinning=true` 时持续匀速旋转，否则静止。用于 Token 概览卡的更新状态行。
+private struct SpinningRefreshIcon: View {
+    let spinning: Bool
+    @State private var angle: Double = 0
+
+    var body: some View {
+        Image(systemName: "arrow.triangle.2.circlepath")
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(Color.white)
+            .rotationEffect(.degrees(angle))
+            .onAppear { if spinning { startSpin() } else { stopSpin() } }
+            .onChange(of: spinning) { _, running in
+                if running { startSpin() } else { stopSpin() }
+            }
+    }
+
+    private func startSpin() {
+        angle = 0
+        withAnimation(.linear(duration: 1).repeatForever(autoreverses: false)) {
+            angle = 360
+        }
+    }
+
+    /// 刷新结束：用一个即时（0 秒）动画覆盖残留的 repeatForever，把角度归零并真正停转。
+    private func stopSpin() {
+        withAnimation(.linear(duration: 0)) {
+            angle = 0
+        }
+    }
+}
+
 private struct TokenFooterMetric: View {
     let title: String
     let value: String
@@ -298,22 +329,56 @@ private struct TokenCacheRatioBar: View {
 }
 
 /// 悬浮球气泡用的今日 Token 概览卡：与 `TokenSummaryCard` 同款视觉，但去掉顶部窗口切换器
-/// 与右下角 TPS 展示，固定「日」窗口（今日）。只读展示聚合数，不含路径/正文/凭证。
+/// 与右下角 TPS 展示，固定「日」窗口（今日）。费用上方加一行更新时间（转圈 icon + 英文相对时间，
+/// 无前缀）。只读展示聚合数，不含路径/正文/凭证。
 struct OrbTokenOverviewCard: View {
     let summary: TokenUsageSummary
+    let syncStatus: TokenSyncStatus
+
+    @State private var now = Date()
+    @StateObject private var smoother = ScanProgressSmoother()
+    private let ticker = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
 
     private var day: TokenUsageWindowSummary? { summary[.day] }
+    private var inProgress: Bool { syncStatus.scanningInProgress || syncStatus.reportingInProgress }
+
+    /// 刷新中显示平滑百分比，否则显示英文相对时间（just now / 3m ago）。
+    private var statusText: String {
+        if inProgress {
+            return TokenUsageFormatting.percent(smoother.displayed)
+        }
+        return TokenUsageFormatting.relativeTimeEnglish(syncStatus.lastScanAt, now: now)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline) {
+            // 左侧大号 token 数字；右侧一列：上=更新状态（转圈 icon + 进度百分比 / 英文相对时间），
+            // 下=估算费用。右列整体与左侧数字等高、右对齐。
+            HStack(alignment: .center) {
                 Text(TokenUsageFormatting.tokens(day?.totalTokens))
                     .font(.system(size: 26, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                 Spacer(minLength: 8)
-                Text(TokenUsageFormatting.cost(day?.estimatedCost))
-                    .font(.system(size: 15, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
+                VStack(alignment: .trailing, spacing: 2) {
+                    HStack(spacing: 4) {
+                        SpinningRefreshIcon(spinning: inProgress)
+                        Text(statusText)
+                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                            .monospacedDigit()
+                    }
+                    .foregroundStyle(Color.white)
+                    Text(TokenUsageFormatting.cost(day?.estimatedCost))
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                }
+            }
+            .onReceive(ticker) { now = $0 }
+            .onAppear { smoother.setTarget(inProgress ? syncStatus.scanProgress : nil, phaseCeiling: syncStatus.scanPhase?.overallCeiling) }
+            .onChange(of: syncStatus.scanProgress) { _, newValue in
+                smoother.setTarget(inProgress ? newValue : nil, phaseCeiling: syncStatus.scanPhase?.overallCeiling)
+            }
+            .onChange(of: inProgress) { _, running in
+                smoother.setTarget(running ? syncStatus.scanProgress : nil, phaseCeiling: syncStatus.scanPhase?.overallCeiling)
             }
 
             TokenCacheRatioBar(cached: day?.cachedTokens, new: day?.newTokens)

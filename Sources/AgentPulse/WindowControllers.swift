@@ -251,7 +251,10 @@ final class OrbWindowController {
         let x = opensRight
             ? panel.frame.maxX + Constants.taskListGap
             : panel.frame.minX - Constants.taskListGap - size.width
-        let y = min(max(panel.frame.midY - size.height / 2, visible.minY), visible.maxY - size.height)
+        // 垂直方向：让气泡顶端高出悬浮球顶端 topOverhang，使悬浮球被气泡在垂直方向包住、
+        // 顶部探出；空间不足时 clamp 会自动下压收进可视区。（AppKit y 向上，顶边 = origin.y + height）
+        let topOverhang: CGFloat = 100
+        let y = panel.frame.maxY + topOverhang - size.height
         let proposed = NSRect(origin: NSPoint(x: x, y: y), size: size)
         detailPanel.setFrame(ScreenPlacement.clamped(proposed, to: screen), display: true)
     }

@@ -602,7 +602,7 @@ struct OrbDetailView: View {
     var body: some View {
         VStack(spacing: 8) {
             OrbTPSCard(model: model)
-            OrbTokenOverviewCard(summary: model.tokenSummary)
+            OrbTokenOverviewCard(summary: model.tokenSummary, syncStatus: model.tokenSyncStatus)
             OrbTaskListView(allTasksValue: allTasksValue, items: items)
             ModelTokenBreakdownCard(summary: model.tokenSummary, window: .day, showsTitle: false, expandable: false)
         }
@@ -611,7 +611,7 @@ struct OrbDetailView: View {
 }
 
 /// 气泡里的实时 TPS 卡：左上 TPS 数值 + 右侧小曲线（总曲线与各模型曲线叠画在同一张小图、
-/// 共享纵轴），下方配全部模型图例（含总计行）。与菜单同源的 15 分钟 sparkline。
+/// 共享纵轴），下方配各模型图例（不含总计行；总曲线仍画在图上）。与菜单同源的 15 分钟 sparkline。
 private struct OrbTPSCard: View {
     @ObservedObject var model: ApplicationModel
 
@@ -633,9 +633,8 @@ private struct OrbTPSCard: View {
                 .frame(width: 120, height: 40)
             }
 
-            // 全部模型图例集中一处：色条 + 模型名 + 当前 TPS；含总计行。
+            // 全部模型图例集中一处：色条 + 模型名 + 当前 TPS。总曲线仍画在图上，但不占图例行。
             VStack(alignment: .leading, spacing: 6) {
-                OrbTPSLegendRow(color: trendColor, name: "总计", value: model.tps ?? 0, bold: true)
                 ForEach(model.modelTPSHistory) { item in
                     OrbTPSLegendRow(
                         color: modelTPSColor(for: item.model, in: model.modelTPSHistory),
