@@ -31,6 +31,8 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyMetricsPersistAggregateAndMapToDerivedRows()
         try verifier.verifyContentDedupKeyCollapsesForkCopies()
         try verifier.verifyCalendarWindowSummariesUseDerivedBucketsAndHostname()
+        try verifier.verifyFinalizeIsScopedToHostname()
+        try verifier.verifyLegacyRawRowsAreClaimedOnlyByCanonicalHostname()
         print("MetricsLedgerPipelineVerification: PASS")
     }
 }
@@ -274,8 +276,102 @@ private struct MetricsLedgerPipelineVerifier {
         try require(try ledger.summary(window: .week, containing: reference, hostname: "host-a", calendar: calendar)?.counts.input == 30, "week window is the rolling 7-day range ending at the reference instant")
         try require(try ledger.summary(window: .month, containing: reference, hostname: "host-a", calendar: calendar)?.counts.input == 60, "month window is the rolling 30-day range ending at the reference instant")
         try require(try ledger.summary(window: nil, containing: reference, hostname: "host-a", calendar: calendar)?.counts.input == 150, "hostname all-time summary")
+        try require(try ledger.summary(window: .day, containing: reference, calendar: calendar)?.counts.input == 109, "display day summary must include every hostname")
+        try require(try ledger.summary(window: .week, containing: reference, calendar: calendar)?.counts.input == 129, "display week summary must include every hostname")
+        try require(try ledger.summary(window: .month, containing: reference, calendar: calendar)?.counts.input == 159, "display month summary must include every hostname")
+        try require(try ledger.summary(window: nil, containing: reference, calendar: calendar)?.counts.input == 249, "display all-time summary must include every hostname")
+        let displayModels = try ledger.modelSummary(window: .day, containing: reference, calendar: calendar)
+        try require(displayModels.first(where: { $0.model == "model-a" })?.counts.input == 99, "display model summary must preserve cross-host model totals")
+        try require(displayModels.first(where: { $0.model == "unknown" })?.counts.input == 10, "display model summary must preserve other models")
+        let displayWeekModels = try ledger.modelSummary(window: .week, containing: reference, calendar: calendar)
+        try require(displayWeekModels.first(where: { $0.model == "model-a" })?.counts.input == 119, "display model summary must sum the same model across hostnames")
+        let dayInterval = try unwrap(UsageSummaryWindow.day.interval(containing: reference, calendar: calendar), "day interval must exist")
+        let displayOutput = try ledger.outputTokenBuckets(start: dayInterval.start, end: reference)
+        try require(displayOutput.count == 1, "display output buckets must group the same bucket across hostnames")
+        try require(displayOutput.reduce(Int64(0)) { $0 + $1.outputTokens } == 3, "display output buckets must include all hostnames")
+        let displayOutputByModel = try ledger.outputTokenBucketsByModel(start: dayInterval.start, end: reference)
+        try require(displayOutputByModel.count == 2, "display model output buckets must group by bucket and model")
+        try require(displayOutputByModel.first(where: { $0.model == "unknown" })?.outputTokens == 3, "display model output buckets must aggregate across hostnames")
         try require(try ledger.summary()?.counts.input == 249, "legacy summary must remain cross-host all-time")
         try require(try ledger.summary(window: .day, containing: localDate(2024, 1, 1, 12, calendar: calendar), hostname: "host-a", calendar: calendar) == nil, "empty summary window must return nil")
+        try require(try ledger.summary(window: .day, containing: localDate(2024, 1, 1, 12, calendar: calendar), calendar: calendar) == nil, "empty display summary window must return nil")
+    }
+
+    func verifyFinalizeIsScopedToHostname() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let timestamp = try date("2026-08-18T01:00:00Z")
+
+        func checkpoint(_ fileID: String) -> UsageFileCheckpoint {
+            UsageFileCheckpoint(
+                fileID: fileID, source: "verification", pathHash: fileID,
+                offset: 1, size: 1, modifiedAt: timestamp,
+                parserVersion: UsageJSONLParser.parserVersion, status: "complete"
+            )
+        }
+        func event(_ id: String, fileID: String, input: Int64) -> UsageEvent {
+            UsageEvent(
+                id: id, source: "verification", model: "model", project: "project",
+                timestamp: timestamp, counts: UsageTokenCounts(input: input, reportedTotal: input),
+                sessionHash: "session-(id)", sourceFileHash: fileID
+            )
+        }
+
+        try ledger.record(events: [event("a1", fileID: "file-a", input: 10)], checkpoint: checkpoint("file-a"), hostname: "host-a")
+        try ledger.record(events: [event("b1", fileID: "file-b", input: 20)], checkpoint: checkpoint("file-b"), hostname: "host-b")
+        _ = try ledger.finalizeDerived(hostname: "host-a")
+        _ = try ledger.finalizeDerived(hostname: "host-b")
+        try require(try ledger.summary(window: nil, containing: timestamp, hostname: "host-a")?.counts.input == 10, "host-a finalize must not consume host-b raw events")
+        try require(try ledger.summary(window: nil, containing: timestamp, hostname: "host-b")?.counts.input == 20, "host-b finalize must retain its own derived rows")
+
+        try ledger.record(events: [event("a2", fileID: "file-a", input: 30)], checkpoint: checkpoint("file-a"), hostname: "host-a")
+        _ = try ledger.finalizeDerived(hostname: "host-a")
+        try require(try ledger.summary(window: nil, containing: timestamp, hostname: "host-a")?.counts.input == 30, "host-a refinalize must only replace host-a derived rows")
+        try require(try ledger.summary(window: nil, containing: timestamp, hostname: "host-b")?.counts.input == 20, "host-a refinalize must not mutate host-b derived rows")
+        try require(try ledger.summary(window: nil, containing: timestamp)?.counts.input == 50, "display summary must add independently derived hostnames")
+    }
+
+    func verifyLegacyRawRowsAreClaimedOnlyByCanonicalHostname() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let timestamp = try date("2026-08-18T02:00:00Z")
+        func checkpoint(_ fileID: String) -> UsageFileCheckpoint {
+            UsageFileCheckpoint(
+                fileID: fileID, source: "verification", pathHash: fileID,
+                offset: 1, size: 1, modifiedAt: timestamp,
+                parserVersion: UsageJSONLParser.parserVersion, status: "complete"
+            )
+        }
+        func event(_ id: String, fileID: String, input: Int64) -> UsageEvent {
+            UsageEvent(
+                id: id, source: "verification", model: "model", project: "project",
+                timestamp: timestamp, counts: UsageTokenCounts(input: input, reportedTotal: input),
+                sessionHash: "session-\(id)", sourceFileHash: fileID
+            )
+        }
+
+        // 首次 record 建立 canonical=host-a；模拟 v10 迁移后仍残留的一条空 hostname 原始行。
+        try ledger.record(events: [event("legacy", fileID: "file-a", input: 10)], checkpoint: checkpoint("file-a"), hostname: "host-a")
+        try ledger.record(events: [event("owned-b", fileID: "file-b", input: 20)], checkpoint: checkpoint("file-b"), hostname: "host-b")
+        try withDatabase(database) { db in
+            try execute(db, "UPDATE usage_events SET hostname='' WHERE event_id='legacy';")
+            try execute(db, "INSERT INTO sync_state(key,value,updated_at_ms) VALUES('unresolved_legacy_raw_hostname','1',0);")
+        }
+
+        _ = try ledger.finalizeDerived(hostname: "host-b")
+        try require(try ledger.summary(window: nil, containing: timestamp, hostname: "host-b")?.counts.input == 20, "non-canonical finalize must ignore legacy raw rows")
+        try withDatabase(database) { db in
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='legacy' AND hostname='';") == 1, "non-canonical finalize must not claim legacy raw rows")
+        }
+
+        _ = try ledger.finalizeDerived(hostname: "host-a")
+        try require(try ledger.summary(window: nil, containing: timestamp, hostname: "host-a")?.counts.input == 10, "canonical finalize must claim legacy raw rows exactly once")
+        try require(try ledger.summary(window: nil, containing: timestamp)?.counts.input == 30, "cross-host display must not double count legacy raw rows")
+        try withDatabase(database) { db in
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='legacy' AND hostname='host-a';") == 1, "canonical finalize must persist legacy ownership")
+        }
     }
 
     private func temporaryDatabaseURL() throws -> URL {
