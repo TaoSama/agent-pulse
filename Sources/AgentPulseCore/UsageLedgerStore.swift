@@ -396,6 +396,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try queue.sync {
             var result = UsageFinalizeResult(reportingEligible: true, blockedReasons: [], collapsedInheritedEvents: 0)
             try transaction {
+                try claimLegacyRawRowsIfUnambiguousUnlocked(hostname: hostname)
                 result = try recomputeDerivedUnlocked(hostname: hostname, progress: progress)
                 // 只有显式 finalize 表示调用方已经成功完成整轮来源扫描。其它内部重算
                 // （例如 hostname 对齐）不能清除此门禁，否则部分扫描失败后会 fail-open。
@@ -471,7 +472,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // 读取时按 v8 归属优先级去重（ownedActive>ownedHistory>legacy），并收集 overwrite 同 tier 冲突；
         // 冲突不静默取其一，而是 fail-closed 阻断 reporting。
         var overwriteConflicts: [String] = []
-        let raw = try readAllRawEvents(overwriteConflicts: &overwriteConflicts)
+        let raw = try readAllRawEvents(hostname: hostname, overwriteConflicts: &overwriteConflicts)
         blockedReasons.append(contentsOf: overwriteConflicts)
         advanceStage() // 1) 读原始事件完成
 
@@ -594,7 +595,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             buckets[key]?.codeMetricVersion = UsageEditLines.codeMetricVersion
         }
         advanceStage() // 4) bucket 聚合完成
-        for edit in try readAllRawEditEntries() {
+        for edit in try readAllRawEditEntries(hostname: hostname) {
             let start = (edit.timestampMs / Self.bucketMilliseconds) * Self.bucketMilliseconds
             let key = "\(edit.source)\u{1}\(edit.model)\u{1}\(edit.project)\u{1}\(start)"
             var agg = buckets[key] ?? BucketAgg()
@@ -607,7 +608,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
         // 3) 重算 sessions（复用聚合器，全部归属当前 hostname）。
         advanceStage() // 5) edit 聚合完成
-        let sessionEvents = try readAllSessionEvents()
+        let sessionEvents = try readAllSessionEvents(hostname: hostname)
         // session project 内容策略：以同一 (source, sessionHash) 下**最新有效** UsageEvent.project 为准
         // （按 timestamp 取最大，非空优先），无则回落空串。project 不参与自然键/分组/去重。
         // 注意：从**全量 raw**（而非血缘去重后的 deduped）计算 —— 去重可能丢弃携带 project 的行，
@@ -798,67 +799,103 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return hostnames[0]
     }
 
-    /// 兼容入口：汇总 usage_buckets 中所有 hostname 的全时段派生数据。
-    /// 新调用方应使用 hostname 版，避免 canonical host 变更时混入旧 host。
-    public func summary(prices: [UsageModelPrice] = []) throws -> UsageSummary? {
-        try queue.sync {
-            let sql = "SELECT model,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,updated_at_ms FROM usage_buckets;"
-            let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
-            return try summarizeBucketRows(statement, prices: prices)
+    /// v10 以前的原始行没有 hostname。只有账本尚无派生设备，或唯一派生设备就是本次目标时，
+    /// 才能证明这些行属于目标设备并一次性认领；多设备或 adopt 新名场景保持为空，避免被重复派生。
+    private func claimLegacyRawRowsIfUnambiguousUnlocked(hostname: String) throws {
+        let canonical = try readTextUnlocked(key: Self.canonicalHostnameKey).flatMap { $0.isEmpty ? nil : $0 }
+        let unresolvedMigration = try readTextUnlocked(key: Self.unresolvedLegacyRawHostnameKey) == "1"
+        // 正常 v10 库已有 canonical 且无迁移债务，直接 O(1) 返回；仅旧库迁移或尚未建立
+        // canonical 的兼容场景才检查/更新原始大表。
+        guard unresolvedMigration || canonical == nil else { return }
+        let candidate = try uniqueLegacyHostnameCandidateUnlocked()
+        let hasDerivedHostname = try hasAnyNonEmptyDerivedHostnameUnlocked()
+        let mayClaim = canonical == hostname || (canonical == nil && (!hasDerivedHostname || candidate == hostname))
+        guard mayClaim else { return }
+        for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
+            guard try tableExistsUnlocked(table) else { continue }
+            let statement = try prepare("UPDATE \(table) SET hostname=? WHERE hostname='';")
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            try done(statement)
         }
+        try deleteKeyUnlocked(Self.unresolvedLegacyRawHostnameKey)
     }
 
-    /// 指定 canonical hostname 的派生桶汇总。window=nil 表示该 hostname 的全时段；
-    /// 非 nil 使用调用方 calendar 的自然日/月/年区间，边界为 [start,end)。
+    private func hasAnyNonEmptyDerivedHostnameUnlocked() throws -> Bool {
+        let statement = try prepare("""
+            SELECT 1 FROM (
+              SELECT hostname FROM usage_buckets WHERE TRIM(hostname)<>''
+              UNION SELECT hostname FROM usage_sessions WHERE TRIM(hostname)<>''
+            ) LIMIT 1;
+            """)
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
+
+    /// 兼容入口：汇总 usage_buckets 中所有 hostname 的全时段派生数据。
+    public func summary(prices: [UsageModelPrice] = []) throws -> UsageSummary? {
+        try summary(window: nil, containing: Date(), hostname: nil, prices: prices)
+    }
+
+    /// 派生桶汇总。hostname=nil 时跨所有设备展示；非 nil 时仅查询指定设备。
+    /// window=nil 表示全时段；非 nil 使用调用方 calendar 的窗口，边界为 [start,end)。
     public func summary(
         window: UsageSummaryWindow?,
         containing date: Date,
-        hostname: String,
+        hostname: String? = nil,
         calendar: Calendar = .current,
         prices: [UsageModelPrice] = []
     ) throws -> UsageSummary? {
         try queue.sync {
-            var sql = "SELECT model,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,updated_at_ms FROM usage_buckets WHERE hostname=?"
+            var sql = "SELECT model,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,updated_at_ms FROM usage_buckets"
+            var predicates: [String] = []
+            if hostname != nil { predicates.append("hostname=?") }
             var interval: DateInterval?
             if let window {
                 interval = window.interval(containing: date, calendar: calendar)
                 guard interval != nil else { return nil }
-                sql += " AND bucket_start_ms>=? AND bucket_start_ms<?"
+                predicates.append("bucket_start_ms>=? AND bucket_start_ms<?")
             }
+            if !predicates.isEmpty { sql += " WHERE " + predicates.joined(separator: " AND ") }
             sql += ";"
             let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
-            try bind(statement, 1, hostname)
+            var bindIndex: Int32 = 1
+            if let hostname { try bind(statement, bindIndex, hostname); bindIndex += 1 }
             if let interval {
-                try bind(statement, 2, millis(interval.start))
-                try bind(statement, 3, millis(interval.end))
+                try bind(statement, bindIndex, millis(interval.start))
+                try bind(statement, bindIndex + 1, millis(interval.end))
             }
             return try summarizeBucketRows(statement, prices: prices)
         }
     }
 
-    /// 指定 canonical hostname 的按模型 token 汇总。window=nil 表示全时段；
+    /// 按模型 token 汇总。hostname=nil 时跨所有设备；window=nil 表示全时段；
     /// 非 nil 使用调用方 calendar 的窗口区间，边界为 [start,end)。
     /// 仅聚合 token 计数（不含费用），按 total 降序返回；无数据返回空数组。
     public func modelSummary(
         window: UsageSummaryWindow?,
         containing date: Date,
-        hostname: String,
+        hostname: String? = nil,
         calendar: Calendar = .current
     ) throws -> [UsageModelTokenSummary] {
         try queue.sync {
-            var sql = "SELECT model,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens FROM usage_buckets WHERE hostname=?"
+            var sql = "SELECT model,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens FROM usage_buckets"
+            var predicates: [String] = []
+            if hostname != nil { predicates.append("hostname=?") }
             var interval: DateInterval?
             if let window {
                 interval = window.interval(containing: date, calendar: calendar)
                 guard interval != nil else { return [] }
-                sql += " AND bucket_start_ms>=? AND bucket_start_ms<?"
+                predicates.append("bucket_start_ms>=? AND bucket_start_ms<?")
             }
+            if !predicates.isEmpty { sql += " WHERE " + predicates.joined(separator: " AND ") }
             sql += ";"
             let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
-            try bind(statement, 1, hostname)
+            var bindIndex: Int32 = 1
+            if let hostname { try bind(statement, bindIndex, hostname); bindIndex += 1 }
             if let interval {
-                try bind(statement, 2, millis(interval.start))
-                try bind(statement, 3, millis(interval.end))
+                try bind(statement, bindIndex, millis(interval.start))
+                try bind(statement, bindIndex + 1, millis(interval.end))
             }
             var byModel: [String: UsageTokenCounts] = [:]
             while sqlite3_step(statement) == SQLITE_ROW {
@@ -891,23 +928,23 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 用于看板 1 天 TPS 曲线（每个 30min bucket 的 output 之和 → /1800 = 平均 TPS）。
     /// 按 bucketStart 升序返回；无数据返回空数组。queue.sync 阻塞，勿在主线程调用。
     public func outputTokenBuckets(
-        hostname: String,
+        hostname: String? = nil,
         start: Date,
         end: Date
     ) throws -> [(bucketStart: Date, outputTokens: Int64)] {
         try queue.sync {
-            let sql = "SELECT bucket_start_ms,SUM(output_tokens) FROM usage_buckets "
-                + "WHERE hostname=? AND bucket_start_ms>=? AND bucket_start_ms<? "
+            var sql = "SELECT bucket_start_ms,SUM(output_tokens) FROM usage_buckets WHERE "
+            if hostname != nil { sql += "hostname=? AND " }
+            sql += "bucket_start_ms>=? AND bucket_start_ms<? "
                 + "GROUP BY bucket_start_ms ORDER BY bucket_start_ms;"
             let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
-            try bind(statement, 1, hostname)
-            try bind(statement, 2, millis(start))
-            try bind(statement, 3, millis(end))
+            var bindIndex: Int32 = 1
+            if let hostname { try bind(statement, bindIndex, hostname); bindIndex += 1 }
+            try bind(statement, bindIndex, millis(start))
+            try bind(statement, bindIndex + 1, millis(end))
             var rows: [(bucketStart: Date, outputTokens: Int64)] = []
             while sqlite3_step(statement) == SQLITE_ROW {
-                let bucketStartMs = sqlite3_column_int64(statement, 0)
-                let output = sqlite3_column_int64(statement, 1)
-                rows.append((Date(timeIntervalSince1970: Double(bucketStartMs) / 1000), output))
+                rows.append((date(sqlite3_column_int64(statement, 0)), sqlite3_column_int64(statement, 1)))
             }
             if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
             return rows
@@ -916,24 +953,23 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     /// 同上，但按 (bucket_start, model) 分组，供看板 1 天分模型曲线。
     public func outputTokenBucketsByModel(
-        hostname: String,
+        hostname: String? = nil,
         start: Date,
         end: Date
     ) throws -> [(bucketStart: Date, model: String, outputTokens: Int64)] {
         try queue.sync {
-            let sql = "SELECT bucket_start_ms,model,SUM(output_tokens) FROM usage_buckets "
-                + "WHERE hostname=? AND bucket_start_ms>=? AND bucket_start_ms<? "
+            var sql = "SELECT bucket_start_ms,model,SUM(output_tokens) FROM usage_buckets WHERE "
+            if hostname != nil { sql += "hostname=? AND " }
+            sql += "bucket_start_ms>=? AND bucket_start_ms<? "
                 + "GROUP BY bucket_start_ms,model ORDER BY bucket_start_ms;"
             let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
-            try bind(statement, 1, hostname)
-            try bind(statement, 2, millis(start))
-            try bind(statement, 3, millis(end))
+            var bindIndex: Int32 = 1
+            if let hostname { try bind(statement, bindIndex, hostname); bindIndex += 1 }
+            try bind(statement, bindIndex, millis(start))
+            try bind(statement, bindIndex + 1, millis(end))
             var rows: [(bucketStart: Date, model: String, outputTokens: Int64)] = []
             while sqlite3_step(statement) == SQLITE_ROW {
-                let bucketStartMs = sqlite3_column_int64(statement, 0)
-                let model = text(statement, 1)
-                let output = sqlite3_column_int64(statement, 2)
-                rows.append((Date(timeIntervalSince1970: Double(bucketStartMs) / 1000), model, output))
+                rows.append((date(sqlite3_column_int64(statement, 0)), text(statement, 1), sqlite3_column_int64(statement, 2)))
             }
             if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
             return rows
@@ -1020,16 +1056,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return result
     }
 
-    private func readAllRawEvents() throws -> [RawEvent] {
-        var ignoredConflicts: [String] = []
-        return try readAllRawEvents(overwriteConflicts: &ignoredConflicts)
-    }
-
-    private func readAllRawEvents(overwriteConflicts: inout [String]) throws -> [RawEvent] {
-        // 读全部（跨文件）原始 token 行，稳定排序（含 source_file_hash 使跨文件同 id 顺序确定）。
+    private func readAllRawEvents(hostname: String, overwriteConflicts: inout [String]) throws -> [RawEvent] {
+        // 读取目标设备的全部（跨文件）原始 token 行，稳定排序。
         let activeFiles = try ownedActiveFileIDsUnlocked()
-        let sql = "SELECT event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,inherited,has_total_snapshot,lineage_fingerprint,codex_dedup_key,skill_counts_json,mcp_counts_json,merge_strategy,source_file_hash,hostname FROM usage_events ORDER BY timestamp_ms,event_id,source_file_hash;"
-        let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
+        let sql = "SELECT event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,inherited,has_total_snapshot,lineage_fingerprint,codex_dedup_key,skill_counts_json,mcp_counts_json,merge_strategy,source_file_hash,hostname FROM usage_events WHERE hostname=? ORDER BY timestamp_ms,event_id,source_file_hash;"
+        let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         var result: [TieredRawEvent] = []
         while sqlite3_step(statement) == SQLITE_ROW {
             let counts = UsageTokenCounts(input: sqlite3_column_int64(statement, 5), output: sqlite3_column_int64(statement, 6), cachedInput: sqlite3_column_int64(statement, 7), cacheCreationInput: sqlite3_column_int64(statement, 8), reasoningOutput: sqlite3_column_int64(statement, 9), reportedTotal: sqlite3_column_int64(statement, 10))
@@ -1163,14 +1194,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
             )
     }
 
-    private func readAllRawEditEntries() throws -> [RawEditEntry] {
+    private func readAllRawEditEntries(hostname: String) throws -> [RawEditEntry] {
         // 跨文件相同 tool_use_id 只保留确定性一条，避免同一编辑被两份文件重复计入行数指标。
         // v8 归属优先级：ownedActive > ownedHistory > legacy；有更高 tier 时完全忽略低 tier 旧行，
         // 仅当无任何 owned 行时保留 legacy。同 tier 内维持既有「按 timestamp,tool_use_id,source_file_hash
         // 稳定排序取首个」的确定性口径。
         let activeFiles = try ownedActiveFileIDsUnlocked()
-        let statement = try prepare("SELECT source,model,project,timestamp_ms,lines_added,lines_deleted,tool_use_id,source_file_hash,hostname FROM usage_edit_entries ORDER BY timestamp_ms,tool_use_id,source_file_hash;")
-        defer { sqlite3_finalize(statement) }
+        let statement = try prepare("SELECT source,model,project,timestamp_ms,lines_added,lines_deleted,tool_use_id,source_file_hash,hostname FROM usage_edit_entries WHERE hostname=? ORDER BY timestamp_ms,tool_use_id,source_file_hash;")
+        defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         var order: [String] = []
         var byKey: [String: (entry: RawEditEntry, tier: AttributionTier)] = [:]
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -1200,14 +1231,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return result
     }
 
-    private func readAllSessionEvents() throws -> [UsageSessionEvent] {
+    private func readAllSessionEvents(hostname: String) throws -> [UsageSessionEvent] {
         // 跨文件相同 (source,event_id) 的会话事件只保留一条。
         // v8 归属优先级：ownedActive > ownedHistory > legacy；有更高 tier 时完全忽略低 tier 旧行，
         // 仅当无任何 owned 行时保留 legacy。同 tier 内维持既有「按 source,event_id,source_file_hash
         // 稳定排序取首个」的确定性口径。
         let activeFiles = try ownedActiveFileIDsUnlocked()
-        let statement = try prepare("SELECT event_id,source,session_hash,role,timestamp_ms,source_file_hash,hostname FROM usage_session_events ORDER BY source,event_id,source_file_hash;")
-        defer { sqlite3_finalize(statement) }
+        let statement = try prepare("SELECT event_id,source,session_hash,role,timestamp_ms,source_file_hash,hostname FROM usage_session_events WHERE hostname=? ORDER BY source,event_id,source_file_hash;")
+        defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         var order: [String] = []
         var byKey: [String: (event: UsageSessionEvent, tier: AttributionTier)] = [:]
         while sqlite3_step(statement) == SQLITE_ROW {
@@ -1798,6 +1829,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // 回填空 hostname：确定「当时的 canonical hostname」。
         var backfill = try readTextUnlocked(key: Self.canonicalHostnameKey).flatMap { $0.isEmpty ? nil : $0 }
         if backfill == nil { backfill = try uniqueLegacyHostnameCandidateUnlocked() }
+        let hasEvents = try tableHasAnyRowUnlocked("usage_events")
+        let hasSessionEvents = try tableHasAnyRowUnlocked("usage_session_events")
+        let hasEditEntries = try tableHasAnyRowUnlocked("usage_edit_entries")
+        let hasRawRows = hasEvents || hasSessionEvents || hasEditEntries
         if let host = backfill, !host.isEmpty {
             for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
                 guard try tableExistsUnlocked(table) else { continue }
@@ -1805,13 +1840,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 defer { sqlite3_finalize(statement) }
                 try bind(statement, 1, host); try done(statement)
             }
+            try deleteKeyUnlocked(Self.unresolvedLegacyRawHostnameKey)
+        } else if hasRawRows {
+            try setTextUnlocked(key: Self.unresolvedLegacyRawHostnameKey, value: "1")
         }
 
         // 若已有原始事件（历史库），置 raw 派生 dirty，直到一次成功 finalize 清除。
-        let hasEvents = try tableHasAnyRowUnlocked("usage_events")
-        let hasSessionEvents = try tableHasAnyRowUnlocked("usage_session_events")
-        let hasEditEntries = try tableHasAnyRowUnlocked("usage_edit_entries")
-        if hasEvents || hasSessionEvents || hasEditEntries {
+        if hasRawRows {
             try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
         }
 
@@ -2007,7 +2042,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private func reportingEligibleKey(_ hostname: String) -> String { "reporting_eligible\u{1}\(hostname)" }
    private static let rebuildPendingKey = "rebuild_pending"
    private static let rebuildCompletedParserVersionKey = "rebuild_completed_parser_version"
-   private static let canonicalHostnameKey = "canonical_hostname"
+    private static let canonicalHostnameKey = "canonical_hostname"
+    /// v9 -> v10 迁移无法唯一确定 legacy 原始行归属时置位；仅在后续能证明归属时扫描并认领一次。
+    private static let unresolvedLegacyRawHostnameKey = "unresolved_legacy_raw_hostname"
     /// raw 派生 dirty 位：每次 raw replace（record）同事务置位；finalizeDerived 成功重算派生后同事务清除。
     /// 置位期间 reportingEligible / pendingBatch 一律 fail-closed，确保文件替换后、
     /// finalize 之前进程崩溃不会上报仍反映旧原始归属的陈旧派生。

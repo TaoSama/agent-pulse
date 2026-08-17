@@ -161,13 +161,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         // 上报所用 hostname 权威优先；否则回落到用户保存的本地 hostname（仅用于本地采集）。
         let effectiveHostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
 
-        // 冷启动只按已知 canonical hostname 恢复四个派生窗口。hostname 未知时保持空，
-        // 等首次扫描 record 播种账本身份后再发布，禁止回退到跨 hostname 的 legacy summary。
+        // 冷启动展示账本中所有 hostname 的派生数据。canonical hostname 仅决定后续采集与上报身份。
         let initialSummary: TokenUsageSummary
-        if let ledger, !effectiveHostname.isEmpty {
+        if let ledger {
             initialSummary = (try? Self.summaries(
                 from: ledger,
-                hostname: effectiveHostname,
                 containing: Date(),
                 calendar: usageSummaryCalendar,
                 mergedEnvURL: self.mergedEnvURL
@@ -499,7 +497,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 progressReporter.enterPhase(.summarizing, total: TokenUsageWindow.allCases.count)
                 let summary = try Self.summaries(
                     from: ledger,
-                    hostname: hostname,
                     containing: Date(),
                     calendar: summaryCalendar,
                     mergedEnvURL: summaryEnvURL
@@ -1164,9 +1161,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         summarySubject.send(summary)
     }
 
-    /// 刷新看板 1 天曲线：解析有效 hostname → off-main 读账本 30min bucket → 换算平均 TPS →
+    /// 刷新看板 1 天曲线：off-main 读取所有 hostname 的 30min bucket → 换算平均 TPS →
     /// 回主线程 send。仅在看板选中 1 天时由 App 触发（span 切换 + 每轮 scan 完成）。
-    /// hostname 缺失或账本不可用时发空序列（视图显示无数据），绝不阻塞主线程。
+    /// 账本不可用时发空序列（视图显示无数据），绝不阻塞主线程。
     /// `active` 标记看板是否停在 1 天视图：true 时后续每轮 scan 完成会自动刷新。
     func refreshDashboardDaySeries(active: Bool = true, now: Date = Date()) {
         dashboardDayActive = active
@@ -1175,16 +1172,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             daySeriesSubject.send(.empty)
             return
         }
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL, envURL: mergedEnvURL)
-        let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
-        let hostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
-        guard !hostname.isEmpty else {
-            daySeriesSubject.send(.empty)
-            return
-        }
         Task { [weak self] in
             let result = await Self.runOffMain { _ in
-                try Self.buildDaySeries(from: ledger, hostname: hostname, now: now)
+                try Self.buildDaySeries(from: ledger, now: now)
             }
             await MainActor.run {
                 guard let self else { return }
@@ -1210,13 +1200,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// off-main：从账本读 [now-24h, now) 的 30min output bucket，换算成 48 桶平均 TPS 曲线（总 + 分模型）。
     nonisolated private static func buildDaySeries(
         from ledger: UsageLedgerStore,
-        hostname: String,
         now: Date
     ) throws -> DashboardDaySeries {
         let span = DashboardTPSSpan.oneDay
         let start = now.addingTimeInterval(-span.totalSeconds)
-        let totalBuckets = try ledger.outputTokenBuckets(hostname: hostname, start: start, end: now)
-        let modelBuckets = try ledger.outputTokenBucketsByModel(hostname: hostname, start: start, end: now)
+        let totalBuckets = try ledger.outputTokenBuckets(start: start, end: now)
+        let modelBuckets = try ledger.outputTokenBucketsByModel(start: start, end: now)
         let total = SparklineAnalysis.makeUsageLedgerTPSPoints(buckets: totalBuckets, end: now)
 
         var byModel: [String: [(bucketStart: Date, outputTokens: Int64)]] = [:]
@@ -1244,46 +1233,41 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         )
     }
 
-    /// 四个窗口共享同一参考时刻、时区与 hostname，并且全部从 derived bucket 查询。
+    /// 四个窗口共享同一参考时刻与时区，并从所有 hostname 的 derived bucket 查询。
     /// `mergedEnvURL` 仅用于按身份 gate 展示层虚拟基线（读 0600 env 的 USER 哨兵），不写库、不上报。
     nonisolated private static func summaries(
         from ledger: UsageLedgerStore,
-        hostname: String,
         containing date: Date,
         calendar: Calendar,
         mergedEnvURL: URL
     ) throws -> TokenUsageSummary {
         // 四窗口真实按模型 token（原始名）：日为纯真实明细；周/月/全部作为叠加到虚拟基线上的真实增量。
         let realModels: [TokenUsageWindow: [UsageModelTokenSummary]] = [
-            .day: try ledger.modelSummary(window: .day, containing: date, hostname: hostname, calendar: calendar),
-            .week: try ledger.modelSummary(window: .week, containing: date, hostname: hostname, calendar: calendar),
-            .month: try ledger.modelSummary(window: .month, containing: date, hostname: hostname, calendar: calendar),
-            .all: try ledger.modelSummary(window: nil, containing: date, hostname: hostname, calendar: calendar),
+            .day: try ledger.modelSummary(window: .day, containing: date, calendar: calendar),
+            .week: try ledger.modelSummary(window: .week, containing: date, calendar: calendar),
+            .month: try ledger.modelSummary(window: .month, containing: date, calendar: calendar),
+            .all: try ledger.modelSummary(window: nil, containing: date, calendar: calendar),
         ]
         return TokenWindowVirtualBuckets.apply(
             to: TokenUsageSummary(
                 day: try ledger.summary(
                     window: .day,
                     containing: date,
-                    hostname: hostname,
                     calendar: calendar
                 ).map(windowSummary(from:)),
                 week: try ledger.summary(
                     window: .week,
                     containing: date,
-                    hostname: hostname,
                     calendar: calendar
                 ).map(windowSummary(from:)),
                 month: try ledger.summary(
                     window: .month,
                     containing: date,
-                    hostname: hostname,
                     calendar: calendar
                 ).map(windowSummary(from:)),
                 all: try ledger.summary(
                     window: nil,
                     containing: date,
-                    hostname: hostname,
                     calendar: calendar
                 ).map(windowSummary(from:))
             ),

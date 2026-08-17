@@ -148,6 +148,7 @@ open dist/AgentPulse.app
 
 - 本地扫描 `~/.codex/sessions/**/*.jsonl` 与 `~/.claude/projects/**/*.jsonl`，事件追加写入独立 SQLite，并聚合为 30 分钟 bucket。
 - 菜单 Token 卡支持日 / 月 / 年 / 全部四个窗口；每个窗口展示总 Tokens、估算费用、缓存 / 新增、缓存命中率，卡片底部展示实时 TPS；无数据时不以 0 冒充。
+- Token 卡、分模型明细与 1 天 TPS 曲线会聚合账本中所有 hostname；canonical hostname 只约束本机新扫描数据的归属与上报身份，不过滤本地展示。
 - 只保存统计维度、token 计数、工具名称与调用次数、编辑增删行和 hash 后的 session/source-file 标识，不保存正文、标题、完整 cwd、工具参数、补丁内容或凭证。
 - 本地长期采集默认开启（仅写本机 SQLite）；上报默认关闭。API 地址（`REPORT_BASE_URL`）为空、canonical hostname（`REPORT_CANONICAL_HOSTNAME`）缺失或 `reporting.json` 协议结构不完整时都无法启用上报，也不会发起任何网络请求或外部进程。
 - 开启自动上报后会立即执行一次“扫描 → 上报”，此后每 30 分钟重复；关闭开关会停止后续周期，配置失效时会持久化关闭，不会在配置恢复后自行重新开启。
@@ -325,7 +326,7 @@ chmod 600 ~/.claude/.credentials/env/agent-pulse.env
 
 - schema v10、WAL 模式；分层保存原始 token/session 事件、skill/MCP 计数、已应用编辑行、派生的 30 分钟聚合 bucket 与 session、源文件 checkpoint 与按 hostname 隔离的同步状态。旧库通过增量列和新表无损迁移到 v10（parser version 仍为 v7）。
 - bucket 自然键为 `(hostname, source, model, project, bucket_start_ms)`；session 自然键为 `(hostname, source, session_hash)`。bucket 额外保存 skill 名称与次数、MCP server 次数、新增 / 删除 / 净行数；session 保存活跃秒数、消息数、小时直方图与 skill 名称。
-- hostname 下沉到原始事件层——每条原始 token/session/edit 事件都记录采集时的本机 hostname，便于设备改名时原地统一历史归属。派生（bucket/session）仍按单一当前 canonical hostname 归属。
+- hostname 下沉到原始事件层——每条原始 token/session/edit 事件都记录采集时的本机 hostname，便于设备改名时原地统一历史归属。派生（bucket/session）按各自 hostname 隔离保存，本地展示跨 hostname 聚合。
 - **设备标识改名**：在设置里改了 canonical hostname 后，下一轮比对发现与账本旧名不一致时会弹确认框，不静默自动改。选「确认改名」在一个事务内把 usage_buckets / usage_sessions 及原始三表（usage_events / usage_session_events / usage_edit_entries）中旧名的行全部原地 UPDATE 成新名，并更新 sync_state.canonical_hostname；改名后这些派生行按现有 dirty 机制（revision>synced_revision）重新变 dirty 重新上报。选「否」则新名从此生效、历史保留旧名（同机两名共存，各自按 hostname 上报），且新名即刻成为 canonical，不再重复弹窗。
 - 数据库主文件及 WAL/SHM 边车文件会收紧为 `0600`。
 - 派生行逐行携带 revision 与 synced_revision：revision 大于 synced_revision 即为 dirty；ack 按（自然键 + revision 快照）精确匹配，避免误 ack 上传期间被重算的行。
