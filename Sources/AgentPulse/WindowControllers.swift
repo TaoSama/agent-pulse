@@ -38,6 +38,7 @@ final class OrbWindowController {
         static let orbSize = CGSize(width: 48, height: 48)
         static let taskListWidth: CGFloat = 260
         static let taskRowHeight: CGFloat = 38
+        static let taskListGap: CGFloat = 8
     }
 
     private let model: ApplicationModel
@@ -242,15 +243,16 @@ final class OrbWindowController {
     private func layoutBubbles() {
         guard let screen = panel.screen ?? NSScreen.main,
               let detailPanel = bubblePanels.first else { return }
-        // 气泡以悬浮球为中心居中：气泡中心对齐悬浮球中心，再 clamp 收进屏幕可视区。
+        // 贴悬浮球一侧展开、不覆盖悬浮球：悬浮球偏左则气泡开在右侧，反之开在左侧；
+        // 垂直方向与悬浮球中心对齐，再 clamp 收进屏幕可视区。
+        let visible = screen.visibleFrame.insetBy(dx: ScreenPlacement.safeInset, dy: ScreenPlacement.safeInset)
         let size = detailPanel.frame.size
-        let center = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
-        let proposed = NSRect(
-            x: center.x - size.width / 2,
-            y: center.y - size.height / 2,
-            width: size.width,
-            height: size.height
-        )
+        let opensRight = panel.frame.midX < visible.midX
+        let x = opensRight
+            ? panel.frame.maxX + Constants.taskListGap
+            : panel.frame.minX - Constants.taskListGap - size.width
+        let y = min(max(panel.frame.midY - size.height / 2, visible.minY), visible.maxY - size.height)
+        let proposed = NSRect(origin: NSPoint(x: x, y: y), size: size)
         detailPanel.setFrame(ScreenPlacement.clamped(proposed, to: screen), display: true)
     }
 
