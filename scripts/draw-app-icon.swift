@@ -3,7 +3,8 @@ import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 
-// Render a 1024x1024 macOS app icon: dark gradient rounded tile + glowing pulse waveform.
+// Render a 1024x1024 macOS app icon: charcoal rounded tile + run-green pulse waveform.
+// Usage: swift scripts/draw-app-icon.swift [output.png]  (defaults to ./AgentPulse-1024.png)
 let S: CGFloat = 1024
 let colorSpace = CGColorSpaceCreateDeviceRGB()
 guard let ctx = CGContext(
@@ -151,7 +152,7 @@ ctx.restoreGState()
 
 // --- Export PNG ---
 guard let image = ctx.makeImage() else { fatalError("image") }
-let outURL = URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "/tmp/agenticon/icon_1024.png")
+let outURL = URL(fileURLWithPath: CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "AgentPulse-1024.png")
 guard let dest = CGImageDestinationCreateWithURL(outURL as CFURL, UTType.png.identifier as CFString, 1, nil) else { fatalError("dest") }
 CGImageDestinationAddImage(dest, image, nil)
 guard CGImageDestinationFinalize(dest) else { fatalError("finalize") }
