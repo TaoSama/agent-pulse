@@ -312,11 +312,17 @@ struct TokenSyncStatus: Sendable, Equatable {
                 state: .notConfigured, title: "未配置上报", detail: detail, tone: .warning
             )
         }
-        // 2) 配好但被门禁挡。
+        // 2) 配好但被门禁挡。上报未开启时这只是本地信息，非活跃故障：降为中性提示，
+        //    不用红色报警（此时本机根本不上报，门禁不构成问题）；开启上报后才是真正的红色阻断。
         if !reportingEligible {
             let detail = reportingBlockedReasons.first ?? "存在无法证明的潜在重复，已阻止上报"
+            if reportingEnabled {
+                return ReportingAuthorityPresentation(
+                    state: .blocked, title: "上报被门禁阻止", detail: detail, tone: .negative
+                )
+            }
             return ReportingAuthorityPresentation(
-                state: .blocked, title: "上报被门禁阻止", detail: detail, tone: .negative
+                state: .blocked, title: "仅本地统计（上报门禁生效）", detail: detail, tone: .neutral
             )
         }
         // 3) 配置就绪但未开启上报。
