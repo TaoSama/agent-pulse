@@ -38,6 +38,7 @@ rm -rf "$app_bundle"
 mkdir -p "$contents_dir/MacOS" "$contents_dir/Resources"
 cp "$project_dir/.build/release/AgentPulse" "$contents_dir/MacOS/AgentPulse"
 cp "$project_dir/Resources/Info.plist" "$contents_dir/Info.plist"
+cp "$project_dir/Resources/AppIcon.icns" "$contents_dir/Resources/AppIcon.icns"
 codesign --force --sign - "$app_bundle"
 
 echo "$app_bundle"
