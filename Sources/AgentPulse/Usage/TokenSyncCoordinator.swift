@@ -133,6 +133,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         ledger = Self.openLedger()
 
         let localCollection = defaults.object(forKey: DefaultsKey.localCollectionEnabled) as? Bool ?? true
+        // 冻结压实默认关闭：不可逆删除必须显式开启。
+        let compaction = defaults.object(forKey: DefaultsKey.compactionEnabled) as? Bool ?? false
         let storedReporting = defaults.object(forKey: DefaultsKey.reportingEnabled) as? Bool ?? false
         // 自动上报间隔（本机行为，不进上报身份）：缺省 30 分钟；非法值回落 30 分钟。
         let reportInterval = TokenReportInterval.from(
@@ -206,9 +208,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             pendingSessions: pending.1,
             lastReportSucceeded: nil
         ))
-        // status literal 未显式列出的字段走默认值；间隔单独回填以回显持久化档位。
+        // status literal 未显式列出的字段走默认值；间隔与压实开关单独回填以回显持久化档位。
         var initialStatus = statusSubject.value
         initialStatus.autoReportInterval = reportInterval
+        initialStatus.compactionEnabled = compaction
         statusSubject.send(initialStatus)
     }
 
@@ -225,6 +228,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             autoLoopTask?.cancel()
             autoLoopTask = nil
         }
+    }
+
+    /// 冻结压实开关（默认关）：开启后每轮 finalize 删除已固化历史（>30 天）的原始事件行以回收磁盘。
+    /// 不可逆，仅改本机行为，不进上报身份；关闭立即停止后续压实，已删原始行不影响账本总数。
+    func setCompactionEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: DefaultsKey.compactionEnabled)
+        updateStatus { $0.compactionEnabled = enabled }
     }
 
     func setReportingEnabled(_ enabled: Bool) {
@@ -491,7 +501,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
                 // 无变化轮（raw 派生 dirty 位未置 且 无 rebuild 待完成）跳过 O(全库) 重算：
                 // 派生已是最新，仅从持久标志读回上报资格，避免每轮全表读+排序（9.4G 库约 90s）。
-                progressReporter.enterPhase(.finalizing)
                 progressReporter.enterPhase(.finalizing)
                 let needsFinalize = try ledger.requiresDerivationCompletion() || ledger.requiresRebuildCompletion()
                 let finalize: UsageFinalizeResult
