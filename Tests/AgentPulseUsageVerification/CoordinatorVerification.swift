@@ -21,6 +21,7 @@ enum CoordinatorVerification {
         try verifyReportingAuthorityFromEnv(source)
         try verifyScanProgressReporting(source)
         try verifyAutoReportIntervalIsConfigurable(source)
+        try verifyNoChangeRoundSkipsFinalize(source)
         print("TokenSyncCoordinator verification passed")
     }
 
@@ -289,6 +290,69 @@ enum CoordinatorVerification {
         try require(week?.counts.total == 3, "week summary is not the rolling 7-day range ending at the reference")
         try require(month?.counts.total == 7, "month summary is not the rolling 30-day range ending at the reference")
         try require(all?.counts.total == 15, "all summary omitted host history")
+    }
+
+    /// A3：无变化轮跳过全库重算。
+    /// - 契约信号：`requiresDerivationCompletion()`（读 raw 派生 dirty 位）——record/网络事件置位，
+    ///   一次成功 finalizeDerived 清除。协调层据此在 finalize 前 gate，跳过时不做 O(全库) 重算。
+    /// - 行为断言（真实 ledger）：record→finalize 后 dirty 清除（可跳过）；重复 finalize 后仍清除；
+    ///   非空 recordNetworkEvents 重新置位（cliproxy 新增仍触发 finalize）；空事件不置位。
+    /// - 源文断言：scanNow 闭包用 requiresDerivationCompletion() 门禁 finalizeDerived，跳过分支从
+    ///   reportingEligible 读回资格而非重算。
+    private static func verifyNoChangeRoundSkipsFinalize(_ source: String) throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "coordinator-skip-finalize-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let ledger = try UsageLedgerStore(path: directory.appending(path: "usage.sqlite3").path)
+        let hostname = "skip-verification"
+        let event = UsageEvent(
+            id: "skip-1", source: "verification", model: "model", project: "project",
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000), counts: UsageTokenCounts(output: 5),
+            sessionHash: "session-skip", sourceFileHash: "skip-file"
+        )
+        let checkpoint = UsageFileCheckpoint(
+            fileID: "skip-file", source: "verification", pathHash: "skip-path",
+            offset: 1, size: 1, modifiedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            parserVersion: UsageJSONLParser.parserVersion, status: "complete"
+        )
+
+        // record 置 dirty：finalize 前必须为 true。
+        try ledger.record(events: [event], checkpoint: checkpoint, hostname: hostname)
+        try require(try ledger.requiresDerivationCompletion(), "record 后 raw 派生 dirty 位未置位")
+
+        // 一次成功 finalize 清除 dirty：下一轮可跳过。
+        _ = try ledger.finalizeDerived(hostname: hostname)
+        try require(!(try ledger.requiresDerivationCompletion()), "finalizeDerived 后 dirty 位未清除，无法跳过无变化轮")
+
+        // 无新事件再 finalize：仍保持清除（幂等，不重新置位）。
+        _ = try ledger.finalizeDerived(hostname: hostname)
+        try require(!(try ledger.requiresDerivationCompletion()), "无变化的重复 finalize 不应重新置位 dirty")
+
+        // 空网络事件：入口 guard 提前返回，绝不置位。
+        try ledger.recordNetworkEvents([], source: CliProxyUsageParser.source, hostname: hostname)
+        try require(!(try ledger.requiresDerivationCompletion()), "空 recordNetworkEvents 不应置位 dirty（不该触发无谓 finalize）")
+
+        // 非空网络事件：重新置位，使 cliproxy 新增在无文件变化轮仍触发 finalize。
+        let networkEvent = UsageEvent(
+            id: "skip-net-1", source: CliProxyUsageParser.source, model: "model", project: "project",
+            timestamp: Date(timeIntervalSince1970: 1_700_000_100), counts: UsageTokenCounts(output: 3),
+            sessionHash: "session-net", sourceFileHash: "network\u{1}\(CliProxyUsageParser.source)"
+        )
+        try ledger.recordNetworkEvents([networkEvent], source: CliProxyUsageParser.source, hostname: hostname)
+        try require(try ledger.requiresDerivationCompletion(), "非空 recordNetworkEvents 未置位 dirty，cliproxy 新增会被无变化轮误跳过")
+
+        // 源文断言：scanNow 闭包必须以 requiresDerivationCompletion() 门禁 finalize，跳过时读 reportingEligible。
+        let scanNowBody = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
+        try require(
+            scanNowBody.contains("requiresDerivationCompletion()"),
+            "scanNow 未用 requiresDerivationCompletion() 门禁 finalize（无变化轮不会跳过全库重算）"
+        )
+        try require(
+            scanNowBody.contains("ledger.reportingEligible(hostname:"),
+            "scanNow 跳过分支未从 reportingEligible 读回上报资格（会伪造 eligible）"
+        )
     }
 
     private static func localDate(

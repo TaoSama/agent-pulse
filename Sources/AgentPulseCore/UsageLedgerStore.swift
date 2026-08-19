@@ -236,6 +236,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try transaction {
                 try insertRawEvents(events, fileID: fileID, hostname: hostname)
                 try writeCheckpoint(checkpoint)
+                // 网络来源有新事件同样令派生 dirty（与文件 record 对称），使无变化轮跳过 finalize
+                // 时 cliproxy 新增仍触发一次重算。空事件已在方法入口 guard 提前返回，不会置位。
+                try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
                 if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
                     try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
                 }

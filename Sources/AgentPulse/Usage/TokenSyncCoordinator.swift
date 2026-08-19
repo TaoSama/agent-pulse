@@ -427,6 +427,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
             // 绑定为不可变值再进入 @Sendable worker，满足 Swift 6 并发捕获约束。
             let networkEvents = cliProxyEvents
+            // 无变化轮跳过全库重算时，上报资格布尔从账本持久标志读回，blocked 原因（未持久化）
+            // 沿用上轮：raw 未变则派生不变，原因列表必与上次 finalize 一致。
+            let priorBlockedReasons = self?.status.reportingBlockedReasons ?? []
             // 阻塞式 SQLite/文件扫描在后台队列执行（不阻塞主线程），不使用 detached 分叉。
             let result = await Self.runOffMain { gate in
                 try gate.throwIfCancelled()
@@ -481,10 +484,26 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 try ledger.recordNetworkEvents(networkEvents, source: CliProxyUsageParser.source, hostname: hostname)
                 try gate.throwIfCancelled()
                 // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
+                // 无变化轮（raw 派生 dirty 位未置 且 无 rebuild 待完成）跳过 O(全库) 重算：
+                // 派生已是最新，仅从持久标志读回上报资格，避免每轮全表读+排序（9.4G 库约 90s）。
                 progressReporter.enterPhase(.finalizing)
-                let finalize = try ledger.finalizeDerived(hostname: hostname) { done, total in
-                    // 重算内部子阶段回调：映射到 .finalizing 段的 done/total（8 步），显示「3/8 步」。
-                    progressReporter.advance(.finalizing, done: done, total: total)
+                let needsFinalize = try ledger.requiresDerivationCompletion() || ledger.requiresRebuildCompletion()
+                let finalize: UsageFinalizeResult
+                if needsFinalize {
+                    finalize = try ledger.finalizeDerived(hostname: hostname) { done, total in
+                        // 重算内部子阶段回调：映射到 .finalizing 段的 done/total（8 步），显示「3/8 步」。
+                        progressReporter.advance(.finalizing, done: done, total: total)
+                    }
+                } else {
+                    // 跳过重算：collapsed 计数本轮为 0（无新折叠工作），eligible 读持久标志，
+                    // blocked 原因沿用上轮（raw 未变则不变）。
+                    let eligible = try ledger.reportingEligible(hostname: hostname)
+                    finalize = UsageFinalizeResult(
+                        reportingEligible: eligible,
+                        blockedReasons: eligible ? [] : priorBlockedReasons,
+                        collapsedInheritedEvents: 0,
+                        collapsedContentDuplicates: 0
+                    )
                 }
                 progressReporter.completePhase(.finalizing)
                 // 只有在所有来源都完整扫描（无致命失败：任一来源枚举失败 / 单文件 I/O 失败都会
