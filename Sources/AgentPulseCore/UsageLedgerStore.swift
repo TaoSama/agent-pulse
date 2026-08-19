@@ -1807,6 +1807,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 try exec("PRAGMA user_version=10;")
             }
         }
+        // 版本无关的性能索引与增量脏键表:每次 open 幂等补建(v10 库不再走 v8 rebuild 建索引路径)。
+        try transaction {
+            try ensurePerformanceIndexesUnlocked()
+        }
     }
 
     /// v9 -> v10：把采集机 hostname 下沉到原始事件层，rebuild 保留多机数据；并清理已废弃的
@@ -1969,6 +1973,45 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 + "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_dedup ON usage_edit_entries(tool_use_id);"
         default: return ""
         }
+    }
+
+    /// 性能索引:消除 finalize 里 `readAll*`（WHERE hostname=? ORDER BY ...）的外部排序,
+    /// 并为增量 finalize 的按 codex_dedup_key 反取全副本提供索引。列顺序 = hostname 等值前缀 +
+    /// 匹配各 readAll 的 ORDER BY,使 SQLite 直接顺序走索引、无 external sort。纯 CREATE INDEX
+    /// IF NOT EXISTS,不改 schema 版本、不改 parserVersion、不触发重建。
+    private static func performanceIndexSQL(for table: String) -> String {
+        switch table {
+        case "usage_events":
+            return "CREATE INDEX IF NOT EXISTS idx_usage_events_host ON usage_events(hostname,timestamp_ms,event_id,source_file_hash);"
+                + "CREATE INDEX IF NOT EXISTS idx_usage_events_dedup ON usage_events(codex_dedup_key);"
+        case "usage_session_events":
+            return "CREATE INDEX IF NOT EXISTS idx_session_events_host ON usage_session_events(hostname,source,event_id,source_file_hash);"
+        case "usage_edit_entries":
+            return "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_host ON usage_edit_entries(hostname,timestamp_ms,tool_use_id,source_file_hash);"
+        default: return ""
+        }
+    }
+
+    /// 幂等地补建性能索引与增量 finalize 的脏键表。`migrate()` 末尾无条件调用:v10 库的 `migrate()`
+    /// 不再走 v8 rebuild 的建索引路径,存量库要靠这里补上新索引。仅当目标表存在时建索引(兼容极简
+    /// fixture)。9.4G 库首次建索引一次性发生在此(WAL + temp_store=MEMORY),之后每轮省去全表排序。
+    private func ensurePerformanceIndexesUnlocked() throws {
+        for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
+            guard try tableExistsUnlocked(table) else { continue }
+            let sql = Self.performanceIndexSQL(for: table)
+            if !sql.isEmpty { try exec(sql) }
+        }
+        // 增量 finalize 的脏键表:record 事务内记录本轮受影响的去重/自然键,供 finalizeDerivedIncremental
+        // 只重算受影响 bucket/session。自然键含 hostname,与派生单机口径一致。
+        try exec("""
+            CREATE TABLE IF NOT EXISTS usage_dirty_keys(
+              hostname TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              key TEXT NOT NULL,
+              created_at_ms INTEGER NOT NULL,
+              PRIMARY KEY(hostname,kind,key)
+            );
+            """)
     }
 
     private func tableExistsUnlocked(_ table: String) throws -> Bool {
