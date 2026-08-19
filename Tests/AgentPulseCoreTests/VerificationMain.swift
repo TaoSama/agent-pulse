@@ -773,7 +773,9 @@ struct AgentPulseCoreVerification {
         try require(resultA.collapsedInheritedEvents == 1, "one inherited event collapsed")
         try require(resultA.reportingEligible, "provable dedup keeps reporting eligible")
 
-        // 4b) 继承回放但只有 last_token_usage（无完整 total 快照）-> 无法证明 -> reporting blocked。
+        // 4b) 继承回放但只有 last_token_usage（无完整 total 快照）-> 无法证明是否重复，但
+        //     不再 fail-closed 阻断上报（上报为累计值幂等 upsert，重复由服务端吸收自愈）。
+        //     仍保留一条信息性说明在 blockedReasons 里，但 reportingEligible 保持 true。
         let dbB = tempUsageDB(); defer { cleanupDB(dbB) }
         let ledgerB = try UsageLedgerStore(path: dbB.path)
         func lastLine(_ ts: String, out: Int) -> String {
@@ -788,10 +790,10 @@ struct AgentPulseCoreVerification {
         try require(cnp.events[0].lineageFingerprint.isEmpty, "no total snapshot => no lineage fingerprint")
         try ledgerB.record(events: cnp.events, sessionEvents: cnp.sessionEvents, checkpoint: cnp.checkpoint, hostname: "h")
         let resultB = try ledgerB.finalizeDerived(hostname: "h")
-        try require(!resultB.reportingEligible, "unprovable inherited replay must block reporting")
-        try require(!resultB.blockedReasons.isEmpty, "blocked reasons must be reported")
+        try require(resultB.reportingEligible, "unprovable inherited replay must NOT block reporting (idempotent upsert self-heals duplicates)")
+        try require(!resultB.blockedReasons.isEmpty, "informational note must still be surfaced for the unprovable replay")
         let eligibleFlag = try ledgerB.reportingEligible(hostname: "h")
-        try require(!eligibleFlag, "reportingEligible(hostname:) reflects blocked state")
+        try require(eligibleFlag, "reportingEligible(hostname:) reflects the non-blocking policy")
     }
 
 
