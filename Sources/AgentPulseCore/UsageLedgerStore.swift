@@ -513,6 +513,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
         var overwriteConflicts: [String] = []
         let raw = try readAllRawEvents(hostname: hostname, overwriteConflicts: &overwriteConflicts)
         blockedReasons.append(contentsOf: overwriteConflicts)
+        // 真正阻断上报的原因：仅同 tier overwrite 冲突（数据自相矛盾，无法确定取哪条）。
+        // 无法证明的 inherited replay 不在此列——见下方 unprovable 分支说明。
+        var blockingReasons: [String] = overwriteConflicts
         advanceStage() // 1) 读原始事件完成
 
         // 1) 血缘证明去重：同一 lineage_fingerprint（仅完整 total 快照才有）只保留一条。
@@ -552,7 +555,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
             }
         }
         if unprovable > 0 {
-            blockedReasons.append("\(unprovable) inherited replay event(s) lack a complete total snapshot; cannot prove they are not duplicates")
+            // 无法证明的 inherited replay：不再 fail-closed 阻断上报。上报是「每 bucket 完整累计值
+            // 幂等 upsert」，即便这些回放行与父会话 turn 重复，服务端按自然键覆盖为同一累计值、
+            // 不会重复累加；漏证明的代价最多是本地少量偏差（已接受的「稍不准」），不构成上游污染。
+            // 保留为信息性说明（计入 blockedReasons 供展示），但不加入 blockingReasons。
+            blockedReasons.append("\(unprovable) inherited replay event(s) lack a complete total snapshot; counted locally, reporting not blocked")
         }
         advanceStage() // 2) 血缘去重完成
 
@@ -739,8 +746,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try setIntUnlocked(key: revisionKey(hostname), value: newRevision - 1)
         }
 
-        // 非对账类阻断（如无法证明的 inherited replay）持久到 per-host eligibility flag。
-        let eligible = blockedReasons.isEmpty
+        // 上报资格：仅同 tier overwrite 冲突（数据自相矛盾）才 fail-closed 阻断。
+        // 无法证明的 inherited replay 只作信息性说明，不再阻断（上报为累计值幂等 upsert，重复自愈）。
+        let eligible = blockingReasons.isEmpty
         try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
         advanceStage() // 8) session 差异写完成（重算结束）
         return UsageFinalizeResult(reportingEligible: eligible, blockedReasons: blockedReasons, collapsedInheritedEvents: collapsed, collapsedContentDuplicates: contentCollapsed)

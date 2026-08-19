@@ -64,7 +64,7 @@ struct TokenSyncSettingsSection: View {
 
                 SettingsToggleRow(
                     title: "冻结压实（回收磁盘）",
-                    subtitle: "删除超过 30 天、已固化历史的原始事件行以缩小账本；不可逆，Token 总数不受影响。",
+                    subtitle: "删除超 30 天、已固化历史的原始事件行；不可逆，Token 总数不受影响。",
                     isOn: compactionBinding,
                     disabled: !model.tokenSyncStatus.localCollectionEnabled
                 )
