@@ -41,6 +41,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         static let ingestBaseURL = "tokenSync.ingestBaseURL"
         static let canonicalHostname = "tokenSync.canonicalHostname"
         static let autoReportInterval = "tokenSync.autoReportIntervalSeconds"
+        /// 冻结压实开关：开启后，每轮 finalize 会推进冻结水位并物理删除已固化历史的原始行以省磁盘。
+        /// 不可逆操作，默认关闭；仅在用户显式开启时生效（谁开谁删）。
+        static let compactionEnabled = "tokenSync.compactionEnabled"
     }
 
     private let defaults: UserDefaults
@@ -430,6 +433,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             // 无变化轮跳过全库重算时，上报资格布尔从账本持久标志读回，blocked 原因（未持久化）
             // 沿用上轮：raw 未变则派生不变，原因列表必与上次 finalize 一致。
             let priorBlockedReasons = self?.status.reportingBlockedReasons ?? []
+            // 冻结压实开关（默认关闭，不可逆）：主线程读定值后进入 worker，避免并发捕获 self。
+            let compactionEnabled = self?.defaults.object(forKey: DefaultsKey.compactionEnabled) as? Bool ?? false
             // 阻塞式 SQLite/文件扫描在后台队列执行（不阻塞主线程），不使用 detached 分叉。
             let result = await Self.runOffMain { gate in
                 try gate.throwIfCancelled()
@@ -487,10 +492,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 // 无变化轮（raw 派生 dirty 位未置 且 无 rebuild 待完成）跳过 O(全库) 重算：
                 // 派生已是最新，仅从持久标志读回上报资格，避免每轮全表读+排序（9.4G 库约 90s）。
                 progressReporter.enterPhase(.finalizing)
+                progressReporter.enterPhase(.finalizing)
                 let needsFinalize = try ledger.requiresDerivationCompletion() || ledger.requiresRebuildCompletion()
                 let finalize: UsageFinalizeResult
                 if needsFinalize {
-                    finalize = try ledger.finalizeDerived(hostname: hostname) { done, total in
+                    // 冻结压实开关（默认关闭，不可逆）：开启后 finalize 同事务推进冻结水位并删除已固化历史原始行。
+                    finalize = try ledger.finalizeDerived(hostname: hostname, compactFrozen: compactionEnabled) { done, total in
                         // 重算内部子阶段回调：映射到 .finalizing 段的 done/total（8 步），显示「3/8 步」。
                         progressReporter.advance(.finalizing, done: done, total: total)
                     }

@@ -473,8 +473,9 @@ enum CoordinatorVerification {
         )
 
         // scanNow() 的 off-main 闭包：markRebuildCompleted 必须在 finalizeDerived 之后。
+        // 用前缀匹配以对 finalizeDerived 的可选参数（如 compactFrozen）鲁棒，仅校验调用顺序不变。
         let scanNowBody = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
-        let finalizeOffset = try offset(of: "ledger.finalizeDerived(hostname: hostname)", in: scanNowBody)
+        let finalizeOffset = try offset(of: "ledger.finalizeDerived(hostname: hostname", in: scanNowBody)
         let markOffset = try offset(of: "ledger.markRebuildCompleted()", in: scanNowBody)
         try require(finalizeOffset < markOffset, "markRebuildCompleted 未在 finalizeDerived 之后调用")
         try require(
