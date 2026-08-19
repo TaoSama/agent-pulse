@@ -41,6 +41,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         static let ingestBaseURL = "tokenSync.ingestBaseURL"
         static let canonicalHostname = "tokenSync.canonicalHostname"
         static let autoReportInterval = "tokenSync.autoReportIntervalSeconds"
+        /// 冻结压实开关：开启后，每轮 finalize 会推进冻结水位并物理删除已固化历史的原始行以省磁盘。
+        /// 不可逆操作，默认关闭；仅在用户显式开启时生效（谁开谁删）。
+        static let compactionEnabled = "tokenSync.compactionEnabled"
     }
 
     private let defaults: UserDefaults
@@ -130,6 +133,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         ledger = Self.openLedger()
 
         let localCollection = defaults.object(forKey: DefaultsKey.localCollectionEnabled) as? Bool ?? true
+        // 冻结压实默认关闭：不可逆删除必须显式开启。
+        let compaction = defaults.object(forKey: DefaultsKey.compactionEnabled) as? Bool ?? false
         let storedReporting = defaults.object(forKey: DefaultsKey.reportingEnabled) as? Bool ?? false
         // 自动上报间隔（本机行为，不进上报身份）：缺省 30 分钟；非法值回落 30 分钟。
         let reportInterval = TokenReportInterval.from(
@@ -203,9 +208,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             pendingSessions: pending.1,
             lastReportSucceeded: nil
         ))
-        // status literal 未显式列出的字段走默认值；间隔单独回填以回显持久化档位。
+        // status literal 未显式列出的字段走默认值；间隔与压实开关单独回填以回显持久化档位。
         var initialStatus = statusSubject.value
         initialStatus.autoReportInterval = reportInterval
+        initialStatus.compactionEnabled = compaction
         statusSubject.send(initialStatus)
     }
 
@@ -222,6 +228,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             autoLoopTask?.cancel()
             autoLoopTask = nil
         }
+    }
+
+    /// 冻结压实开关（默认关）：开启后每轮 finalize 删除已固化历史（>30 天）的原始事件行以回收磁盘。
+    /// 不可逆，仅改本机行为，不进上报身份；关闭立即停止后续压实，已删原始行不影响账本总数。
+    func setCompactionEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: DefaultsKey.compactionEnabled)
+        updateStatus { $0.compactionEnabled = enabled }
     }
 
     func setReportingEnabled(_ enabled: Bool) {
@@ -430,6 +443,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             // 无变化轮跳过全库重算时，上报资格布尔从账本持久标志读回，blocked 原因（未持久化）
             // 沿用上轮：raw 未变则派生不变，原因列表必与上次 finalize 一致。
             let priorBlockedReasons = self?.status.reportingBlockedReasons ?? []
+            // 冻结压实开关（默认关闭，不可逆）：主线程读定值后进入 worker，避免并发捕获 self。
+            let compactionEnabled = self?.defaults.object(forKey: DefaultsKey.compactionEnabled) as? Bool ?? false
             // 阻塞式 SQLite/文件扫描在后台队列执行（不阻塞主线程），不使用 detached 分叉。
             let result = await Self.runOffMain { gate in
                 try gate.throwIfCancelled()
@@ -490,7 +505,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 let needsFinalize = try ledger.requiresDerivationCompletion() || ledger.requiresRebuildCompletion()
                 let finalize: UsageFinalizeResult
                 if needsFinalize {
-                    finalize = try ledger.finalizeDerived(hostname: hostname) { done, total in
+                    // 冻结压实开关（默认关闭，不可逆）：开启后 finalize 同事务推进冻结水位并删除已固化历史原始行。
+                    finalize = try ledger.finalizeDerived(hostname: hostname, compactFrozen: compactionEnabled) { done, total in
                         // 重算内部子阶段回调：映射到 .finalizing 段的 done/total（8 步），显示「3/8 步」。
                         progressReporter.advance(.finalizing, done: done, total: total)
                     }

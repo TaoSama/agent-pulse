@@ -62,6 +62,13 @@ struct TokenSyncSettingsSection: View {
                     isOn: localCollectionBinding
                 )
 
+                SettingsToggleRow(
+                    title: "冻结压实（回收磁盘）",
+                    subtitle: "删除超过 30 天、已固化历史的原始事件行以缩小账本；不可逆，Token 总数不受影响。",
+                    isOn: compactionBinding,
+                    disabled: !model.tokenSyncStatus.localCollectionEnabled
+                )
+
                 // hostname 权威来自合并 env 的 REPORT_CANONICAL_HOSTNAME：双源可读可填，
                 // 手填经 coordinator 写回 env 并刷新上报状态（非密钥，明文回显）。
                 // 单行「标题 · ? · 值 · 编辑」，值不折行；说明进 ? 悬浮。
@@ -214,6 +221,13 @@ struct TokenSyncSettingsSection: View {
         Binding(
             get: { model.tokenSyncStatus.localCollectionEnabled },
             set: { model.setTokenLocalCollection($0) }
+        )
+    }
+
+    private var compactionBinding: Binding<Bool> {
+        Binding(
+            get: { model.tokenSyncStatus.compactionEnabled },
+            set: { model.setTokenCompaction($0) }
         )
     }
 

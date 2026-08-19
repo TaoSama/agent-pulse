@@ -44,6 +44,16 @@ struct UsageReportingSmoke {
             return
         }
 
+        // Compact-verify mode: run frozen-watermark compaction against a *copy* of a
+        // ledger and assert token totals are preserved while raw rows shrink. Never
+        // touches the production ledger; point AGENT_PULSE_SMOKE_COMPACT_LEDGER at a
+        // backup copy only. Read-only over the JSONL sources (does not rescan).
+        if let compactLedger = env["AGENT_PULSE_SMOKE_COMPACT_LEDGER"],
+           let hostname = env["AGENT_PULSE_SMOKE_HOSTNAME"] {
+            compactVerify(ledgerPath: compactLedger, hostname: hostname)
+            return
+        }
+
         guard let ledgerPath = env["AGENT_PULSE_SMOKE_LEDGER"],
               let configPath = env["AGENT_PULSE_SMOKE_CONFIG"],
               let baseURLString = env["AGENT_PULSE_SMOKE_BASE_URL"],
@@ -237,8 +247,71 @@ struct UsageReportingSmoke {
         }
     }
 
-    /// Re-scan one root with the current parser, mirroring the app's per-file
-    /// parse+record sequence. Returns the present fileIDs and the count of files
+    /// Compact-verify: 在 ledger 副本上执行冻结压实，断言 token 总数（billableTotal 之和）
+    /// 在 compact 前后一致，并报告原始行数与文件体积的回收。只读 JSONL 源（不 rescan），
+    /// 只对副本做 finalizeDerived(compactFrozen: true)。绝不碰活库。
+    static func compactVerify(ledgerPath: String, hostname: String) {
+        func fileBytes(_ path: String) -> Int64 {
+            var total: Int64 = 0
+            for suffix in ["", "-wal", "-shm"] {
+                let attrs = try? FileManager.default.attributesOfItem(atPath: path + suffix)
+                total += (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+            }
+            return total
+        }
+        func mb(_ v: Int64) -> String { String(format: "%.1f MB", Double(v) / 1_048_576.0) }
+        func b(_ v: Int64) -> String { String(format: "%.3fB", Double(v) / 1e9) }
+
+        do {
+            let ledger = try UsageLedgerStore(path: ledgerPath)
+            print("[compact] ledger=\(ledgerPath)")
+
+            // 对齐 hostname（与 app 在 mismatch 时同一操作），再重算派生，得到 compact 前基线。
+            switch try ledger.hostnameState(current: hostname) {
+            case .match: print("[compact] hostname already \(hostname)")
+            case .unset, .mismatch:
+                print("[compact] aligning hostname → \(hostname)")
+                try ledger.rebuildForHostname(hostname)
+            }
+            _ = try ledger.finalizeDerived(hostname: hostname)
+
+            let bucketsBefore = try ledger.buckets(hostname: hostname)
+            let totalBefore = bucketsBefore.reduce(Int64(0)) { $0 + $1.counts.billableTotal }
+            let eventsBefore = try ledger.eventCount()
+            let sessionEventsBefore = try ledger.sessionEventCount()
+            let bytesBefore = fileBytes(ledgerPath)
+            print("[compact] BEFORE: buckets=\(bucketsBefore.count) tokenTotal=\(b(totalBefore)) rawEvents=\(eventsBefore) rawSessionEvents=\(sessionEventsBefore) file=\(mb(bytesBefore))")
+
+            // 开启压实跑一轮：推进冻结水位（30 天前对齐边界）并删除已固化区间原始行 + VACUUM。
+            _ = try ledger.finalizeDerived(hostname: hostname, compactFrozen: true)
+
+            let bucketsAfter = try ledger.buckets(hostname: hostname)
+            let totalAfter = bucketsAfter.reduce(Int64(0)) { $0 + $1.counts.billableTotal }
+            let eventsAfter = try ledger.eventCount()
+            let sessionEventsAfter = try ledger.sessionEventCount()
+            let bytesAfter = fileBytes(ledgerPath)
+            print("[compact] AFTER : buckets=\(bucketsAfter.count) tokenTotal=\(b(totalAfter)) rawEvents=\(eventsAfter) rawSessionEvents=\(sessionEventsAfter) file=\(mb(bytesAfter))")
+
+            let deletedEvents = eventsBefore - eventsAfter
+            let deletedSessionEvents = sessionEventsBefore - sessionEventsAfter
+            let reclaimed = bytesBefore - bytesAfter
+            print("[compact] DELTA : rawEventsDeleted=\(deletedEvents) rawSessionEventsDeleted=\(deletedSessionEvents) reclaimed=\(mb(reclaimed))")
+
+            if totalBefore == totalAfter {
+                print("[compact] PASS: token total preserved across compaction (\(b(totalAfter)))")
+            } else {
+                print("[compact] FAIL: token total changed \(b(totalBefore)) → \(b(totalAfter)) (diff \(b(totalAfter - totalBefore)))")
+                exit(1)
+            }
+            if deletedEvents == 0 && deletedSessionEvents == 0 {
+                print("[compact] NOTE: no raw rows were frozen — all data is newer than the 30-day silence window; compaction is a no-op on this copy (correct, but no space reclaimed)")
+            }
+        } catch {
+            FileHandle.standardError.write(Data("[compact] error: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
     /// actually re-parsed.
     private static func rescanRoot(_ root: URL, source: String, subagents: Bool,
                                    ledger: UsageLedgerStore, hostname: String) throws -> (present: [String], reparsed: Int) {

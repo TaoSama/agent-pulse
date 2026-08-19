@@ -191,10 +191,30 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 // 非空则必须与 checkpoint.fileID 相符，否则拒绝（防止把 A 文件的行混入 B 文件的替换事务）。
                 let fileID = checkpoint.fileID
                 try validateAttribution(events: events, sessionEvents: sessionEvents, editEntries: editEntries, fileID: fileID)
+                // 冻结水位护栏：早于 frozen 的迟到原始事件（rsync 老文件 / local-sources 新目录 /
+                // degraded 重解析补出）一律丢弃、不入库，绝不回退 frozen、绝不触发重算——冻结区原始行
+                // 可能已被 compact 物理删除，重算无源可算只会把正确的历史派生覆盖成残值。代价是这条
+                // 晚到事件不计入总数（已接受的"稍不准"）。丢弃计数累计到 sync_state 供观测/验证。
+                let frozen = try frozenBeforeMsUnlocked(hostname)
+                let keptEvents: [UsageEvent]
+                let keptSessionEvents: [UsageSessionEvent]
+                if frozen > 0 {
+                    keptEvents = events.filter { millis($0.timestamp) >= frozen }
+                    keptSessionEvents = sessionEvents.filter { millis($0.timestamp) >= frozen }
+                    let dropped = (events.count - keptEvents.count) + (sessionEvents.count - keptSessionEvents.count)
+                    if dropped > 0 {
+                        let key = frozenDroppedEventsKey(hostname)
+                        let prior = try readIntUnlocked(key: key) ?? 0
+                        try setIntUnlocked(key: key, value: prior + Int64(dropped))
+                    }
+                } else {
+                    keptEvents = events
+                    keptSessionEvents = sessionEvents
+                }
                 // 先删除该 fileID 的旧归属原始行，再插入本批新行：同事务实现「对该文件的原子替换」。
                 try deleteRawForFileUnlocked(fileID: fileID)
-                try insertRawEvents(events, fileID: fileID, hostname: hostname)
-                try insertRawSessionEvents(sessionEvents, fileID: fileID, hostname: hostname)
+                try insertRawEvents(keptEvents, fileID: fileID, hostname: hostname)
+                try insertRawSessionEvents(keptSessionEvents, fileID: fileID, hostname: hostname)
                 try insertRawEditEntries(editEntries, fileID: fileID, hostname: hostname)
                 if editMetricsSupported && checkpoint.status == "complete" {
                     try markEditMetricSourceUnlocked(checkpoint.source)
@@ -394,17 +414,33 @@ public final class UsageLedgerStore: @unchecked Sendable {
     @discardableResult
     public func finalizeDerived(
         hostname: String,
+        compactFrozen: Bool = false,
         progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
     ) throws -> UsageFinalizeResult {
         try queue.sync {
             var result = UsageFinalizeResult(reportingEligible: true, blockedReasons: [], collapsedInheritedEvents: 0)
+            var didCompact = false
             try transaction {
                 try claimLegacyRawRowsIfUnambiguousUnlocked(hostname: hostname)
                 result = try recomputeDerivedUnlocked(hostname: hostname, progress: progress)
                 // 只有显式 finalize 表示调用方已经成功完成整轮来源扫描。其它内部重算
                 // （例如 hostname 对齐）不能清除此门禁，否则部分扫描失败后会 fail-open。
                 try deleteKeyUnlocked(Self.rawDerivationPendingKey)
+                // 冻结压实是显式开启的省磁盘行为（默认关闭）：删原始行不可逆，只在调用方（应用采集链路）
+                // 明确要求时才做，绝不对任意导入的历史数据默认自动删。本轮派生已算好并落库后，在同一
+                // 事务内顺序推进冻结水位并压实：先推进 frozen（单调、满足前置才推），再删被新冻结区间的
+                // 原始行。二者同事务原子提交——绝不允许「删了行但 frozen 没推进」的中间态。
+                // 这两个方法均为 *Unlocked，不自带 queue.sync/transaction，也不再触发 recompute。
+                if compactFrozen {
+                    let advancedTo = try advanceFrozenWatermarkUnlocked(hostname: hostname)
+                    if advancedTo > 0 {
+                        try compactFrozenRawUnlocked(hostname: hostname, frozen: advancedTo)
+                        didCompact = true
+                    }
+                }
             }
+            // VACUUM 必须在事务外执行（SQLite 限制）；失败无害，下一轮压实后重试即可回收。
+            if didCompact { try? exec("VACUUM;") }
             return result
         }
     }
@@ -643,8 +679,19 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let newRevision = try nextRevisionUnlocked(hostname: hostname)
         var changed = false
 
+        // 冻结豁免：frozen 之前的派生行已固化，其原始行可能已被 compact 物理删除。这些行必须对
+        // 本次重算「完全隐形」——既不参与消费/覆盖，也不参与删除，changed 不被它们触发（无 revision
+        // churn、无 dirty 重报）。判定谓词与 compact 删除谓词严格一致：bucket 按 bucket_start<frozen；
+        // session 按 last_activity<frozen（完全冻结）。跨界 session（first<frozen<=last）last_activity>=frozen
+        // 不算冻结，照常参与重算、其原始行被 record/compact 保留于活跃区。
+        let frozen = try frozenBeforeMsUnlocked(hostname)
+
         var existingBuckets = try readBucketRowsUnlocked(hostname: hostname)
         for (key, meta) in bucketMeta {
+            // 冻结区 bucket 不应出现在重算产出里（record 已丢弃 <frozen 事件、compact 已删其原始行）；
+            // 唯一例外是「首次冻结那一轮」compact 尚未执行、原始行仍在——此时也必须跳过，避免用重算值
+            // 覆盖即将被 compact 固化的行。两边（产出侧 + existing 侧）一致跳过是防误 upsert 的关键。
+            if frozen > 0 && meta.start < frozen { continue }
             let aggregate = buckets[key]!
             let bucket = UsageBucket(
                 hostname: hostname, source: meta.source, model: meta.model, project: meta.project,
@@ -660,8 +707,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
             }
             existingBuckets[key] = nil
         }
-        // 删除不再出现的 bucket（例如事件减少）。
-        for (key, _) in existingBuckets {
+        // 删除不再出现的 bucket（例如事件减少）——但冻结区 bucket 一律保留，不进删除候选。
+        for (key, row) in existingBuckets {
+            if frozen > 0 && millis(row.bucket.bucketStart) < frozen { continue }
             try deleteBucketUnlocked(hostname: hostname, key: key)
             changed = true
         }
@@ -670,6 +718,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
         advanceStage() // 7) bucket 差异写完成
         for session in sessions {
             let key = "\(session.source)\u{1}\(session.sessionHash)"
+            // 完全冻结的 session（last_activity<frozen）对重算隐形：其 session_events 已被 compact 删、
+            // 派生行固化保留。跨界 session（last_activity>=frozen）照常重算。
+            if frozen > 0 && millis(session.lastActivity) < frozen { continue }
             let existing = existingSessions[key]
             if existing?.session != session {
                 try upsertSessionUnlocked(session, revision: newRevision)
@@ -677,7 +728,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
             }
             existingSessions[key] = nil
         }
-        for (key, _) in existingSessions {
+        for (key, row) in existingSessions {
+            if frozen > 0 && millis(row.session.lastActivity) < frozen { continue }
             try deleteSessionUnlocked(hostname: hostname, key: key)
             changed = true
         }
@@ -700,6 +752,68 @@ public final class UsageLedgerStore: @unchecked Sendable {
             guard try !hasLocalDerivationPendingUnlocked() else { return false }
             return (try readTextUnlocked(key: reportingEligibleKey(hostname)) ?? "1") == "1"
         }
+    }
+
+    // MARK: - Frozen watermark (compaction, unlocked; called inside finalizeDerived transaction)
+
+    /// 冻结静默期：只固化「早于 now - 此值」且已对齐 30 分钟 bucket 边界的历史。取 30 天，远大于
+    /// codex fork / claude resume 的常见回放窗口，把跨区去重折叠的偏差压到可忽略（已接受的"稍不准"）。
+    static let frozenSilenceMs: Int64 = 30 * 24 * 60 * 60 * 1_000
+
+    /// 推进冻结水位线（单调不减、永不回退），返回推进后的 frozen（未推进返回 0，表示本轮不 compact）。
+    /// 目标 = floor((now - 静默期) / bucketMs) * bucketMs，与当前 frozen 取 max。
+    /// 前置门禁（任一不满足则本轮不推进，保守放弃省空间而非冒错删风险）：
+    /// - 全库不存在 scan_status='degraded' 的文件（degraded=解析未收敛，其区间可能后续补出 <frozen
+    ///   事件；一票否决，避免固化未收敛区间）。
+    /// - 无 raw_derivation_pending（finalize 事务内此刻已清除，天然满足；此处再校验一次是防御性冗余）。
+    /// 注意：调用方保证已在 finalizeDerived 事务内、recompute 之后执行——本轮派生已反映最新活跃区。
+    func advanceFrozenWatermarkUnlocked(hostname: String) throws -> Int64 {
+        // degraded 一票否决：只要存在未收敛文件就不推进（保守）。
+        if try scalar("SELECT EXISTS(SELECT 1 FROM usage_files WHERE scan_status='degraded');") != 0 {
+            return 0
+        }
+        if try readTextUnlocked(key: Self.rawDerivationPendingKey) != nil { return 0 }
+
+        let bucketMs = Self.bucketMilliseconds
+        let nowMs = millis(Date())
+        // 对齐到 30 分钟 bucket 边界，保证冻结边界永不劈开任何 bucket。
+        let target = ((nowMs - Self.frozenSilenceMs) / bucketMs) * bucketMs
+        let current = try frozenBeforeMsUnlocked(hostname)
+        // 单调不减：目标不高于当前则不推进（含 now 回拨的情形——回拨使 target 变小，被 max 挡住）。
+        guard target > current else { return 0 }
+        try setIntUnlocked(key: frozenBeforeKey(hostname), value: target)
+        return target
+    }
+
+    /// 压实：删除已冻结区间（timestamp < frozen）的原始行以回收磁盘。仅 usage_events 与
+    /// usage_session_events 两张大表；usage_edit_entries 不动（体积可忽略）。
+    /// - usage_events：按 timestamp_ms < frozen 逐行删（bucket 对齐后等价于 bucket_start < frozen）。
+    /// - usage_session_events：仅删「完全冻结」的 session——该 (source,session_hash) 的所有事件都 < frozen
+    ///   （MAX(timestamp) < frozen）。跨界 session（尚有 >=frozen 的事件）整体保留，避免截断其派生指标。
+    /// **跨所有 hostname 删除**：hostname 下沉在原始事件层只是「采集机痕迹」，派生已由 rebuildForHostname +
+    /// recompute 统一归属到当前 canonical hostname（包含所有采集机的贡献）。冻结边界是全局时间概念，
+    /// 若只删 canonical hostname 的行，旧机器名（改名前/多机同步）的历史原始行会成为永不可回收的死数据。
+    /// 必须在 finalizeDerived 事务内、frozen 推进之后同事务调用；VACUUM 由调用方在事务外执行。
+    func compactFrozenRawUnlocked(hostname: String, frozen: Int64) throws {
+        guard frozen > 0 else { return }
+        let delEvents = try prepare("DELETE FROM usage_events WHERE timestamp_ms < ?;")
+        defer { sqlite3_finalize(delEvents) }
+        try bind(delEvents, 1, frozen); try done(delEvents)
+
+        // 只删完全冻结 session 的 session_events：排除任何仍有 timestamp>=frozen 事件的 (source,session_hash)。
+        // 按 (source,session_hash) 复合匹配（与聚合器 session 自然键一致），且跨 hostname 判定——
+        // 同一逻辑 session 可能被不同采集机记录，只要任一机器仍有活跃事件就整体保留。
+        let delSessions = try prepare("""
+            DELETE FROM usage_session_events
+            WHERE timestamp_ms < ?
+              AND (source, session_hash) NOT IN (
+                SELECT source, session_hash FROM usage_session_events
+                WHERE timestamp_ms >= ?
+              );
+            """)
+        defer { sqlite3_finalize(delSessions) }
+        try bind(delSessions, 1, frozen); try bind(delSessions, 2, frozen)
+        try done(delSessions)
     }
 
     // MARK: - Reads
@@ -1683,6 +1797,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 try exec("DELETE FROM usage_files;")
                 // 清 sync_state，但保留 per-host revision 高水位（revision\u{1}*），
                 // 使 reset 后新行从高水位继续递增，旧在途 batch 因 revision 不匹配无法误 ack。
+                // 注意：frozen_before_ms\u{1}* 不在保留之列——resetForRebuild 从磁盘源文件全量重扫重建，
+                // 冻结水位必须一并清零，否则旧 frozen 会挡住重扫数据进入派生。生产不调用此路径。
                 try exec("DELETE FROM sync_state WHERE key NOT LIKE 'revision\u{1}%';")
                 // 清库与 pending 标记同事务提交：进程在后续重扫期间退出，重启仍能继续 rebuild。
                 try setTextUnlocked(key: Self.rebuildPendingKey, value: "1")
@@ -2086,6 +2202,22 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private func revisionKey(_ hostname: String) -> String { "revision\u{1}\(hostname)" }
     private func lastSyncedKey(_ hostname: String) -> String { "last_synced_at_ms\u{1}\(hostname)" }
     private func reportingEligibleKey(_ hostname: String) -> String { "reporting_eligible\u{1}\(hostname)" }
+    /// 冻结水位线（per-hostname）：早于该毫秒边界（对齐 30 分钟 bucket）的 bucket/session 视为已固化。
+    /// 单调不减、永不回退；其原始行可被 compact 删除以省磁盘，派生行保留供本地看总数。
+    private func frozenBeforeKey(_ hostname: String) -> String { "frozen_before_ms\u{1}\(hostname)" }
+
+    /// 读取某 hostname 的冻结水位线（毫秒）；未设置返回 0（无冻结）。
+    func frozenBeforeMsUnlocked(_ hostname: String) throws -> Int64 {
+        try readIntUnlocked(key: frozenBeforeKey(hostname)) ?? 0
+    }
+
+    /// 因 timestamp < frozen 被 record 丢弃的迟到原始事件累计数（per-hostname，观测/验证用）。
+    private func frozenDroppedEventsKey(_ hostname: String) -> String { "frozen_dropped_events\u{1}\(hostname)" }
+
+    /// 已丢弃的迟到事件累计数（供 smoke/验证断言迟到事件确被丢弃而非入库）。
+    public func frozenDroppedEventCount(hostname: String) throws -> Int64 {
+        try queue.sync { try readIntUnlocked(key: frozenDroppedEventsKey(hostname)) ?? 0 }
+    }
    private static let rebuildPendingKey = "rebuild_pending"
    private static let rebuildCompletedParserVersionKey = "rebuild_completed_parser_version"
     private static let canonicalHostnameKey = "canonical_hostname"

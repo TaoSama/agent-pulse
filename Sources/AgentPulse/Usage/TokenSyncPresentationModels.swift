@@ -240,6 +240,9 @@ struct ReportingAuthorityPresentation: Equatable, Sendable {
 struct TokenSyncStatus: Sendable, Equatable {
     /// 本地长期采集开关（历史会话删除后数据仍保留）。
     var localCollectionEnabled: Bool
+    /// 冻结压实开关（默认关）：开启后每轮 finalize 会删除已固化历史（>30 天）的原始事件行以回收磁盘，
+    /// 不可逆——被删原始行只能靠源 JSONL 重扫恢复，账本总数（派生表）不受影响。
+    var compactionEnabled: Bool = false
     /// 普通上报开关；未配置 API 地址时强制为 false。
     var reportingEnabled: Bool
     /// 上报 API 地址；为空表示仅本地，不发起任何网络请求。
@@ -383,6 +386,7 @@ protocol TokenSyncCoordinating: AnyObject {
     var dashboardDaySeriesPublisher: AnyPublisher<DashboardDaySeries, Never> { get }
 
     func setLocalCollectionEnabled(_ enabled: Bool)
+    func setCompactionEnabled(_ enabled: Bool)
     func setReportingEnabled(_ enabled: Bool)
     func setIngestBaseURL(_ url: String)
     func setCanonicalHostname(_ hostname: String)

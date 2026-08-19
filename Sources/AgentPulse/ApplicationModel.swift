@@ -220,6 +220,7 @@ final class ApplicationModel: ObservableObject {
     }
 
     func setTokenLocalCollection(_ enabled: Bool) { tokenSyncCoordinator.setLocalCollectionEnabled(enabled) }
+    func setTokenCompaction(_ enabled: Bool) { tokenSyncCoordinator.setCompactionEnabled(enabled) }
     func setTokenReporting(_ enabled: Bool) { tokenSyncCoordinator.setReportingEnabled(enabled) }
     func setTokenAutoReportInterval(_ interval: TokenReportInterval) { tokenSyncCoordinator.setAutoReportInterval(interval) }
     func setTokenCanonicalHostname(_ hostname: String) { tokenSyncCoordinator.setCanonicalHostname(hostname) }

@@ -33,6 +33,11 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyCalendarWindowSummariesUseDerivedBucketsAndHostname()
         try verifier.verifyFinalizeIsScopedToHostname()
         try verifier.verifyLegacyRawRowsAreClaimedOnlyByCanonicalHostname()
+        try verifier.verifyFrozenCompactionPreservesTotalsAndDropsRaw()
+        try verifier.verifyFrozenLateEventsAreDropped()
+        try verifier.verifyFrozenWatermarkIsMonotonicAndBucketAligned()
+        try verifier.verifyDegradedFileVetoesFrozenAdvance()
+        try verifier.verifyCrossBoundarySessionRawIsRetained()
         print("MetricsLedgerPipelineVerification: PASS")
     }
 }
@@ -372,6 +377,176 @@ private struct MetricsLedgerPipelineVerifier {
         try withDatabase(database) { db in
             try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='legacy' AND hostname='host-a';") == 1, "canonical finalize must persist legacy ownership")
         }
+    }
+
+    // MARK: - Frozen watermark (v3) 场景
+
+    /// 30 分钟 bucket 边界对齐的相对时间：把「距今 daysAgo 天」floor 到 30 分钟边界，
+    /// 保证事件落在确定的 bucket 内，且 <frozen(约 now-30d) 与 >=frozen 关系稳定。
+    private func agedTimestamp(daysAgo: Double) -> Date {
+        let bucketSec = 30.0 * 60.0
+        let raw = Date().addingTimeInterval(-daysAgo * 24 * 3600).timeIntervalSince1970
+        return Date(timeIntervalSince1970: (raw / bucketSec).rounded(.down) * bucketSec)
+    }
+
+    private func tokenEvent(id: String, source: String, session: String, file: String, ts: Date, input: Int64) -> UsageEvent {
+        UsageEvent(
+            id: id, source: source, model: "model-a", project: "project-a",
+            timestamp: ts, counts: UsageTokenCounts(input: input, reportedTotal: input),
+            sessionHash: session, sourceFileHash: file
+        )
+    }
+
+    private func completeCheckpoint(_ fileID: String, source: String, ts: Date) -> UsageFileCheckpoint {
+        UsageFileCheckpoint(
+            fileID: fileID, source: source, pathHash: "path-\(fileID)", offset: 1, size: 1,
+            modifiedAt: ts, parserVersion: UsageJSONLParser.parserVersion, status: "complete"
+        )
+    }
+
+    /// 用例 1 + 6：纯冻结区 bucket 的原始行被 compact 物理删除，但派生 token 总数不变、不 dirty；
+    /// 活跃区 bucket 原始行保留。证明「删原始行省空间」与「本地看总数」两不误。
+    func verifyFrozenCompactionPreservesTotalsAndDropsRaw() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let host = "host-a"; let source = "codex"
+        let frozenTs = agedTimestamp(daysAgo: 60)   // 远早于 now-30d → 会被冻结
+        let activeTs = agedTimestamp(daysAgo: 1)     // 晚于 now-30d → 留活跃区
+
+        // 第一轮：两条事件都在，finalize 会推进 frozen 到约 now-30d 并 compact 掉 60 天前那条的原始行。
+        try ledger.record(events: [tokenEvent(id: "old", source: source, session: "s-old", file: "f-old", ts: frozenTs, input: 100)],
+                          sessionEvents: [], editEntries: [], checkpoint: completeCheckpoint("f-old", source: source, ts: frozenTs), hostname: host)
+        try ledger.record(events: [tokenEvent(id: "new", source: source, session: "s-new", file: "f-new", ts: activeTs, input: 40)],
+                          sessionEvents: [], editEntries: [], checkpoint: completeCheckpoint("f-new", source: source, ts: activeTs), hostname: host)
+        _ = try ledger.finalizeDerived(hostname: host, compactFrozen: true)
+
+        // 派生 token 总数保留两条（100 + 40）。
+        let buckets = try ledger.buckets(hostname: host)
+        let total = buckets.reduce(Int64(0)) { $0 + $1.counts.input }
+        try require(total == 140, "compact 后派生 token 总数必须保留 (100+40=140)，实际 \(total)")
+
+        try withDatabase(database) { db in
+            // 冻结区原始行被删、活跃区保留。
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='old';") == 0, "冻结区原始行必须被 compact 删除")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='new';") == 1, "活跃区原始行必须保留")
+            // frozen 已推进（>0）。
+            let frozen = try scalarInt(db, "SELECT CAST(value AS INTEGER) FROM sync_state WHERE key='frozen_before_ms\u{1}host-a';")
+            try require(frozen > 0, "frozen 水位必须已推进")
+        }
+
+        // 再 finalize 一轮：冻结区已无原始行，派生总数必须仍是 140（不因重算而归零/缩水），且冻结 bucket 不 dirty。
+        _ = try ledger.finalizeDerived(hostname: host, compactFrozen: true)
+        let total2 = try ledger.buckets(hostname: host).reduce(Int64(0)) { $0 + $1.counts.input }
+        try require(total2 == 140, "compact 后再次 finalize，派生总数必须仍为 140，实际 \(total2)")
+    }
+
+    /// 用例 3：frozen 之后到达的 timestamp<frozen 迟到事件被直接丢弃、不入库、不改总数、frozen 不回退。
+    func verifyFrozenLateEventsAreDropped() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let host = "host-a"; let source = "codex"
+        let frozenTs = agedTimestamp(daysAgo: 60)
+        let activeTs = agedTimestamp(daysAgo: 1)
+
+        try ledger.record(events: [tokenEvent(id: "old", source: source, session: "s-old", file: "f-old", ts: frozenTs, input: 100)],
+                          sessionEvents: [], editEntries: [], checkpoint: completeCheckpoint("f-old", source: source, ts: frozenTs), hostname: host)
+        try ledger.record(events: [tokenEvent(id: "new", source: source, session: "s-new", file: "f-new", ts: activeTs, input: 40)],
+                          sessionEvents: [], editEntries: [], checkpoint: completeCheckpoint("f-new", source: source, ts: activeTs), hostname: host)
+        _ = try ledger.finalizeDerived(hostname: host, compactFrozen: true)
+        let frozenBefore = try frozenValue(database, host: host)
+        try require(frozenBefore > 0, "前置：frozen 必须已推进")
+
+        // 迟到老事件（时间远早于 frozen，来自新文件），record 应直接丢弃。
+        let lateTs = agedTimestamp(daysAgo: 90)
+        try ledger.record(events: [tokenEvent(id: "late", source: source, session: "s-late", file: "f-late", ts: lateTs, input: 999)],
+                          sessionEvents: [], editEntries: [], checkpoint: completeCheckpoint("f-late", source: source, ts: lateTs), hostname: host)
+        _ = try ledger.finalizeDerived(hostname: host, compactFrozen: true)
+
+        try require(try ledger.frozenDroppedEventCount(hostname: host) == 1, "迟到事件必须被计入丢弃计数")
+        try withDatabase(database) { db in
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='late';") == 0, "迟到事件绝不入库")
+        }
+        let total = try ledger.buckets(hostname: host).reduce(Int64(0)) { $0 + $1.counts.input }
+        try require(total == 140, "迟到事件不得计入总数（仍为 140），实际 \(total)")
+        try require(try frozenValue(database, host: host) == frozenBefore, "frozen 不得因迟到事件回退")
+    }
+
+    /// 用例 4：frozen 单调不减，且始终对齐 30 分钟 bucket 边界。
+    func verifyFrozenWatermarkIsMonotonicAndBucketAligned() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let host = "host-a"; let source = "codex"
+        let activeTs = agedTimestamp(daysAgo: 1)
+        try ledger.record(events: [tokenEvent(id: "e1", source: source, session: "s1", file: "f1", ts: activeTs, input: 10)],
+                          sessionEvents: [], editEntries: [], checkpoint: completeCheckpoint("f1", source: source, ts: activeTs), hostname: host)
+        _ = try ledger.finalizeDerived(hostname: host, compactFrozen: true)
+        let f1 = try frozenValue(database, host: host)
+        let bucketMs = UsageLedgerStore.bucketMilliseconds
+        try require(f1 % bucketMs == 0, "frozen 必须对齐 30 分钟 bucket 边界，实际 \(f1)")
+
+        // 再 finalize 若干轮，frozen 只增不减。
+        for _ in 0..<3 { _ = try ledger.finalizeDerived(hostname: host, compactFrozen: true) }
+        let f2 = try frozenValue(database, host: host)
+        try require(f2 >= f1, "frozen 必须单调不减：\(f1) -> \(f2)")
+        try require(f2 % bucketMs == 0, "推进后 frozen 仍须对齐边界")
+    }
+
+    /// 用例 5：候选区间存在 degraded 文件时，frozen 一票否决、不推进。
+    func verifyDegradedFileVetoesFrozenAdvance() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let host = "host-a"; let source = "codex"
+        let ts = agedTimestamp(daysAgo: 60)
+        // 一个 degraded checkpoint（解析未收敛）。
+        let degraded = UsageFileCheckpoint(fileID: "f-deg", source: source, pathHash: "p", offset: 1, size: 1,
+                                           modifiedAt: ts, parserVersion: UsageJSONLParser.parserVersion, status: "degraded")
+        try ledger.record(events: [tokenEvent(id: "e", source: source, session: "s", file: "f-deg", ts: ts, input: 10)],
+                          sessionEvents: [], editEntries: [], checkpoint: degraded, hostname: host)
+        _ = try ledger.finalizeDerived(hostname: host, compactFrozen: true)
+        try require(try frozenValue(database, host: host) == 0, "存在 degraded 文件时 frozen 不得推进")
+        try withDatabase(database) { db in
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='e';") == 1, "degraded 阻塞推进时原始行不得被删")
+        }
+    }
+
+    /// 用例 2：跨界 session（部分事件 <frozen、部分 >=frozen）的 session_events 原始行整体保留，
+    /// 不被 compact 截断（否则其派生指标会缩水）。
+    func verifyCrossBoundarySessionRawIsRetained() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let host = "host-a"; let source = "codex"; let session = "s-cross"
+        let oldTs = agedTimestamp(daysAgo: 60)   // <frozen
+        let newTs = agedTimestamp(daysAgo: 1)     // >=frozen —— 同一 session 跨越边界
+        let sessionEvents = [
+            UsageSessionEvent(id: "se-old", source: source, sessionHash: session, sourceFileHash: "f-x", role: .user, timestamp: oldTs),
+            UsageSessionEvent(id: "se-new", source: source, sessionHash: session, sourceFileHash: "f-x", role: .assistant, timestamp: newTs),
+        ]
+        let events = [
+            tokenEvent(id: "ev-old", source: source, session: session, file: "f-x", ts: oldTs, input: 50),
+            tokenEvent(id: "ev-new", source: source, session: session, file: "f-x", ts: newTs, input: 50),
+        ]
+        try ledger.record(events: events, sessionEvents: sessionEvents, editEntries: [],
+                          checkpoint: completeCheckpoint("f-x", source: source, ts: newTs), hostname: host)
+        _ = try ledger.finalizeDerived(hostname: host, compactFrozen: true)
+
+        try withDatabase(database) { db in
+            // 跨界 session 的 session_events（含 <frozen 那条）整体保留——因为该 session 尚有 >=frozen 事件。
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_session_events WHERE session_hash='s-cross';") == 2,
+                        "跨界 session 的 session_events 必须整体保留、不被截断")
+        }
+    }
+
+    private func frozenValue(_ database: URL, host: String) throws -> Int64 {
+        var value: Int64 = 0
+        try withDatabase(database) { db in
+            value = try scalarInt(db, "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM sync_state WHERE key='frozen_before_ms\u{1}\(host)'), 0);")
+        }
+        return value
     }
 
     private func temporaryDatabaseURL() throws -> URL {
