@@ -324,6 +324,14 @@ public actor CodexRuntimeMetricsCollector {
         let currentModel: String?
         /// 是否已在该文件里见过权威的 turn_context 模型；见过后不再回退 knownModelName。
         let hasSeenTurnContext: Bool
+        /// 子 agent 文件首行 session_meta 的时间戳，作为「继承前缀」时间簇锚点；仅子 agent 文件有值。
+        /// 子会话开头是父线程逐字节副本，这些前缀行时间戳全部紧贴 meta（同一瞬间批量灌入），
+        /// 其 total_output 是父累计快照；本会话真实产出在其后一个明显时间 gap 之后才开始。
+        let metaStartedAt: Date?
+        /// 是否已越过继承前缀（出现第一条时间戳明显晚于 metaStartedAt 的 token）。
+        /// 未越过时，前缀 token 只更新 previousTotal 基线、不产出 TPS 事件，避免把父会话累计量
+        /// 在子文件里复算成重复 output（并消除该段因 model 未声明而产生的 unknown 归属）。
+        let crossedInheritedPrefix: Bool
         let initializedForLiveTracking: Bool
         let messageUsage: [String: MessageUsage]
         let messageSequence: UInt64
@@ -1083,6 +1091,13 @@ public actor CodexRuntimeMetricsCollector {
                 CodexSessionParser.parseSessionMeta(line: String($0))
             }
             : nil
+        // 子 agent 文件才需要继承前缀锚点：取首行 session_meta 的时间戳作为时间簇基准。
+        // 顶层文件 metaStartedAt 为 nil，crossedInheritedPrefix 恒 true（不做任何前缀跳过）。
+        let isSubagentFile = meta?.threadSource == "subagent"
+        let metaStartedAt: Date? = isSubagentFile
+            ? contents.split(whereSeparator: { $0.isNewline }).first.flatMap { sessionMetaTimestamp(String($0)) }
+            : nil
+        var crossedInheritedPrefix = (metaStartedAt == nil)
         let completed = meta.map { _ in
             CodexSessionParser.completedTasks(
                 inSessionContents: contents,
@@ -1120,6 +1135,13 @@ public actor CodexRuntimeMetricsCollector {
                 guard let parsed = parseTokenLine(line, now: now) else { continue }
                 tokenDiagnostics.parsedOutputObservations += 1
                 tokenDiagnostics.baselineObservations += 1
+                // 子 agent 继承前缀跟踪：一旦某条 token 时间戳越过 meta 时间簇，标记已越过。
+                // baseline 分支本就只建 previousTotal 基线、不产出事件，所以前缀在 baseline 里天然不入账；
+                // 此处推进 crossedInheritedPrefix 只为把越过状态存入 cache，供后续增量路径判定。
+                if !crossedInheritedPrefix, let anchor = metaStartedAt,
+                   parsed.timestamp.timeIntervalSince(anchor) >= Self.inheritedPrefixClusterTolerance {
+                    crossedInheritedPrefix = true
+                }
                 if let total = parsed.total {
                     tokenDiagnostics.cumulativeObservations += 1
                     previousTotal = total
@@ -1191,6 +1213,8 @@ public actor CodexRuntimeMetricsCollector {
             previousOutputTimestamp: previousTimestamp,
             currentModel: currentModel,
             hasSeenTurnContext: hasSeenTurnContext,
+            metaStartedAt: metaStartedAt,
+            crossedInheritedPrefix: crossedInheritedPrefix,
             initializedForLiveTracking: liveTrackedPaths.contains(file.path),
             messageUsage: messageUsage,
             messageSequence: messageSequence,
@@ -1245,6 +1269,8 @@ public actor CodexRuntimeMetricsCollector {
                 previousOutputTimestamp: cached.previousOutputTimestamp,
                 currentModel: cached.currentModel,
                 hasSeenTurnContext: cached.hasSeenTurnContext,
+                metaStartedAt: cached.metaStartedAt,
+                crossedInheritedPrefix: cached.crossedInheritedPrefix,
                 initializedForLiveTracking: cached.initializedForLiveTracking,
                 messageUsage: cached.messageUsage,
                 messageSequence: cached.messageSequence,
@@ -1283,6 +1309,11 @@ public actor CodexRuntimeMetricsCollector {
         }
         var messageUsage = cached.messageUsage
         var messageSequence = cached.messageSequence
+        // 子 agent 继承前缀状态从 cache 恢复：未越过前缀时，前缀 token 只更新 previousTotal 基线、
+        // 不产出事件，避免复算父会话累计量（并消除该段的 unknown 归属）。顶层文件 metaStartedAt 为 nil、
+        // crossedInheritedPrefix 恒 true，走原逻辑不受影响。
+        let metaStartedAt = cached.metaStartedAt
+        var crossedInheritedPrefix = cached.crossedInheritedPrefix
         // 内容指纹去重，只作用于「无 message id 的增量（incremental）路径」——主要是 Claude CLI
         // 中缺 message.id 的逐条 usage 行：同一次真实 output 会被重复刷新成多条除时间戳外逐字节相同
         // 的行，不去重会按刷新条数重复累加（实测约 2x）。指纹取 model + token 增量（不含时间戳，避免
@@ -1346,6 +1377,20 @@ public actor CodexRuntimeMetricsCollector {
             guard liveTrackedPaths.contains(file.path),
                   let parsed = parseTokenLine(Data(line.utf8), now: now) else { continue }
             tokenDiagnostics.parsedOutputObservations += 1
+            // 子 agent 继承前缀：时间戳仍在 meta 时间簇内的 token 属于父线程副本，不产出 TPS 事件。
+            // 但仍推进 previousTotal/previousTimestamp 基线，使越过前缀后的第一条真实产出从继承末值
+            // 起差分（而非从 0 暴涨）；越过一次后 crossedInheritedPrefix 恒 true，本会话产出正常入账。
+            if !crossedInheritedPrefix, let anchor = metaStartedAt {
+                if parsed.timestamp.timeIntervalSince(anchor) >= Self.inheritedPrefixClusterTolerance {
+                    crossedInheritedPrefix = true
+                } else {
+                    if let total = parsed.total {
+                        previousTotal = total
+                        previousTimestamp = parsed.timestamp
+                    }
+                    continue
+                }
+            }
             var emittedTokens = 0
             if let total = parsed.total {
                 tokenDiagnostics.cumulativeObservations += 1
@@ -1483,6 +1528,8 @@ public actor CodexRuntimeMetricsCollector {
             previousOutputTimestamp: previousTimestamp,
             currentModel: currentModel,
             hasSeenTurnContext: hasSeenTurnContext,
+            metaStartedAt: metaStartedAt,
+            crossedInheritedPrefix: crossedInheritedPrefix,
             initializedForLiveTracking: true,
             messageUsage: messageUsage,
             messageSequence: messageSequence,
@@ -2000,6 +2047,15 @@ public actor CodexRuntimeMetricsCollector {
         fractionalISO8601.date(from: value) ?? basicISO8601.date(from: value)
     }
 
+    /// 从 session_meta 首行 JSON 提取时间戳（顶层 "timestamp" 字段），作为子 agent 继承前缀的时间簇锚点。
+    /// 解析失败返回 nil（此时不启用前缀跳过，退回原行为）。
+    private func sessionMetaTimestamp(_ line: String) -> Date? {
+        guard let data = line.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let raw = object["timestamp"] as? String else { return nil }
+        return parseTimestamp(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
     private func safePositiveDifference(_ current: Int, _ previous: Int) -> Int {
         let (difference, overflow) = current.subtractingReportingOverflow(previous)
         if overflow { return Int.max }
@@ -2015,6 +2071,10 @@ public actor CodexRuntimeMetricsCollector {
     private static let trackedFileRetention: TimeInterval = 30 * 60
     private static let messageRetention: TimeInterval = 10 * 60
     private static let futureTimestampTolerance = CodexRuntimeMetricsConfiguration.futureTimestampToleranceSeconds
+    /// 子 agent「继承前缀」时间簇容差：token 时间戳与首行 session_meta 之差在此以内视为仍在
+    /// 继承前缀（父线程逐字节副本，同一瞬间批量灌入）。实测继承段全部紧贴 meta（<1s），
+    /// 本会话真实产出在其后 17-37s 的大 gap 之后，2s 阈值有充足安全边际。
+    private static let inheritedPrefixClusterTolerance: TimeInterval = 2
     private static let maximumAppendReadBytes = 512 * 1024
     private static let maximumTrackedFiles = 96
     private static let maximumMessageIdentities = 2_048
