@@ -79,6 +79,11 @@ final class OrbWindowController {
         host.sizingOptions = []
         host.frame = NSRect(origin: .zero, size: Constants.orbSize)
         host.autoresizingMask = [.width, .height]
+        // Layer-back the orb so window drags composite independently of the ~1 Hz
+        // metrics redraws; otherwise the sparkline repaint contends with
+        // setFrameOrigin on the main thread and the orb lags behind the cursor.
+        host.wantsLayer = true
+        host.layerContentsRedrawPolicy = .onSetNeedsDisplay
         host.onClick = { [weak self] in self?.toggleExpanded() }
         host.onDoubleClick = { [weak self] in self?.openDashboard() }
         host.onRightClick = { [weak self] in self?.openMenuBarPanel() }
@@ -136,8 +141,10 @@ final class OrbWindowController {
     }
 
     private func drag(to mouse: NSPoint) {
-        if expanded { collapse() }
         if dragPointerOffset == nil {
+            // First frame of the gesture: collapse any open bubbles once (not every
+            // frame — collapse() mutates @Published state and tears down panels).
+            if expanded { collapse() }
             dragPointerOffset = NSPoint(x: mouse.x - panel.frame.minX, y: mouse.y - panel.frame.minY)
         }
         guard let offset = dragPointerOffset else { return }
