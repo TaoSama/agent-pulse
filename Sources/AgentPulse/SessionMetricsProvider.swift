@@ -39,6 +39,16 @@ public struct ModelTPSHistory: Sendable, Equatable, Identifiable {
     }
 }
 
+/// 每秒刷新时由样本历史派生的曲线集合。全部为纯计算结果，可在后台线程算好后
+/// 一次性回主线程赋值，避免每秒在主线程重跑总曲线 + 每模型曲线 ×2 套口径。
+private struct DerivedSeries: Sendable {
+    var sparklinePoints: [SparklinePoint]
+    var sparklineRegression: SparklineRegression
+    var modelTPSHistory: [ModelTPSHistory]
+    var dashboardSparklinePoints: [SparklinePoint]
+    var dashboardModelTPSHistory: [ModelTPSHistory]
+}
+
 /// App 的轻量展示适配器。所有 rollout 解析、TPS 与持久化均由 AgentPulseCore 完成。
 @MainActor
 public final class MetricsStore: ObservableObject {
@@ -193,17 +203,25 @@ public final class MetricsStore: ObservableObject {
                 guard let value = sample.tps else { return nil }
                 return TPSPoint(timestamp: sample.timestamp, tokensPerSecond: value, state: sample.state)
             }
-            let sparkline = SparklineAnalysis.makeSparkline(
-                from: result.history,
-                end: result.sampledAt
-            )
-            sparklinePoints = sparkline.points
-            sparklineRegression = sparkline.regression
-            modelTPSHistory = makeModelTPSHistory(from: result.history, end: result.sampledAt)
-            // 看板不重叠桶：用较长历史（最多 3600s）按当前跨度重算，并缓存供跨度切换即时重算。
+            // 看板不重叠桶：缓存较长历史（最多 3600s）供跨度切换即时重算。
             dashboardSampleCache = result.dashboardHistory
             dashboardSampleEnd = result.sampledAt
-            recomputeDashboardSeries()
+            // 总曲线 + 每模型曲线 ×2 套口径都是无 UI 依赖的纯计算。放到后台线程算好，
+            // 主线程只做一次批量赋值，避免每秒在 MainActor 上重跑整批 sparkline 管线。
+            let span = dashboardSpan
+            let derived = await Self.deriveSeries(
+                history: result.history,
+                dashboardSamples: result.dashboardHistory,
+                end: result.sampledAt,
+                span: span,
+                model: makeModelTPSHistory,
+                dashboardModel: makeDashboardModelTPSHistory
+            )
+            sparklinePoints = derived.sparklinePoints
+            sparklineRegression = derived.sparklineRegression
+            modelTPSHistory = derived.modelTPSHistory
+            dashboardSparklinePoints = derived.dashboardSparklinePoints
+            dashboardModelTPSHistory = derived.dashboardModelTPSHistory
             lastRefresh = result.sampledAt
             isShowingCachedSnapshot = false
             collectionWarning = result.unreadableFiles > 0
@@ -288,7 +306,42 @@ public final class MetricsStore: ObservableObject {
         isShowingCachedSnapshot = true
     }
 
-    private func makeModelTPSHistory(
+    /// 在后台线程一次算好每秒刷新所需的全部派生曲线（总 + 分模型 ×2 套口径）。
+    /// 纯计算，无 MainActor 状态依赖：`span` 与两个计算函数由调用方传入。
+    private nonisolated static func deriveSeries(
+        history: [LiveRateSample],
+        dashboardSamples: [LiveRateSample],
+        end: Date,
+        span: DashboardTPSSpan,
+        model: @Sendable @escaping ([LiveRateSample], Date) -> [ModelTPSHistory],
+        dashboardModel: @Sendable @escaping ([LiveRateSample], Date, DashboardTPSSpan) -> [ModelTPSHistory]
+    ) async -> DerivedSeries {
+        await Task.detached(priority: .userInitiated) {
+            let sparkline = SparklineAnalysis.makeSparkline(from: history, end: end)
+            let modelHistory = model(history, end)
+            let dashboardPoints: [SparklinePoint]
+            let dashboardModelHistory: [ModelTPSHistory]
+            if span.source == .perSecondSamples {
+                dashboardPoints = SparklineAnalysis.makeBucketedDashboardSparkline(
+                    from: dashboardSamples, end: end, span: span
+                )
+                dashboardModelHistory = dashboardModel(dashboardSamples, end, span)
+            } else {
+                // 1 天跨度由 coordinator 账本 series 接管，这两条置空。
+                dashboardPoints = []
+                dashboardModelHistory = []
+            }
+            return DerivedSeries(
+                sparklinePoints: sparkline.points,
+                sparklineRegression: sparkline.regression,
+                modelTPSHistory: modelHistory,
+                dashboardSparklinePoints: dashboardPoints,
+                dashboardModelTPSHistory: dashboardModelHistory
+            )
+        }.value
+    }
+
+    private nonisolated func makeModelTPSHistory(
         from history: [LiveRateSample],
         end: Date
     ) -> [ModelTPSHistory] {
@@ -338,7 +391,7 @@ public final class MetricsStore: ObservableObject {
     }
 
     /// 看板分模型不重叠桶曲线：与总曲线同栅格；latestTPS 仍 180s 口径（图例数字不变）。
-    private func makeDashboardModelTPSHistory(
+    private nonisolated func makeDashboardModelTPSHistory(
         from history: [LiveRateSample],
         end: Date,
         span: DashboardTPSSpan
