@@ -31,7 +31,7 @@ struct ModelTokenBreakdownCard: View {
                 if showsTitle {
                     Text("TOP 3 · 按模型 TOKENS")
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(Color.white.opacity(0.6))
+                        .foregroundStyle(Color.white)
                 }
 
                 VStack(spacing: 8) {
@@ -55,7 +55,7 @@ struct ModelTokenBreakdownCard: View {
                             Text(expanded ? "收起" : "+\(hiddenCount) 更多")
                                 .font(.system(size: 11, weight: .medium))
                         }
-                        .foregroundStyle(Color.white.opacity(0.7))
+                        .foregroundStyle(Color.white)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .contentShape(Rectangle())
                     }
@@ -113,7 +113,7 @@ private struct ModelTokenRow: View {
                 .frame(width: 56, alignment: .trailing)
             Text(TokenUsageFormatting.percent(fraction))
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
-                .foregroundStyle(Color.white.opacity(0.6))
+                .foregroundStyle(Color.white)
                 .frame(width: 44, alignment: .trailing)
         }
         .foregroundStyle(Color.white)
