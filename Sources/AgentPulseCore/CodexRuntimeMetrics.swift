@@ -1114,14 +1114,18 @@ public actor CodexRuntimeMetricsCollector {
         var messageUsage: [String: MessageUsage] = [:]
         var messageSequence: UInt64 = 0
         var tokenDiagnostics = TokenDiagnostics()
+        // 会话级 model 播种无条件执行（不受 live-track 门禁）：Codex 的 turn_context 全生命周期
+        // 只在文件顶部出现一次，其后正文再无 model 声明。若首解析时文件未 live-tracked 就跳过播种，
+        // cache 里 currentModel 会一直是 nil；待该文件晋升 live-tracked 走增量路径时，增量预播种只回看
+        // 当前追加批次（顶部 turn_context 早已消费），永远拿不到 model → 整段 output 归 "unknown"。
+        // 首解析即无条件播种、存入 cache，可让 model 成为会话级粘性值，杜绝这条 nil 竞态。
+        if let contextModel = latestTurnContextModel(in: fileData) {
+            currentModel = contextModel
+            hasSeenTurnContext = true
+        } else {
+            currentModel = latestKnownModel(in: fileData)
+        }
         if liveTrackedPaths.contains(file.path) {
-            // 优先用最近一次 turn_context 的权威模型做种子；找不到才回退宽松匹配。
-            if let contextModel = latestTurnContextModel(in: fileData) {
-                currentModel = contextModel
-                hasSeenTurnContext = true
-            } else {
-                currentModel = latestKnownModel(in: fileData)
-            }
             let baseline = baselineData(from: fileData)
             for line in completeLines(in: baseline.data, skippingLeadingPartialLine: baseline.skipsLeadingPartialLine) {
                 if let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] {
