@@ -128,6 +128,9 @@ struct SecureConfigVerification {
         try require(SecretMask.mask("abc") == "***", "short value masks fully")
         try require(SecretMask.mask("12345678") == "********", "8-char value masks fully")
         try require(SecretMask.mask("abcdEFGHwxyz") == "abcd****wxyz", "long value shows first4 + **** + last4")
+        try require(MergedEnvKeys.isSecret("CLIPROXY_CPA_MANAGEMENT_KEY"), "named source management key must be secret")
+        try require(MergedEnvKeys.isSecret("CLIPROXY_CPA_TARGET_API_KEY"), "named source target key must be secret")
+        try require(!MergedEnvKeys.isSecret("CLIPROXY_CPA_BASE_URL"), "named source base URL must remain visible")
     }
 
     private static func expectEnvError(_ url: URL, expected: EnvFile.Error, _ message: String) throws {

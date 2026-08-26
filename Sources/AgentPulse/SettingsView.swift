@@ -73,9 +73,12 @@ struct AgentPulseSettingsView: View {
                 dualSourceField("Base URL", key: MergedEnvKeys.cliProxyBaseURL)
                 dualSourceField("Management Key", key: MergedEnvKeys.cliProxyManagementKey)
                 dualSourceField("Target API Key", key: MergedEnvKeys.cliProxyTargetAPIKey)
+                SettingsFootnote("额外来源通过凭证文件中的 CLIPROXY_<SOURCE>_* 三元组配置。")
                 SettingsRow(title: "采集状态") {
                     SettingsStatusBadge(
-                        text: model.tokenSyncStatus.cliProxyConfigured ? "已配置" : "未配置",
+                        text: model.tokenSyncStatus.cliProxyConfigured
+                            ? "已配置 \(model.tokenSyncStatus.cliProxySourceCount) 个来源"
+                            : "未配置",
                         tone: model.tokenSyncStatus.cliProxyConfigured ? .positive : .neutral
                     )
                 }

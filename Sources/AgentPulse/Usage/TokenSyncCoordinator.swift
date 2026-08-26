@@ -422,11 +422,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             // 返回空事件，绝不影响本地文件采集与既有链路。
             var cliProxyEvents: [UsageEvent] = []
             var cliProxyError: String?
-            let cliProxyConfigured = CliProxyUsageService.isConfigured(atPath: cliProxyConfigPath)
+            let cliProxySourceCount = CliProxyUsageService.configuredSourceCount(atPath: cliProxyConfigPath)
+            let cliProxyConfigured = cliProxySourceCount > 0
             progressReporter.enterPhase(.cliproxy)
             if cliProxyConfigured {
                 do {
-                    cliProxyEvents = try await cliProxyService.fetchUsageEvents(atPath: cliProxyConfigPath)
+                    let result = try await cliProxyService.fetchUsage(atPath: cliProxyConfigPath)
+                    cliProxyEvents = result.events
+                    if result.failedSourceCount > 0 {
+                        cliProxyError = "部分 CPA 来源采集失败（\(result.failedSourceCount)/\(result.sourceCount)）"
+                    }
                 } catch is CancellationError {
                     // 取消：走后续 cancelled 分支统一处理。
                 } catch {
@@ -436,7 +441,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             // 登记本阶段计数：拉取到的事件数（未配置或失败时为 0，则该阶段不显示计数）。
             progressReporter.setPhaseTotal(.cliproxy, total: cliProxyEvents.count)
             progressReporter.completePhase(.cliproxy)
-            self?.updateCliProxyStatus(configured: cliProxyConfigured, error: cliProxyError, generation: generation)
+            self?.updateCliProxyStatus(
+                configured: cliProxyConfigured,
+                sourceCount: cliProxySourceCount,
+                error: cliProxyError,
+                generation: generation
+            )
 
             // 绑定为不可变值再进入 @Sendable worker，满足 Swift 6 并发捕获约束。
             let networkEvents = cliProxyEvents
@@ -584,10 +594,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     /// 把 cliproxy 采集配置状态与错误刷新到 UI（只在当前 generation 有效时）。
-    private func updateCliProxyStatus(configured: Bool, error: String?, generation: UInt64) {
+    private func updateCliProxyStatus(configured: Bool, sourceCount: Int, error: String?, generation: UInt64) {
         guard generation == scanGeneration else { return }
         updateStatus { status in
             status.cliProxyConfigured = configured
+            status.cliProxySourceCount = sourceCount
             status.cliProxyError = error
         }
     }

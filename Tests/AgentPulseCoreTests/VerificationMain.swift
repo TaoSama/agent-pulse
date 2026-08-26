@@ -84,6 +84,15 @@ struct AgentPulseCoreVerification {
         if try await reconcileFrozenSnapshotIfConfigured() {
             return
         }
+        if ProcessInfo.processInfo.environment["AGENT_PULSE_VERIFY_CLIPROXY_CONFIG"] == "1" {
+            let path = ProcessInfo.processInfo.environment["AGENT_PULSE_CLIPROXY_CONFIG_PATH"]
+                ?? MergedEnvKeys.defaultPath
+            let sourceCount = CliProxyUsageService.configuredSourceCount(atPath: path)
+            let result = try await CliProxyUsageService().fetchUsage(atPath: path)
+            try require(sourceCount == result.sourceCount, "configured and fetched source counts must match")
+            print("AgentPulseCoreVerification(cliproxy): PASS sources=\(result.sourceCount) failed=\(result.failedSourceCount) events=\(result.events.count)")
+            return
+        }
         if ProcessInfo.processInfo.environment["AGENT_PULSE_VERIFY_PARSER_METRICS_ONLY"] == "1" {
             try verifyV2ParserProtocol()
             try verifyV2ClaudeReasoningSplit()
@@ -109,6 +118,7 @@ struct AgentPulseCoreVerification {
         try await verifyColdStartModelSeeding()
         try verifySparklineAnalysis()
         try verifyCliProxyUsageParser()
+        try await verifyCliProxyMultipleSources()
         print("AgentPulseCoreVerification: PASS")
     }
 
@@ -3695,6 +3705,15 @@ struct AgentPulseCoreVerification {
         let again = CliProxyUsageParser.parse(data: data, targetAPIKey: targetKey)
         try require(Set(events.map(\.id)) == Set(again.map(\.id)), "event ids must be stable across parses")
 
+        let namedSource = CliProxyUsageParser.parse(
+            data: data,
+            targetAPIKey: targetKey,
+            sourceIdentifier: "CPA"
+        )
+        try require(namedSource.count == events.count, "named source must retain all matching events")
+        try require(Set(namedSource.map(\.id)).isDisjoint(with: Set(events.map(\.id))), "named source event ids must not collide with default source")
+        try require(namedSource.allSatisfy { $0.project != identity && $0.sessionHash == $0.project }, "named source must use an isolated hashed identity")
+
         // 空 / 非法输入稳健返回空。
         try require(CliProxyUsageParser.parse(data: Data("not json".utf8), targetAPIKey: targetKey).isEmpty, "invalid json must yield empty")
         try require(CliProxyUsageParser.parse(data: data, targetAPIKey: "").isEmpty, "empty target key must yield empty")
@@ -3719,5 +3738,73 @@ struct AgentPulseCoreVerification {
         // recordNetworkEvents 不得写入 usage_files checkpoint（网络来源无 parser 版本轴）。
         let needsRebuild = try ledger.requiresParserRebuild(currentParserVersion: UsageJSONLParser.parserVersion)
         try require(!needsRebuild, "cliproxy events must not trigger parser rebuild")
+    }
+
+    private static func verifyCliProxyMultipleSources() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "cliproxy-multi-verify-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appending(path: "agent-pulse.env")
+        let sharedKey = "sk-shared-verification"
+        try EnvFile.writeBack([
+            MergedEnvKeys.cliProxyBaseURL: "https://default.example",
+            MergedEnvKeys.cliProxyManagementKey: "default-management",
+            MergedEnvKeys.cliProxyTargetAPIKey: sharedKey,
+            "CLIPROXY_CPA_BASE_URL": "https://cpa.example",
+            "CLIPROXY_CPA_MANAGEMENT_KEY": "cpa-management",
+            "CLIPROXY_CPA_TARGET_API_KEY": sharedKey,
+            "CLIPROXY_INCOMPLETE_BASE_URL": "https://incomplete.example",
+        ], to: file)
+
+        try require(
+            CliProxyUsageService.configuredSourceCount(atPath: file.path) == 2,
+            "default and named CPA source must load while an incomplete source is skipped"
+        )
+
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "apis": [
+                "POST /v1/responses": [
+                    "models": [
+                        "model": [
+                            "details": [[
+                                "timestamp": "2026-08-27T00:00:00Z",
+                                "api_key_hash": CliProxyUsageParser.apiKeyHash(for: sharedKey),
+                                "resolved_model": "model",
+                                "tokens": ["input_tokens": 10, "output_tokens": 5, "total_tokens": 15],
+                            ]],
+                        ],
+                    ],
+                ],
+            ],
+        ])
+        let service = CliProxyUsageService { request in
+            let status = request.url?.host == "cpa.example" ? 401 : 200
+            return (payload, HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: nil,
+                headerFields: nil
+            )!)
+        }
+        let partial = try await service.fetchUsage(atPath: file.path)
+        try require(partial.sourceCount == 3 && partial.failedSourceCount == 2, "HTTP and incomplete source failures must be isolated")
+        try require(partial.events.count == 1, "successful source events must survive another source failure")
+
+        let successfulService = CliProxyUsageService { request in
+            (payload, HTTPURLResponse(
+                url: request.url!,
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!)
+        }
+        let complete = try await successfulService.fetchUsage(atPath: file.path)
+        try require(complete.sourceCount == 3 && complete.failedSourceCount == 1, "incomplete source must remain visible as a failure")
+        try require(complete.events.count == 2, "both complete sources must be collected")
+        try require(Set(complete.events.map(\.project)).count == 2, "same API key across sources must use isolated bucket identities")
+        try require(Set(complete.events.map(\.id)).count == 2, "same usage detail across sources must use isolated event ids")
+        let defaultIdentity = CliProxyUsageParser.apiKeyIdentity(for: sharedKey)
+        try require(complete.events.contains { $0.project == defaultIdentity }, "default source must retain its historical identity")
     }
 }
