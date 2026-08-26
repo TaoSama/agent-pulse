@@ -34,14 +34,18 @@ public enum CliProxyUsageParser {
     ///   - data: `/v0/management/usage` 的完整响应体。
     ///   - targetAPIKey: 要监控的目标 apikey（明文，仅用于本地计算 SHA256 比对，不外发）。
     /// - Returns: 目标 key 的 `UsageEvent` 列表；数据不可解析或无匹配时返回空数组。
-    public static func parse(data: Data, targetAPIKey: String) -> [UsageEvent] {
+    public static func parse(
+        data: Data,
+        targetAPIKey: String,
+        sourceIdentifier: String? = nil
+    ) -> [UsageEvent] {
         let trimmedKey = targetAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedKey.isEmpty else { return [] }
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let apis = root["apis"] as? [String: Any] else { return [] }
 
         let targetHash = apiKeyHash(for: trimmedKey)
-        let identity = String(targetHash.prefix(16))
+        let identity = sourceIdentity(apiKeyHash: targetHash, sourceIdentifier: sourceIdentifier)
 
         var events: [UsageEvent] = []
         var seenIDs = Set<String>()
@@ -65,6 +69,16 @@ public enum CliProxyUsageParser {
             }
         }
         return events
+    }
+
+    /// 默认来源沿用历史 key 身份；具名来源把来源标识纳入不可逆身份，避免相同 key
+    /// 在多个 CPA 部署上的事件 ID / bucket 自然键碰撞。
+    static func sourceIdentity(apiKeyHash: String, sourceIdentifier: String?) -> String {
+        guard let sourceIdentifier = sourceIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sourceIdentifier.isEmpty else {
+            return String(apiKeyHash.prefix(16))
+        }
+        return String(hash("cliproxy-source|\(sourceIdentifier)|\(apiKeyHash)").prefix(16))
     }
 
     /// 把单条 detail 映射为一个 `UsageEvent`；无有效时间戳或零用量时跳过。

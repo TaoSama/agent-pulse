@@ -212,10 +212,15 @@ public enum MergedEnvKeys {
     public static let r2AccessKeyID = "R2_ACCESS_KEY_ID"
     public static let r2SecretAccessKey = "R2_SECRET_ACCESS_KEY"
 
-    // cliproxy（键名保持不变）。
+    // cliproxy 默认来源（键名保持不变）。额外来源使用
+    // CLIPROXY_<SOURCE>_{BASE_URL,MANAGEMENT_KEY,TARGET_API_KEY}。
     public static let cliProxyBaseURL = "CLIPROXY_BASE_URL"
     public static let cliProxyManagementKey = "CLIPROXY_MANAGEMENT_KEY"
     public static let cliProxyTargetAPIKey = "CLIPROXY_TARGET_API_KEY"
+    public static let cliProxyPrefix = "CLIPROXY_"
+    public static let cliProxyBaseURLSuffix = "_BASE_URL"
+    public static let cliProxyManagementKeySuffix = "_MANAGEMENT_KEY"
+    public static let cliProxyTargetAPIKeySuffix = "_TARGET_API_KEY"
 
     // 上报简单值（新键，明文）。
     public static let reportBaseURL = "REPORT_BASE_URL"
@@ -230,7 +235,12 @@ public enum MergedEnvKeys {
     ]
 
     /// 某键是否为密钥（掩码判定）。
-    public static func isSecret(_ key: String) -> Bool { secretKeys.contains(key) }
+    public static func isSecret(_ key: String) -> Bool {
+        secretKeys.contains(key)
+            || (key.hasPrefix(cliProxyPrefix)
+                && (key.hasSuffix(cliProxyManagementKeySuffix)
+                    || key.hasSuffix(cliProxyTargetAPIKeySuffix)))
+    }
 
     /// 默认合并 env 路径：当前用户家目录下的凭证文件（不硬编码用户名）。
     public static let defaultPath: String = {
