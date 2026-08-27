@@ -304,11 +304,11 @@ chmod 600 ~/.claude/.credentials/env/agent-pulse.env
 
 ### cliproxyapi 用量采集
 
-- 采集在本地长期采集的同一节奏（应用启动一次 + 每 30 分钟）随扫描触发：拉取 cliproxyapi management 的 `GET /v0/management/usage`，在**本地**按目标 apikey 的 `SHA256` 与响应中的 `api_key_hash` 精确比对，只提取目标 key 的 token 用量。
+- 采集在本地长期采集的同一节奏（应用启动一次 + 每 30 分钟）随扫描触发：优先调用 `POST /v0/management/monitoring/analytics`，在服务端按目标 apikey 的 `SHA256` 和本机账本水位过滤，用 `(timestamp_ms,id)` 游标倒序分页只拉增量明细。仅当 analytics 端点明确不支持（`404` / `405` / `501` 或协议结构不兼容）时回退到旧 `GET /v0/management/usage`。
 - 默认来源使用 `CLIPROXY_BASE_URL` / `CLIPROXY_MANAGEMENT_KEY` / `CLIPROXY_TARGET_API_KEY`；额外来源使用具名三元组 `CLIPROXY_<SOURCE>_BASE_URL` / `CLIPROXY_<SOURCE>_MANAGEMENT_KEY` / `CLIPROXY_<SOURCE>_TARGET_API_KEY`。每个来源必须完整提供三项，`SOURCE` 只允许大写字母、数字和下划线，并作为稳定账本身份的一部分，配置后不要重命名。
 - 多来源并发、独立采集；单个来源失败不会丢弃其他来源已获取的事件。来源标识与目标 key 共同哈希为账本身份，不保存来源地址或明文 key，也不会让同一 key 在不同 CPA 上发生自然键碰撞。
-- 用量以来源 `cliproxy` 并入既有 usage 账本与上报链路（30 分钟 bucket、按 revision 精确对账），复用现有上报开关与协议，不新造上报通道。
-- 鉴权用 `Authorization: Bearer <management-key>`；生产地址要求 `https`，`http` 仅在 loopback 或私有内网地址放行。响应无界，设有最大字节保护，超限或拉取失败时**跳过本轮**，绝不影响本地文件采集与既有链路。
+- 用量以来源 `cliproxy` 并入既有 usage 账本与上报链路（30 分钟 bucket、按 revision 精确对账），复用现有上报开关与协议，不新造上报通道。网络事件入库时在同一 SQLite 事务内只重算受影响的 bucket，不因少量 CPA 增量触发全账本派生。
+- 鉴权用 `Authorization: Bearer <management-key>`；生产地址要求 `https`，`http` 仅在 loopback 或私有内网地址放行。每页设有最大字节、最大页数和游标防环保护，超限或拉取失败时**跳过本轮**，绝不影响本地文件采集与既有链路。
 - 账本只保存 hash 后的 key 身份、model、token 计数与时间，不含明文 key、掩码 source、地址或正文。
 
 ---
