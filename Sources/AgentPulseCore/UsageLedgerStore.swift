@@ -523,7 +523,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                     reasoning_output_tokens, total_tokens, session_hash,
                     inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                    skill_counts_json, mcp_counts_json, merge_strategy,
+                    skill_counts_json, mcp_counts_json, merge_strategy, has_identity_conflict,
                     CASE
                         WHEN source_file_hash = '' THEN 0
                         WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
@@ -557,9 +557,16 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     MAX(has_total_snapshot) AS has_total_snapshot,
                     MAX(lineage_fingerprint) AS lineage_fingerprint,
                     MAX(codex_dedup_key) AS codex_dedup_key,
-                    MAX(merge_strategy) AS merge_strategy,
+                    COALESCE(MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 'cumulativeMax' END), MAX(merge_strategy)) AS merge_strategy,
                     MAX(skill_counts_json) AS skill_counts_json,
-                    MAX(mcp_counts_json) AS mcp_counts_json
+                    MAX(mcp_counts_json) AS mcp_counts_json,
+                    CASE
+                        WHEN MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 1 ELSE 0 END) = 1 THEN 0
+                        WHEN COUNT(DISTINCT session_hash) > 1 THEN 1
+                        WHEN COUNT(DISTINCT CASE WHEN model <> 'unknown' THEN model END) > 1 THEN 1
+                        WHEN COUNT(DISTINCT CASE WHEN project <> 'unknown' THEN project END) > 1 THEN 1
+                        ELSE 0
+                    END AS has_identity_conflict
                 FROM top_tier
                 GROUP BY source, event_id
             ),
@@ -573,14 +580,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                        reasoning_output_tokens, total_tokens, session_hash,
                        inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
+                       skill_counts_json, mcp_counts_json, merge_strategy, has_identity_conflict
                 FROM lineage_ranked WHERE rn = 1
                 UNION ALL
                 SELECT source, event_id, model, project, timestamp_ms,
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                        reasoning_output_tokens, total_tokens, session_hash,
                        inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
+                       skill_counts_json, mcp_counts_json, merge_strategy, has_identity_conflict
                 FROM logical_dedup WHERE lineage_fingerprint = ''
             ),
             content_ranked AS (
@@ -593,14 +600,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                        reasoning_output_tokens, total_tokens, session_hash,
                        inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
+                       skill_counts_json, mcp_counts_json, merge_strategy, has_identity_conflict
                 FROM content_ranked WHERE rn = 1
                 UNION ALL
                 SELECT source, event_id, model, project, timestamp_ms,
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                        reasoning_output_tokens, total_tokens, session_hash,
                        inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
+                       skill_counts_json, mcp_counts_json, merge_strategy, has_identity_conflict
                 FROM lineage_dedup WHERE codex_dedup_key = ''
             )
             SELECT * FROM content_dedup;
@@ -618,7 +625,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
             ),
             tiered AS (
-                SELECT event_id, source, lineage_fingerprint, codex_dedup_key, inherited,
+                SELECT event_id, source, session_hash, model, project, lineage_fingerprint, codex_dedup_key, inherited,
                     has_total_snapshot,
                     CASE
                         WHEN source_file_hash = '' THEN 0
@@ -638,6 +645,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
             ),
             logical_dedup AS (
                 SELECT source, event_id,
+                    MAX(session_hash) AS session_hash,
+                    MAX(model) AS model,
+                    MAX(project) AS project,
                     MAX(lineage_fingerprint) AS lineage_fingerprint,
                     MAX(codex_dedup_key) AS codex_dedup_key,
                     MIN(inherited) AS inherited,
@@ -660,7 +670,18 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     - (SELECT COUNT(DISTINCT lineage_fingerprint) FROM logical_dedup WHERE lineage_fingerprint <> '') AS collapsed_inherited,
                 (SELECT COUNT(*) FROM lineage_dedup WHERE codex_dedup_key <> '')
                     - (SELECT COUNT(DISTINCT codex_dedup_key) FROM lineage_dedup WHERE codex_dedup_key <> '') AS collapsed_content,
-                (SELECT COUNT(*) FROM logical_dedup WHERE inherited = 1 AND lineage_fingerprint = '') AS unprovable_inherited
+                (SELECT COUNT(*) FROM logical_dedup WHERE inherited = 1 AND lineage_fingerprint = '') AS unprovable_inherited,
+                (SELECT COUNT(*) FROM (
+                    SELECT source, event_id
+                    FROM top_tier
+                    GROUP BY source, event_id
+                    HAVING COUNT(*) > 1
+                    AND (
+                        COUNT(DISTINCT session_hash) > 1
+                        OR COUNT(DISTINCT CASE WHEN model <> 'unknown' THEN model END) > 1
+                        OR COUNT(DISTINCT CASE WHEN project <> 'unknown' THEN project END) > 1
+                    )
+                )) AS identity_conflicts
             """
         let collapseStmt = try prepare(collapseCountSQL)
         defer { sqlite3_finalize(collapseStmt) }
@@ -668,10 +689,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
         var collapsedInheritedEvents = 0
         var collapsedContentDuplicates = 0
         var unprovableInherited = 0
+        var identityConflicts = 0
         if sqlite3_step(collapseStmt) == SQLITE_ROW {
             collapsedInheritedEvents = Int(sqlite3_column_int64(collapseStmt, 0))
             collapsedContentDuplicates = Int(sqlite3_column_int64(collapseStmt, 1))
             unprovableInherited = Int(sqlite3_column_int64(collapseStmt, 2))
+            identityConflicts = Int(sqlite3_column_int64(collapseStmt, 3))
         }
 
         // 不可证明的继承回放：inherited 但无 total snapshot（无 lineage 指纹），无法证明是否重复。
@@ -679,6 +702,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
         var blockedReasons: [String] = []
         if unprovableInherited > 0 {
             blockedReasons.append("\(unprovableInherited) inherited replay event(s) without total snapshot cannot be proven duplicate; reporting proceeds (idempotent upsert self-heals)")
+        }
+        if identityConflicts > 0 {
+            blockedReasons.append("\(identityConflicts) logical event(s) have conflicting identity (session/model/project) across same-tier files; reporting blocked")
         }
 
         // bucket token 聚合：直接 GROUP BY，不加载事件到 Swift。
@@ -1133,7 +1159,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try setIntUnlocked(key: revisionKey(hostname), value: newRevision - 1)
         }
 
-        let eligible = blockingReasons.isEmpty
+        let eligible = blockingReasons.isEmpty && identityConflicts == 0
         try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
         advanceStage() // 8) session 差异写完成
 
