@@ -266,6 +266,27 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
+    /// 返回指定网络来源身份已入库事件的最新毫秒时间戳。先从小型派生表定位
+    /// 最后一个 bucket，再通过 timestamp 索引只扫描该 bucket，避免遍历大型原始表。
+    public func latestNetworkEventTimestampMS(project: String, source: String) throws -> Int64? {
+        try queue.sync {
+            let bucket = try prepare("SELECT MAX(bucket_start_ms) FROM usage_buckets WHERE source=? AND project=?;")
+            defer { sqlite3_finalize(bucket) }
+            try bind(bucket, 1, source)
+            try bind(bucket, 2, project)
+            guard sqlite3_step(bucket) == SQLITE_ROW, sqlite3_column_type(bucket, 0) != SQLITE_NULL else { return nil }
+            let bucketStart = sqlite3_column_int64(bucket, 0)
+
+            let statement = try prepare("SELECT MAX(timestamp_ms) FROM usage_events WHERE timestamp_ms>=? AND source=? AND project=?;")
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, bucketStart)
+            try bind(statement, 2, source)
+            try bind(statement, 3, project)
+            guard sqlite3_step(statement) == SQLITE_ROW, sqlite3_column_type(statement, 0) != SQLITE_NULL else { return nil }
+            return sqlite3_column_int64(statement, 0)
+        }
+    }
+
     /// 网络来源 checkpoint 的 parser 版本基线：取一个足够大的稳定值，保证不小于任何本地
     /// JSONL 解析器版本，从而永不触发 parser 升级重建。
     private static let networkParserVersion: Int32 = 1_000_000

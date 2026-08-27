@@ -427,7 +427,19 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             progressReporter.enterPhase(.cliproxy)
             if cliProxyConfigured {
                 do {
-                    let result = try await cliProxyService.fetchUsage(atPath: cliProxyConfigPath)
+                    var watermarks: [String: Int64] = [:]
+                    for identity in CliProxyUsageService.configuredSourceIdentities(atPath: cliProxyConfigPath) {
+                        if let latest = try ledger.latestNetworkEventTimestampMS(
+                            project: identity,
+                            source: CliProxyUsageParser.source
+                        ) {
+                            watermarks[identity] = latest
+                        }
+                    }
+                    let result = try await cliProxyService.fetchUsage(
+                        atPath: cliProxyConfigPath,
+                        latestTimestampMSByIdentity: watermarks
+                    )
                     cliProxyEvents = result.events
                     if result.failedSourceCount > 0 {
                         cliProxyError = "部分 CPA 来源采集失败（\(result.failedSourceCount)/\(result.sourceCount)）"

@@ -47,6 +47,23 @@ private struct FakeScanner: ProcessScanning {
     }
 }
 
+private final class RequestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+
+    func increment(_ key: String) {
+        lock.lock()
+        counts[key, default: 0] += 1
+        lock.unlock()
+    }
+
+    func value(_ key: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts[key, default: 0]
+    }
+}
+
 private final class SequencedScanner: ProcessScanning, @unchecked Sendable {
     private let lock = NSLock()
     private var snapshots: [[RunningProcess]]
@@ -118,6 +135,7 @@ struct AgentPulseCoreVerification {
         try await verifyColdStartModelSeeding()
         try verifySparklineAnalysis()
         try verifyCliProxyUsageParser()
+        try await verifyCliProxyAnalytics()
         try await verifyCliProxyMultipleSources()
         print("AgentPulseCoreVerification: PASS")
     }
@@ -3734,10 +3752,103 @@ struct AgentPulseCoreVerification {
         try require(cliProxyTotal == 210, "cliproxy bucket total must equal 140+70=210, got \(cliProxyTotal)")
         let ledgerEventCount = try ledger.eventCount()
         try require(ledgerEventCount == 2, "duplicate recordNetworkEvents must remain idempotent")
+        let latestNetworkTimestamp = try ledger.latestNetworkEventTimestampMS(
+            project: identity,
+            source: CliProxyUsageParser.source
+        )
+        try require(latestNetworkTimestamp == 1_786_352_400_000, "network watermark must use the latest event for that CPA identity: \(String(describing: latestNetworkTimestamp))")
 
         // recordNetworkEvents 不得写入 usage_files checkpoint（网络来源无 parser 版本轴）。
         let needsRebuild = try ledger.requiresParserRebuild(currentParserVersion: UsageJSONLParser.parserVersion)
         try require(!needsRebuild, "cliproxy events must not trigger parser rebuild")
+    }
+
+    private static func verifyCliProxyAnalytics() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "cliproxy-analytics-verify-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appending(path: "agent-pulse.env")
+        let targetKey = "sk-analytics-verification"
+        let targetHash = CliProxyUsageParser.apiKeyHash(for: targetKey)
+        try EnvFile.writeBack([
+            MergedEnvKeys.cliProxyBaseURL: "https://analytics.example",
+            MergedEnvKeys.cliProxyManagementKey: "management",
+            MergedEnvKeys.cliProxyTargetAPIKey: targetKey,
+        ], to: file)
+
+        func page(_ timestamp: Int64, nextMS: Int64, nextID: Int64, hasMore: Bool) throws -> Data {
+            try JSONSerialization.data(withJSONObject: [
+                "events": [
+                    "items": [[
+                        "event_hash": "ignored-upstream-id",
+                        "timestamp_ms": timestamp,
+                        "api_key_hash": targetHash,
+                        "resolved_model": "model-a",
+                        "input_tokens": 100,
+                        "output_tokens": 40,
+                        "cache_read_tokens": 30,
+                        "cache_creation_tokens": 5,
+                        "reasoning_tokens": 10,
+                        "total_tokens": 140,
+                    ]],
+                    "next_before_ms": nextMS,
+                    "next_before_id": nextID,
+                    "has_more": hasMore,
+                    "total_count": 2,
+                ],
+            ])
+        }
+        let firstPage = try page(2_000, nextMS: 2_000, nextID: 9, hasMore: true)
+        let secondPage = try page(1_000, nextMS: 0, nextID: 0, hasMore: false)
+        let requests = RequestCounter()
+        let service = CliProxyUsageService { request in
+            if request.url?.path == "/v0/management/monitoring/analytics" {
+                requests.increment("analytics")
+                let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+                let include = body?["include"] as? [String: Any]
+                let eventsPage = include?["events_page"] as? [String: Any]
+                let filters = body?["filters"] as? [String: Any]
+                try require((filters?["api_key_hashes"] as? [String]) == [targetHash], "analytics must filter by target hash")
+                let data = eventsPage?["before_id"] == nil ? firstPage : secondPage
+                return (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+            }
+            requests.increment("legacy")
+            return (Data(), HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+        }
+        let result = try await service.fetchUsage(atPath: file.path)
+        try require(result.events.count == 2, "analytics pagination must collect both pages")
+        try require(requests.value("analytics") == 2 && requests.value("legacy") == 0, "successful analytics must not call legacy usage")
+        try require(result.events.allSatisfy { $0.counts.total == 140 }, "analytics token mapping must preserve reported total")
+
+        let incremental = CliProxyUsageService { request in
+            let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+            try require((body?["from_ms"] as? NSNumber)?.int64Value == 1_235, "analytics must start one millisecond after the persisted watermark")
+            return (secondPage, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let identity = CliProxyUsageService.configuredSourceIdentities(atPath: file.path).first!
+        _ = try await incremental.fetchUsage(atPath: file.path, latestTimestampMSByIdentity: [identity: 1_234])
+
+        let legacyPayload = try JSONSerialization.data(withJSONObject: [
+            "apis": ["endpoint": ["models": ["model-a": ["details": [[
+                "timestamp": "2026-08-27T00:00:00Z",
+                "api_key_hash": targetHash,
+                "resolved_model": "model-a",
+                "tokens": ["input_tokens": 10, "output_tokens": 5, "total_tokens": 15],
+            ]]]]]],
+        ])
+        let fallbackRequests = RequestCounter()
+        let fallback = CliProxyUsageService { request in
+            if request.httpMethod == "POST" {
+                fallbackRequests.increment("analytics")
+                return (Data(), HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+            }
+            fallbackRequests.increment("legacy")
+            return (legacyPayload, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let fallbackResult = try await fallback.fetchUsage(atPath: file.path)
+        try require(fallbackResult.events.count == 1, "404 analytics must fall back to legacy usage")
+        try require(fallbackRequests.value("analytics") == 1 && fallbackRequests.value("legacy") == 1, "fallback must make exactly one request per endpoint")
     }
 
     private static func verifyCliProxyMultipleSources() async throws {

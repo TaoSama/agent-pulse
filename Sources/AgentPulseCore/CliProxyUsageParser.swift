@@ -12,6 +12,18 @@ import Foundation
 /// 隐私：产出的 `UsageEvent` 只含 hash 后的 key 身份、resolved model、token 计数与
 /// 时间戳；绝不保留明文 apikey、掩码 source、base URL 或 management key。
 public enum CliProxyUsageParser {
+    public struct AnalyticsPage: Sendable, Equatable {
+        public let events: [UsageEvent]
+        public let nextBeforeMS: Int64
+        public let nextBeforeID: Int64
+        public let hasMore: Bool
+        public let totalCount: Int64
+    }
+
+    public enum AnalyticsParseError: Error, Sendable, Equatable {
+        case incompatibleSchema
+    }
+
     /// 采集来源标识，与 `codex` / `claude-code` 并列。
     public static let source = "cliproxy"
 
@@ -69,6 +81,66 @@ public enum CliProxyUsageParser {
             }
         }
         return events
+    }
+
+    /// Parse one CPAMP monitoring analytics detail page.
+    public static func parseAnalyticsPage(
+        data: Data,
+        targetAPIKey: String,
+        sourceIdentifier: String? = nil
+    ) throws -> AnalyticsPage {
+        let trimmedKey = targetAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty,
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let container = root["events"] as? [String: Any],
+              let items = container["items"] as? [[String: Any]],
+              let hasMore = boolean(container["has_more"]),
+              let nextBeforeMS = exactInteger(container["next_before_ms"]),
+              let nextBeforeID = exactInteger(container["next_before_id"]),
+              let totalCount = exactInteger(container["total_count"]) else {
+            throw AnalyticsParseError.incompatibleSchema
+        }
+
+        let targetHash = apiKeyHash(for: trimmedKey)
+        let identity = sourceIdentity(apiKeyHash: targetHash, sourceIdentifier: sourceIdentifier)
+        var events: [UsageEvent] = []
+        var seenIDs = Set<String>()
+        for item in items {
+            guard string(item["api_key_hash"])?.lowercased() == targetHash else { continue }
+            let model = nonemptyString(item["resolved_model"])
+                ?? nonemptyString(item["analytics_model"])
+                ?? nonemptyString(item["model"])
+                ?? nonemptyString(item["requested_model"])
+                ?? "unknown"
+            guard let timestampMS = exactInteger(item["timestamp_ms"]), timestampMS > 0 else { continue }
+            let counts = tokenCounts(item)
+            guard counts.total > 0 else { continue }
+            let timestamp = Date(timeIntervalSince1970: Double(timestampMS) / 1_000)
+            let eventID = hash("cliproxy-usage|\(identity)|\(model)|\(iso(timestamp))|\(usageIdentity(counts))")
+            guard seenIDs.insert(eventID).inserted else { continue }
+            events.append(UsageEvent(
+                id: eventID,
+                source: source,
+                model: model,
+                project: identity,
+                timestamp: timestamp,
+                counts: counts,
+                sessionHash: identity,
+                sourceFileHash: identity,
+                rolloutKey: "",
+                parentRolloutKey: "",
+                inherited: false,
+                hasTotalSnapshot: false,
+                lineageFingerprint: ""
+            ))
+        }
+        return AnalyticsPage(
+            events: events,
+            nextBeforeMS: nextBeforeMS,
+            nextBeforeID: nextBeforeID,
+            hasMore: hasMore,
+            totalCount: totalCount
+        )
     }
 
     /// 默认来源沿用历史 key 身份；具名来源把来源标识纳入不可逆身份，避免相同 key
@@ -150,6 +222,15 @@ public enum CliProxyUsageParser {
     private static func integer(_ value: Any?) -> Int64 {
         if let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() { return number.int64Value }
         return Int64(value as? String ?? "") ?? 0
+    }
+    private static func exactInteger(_ value: Any?) -> Int64? {
+        if let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() { return number.int64Value }
+        if let string = value as? String { return Int64(string) }
+        return nil
+    }
+    private static func boolean(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+        return number.boolValue
     }
     private static func usageIdentity(_ counts: UsageTokenCounts) -> String {
         "\(counts.input)|\(counts.output)|\(counts.cachedInput)|\(counts.cacheCreationInput)|\(counts.reasoningOutput)|\(counts.reportedTotal)"
