@@ -153,43 +153,57 @@ public enum CodexSessionParser {
     /// - 完成事件：event_msg.payload.type == "task_complete"，去重键为 (sessionID, turn_id)。
     /// - task_complete 缺 turn_id：仍以行号占位计数，但标记 degradedButUsable=true（触发 partial）。
     public static func completedTasks(inSessionContents contents: String, automationRoots: [String]) -> CodexCompletedTasks {
-        var lineIterator = contents.split(whereSeparator: { $0.isNewline }).makeIterator()
-        // 首行必须是 session_meta。
-        guard let firstLine = lineIterator.next(),
-              let meta = parseSessionMeta(line: String(firstLine)) else {
-            return .empty
-        }
-        guard meta.isTopLevel else { return .empty }
-        // cwd 缺失时无法证明它不是 automation；保守排除并降低可信度。
-        guard let cwd = meta.cwd else {
-            return CodexCompletedTasks(identities: [], degradedButUsable: true)
-        }
-        if isUnderAutomation(cwd: cwd, automationRoots: automationRoots) {
-            return .empty
-        }
-
+        // 用 enumerateLines 逐行迭代，避免 split 为整个文件分配行数组。
+        var firstLine: String?
         var identities = Set<String>()
         var degraded = false
-        var lineNumber = 1
-        // 逐行扫描剩余内容，收集 task_complete。
-        while let raw = lineIterator.next() {
+        var lineNumber = 0
+        var meta: CodexSessionMeta?
+        contents.enumerateLines { line, stop in
             lineNumber += 1
-            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty, line.contains("task_complete") else { continue }
+            if firstLine == nil {
+                firstLine = line
+                guard let parsed = parseSessionMeta(line: line) else {
+                    stop = true
+                    return
+                }
+                meta = parsed
+                guard parsed.isTopLevel else {
+                    stop = true
+                    return
+                }
+                guard parsed.cwd != nil else {
+                    stop = true
+                    return
+                }
+                if let cwd = parsed.cwd, isUnderAutomation(cwd: cwd, automationRoots: automationRoots) {
+                    stop = true
+                    return
+                }
+                return
+            }
+            guard !line.isEmpty, line.contains("task_complete") else { return }
             guard let data = line.data(using: .utf8),
                   let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   (root["type"] as? String) == "event_msg",
                   let payload = root["payload"] as? [String: Any],
                   (payload["type"] as? String) == "task_complete" else {
-                continue
+                return
             }
-            if let turnID = payload["turn_id"] as? String, !turnID.isEmpty {
-                identities.insert(meta.sessionID + "\u{0}" + turnID)
-            } else {
-                // 缺 turn_id：仍计数，但可信度下降。
+            if let turnID = payload["turn_id"] as? String, !turnID.isEmpty, let m = meta {
+                identities.insert(m.sessionID + "\u{0}" + turnID)
+            } else if let m = meta {
                 degraded = true
-                identities.insert(meta.sessionID + missingTurnMarker + String(lineNumber))
+                identities.insert(m.sessionID + missingTurnMarker + String(lineNumber))
             }
+        }
+        guard let meta else { return .empty }
+        guard meta.isTopLevel else { return .empty }
+        guard meta.cwd != nil else {
+            return CodexCompletedTasks(identities: [], degradedButUsable: true)
+        }
+        if let cwd = meta.cwd, isUnderAutomation(cwd: cwd, automationRoots: automationRoots) {
+            return .empty
         }
         return CodexCompletedTasks(identities: identities, degradedButUsable: degraded)
     }
@@ -271,10 +285,22 @@ public extension CodexSessionParser {
     /// 从尾部反向扫描 rollout，返回最后一个生命周期事件（task_started/complete/turn_aborted）。
     /// 仅读取结构化字段，忽略正文；无生命周期事件返回 nil。
     static func lastLifecycle(inSessionContents contents: String) -> CodexTurnLifecycle? {
-        for raw in contents.split(whereSeparator: { $0.isNewline }).reversed() {
-            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        // 从字符串末尾反向逐行扫描，找到最后一个生命周期事件即返回。
+        // 避免 split(whereSeparator:).reversed() 为整个文件分配行数组。
+        var index = contents.endIndex
+        while index > contents.startIndex {
+            let lineStart = contents.range(
+                of: "\n",
+                options: .backwards,
+                range: contents.startIndex..<index
+            )?.upperBound ?? contents.startIndex
+            let raw = contents[lineStart..<index]
+            index = lineStart
+            if lineStart > contents.startIndex {
+                index = contents.index(before: lineStart)
+            }
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !line.isEmpty else { continue }
-            // 仅解析可能是生命周期事件的行；正文即便含同名字符串也会在 JSON 结构校验处被拒。
             guard line.contains("task_started") || line.contains("task_complete") || line.contains("turn_aborted") else {
                 continue
             }

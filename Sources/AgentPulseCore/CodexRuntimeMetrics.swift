@@ -1087,15 +1087,19 @@ public actor CodexRuntimeMetricsCollector {
         case .codex, nil: true
         }
         let meta = isCodexFile
-            ? contents.split(whereSeparator: { $0.isNewline }).first.flatMap {
-                CodexSessionParser.parseSessionMeta(line: String($0))
-            }
+            ? {
+                let firstLine = contents.prefix(while: { !$0.isNewline })
+                return firstLine.isEmpty ? nil : CodexSessionParser.parseSessionMeta(line: String(firstLine))
+            }()
             : nil
         // 子 agent 文件才需要继承前缀锚点：取首行 session_meta 的时间戳作为时间簇基准。
         // 顶层文件 metaStartedAt 为 nil，crossedInheritedPrefix 恒 true（不做任何前缀跳过）。
         let isSubagentFile = meta?.threadSource == "subagent"
         let metaStartedAt: Date? = isSubagentFile
-            ? contents.split(whereSeparator: { $0.isNewline }).first.flatMap { sessionMetaTimestamp(String($0)) }
+            ? {
+                let firstLine = contents.prefix(while: { !$0.isNewline })
+                return firstLine.isEmpty ? nil : sessionMetaTimestamp(String(firstLine))
+            }()
             : nil
         var crossedInheritedPrefix = (metaStartedAt == nil)
         let completed = meta.map { _ in
@@ -2079,7 +2083,7 @@ public actor CodexRuntimeMetricsCollector {
     /// 继承前缀（父线程逐字节副本，同一瞬间批量灌入）。实测继承段全部紧贴 meta（<1s），
     /// 本会话真实产出在其后 17-37s 的大 gap 之后，2s 阈值有充足安全边际。
     private static let inheritedPrefixClusterTolerance: TimeInterval = 2
-    private static let maximumAppendReadBytes = 512 * 1024
+    private static let maximumAppendReadBytes = 64 * 1024 * 1024
     private static let maximumTrackedFiles = 96
     private static let maximumMessageIdentities = 2_048
 }

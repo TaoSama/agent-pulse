@@ -121,10 +121,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try exec("PRAGMA foreign_keys=ON;")
             // 批量写入 / 全表重读调优：WAL 下 synchronous=NORMAL 崩溃至多丢最后一个未 checkpoint
             // 事务（本账本可重扫恢复，可接受）；32MiB 页缓存吃下全库 raw 重读；派生重算的
-            // ORDER BY 临时排序走内存，减少落盘。
+            // 临时表/排序走磁盘：大库（4.4M+ 事件）下 MEMORY 会把 temp_deduped_events 全放内存触发 jetsam。
             try exec("PRAGMA synchronous=NORMAL;")
             try exec("PRAGMA cache_size=-32768;")
-            try exec("PRAGMA temp_store=MEMORY;")
+            try exec("PRAGMA temp_store=FILE;")
             try migrate()
             // WAL 模式与迁移都会创建/触碰 db、-wal、-shm；统一在此收紧到 0600，
             // 不放宽已更严格的权限（best-effort：文件不存在则跳过）。
@@ -499,114 +499,199 @@ public final class UsageLedgerStore: @unchecked Sendable {
         hostname: String,
         progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
     ) throws -> UsageFinalizeResult {
-        // 重算内部按 8 个自然阶段边界回报进度，让协调层的 .finalizing 段平滑推进而非跳变。
-        // 回调是纯计数、在本 worker 队列 + 事务体内同步调用，不触碰主线程（主线程搬运在协调层适配）。
         let progressTotalStages = 8
         var progressStage = 0
         func advanceStage() {
             progressStage += 1
             progress?(progressStage, progressTotalStages)
         }
-        var blockedReasons: [String] = []
-        // 读取时按 v8 归属优先级去重（ownedActive>ownedHistory>legacy），并收集 overwrite 同 tier 冲突；
-        // 冲突不静默取其一，而是 fail-closed 阻断 reporting。
-        var overwriteConflicts: [String] = []
-        let raw = try readAllRawEvents(hostname: hostname, overwriteConflicts: &overwriteConflicts)
-        blockedReasons.append(contentsOf: overwriteConflicts)
-        // 真正阻断上报的原因：仅同 tier overwrite 冲突（数据自相矛盾，无法确定取哪条）。
-        // 无法证明的 inherited replay 不在此列——见下方 unprovable 分支说明。
-        var blockingReasons: [String] = overwriteConflicts
-        advanceStage() // 1) 读原始事件完成
 
-        // 1) 血缘证明去重：同一 lineage_fingerprint（仅完整 total 快照才有）只保留一条。
-        var fingerprintIndexes: [String: Int] = [:]
-        var deduped: [RawEvent] = []
-        var collapsed = 0
-        var unprovable = 0
-        for event in raw {
-            if !event.lineageFingerprint.isEmpty {
-                if let existingIndex = fingerprintIndexes[event.lineageFingerprint] {
-                    // 同一完整 total 快照优先保留非继承的原始事件，避免扫描顺序决定
-                    // model/project/session 等聚合维度。
-                    let existing = deduped[existingIndex]
-                    let preferred = existing.inherited && !event.inherited ? event : existing
-                    deduped[existingIndex] = RawEvent(
-                        id: preferred.id, source: preferred.source, model: preferred.model, project: preferred.project,
-                        timestampMs: preferred.timestampMs, counts: preferred.counts, sessionHash: preferred.sessionHash,
-                        inherited: preferred.inherited, hasTotalSnapshot: preferred.hasTotalSnapshot,
-                        lineageFingerprint: preferred.lineageFingerprint,
-                        codexDedupKey: preferred.codexDedupKey,
-                        skillCounts: maximumCounts(existing.skillCounts, event.skillCounts),
-                        mcpCounts: maximumCounts(existing.mcpCounts, event.mcpCounts),
-                        mergeStrategy: preferred.mergeStrategy,
-                        hostname: preferred.hostname
-                    )
-                    collapsed += 1
-                    continue
-                }
-                fingerprintIndexes[event.lineageFingerprint] = deduped.count
-                deduped.append(event)
-            } else {
-                // 无血缘指纹（无完整 total 快照）。若是继承回放行，则无法证明是否重复。
-                if event.inherited {
-                    unprovable += 1
-                }
-                deduped.append(event)
-            }
-        }
-        if unprovable > 0 {
-            // 无法证明的 inherited replay：不再 fail-closed 阻断上报。上报是「每 bucket 完整累计值
-            // 幂等 upsert」，即便这些回放行与父会话 turn 重复，服务端按自然键覆盖为同一累计值、
-            // 不会重复累加；漏证明的代价最多是本地少量偏差（已接受的「稍不准」），不构成上游污染。
-            // 保留为信息性说明（计入 blockedReasons 供展示），但不加入 blockingReasons。
-            blockedReasons.append("\(unprovable) inherited replay event(s) lack a complete total snapshot; counted locally, reporting not blocked")
-        }
-        advanceStage() // 2) 血缘去重完成
+        let blockingReasons: [String] = []
 
-        // 1.5) 内容型去重：折叠共享同一 codexDedupKey 的 codex 事件（fork / subagent
-        // 回放出的逐字节相同 turn）。同键保留 5 分量之和更大的一行（与参考实现的
-        // largest-total-wins 一致，不用 reportedTotal 以免偏差），skill/mcp 取 max 并集。
-        // 空键（含所有非 codex 事件）永不折叠。顺序在血缘去重之后，与参考实现的
-        // ①replay ②dedupKey 一致。
-        var dedupKeyIndexes: [String: Int] = [:]
-        var contentDeduped: [RawEvent] = []
-        contentDeduped.reserveCapacity(deduped.count)
-        var contentCollapsed = 0
-        for event in deduped {
-            guard !event.codexDedupKey.isEmpty else { contentDeduped.append(event); continue }
-            guard let existingIndex = dedupKeyIndexes[event.codexDedupKey] else {
-                dedupKeyIndexes[event.codexDedupKey] = contentDeduped.count
-                contentDeduped.append(event)
-                continue
-            }
-            let existing = contentDeduped[existingIndex]
-            contentCollapsed += 1
-            let mergedSkill = maximumCounts(existing.skillCounts, event.skillCounts)
-            let mergedMcp = maximumCounts(existing.mcpCounts, event.mcpCounts)
-            // 快速路径：保留行仍是 existing（新行不更大）且 skill/mcp 并集未变化，
-            // 免去整份 RawEvent 重建（codex token 事件的 skill/mcp 几乎恒空）。
-            if event.counts.billableTotal <= existing.counts.billableTotal,
-               mergedSkill == existing.skillCounts, mergedMcp == existing.mcpCounts {
-                continue
-            }
-            let keep = event.counts.billableTotal > existing.counts.billableTotal ? event : existing
-            contentDeduped[existingIndex] = RawEvent(
-                id: keep.id, source: keep.source, model: keep.model, project: keep.project,
-                timestampMs: keep.timestampMs, counts: keep.counts, sessionHash: keep.sessionHash,
-                inherited: keep.inherited, hasTotalSnapshot: keep.hasTotalSnapshot,
-                lineageFingerprint: keep.lineageFingerprint,
-                codexDedupKey: keep.codexDedupKey,
-                skillCounts: mergedSkill,
-                mcpCounts: mergedMcp,
-                mergeStrategy: keep.mergeStrategy,
-                hostname: keep.hostname
+        // 全量去重 + 聚合下推到 SQLite，避免把 4.4M 行加载到 Swift 内存（原实现峰值 11GB+ 触发 jetsam）。
+        // 阶段：logical ID 去重（tier 优先级 + MAX 计数）→ lineage 去重 → content 去重 → bucket 聚合。
+        try exec("DROP TABLE IF EXISTS temp_deduped_events;")
+        let bucketMs = Self.bucketMilliseconds
+        let dedupSQL = """
+            CREATE TEMP TABLE temp_deduped_events AS
+            WITH active_files AS (
+                SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
+            ),
+            tiered AS (
+                SELECT
+                    event_id, source, model, project, timestamp_ms,
+                    input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                    reasoning_output_tokens, total_tokens, session_hash,
+                    inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
+                    skill_counts_json, mcp_counts_json, merge_strategy,
+                    CASE
+                        WHEN source_file_hash = '' THEN 0
+                        WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
+                        ELSE 1
+                    END AS tier
+                FROM usage_events
+                WHERE hostname = ?
+            ),
+            max_tier AS (
+                SELECT source, event_id, MAX(tier) AS max_tier
+                FROM tiered GROUP BY source, event_id
+            ),
+            top_tier AS (
+                SELECT t.* FROM tiered t
+                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
+            ),
+            logical_dedup AS (
+                SELECT
+                    source, event_id,
+                    COALESCE(MAX(CASE WHEN model <> 'unknown' THEN model END), MAX(model)) AS model,
+                    MAX(project) AS project,
+                    MIN(timestamp_ms) AS timestamp_ms,
+                    MAX(input_tokens) AS input_tokens,
+                    MAX(output_tokens) AS output_tokens,
+                    MAX(cached_input_tokens) AS cached_input_tokens,
+                    MAX(cache_creation_input_tokens) AS cache_creation_input_tokens,
+                    MAX(reasoning_output_tokens) AS reasoning_output_tokens,
+                    MAX(total_tokens) AS total_tokens,
+                    MAX(session_hash) AS session_hash,
+                    MIN(inherited) AS inherited,
+                    MAX(has_total_snapshot) AS has_total_snapshot,
+                    MAX(lineage_fingerprint) AS lineage_fingerprint,
+                    MAX(codex_dedup_key) AS codex_dedup_key,
+                    MAX(merge_strategy) AS merge_strategy,
+                    MAX(skill_counts_json) AS skill_counts_json,
+                    MAX(mcp_counts_json) AS mcp_counts_json
+                FROM top_tier
+                GROUP BY source, event_id
+            ),
+            lineage_ranked AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY lineage_fingerprint ORDER BY inherited ASC, timestamp_ms ASC) AS rn
+                FROM logical_dedup
+                WHERE lineage_fingerprint <> ''
+            ),
+            lineage_dedup AS (
+                SELECT source, event_id, model, project, timestamp_ms,
+                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                       reasoning_output_tokens, total_tokens, session_hash,
+                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
+                       skill_counts_json, mcp_counts_json, merge_strategy
+                FROM lineage_ranked WHERE rn = 1
+                UNION ALL
+                SELECT source, event_id, model, project, timestamp_ms,
+                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                       reasoning_output_tokens, total_tokens, session_hash,
+                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
+                       skill_counts_json, mcp_counts_json, merge_strategy
+                FROM logical_dedup WHERE lineage_fingerprint = ''
+            ),
+            content_ranked AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY codex_dedup_key ORDER BY total_tokens DESC) AS rn
+                FROM lineage_dedup
+                WHERE codex_dedup_key <> ''
+            ),
+            content_dedup AS (
+                SELECT source, event_id, model, project, timestamp_ms,
+                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                       reasoning_output_tokens, total_tokens, session_hash,
+                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
+                       skill_counts_json, mcp_counts_json, merge_strategy
+                FROM content_ranked WHERE rn = 1
+                UNION ALL
+                SELECT source, event_id, model, project, timestamp_ms,
+                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                       reasoning_output_tokens, total_tokens, session_hash,
+                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
+                       skill_counts_json, mcp_counts_json, merge_strategy
+                FROM lineage_dedup WHERE codex_dedup_key = ''
             )
+            SELECT * FROM content_dedup;
+            """
+        let dedupStmt = try prepare(dedupSQL)
+        defer { sqlite3_finalize(dedupStmt) }
+        try bind(dedupStmt, 1, hostname)
+        try done(dedupStmt)
+        advanceStage() // 1-3) 三级去重在 SQLite 内完成
+
+        // 计算 lineage / content 去重折叠数：从原始事件经 tier+logical 去重后，
+        // 按 lineage_fingerprint / codex_dedup_key 统计被折叠的事件数。
+        let collapseCountSQL = """
+            WITH active_files AS (
+                SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
+            ),
+            tiered AS (
+                SELECT event_id, source, lineage_fingerprint, codex_dedup_key, inherited,
+                    has_total_snapshot,
+                    CASE
+                        WHEN source_file_hash = '' THEN 0
+                        WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
+                        ELSE 1
+                    END AS tier
+                FROM usage_events
+                WHERE hostname = ?
+            ),
+            max_tier AS (
+                SELECT source, event_id, MAX(tier) AS max_tier
+                FROM tiered GROUP BY source, event_id
+            ),
+            top_tier AS (
+                SELECT t.* FROM tiered t
+                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
+            ),
+            logical_dedup AS (
+                SELECT source, event_id,
+                    MAX(lineage_fingerprint) AS lineage_fingerprint,
+                    MAX(codex_dedup_key) AS codex_dedup_key,
+                    MIN(inherited) AS inherited,
+                    MAX(has_total_snapshot) AS has_total_snapshot
+                FROM top_tier
+                GROUP BY source, event_id
+            ),
+            lineage_ranked AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY lineage_fingerprint ORDER BY 1) AS rn
+                FROM logical_dedup
+                WHERE lineage_fingerprint <> ''
+            ),
+            lineage_dedup AS (
+                SELECT lineage_fingerprint, codex_dedup_key FROM lineage_ranked WHERE rn = 1
+                UNION ALL
+                SELECT lineage_fingerprint, codex_dedup_key FROM logical_dedup WHERE lineage_fingerprint = ''
+            )
+            SELECT
+                (SELECT COUNT(*) FROM logical_dedup WHERE lineage_fingerprint <> '')
+                    - (SELECT COUNT(DISTINCT lineage_fingerprint) FROM logical_dedup WHERE lineage_fingerprint <> '') AS collapsed_inherited,
+                (SELECT COUNT(*) FROM lineage_dedup WHERE codex_dedup_key <> '')
+                    - (SELECT COUNT(DISTINCT codex_dedup_key) FROM lineage_dedup WHERE codex_dedup_key <> '') AS collapsed_content,
+                (SELECT COUNT(*) FROM logical_dedup WHERE inherited = 1 AND lineage_fingerprint = '') AS unprovable_inherited
+            """
+        let collapseStmt = try prepare(collapseCountSQL)
+        defer { sqlite3_finalize(collapseStmt) }
+        try bind(collapseStmt, 1, hostname)
+        var collapsedInheritedEvents = 0
+        var collapsedContentDuplicates = 0
+        var unprovableInherited = 0
+        if sqlite3_step(collapseStmt) == SQLITE_ROW {
+            collapsedInheritedEvents = Int(sqlite3_column_int64(collapseStmt, 0))
+            collapsedContentDuplicates = Int(sqlite3_column_int64(collapseStmt, 1))
+            unprovableInherited = Int(sqlite3_column_int64(collapseStmt, 2))
         }
 
-        // 2) 重算 buckets（按 source,model,project,bucketStart 聚合）。
-        // 派生全部归属到传入的当前 hostname（单一本机口径）。原始层虽存各事件采集机 hostname，
-        // 但派生不做多机拆分——历史归属由 hostname 改名时的原地 UPDATE 统一维护。
-        advanceStage() // 3) 内容去重完成
+        // 不可证明的继承回放：inherited 但无 total snapshot（无 lineage 指纹），无法证明是否重复。
+        // 上报为累计值幂等 upsert，重复由服务端吸收自愈，因此不阻断上报；仅在 blockedReasons 留信息性说明。
+        var blockedReasons: [String] = []
+        if unprovableInherited > 0 {
+            blockedReasons.append("\(unprovableInherited) inherited replay event(s) without total snapshot cannot be proven duplicate; reporting proceeds (idempotent upsert self-heals)")
+        }
+
+        // bucket token 聚合：直接 GROUP BY，不加载事件到 Swift。
+        let bucketSQL = """
+            SELECT source, model, project, (timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start,
+                   SUM(input_tokens), SUM(output_tokens), SUM(cached_input_tokens),
+                   SUM(cache_creation_input_tokens), SUM(reasoning_output_tokens), SUM(total_tokens)
+            FROM temp_deduped_events
+            GROUP BY source, model, project, bucket_start;
+            """
+        let bucketStmt = try prepare(bucketSQL)
+        defer { sqlite3_finalize(bucketStmt) }
+
         struct BucketAgg {
             var counts = UsageTokenCounts()
             var skillCounts: [String: Int] = [:]
@@ -617,32 +702,177 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
         var buckets: [String: BucketAgg] = [:]
         var bucketMeta: [String: (source: String, model: String, project: String, start: Int64)] = [:]
-        for event in contentDeduped {
-            let start = (event.timestampMs / Self.bucketMilliseconds) * Self.bucketMilliseconds
-            let key = "\(event.source)\u{1}\(event.model)\u{1}\(event.project)\u{1}\(start)"
-            var agg = buckets[key] ?? BucketAgg()
-            let c = event.counts
-            agg.counts = UsageTokenCounts(
-                input: saturatedAdd(agg.counts.input, c.input), output: saturatedAdd(agg.counts.output, c.output),
-                cachedInput: saturatedAdd(agg.counts.cachedInput, c.cachedInput),
-                cacheCreationInput: saturatedAdd(agg.counts.cacheCreationInput, c.cacheCreationInput),
-                reasoningOutput: saturatedAdd(agg.counts.reasoningOutput, c.reasoningOutput),
-                reportedTotal: saturatedAdd(agg.counts.reportedTotal, c.total)
+
+        while sqlite3_step(bucketStmt) == SQLITE_ROW {
+            let source = text(bucketStmt, 0)
+            let model = text(bucketStmt, 1)
+            let project = text(bucketStmt, 2)
+            let start = sqlite3_column_int64(bucketStmt, 3)
+            let key = "\(source)\u{1}\(model)\u{1}\(project)\u{1}\(start)"
+            let counts = UsageTokenCounts(
+                input: sqlite3_column_int64(bucketStmt, 4),
+                output: sqlite3_column_int64(bucketStmt, 5),
+                cachedInput: sqlite3_column_int64(bucketStmt, 6),
+                cacheCreationInput: sqlite3_column_int64(bucketStmt, 7),
+                reasoningOutput: sqlite3_column_int64(bucketStmt, 8),
+                reportedTotal: sqlite3_column_int64(bucketStmt, 9)
             )
-            agg.skillCounts = UsageToolMetrics.mergeCounts(agg.skillCounts, event.skillCounts)
-            agg.mcpCounts = UsageToolMetrics.mergeCounts(agg.mcpCounts, event.mcpCounts)
-            buckets[key] = agg
-            bucketMeta[key] = (event.source, event.model, event.project, start)
+            buckets[key] = BucketAgg(counts: counts)
+            bucketMeta[key] = (source, model, project, start)
         }
 
+        advanceStage() // 4) bucket token 聚合完成
+
+        // skill/mcp 计数合并：SQL MAX(JSON) 无法按 key 取 max，因此加载所有非空计数事件
+        // （约 1.5 万行），在 Swift 端复现 tier→logical ID→lineage→content 四级去重的计数合并。
+        struct SkillMergeEvent {
+            let source: String
+            let eventID: String
+            let model: String
+            let project: String
+            let timestampMs: Int64
+            let inherited: Bool
+            let totalTokens: Int64
+            let lineageFingerprint: String
+            let codexDedupKey: String
+            let skillCounts: [String: Int]
+            let mcpCounts: [String: Int]
+            let tier: Int
+        }
+        let skillEventSQL = """
+            SELECT e.source, e.event_id, e.model, e.project, e.timestamp_ms,
+                   e.inherited, e.total_tokens, e.lineage_fingerprint, e.codex_dedup_key,
+                   e.skill_counts_json, e.mcp_counts_json,
+                   CASE
+                       WHEN e.source_file_hash = '' THEN 0
+                       WHEN EXISTS (SELECT 1 FROM usage_files f WHERE f.file_id = e.source_file_hash AND f.scan_status <> 'missing') THEN 2
+                       ELSE 1
+                   END AS tier
+            FROM usage_events e
+            WHERE e.hostname = ? AND (e.skill_counts_json <> '{}' OR e.mcp_counts_json <> '{}');
+            """
+        let skillEventStmt = try prepare(skillEventSQL)
+        defer { sqlite3_finalize(skillEventStmt) }
+        try bind(skillEventStmt, 1, hostname)
+        var skillEvents: [SkillMergeEvent] = []
+        while sqlite3_step(skillEventStmt) == SQLITE_ROW {
+            skillEvents.append(SkillMergeEvent(
+                source: text(skillEventStmt, 0),
+                eventID: text(skillEventStmt, 1),
+                model: text(skillEventStmt, 2),
+                project: text(skillEventStmt, 3),
+                timestampMs: sqlite3_column_int64(skillEventStmt, 4),
+                inherited: sqlite3_column_int64(skillEventStmt, 5) != 0,
+                totalTokens: sqlite3_column_int64(skillEventStmt, 6),
+                lineageFingerprint: text(skillEventStmt, 7),
+                codexDedupKey: text(skillEventStmt, 8),
+                skillCounts: decodeStringIntMap(text(skillEventStmt, 9)),
+                mcpCounts: decodeStringIntMap(text(skillEventStmt, 10)),
+                tier: Int(sqlite3_column_int64(skillEventStmt, 11))
+            ))
+        }
+
+        // 1) logical ID 去重：同 (source, event_id) 取最高 tier，计数按 key 取 max。
+        var logicalByKey: [String: SkillMergeEvent] = [:]
+        for ev in skillEvents {
+            let key = "\(ev.source)\u{1}\(ev.eventID)"
+            if let existing = logicalByKey[key] {
+                if ev.tier > existing.tier {
+                    logicalByKey[key] = ev
+                } else if ev.tier == existing.tier {
+                    logicalByKey[key] = SkillMergeEvent(
+                        source: existing.source, eventID: existing.eventID,
+                        model: existing.model, project: existing.project,
+                        timestampMs: existing.timestampMs, inherited: existing.inherited,
+                        totalTokens: max(existing.totalTokens, ev.totalTokens),
+                        lineageFingerprint: existing.lineageFingerprint.isEmpty ? ev.lineageFingerprint : existing.lineageFingerprint,
+                        codexDedupKey: existing.codexDedupKey.isEmpty ? ev.codexDedupKey : existing.codexDedupKey,
+                        skillCounts: maximumCounts(existing.skillCounts, ev.skillCounts),
+                        mcpCounts: maximumCounts(existing.mcpCounts, ev.mcpCounts),
+                        tier: existing.tier
+                    )
+                }
+            } else {
+                logicalByKey[key] = ev
+            }
+        }
+        let logicalDeduped = Array(logicalByKey.values)
+
+        // 2) lineage 去重：同 lineage_fingerprint 保留非 inherited，计数按 key 取 max。
+        var lineageByFP: [String: SkillMergeEvent] = [:]
+        var lineageCollapsed = 0
+        for ev in logicalDeduped where !ev.lineageFingerprint.isEmpty {
+            if let existing = lineageByFP[ev.lineageFingerprint] {
+                lineageCollapsed += 1
+                let keep = existing.inherited && !ev.inherited ? ev : existing
+                lineageByFP[ev.lineageFingerprint] = SkillMergeEvent(
+                    source: keep.source, eventID: keep.eventID,
+                    model: keep.model, project: keep.project,
+                    timestampMs: keep.timestampMs, inherited: keep.inherited,
+                    totalTokens: keep.totalTokens,
+                    lineageFingerprint: keep.lineageFingerprint,
+                    codexDedupKey: keep.codexDedupKey,
+                    skillCounts: maximumCounts(existing.skillCounts, ev.skillCounts),
+                    mcpCounts: maximumCounts(existing.mcpCounts, ev.mcpCounts),
+                    tier: keep.tier
+                )
+            } else {
+                lineageByFP[ev.lineageFingerprint] = ev
+            }
+        }
+        // 无 lineage 指纹的事件直接保留。
+        var afterLineage = Array(lineageByFP.values)
+        afterLineage.append(contentsOf: logicalDeduped.filter { $0.lineageFingerprint.isEmpty })
+
+        // 3) content 去重：同 codex_dedup_key 保留 total_tokens 更大者，计数按 key 取 max。
+        var contentByKey: [String: SkillMergeEvent] = [:]
+        var contentCollapsed = 0
+        for ev in afterLineage where !ev.codexDedupKey.isEmpty {
+            if let existing = contentByKey[ev.codexDedupKey] {
+                contentCollapsed += 1
+                let keep = ev.totalTokens > existing.totalTokens ? ev : existing
+                contentByKey[ev.codexDedupKey] = SkillMergeEvent(
+                    source: keep.source, eventID: keep.eventID,
+                    model: keep.model, project: keep.project,
+                    timestampMs: keep.timestampMs, inherited: keep.inherited,
+                    totalTokens: keep.totalTokens,
+                    lineageFingerprint: keep.lineageFingerprint,
+                    codexDedupKey: keep.codexDedupKey,
+                    skillCounts: maximumCounts(existing.skillCounts, ev.skillCounts),
+                    mcpCounts: maximumCounts(existing.mcpCounts, ev.mcpCounts),
+                    tier: keep.tier
+                )
+            } else {
+                contentByKey[ev.codexDedupKey] = ev
+            }
+        }
+        var afterContent = Array(contentByKey.values)
+        afterContent.append(contentsOf: afterLineage.filter { $0.codexDedupKey.isEmpty })
+
+        // 4) 按 bucket 合并 skill/mcp 计数。
+        for ev in afterContent {
+            let start = (ev.timestampMs / bucketMs) * bucketMs
+            let key = "\(ev.source)\u{1}\(ev.model)\u{1}\(ev.project)\u{1}\(start)"
+            if var agg = buckets[key] {
+                agg.skillCounts = UsageToolMetrics.mergeCounts(agg.skillCounts, ev.skillCounts)
+                agg.mcpCounts = UsageToolMetrics.mergeCounts(agg.mcpCounts, ev.mcpCounts)
+                buckets[key] = agg
+            }
+        }
+
+        // collapsedInheritedEvents / collapsedContentDuplicates 由 SQL 全量去重统计（覆盖所有事件），
+        // 此处 Swift 仅处理 skill/mcp 计数合并，不覆盖折叠数。
+        advanceStage() // 4.5) skill/mcp 合并完成
+
+
+        // edit 条目聚合（edit 表行数少，沿用原 Swift 实现）。
         let editMetricSources = try readEditMetricSourcesUnlocked()
         for key in bucketMeta.keys {
             guard let meta = bucketMeta[key], editMetricSources.contains(meta.source) else { continue }
             buckets[key]?.codeMetricVersion = UsageEditLines.codeMetricVersion
         }
-        advanceStage() // 4) bucket 聚合完成
         for edit in try readAllRawEditEntries(hostname: hostname) {
-            let start = (edit.timestampMs / Self.bucketMilliseconds) * Self.bucketMilliseconds
+            let start = (edit.timestampMs / bucketMs) * bucketMs
             let key = "\(edit.source)\u{1}\(edit.model)\u{1}\(edit.project)\u{1}\(start)"
             var agg = buckets[key] ?? BucketAgg()
             agg.linesAdded = saturatedAdd(agg.linesAdded, edit.added)
@@ -651,53 +881,214 @@ public final class UsageLedgerStore: @unchecked Sendable {
             buckets[key] = agg
             bucketMeta[key] = (edit.source, edit.model, edit.project, start)
         }
-
-        // 3) 重算 sessions（复用聚合器，全部归属当前 hostname）。
         advanceStage() // 5) edit 聚合完成
-        let sessionEvents = try readAllSessionEvents(hostname: hostname)
-        // session project 内容策略：以同一 (source, sessionHash) 下**最新有效** UsageEvent.project 为准
-        // （按 timestamp 取最大，非空优先），无则回落空串。project 不参与自然键/分组/去重。
-        // 注意：从**全量 raw**（而非血缘去重后的 deduped）计算 —— 去重可能丢弃携带 project 的行，
-        // 从 deduped 取会漏算 project；project 只是内容字段，用全量取最新非空更稳。
+
+        // session 聚合：8.1M session 事件全部下推到 SQLite，仅返回 ~2.7K 个 session 结果行。
+        // 三级去重（tier 优先级）+ 分段活跃秒数 + 计数 + 小时直方图均在 SQL 内完成。
         var sessionProject: [String: (project: String, timestampMs: Int64)] = [:]
         var sessionSkillCounts: [String: [String: Int]] = [:]
-        for event in raw where !event.project.isEmpty {
-            let key = "\(event.source)\u{1}\(event.sessionHash)"
-            if let current = sessionProject[key], current.timestampMs >= event.timestampMs { continue }
-            sessionProject[key] = (event.project, event.timestampMs)
-        }
-        for event in raw where !event.inherited {
-            let key = "\(event.source)\u{1}\(event.sessionHash)"
-            sessionSkillCounts[key] = UsageToolMetrics.mergeCounts(sessionSkillCounts[key] ?? [:], event.skillCounts)
-        }
-        let sessions = UsageSessionAggregator.aggregate(
-            events: sessionEvents,
-            hostname: hostname,
-            projectForSession: { source, sessionHash in
-                sessionProject["\(source)\u{1}\(sessionHash)"]?.project ?? ""
-            },
-            skillsForSession: { source, sessionHash in
-                UsageToolMetrics.skillNames(sessionSkillCounts["\(source)\u{1}\(sessionHash)"] ?? [:])
-            }
-        )
 
-        // 4) 差异写入：仅对内容变化的行提升 revision（变 dirty），未变行保持原 revision/synced。
+        // session project 必须从全量 raw 事件取（经 tier+logical 去重），不能从 lineage/content 去重后的
+        // temp_deduped_events 取——被血缘折叠的事件可能携带另一个 session 的 project，去重后会丢失。
+        let sessionProjSQL = """
+            WITH active_files AS (
+                SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
+            ),
+            tiered AS (
+                SELECT event_id, source, session_hash, project, timestamp_ms,
+                    CASE
+                        WHEN source_file_hash = '' THEN 0
+                        WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
+                        ELSE 1
+                    END AS tier
+                FROM usage_events
+                WHERE hostname = ? AND project <> ''
+            ),
+            max_tier AS (
+                SELECT source, event_id, MAX(tier) AS max_tier
+                FROM tiered GROUP BY source, event_id
+            ),
+            top_tier AS (
+                SELECT t.* FROM tiered t
+                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
+            ),
+            ranked AS (
+                SELECT source, session_hash, project, timestamp_ms,
+                       ROW_NUMBER() OVER (PARTITION BY source, session_hash ORDER BY timestamp_ms DESC) AS rn
+                FROM top_tier
+            )
+            SELECT source, session_hash, project, timestamp_ms
+            FROM ranked WHERE rn = 1;
+            """
+        let sessionProjStmt = try prepare(sessionProjSQL)
+        defer { sqlite3_finalize(sessionProjStmt) }
+        try bind(sessionProjStmt, 1, hostname)
+        var sessionProjRowCount = 0
+        while sqlite3_step(sessionProjStmt) == SQLITE_ROW {
+            sessionProjRowCount += 1
+            let source = text(sessionProjStmt, 0)
+            let sessionHash = text(sessionProjStmt, 1)
+            let project = text(sessionProjStmt, 2)
+            let timestampMs = sqlite3_column_int64(sessionProjStmt, 3)
+            let key = "\(source)\u{1}\(sessionHash)"
+            if let current = sessionProject[key], current.timestampMs >= timestampMs { continue }
+            sessionProject[key] = (project, timestampMs)
+        }
+        print("DEBUG sessionProj rows=\(sessionProjRowCount) keys=\(Array(sessionProject.keys))")
+
+        let sessionSkillSQL = """
+            SELECT source, session_hash, skill_counts_json
+            FROM temp_deduped_events
+            WHERE inherited = 0 AND skill_counts_json <> '{}';
+            """
+        let sessionSkillStmt = try prepare(sessionSkillSQL)
+        defer { sqlite3_finalize(sessionSkillStmt) }
+        while sqlite3_step(sessionSkillStmt) == SQLITE_ROW {
+            let source = text(sessionSkillStmt, 0)
+            let sessionHash = text(sessionSkillStmt, 1)
+            let skillCounts = decodeStringIntMap(text(sessionSkillStmt, 2))
+            let key = "\(source)\u{1}\(sessionHash)"
+            sessionSkillCounts[key] = UsageToolMetrics.mergeCounts(sessionSkillCounts[key] ?? [:], skillCounts)
+        }
+
+        let sessionAggSQL = """
+            WITH active_files AS (
+                SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
+            ),
+            tiered AS (
+                SELECT event_id, source, session_hash, role, timestamp_ms,
+                    CASE
+                        WHEN source_file_hash = '' THEN 0
+                        WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
+                        ELSE 1
+                    END AS tier
+                FROM usage_session_events
+                WHERE hostname = ?
+            ),
+            max_tier AS (
+                SELECT source, event_id, MAX(tier) AS max_tier
+                FROM tiered GROUP BY source, event_id
+            ),
+            deduped AS (
+                SELECT t.event_id, t.source, t.session_hash, t.role, t.timestamp_ms
+                FROM tiered t
+                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
+            ),
+            logical_dedup AS (
+                SELECT source, event_id,
+                    MIN(session_hash) AS session_hash,
+                    MIN(role) AS role,
+                    MIN(timestamp_ms) AS timestamp_ms
+                FROM deduped
+                GROUP BY source, event_id
+            ),
+            ranked AS (
+                SELECT *,
+                    SUM(CASE WHEN role IN ('user', 'synthetic_user') THEN 1 ELSE 0 END)
+                        OVER (PARTITION BY source, session_hash
+                              ORDER BY timestamp_ms, CASE role WHEN 'user' THEN 0 WHEN 'synthetic_user' THEN 1 ELSE 2 END) AS seg_id
+                FROM logical_dedup
+            ),
+            segments AS (
+                SELECT source, session_hash, seg_id,
+                    MIN(CASE WHEN role = 'assistant' THEN timestamp_ms END) AS seg_start,
+                    MAX(CASE WHEN role = 'assistant' THEN timestamp_ms END) AS seg_end
+                FROM ranked
+                GROUP BY source, session_hash, seg_id
+            ),
+            session_active AS (
+                SELECT source, session_hash,
+                    CAST(SUM(CASE WHEN seg_id > 0 AND seg_start IS NOT NULL AND seg_end IS NOT NULL AND seg_end > seg_start THEN seg_end - seg_start ELSE 0 END) / 1000 AS INTEGER) AS active_seconds
+                FROM segments
+                GROUP BY source, session_hash
+            ),
+            session_stats AS (
+                SELECT source, session_hash,
+                    COUNT(*) AS message_count,
+                    SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END) AS user_message_count,
+                    SUM(CASE WHEN role = 'assistant' THEN 1 ELSE 0 END) AS assistant_events,
+                    MIN(timestamp_ms) AS first_activity,
+                    MAX(timestamp_ms) AS last_activity
+                FROM ranked
+                GROUP BY source, session_hash
+            ),
+            session_hist AS (
+                SELECT source, session_hash,
+                    GROUP_CONCAT(hour || ':' || cnt, ',') AS histogram
+                FROM (
+                    SELECT source, session_hash,
+                        CAST(strftime('%H', datetime(timestamp_ms/1000, 'unixepoch')) AS INTEGER) AS hour,
+                        COUNT(*) AS cnt
+                    FROM ranked
+                    WHERE role = 'user'
+                    GROUP BY source, session_hash, hour
+                )
+                GROUP BY source, session_hash
+            )
+            SELECT st.source, st.session_hash, s.active_seconds,
+                   st.message_count, st.user_message_count, st.assistant_events,
+                   st.first_activity, st.last_activity,
+                   COALESCE(sh.histogram, '') AS histogram
+            FROM session_stats st
+            JOIN session_active s ON s.source = st.source AND s.session_hash = st.session_hash
+            LEFT JOIN session_hist sh ON sh.source = st.source AND sh.session_hash = st.session_hash
+            ORDER BY st.source, st.session_hash;
+            """
+        let sessionAggStmt = try prepare(sessionAggSQL)
+        defer { sqlite3_finalize(sessionAggStmt) }
+        try bind(sessionAggStmt, 1, hostname)
+
+        var sessions: [UsageSession] = []
+        while sqlite3_step(sessionAggStmt) == SQLITE_ROW {
+            let source = text(sessionAggStmt, 0)
+            let sessionHash = text(sessionAggStmt, 1)
+            let activeSeconds = sqlite3_column_int64(sessionAggStmt, 2)
+            let messageCount = sqlite3_column_int64(sessionAggStmt, 3)
+            let userMessageCount = sqlite3_column_int64(sessionAggStmt, 4)
+            let assistantEvents = sqlite3_column_int64(sessionAggStmt, 5)
+            let firstActivity = date(sqlite3_column_int64(sessionAggStmt, 6))
+            let lastActivity = date(sqlite3_column_int64(sessionAggStmt, 7))
+            let histogramStr = text(sessionAggStmt, 8)
+
+            var histogram = [Int64](repeating: 0, count: 24)
+            if !histogramStr.isEmpty {
+                for pair in histogramStr.split(separator: ",") {
+                    let parts = pair.split(separator: ":")
+                    if parts.count == 2, let hour = Int(parts[0]), let cnt = Int64(parts[1]), hour >= 0 && hour < 24 {
+                        histogram[hour] = cnt
+                    }
+                }
+            }
+
+            let projKey = "\(source)\u{1}\(sessionHash)"
+            let project = sessionProject[projKey]?.project ?? ""
+            let skills = UsageToolMetrics.skillNames(sessionSkillCounts[projKey] ?? [:])
+
+            sessions.append(UsageSession(
+                hostname: hostname,
+                source: source,
+                sessionHash: sessionHash,
+                project: project,
+                skills: skills,
+                firstActivity: firstActivity,
+                lastActivity: lastActivity,
+                activeSeconds: activeSeconds,
+                messageCount: messageCount,
+                userMessageCount: userMessageCount,
+                assistantEvents: assistantEvents,
+                hourHistogramUTC: histogram
+            ))
+        }
         advanceStage() // 6) session 聚合完成
+
+
+        // 差异写入：仅对内容变化的行提升 revision，未变行保持原 revision/synced。
         let newRevision = try nextRevisionUnlocked(hostname: hostname)
         var changed = false
-
-        // 冻结豁免：frozen 之前的派生行已固化，其原始行可能已被 compact 物理删除。这些行必须对
-        // 本次重算「完全隐形」——既不参与消费/覆盖，也不参与删除，changed 不被它们触发（无 revision
-        // churn、无 dirty 重报）。判定谓词与 compact 删除谓词严格一致：bucket 按 bucket_start<frozen；
-        // session 按 last_activity<frozen（完全冻结）。跨界 session（first<frozen<=last）last_activity>=frozen
-        // 不算冻结，照常参与重算、其原始行被 record/compact 保留于活跃区。
         let frozen = try frozenBeforeMsUnlocked(hostname)
 
         var existingBuckets = try readBucketRowsUnlocked(hostname: hostname)
         for (key, meta) in bucketMeta {
-            // 冻结区 bucket 不应出现在重算产出里（record 已丢弃 <frozen 事件、compact 已删其原始行）；
-            // 唯一例外是「首次冻结那一轮」compact 尚未执行、原始行仍在——此时也必须跳过，避免用重算值
-            // 覆盖即将被 compact 固化的行。两边（产出侧 + existing 侧）一致跳过是防误 upsert 的关键。
             if frozen > 0 && meta.start < frozen { continue }
             let aggregate = buckets[key]!
             let bucket = UsageBucket(
@@ -714,7 +1105,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
             }
             existingBuckets[key] = nil
         }
-        // 删除不再出现的 bucket（例如事件减少）——但冻结区 bucket 一律保留，不进删除候选。
         for (key, row) in existingBuckets {
             if frozen > 0 && millis(row.bucket.bucketStart) < frozen { continue }
             try deleteBucketUnlocked(hostname: hostname, key: key)
@@ -725,8 +1115,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
         advanceStage() // 7) bucket 差异写完成
         for session in sessions {
             let key = "\(session.source)\u{1}\(session.sessionHash)"
-            // 完全冻结的 session（last_activity<frozen）对重算隐形：其 session_events 已被 compact 删、
-            // 派生行固化保留。跨界 session（last_activity>=frozen）照常重算。
             if frozen > 0 && millis(session.lastActivity) < frozen { continue }
             let existing = existingSessions[key]
             if existing?.session != session {
@@ -742,16 +1130,21 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
 
         if !changed {
-            // 无变化则回退 revision 计数，避免无谓递增。
             try setIntUnlocked(key: revisionKey(hostname), value: newRevision - 1)
         }
 
-        // 上报资格：仅同 tier overwrite 冲突（数据自相矛盾）才 fail-closed 阻断。
-        // 无法证明的 inherited replay 只作信息性说明，不再阻断（上报为累计值幂等 upsert，重复自愈）。
         let eligible = blockingReasons.isEmpty
         try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
-        advanceStage() // 8) session 差异写完成（重算结束）
-        return UsageFinalizeResult(reportingEligible: eligible, blockedReasons: blockedReasons, collapsedInheritedEvents: collapsed, collapsedContentDuplicates: contentCollapsed)
+        advanceStage() // 8) session 差异写完成
+
+        try? exec("DROP TABLE IF EXISTS temp_deduped_events;")
+
+        return UsageFinalizeResult(
+            reportingEligible: eligible,
+            blockedReasons: blockedReasons,
+            collapsedInheritedEvents: collapsedInheritedEvents,
+            collapsedContentDuplicates: collapsedContentDuplicates
+        )
     }
 
     public func reportingEligible(hostname: String) throws -> Bool {
@@ -2121,7 +2514,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     /// 幂等地补建性能索引与增量 finalize 的脏键表。`migrate()` 末尾无条件调用:v10 库的 `migrate()`
     /// 不再走 v8 rebuild 的建索引路径,存量库要靠这里补上新索引。仅当目标表存在时建索引(兼容极简
-    /// fixture)。9.4G 库首次建索引一次性发生在此(WAL + temp_store=MEMORY),之后每轮省去全表排序。
+    /// fixture)。9.4G 库首次建索引一次性发生在此(WAL + temp_store=FILE),之后每轮省去全表排序。
     private func ensurePerformanceIndexesUnlocked() throws {
         for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
             guard try tableExistsUnlocked(table) else { continue }
