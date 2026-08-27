@@ -116,7 +116,10 @@ public enum CliProxyUsageParser {
             let counts = tokenCounts(item)
             guard counts.total > 0 else { continue }
             let timestamp = Date(timeIntervalSince1970: Double(timestampMS) / 1_000)
-            let eventID = hash("cliproxy-usage|\(identity)|\(model)|\(iso(timestamp))|\(usageIdentity(counts))")
+            let upstreamIdentity = nonemptyString(item["event_hash"])
+                ?? exactInteger(item["id"]).map(String.init)
+            let eventID = upstreamIdentity.map { hash("cliproxy-analytics|\(identity)|\($0)") }
+                ?? hash("cliproxy-usage|\(identity)|\(model)|\(iso(timestamp))|\(usageIdentity(counts))")
             guard seenIDs.insert(eventID).inserted else { continue }
             events.append(UsageEvent(
                 id: eventID,

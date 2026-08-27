@@ -431,7 +431,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     for identity in CliProxyUsageService.configuredSourceIdentities(atPath: cliProxyConfigPath) {
                         if let latest = try ledger.latestNetworkEventTimestampMS(
                             project: identity,
-                            source: CliProxyUsageParser.source
+                            source: CliProxyUsageParser.source,
+                            hostname: hostname
                         ) {
                             watermarks[identity] = latest
                         }
