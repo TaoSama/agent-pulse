@@ -506,14 +506,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
             progress?(progressStage, progressTotalStages)
         }
 
-        let blockingReasons: [String] = []
-
         // 全量去重 + 聚合下推到 SQLite，避免把 4.4M 行加载到 Swift 内存（原实现峰值 11GB+ 触发 jetsam）。
-        // 阶段：logical ID 去重（tier 优先级 + MAX 计数）→ lineage 去重 → content 去重 → bucket 聚合。
+        // logical ID 结果会被 lineage/content 去重、冲突统计和 session project 共同使用，只物化一次，
+        // 避免每个消费者都重新扫描和排序完整 usage_events 历史。
+        try exec("DROP TABLE IF EXISTS temp_logical_events;")
         try exec("DROP TABLE IF EXISTS temp_deduped_events;")
         let bucketMs = Self.bucketMilliseconds
-        let dedupSQL = """
-            CREATE TEMP TABLE temp_deduped_events AS
+        let logicalSQL = """
+            CREATE TEMP TABLE temp_logical_events AS
             WITH active_files AS (
                 SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
             ),
@@ -544,7 +544,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 SELECT
                     source, event_id,
                     COALESCE(MAX(CASE WHEN model <> 'unknown' THEN model END), MAX(model)) AS model,
-                    MAX(project) AS project,
+                    COALESCE(MAX(CASE WHEN project <> 'unknown' THEN project END), MAX(project)) AS project,
                     MIN(timestamp_ms) AS timestamp_ms,
                     MAX(input_tokens) AS input_tokens,
                     MAX(output_tokens) AS output_tokens,
@@ -569,10 +569,22 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     END AS has_identity_conflict
                 FROM top_tier
                 GROUP BY source, event_id
-            ),
+            )
+            SELECT * FROM logical_dedup;
+            """
+        do {
+            let logicalStmt = try prepare(logicalSQL)
+            defer { sqlite3_finalize(logicalStmt) }
+            try bind(logicalStmt, 1, hostname)
+            try done(logicalStmt)
+        }
+
+        let dedupSQL = """
+            CREATE TEMP TABLE temp_deduped_events AS
+            WITH
             lineage_ranked AS (
                 SELECT *, ROW_NUMBER() OVER (PARTITION BY lineage_fingerprint ORDER BY inherited ASC, timestamp_ms ASC) AS rn
-                FROM logical_dedup
+                FROM temp_logical_events
                 WHERE lineage_fingerprint <> ''
             ),
             lineage_dedup AS (
@@ -580,18 +592,22 @@ public final class UsageLedgerStore: @unchecked Sendable {
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                        reasoning_output_tokens, total_tokens, session_hash,
                        inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy, has_identity_conflict
+                       skill_counts_json, mcp_counts_json, merge_strategy
                 FROM lineage_ranked WHERE rn = 1
                 UNION ALL
                 SELECT source, event_id, model, project, timestamp_ms,
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                        reasoning_output_tokens, total_tokens, session_hash,
                        inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy, has_identity_conflict
-                FROM logical_dedup WHERE lineage_fingerprint = ''
+                       skill_counts_json, mcp_counts_json, merge_strategy
+                FROM temp_logical_events WHERE lineage_fingerprint = ''
             ),
             content_ranked AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY codex_dedup_key ORDER BY total_tokens DESC) AS rn
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY codex_dedup_key
+                    ORDER BY (input_tokens + output_tokens + cached_input_tokens
+                              + cache_creation_input_tokens + reasoning_output_tokens) DESC
+                ) AS rn
                 FROM lineage_dedup
                 WHERE codex_dedup_key <> ''
             ),
@@ -600,101 +616,56 @@ public final class UsageLedgerStore: @unchecked Sendable {
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                        reasoning_output_tokens, total_tokens, session_hash,
                        inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy, has_identity_conflict
+                       skill_counts_json, mcp_counts_json, merge_strategy
                 FROM content_ranked WHERE rn = 1
                 UNION ALL
                 SELECT source, event_id, model, project, timestamp_ms,
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                        reasoning_output_tokens, total_tokens, session_hash,
                        inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy, has_identity_conflict
+                       skill_counts_json, mcp_counts_json, merge_strategy
                 FROM lineage_dedup WHERE codex_dedup_key = ''
             )
             SELECT * FROM content_dedup;
             """
-        let dedupStmt = try prepare(dedupSQL)
-        defer { sqlite3_finalize(dedupStmt) }
-        try bind(dedupStmt, 1, hostname)
-        try done(dedupStmt)
+        try exec(dedupSQL)
         advanceStage() // 1-3) 三级去重在 SQLite 内完成
 
         // 计算 lineage / content 去重折叠数：从原始事件经 tier+logical 去重后，
         // 按 lineage_fingerprint / codex_dedup_key 统计被折叠的事件数。
         let collapseCountSQL = """
-            WITH active_files AS (
-                SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
-            ),
-            tiered AS (
-                SELECT event_id, source, session_hash, model, project, lineage_fingerprint, codex_dedup_key, inherited,
-                    has_total_snapshot,
-                    CASE
-                        WHEN source_file_hash = '' THEN 0
-                        WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
-                        ELSE 1
-                    END AS tier
-                FROM usage_events
-                WHERE hostname = ?
-            ),
-            max_tier AS (
-                SELECT source, event_id, MAX(tier) AS max_tier
-                FROM tiered GROUP BY source, event_id
-            ),
-            top_tier AS (
-                SELECT t.* FROM tiered t
-                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
-            ),
-            logical_dedup AS (
-                SELECT source, event_id,
-                    MAX(session_hash) AS session_hash,
-                    MAX(model) AS model,
-                    MAX(project) AS project,
-                    MAX(lineage_fingerprint) AS lineage_fingerprint,
-                    MAX(codex_dedup_key) AS codex_dedup_key,
-                    MIN(inherited) AS inherited,
-                    MAX(has_total_snapshot) AS has_total_snapshot
-                FROM top_tier
-                GROUP BY source, event_id
-            ),
-            lineage_ranked AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY lineage_fingerprint ORDER BY 1) AS rn
-                FROM logical_dedup
+            WITH lineage_ranked AS (
+                SELECT lineage_fingerprint, codex_dedup_key,
+                       ROW_NUMBER() OVER (PARTITION BY lineage_fingerprint ORDER BY inherited ASC, timestamp_ms ASC) AS rn
+                FROM temp_logical_events
                 WHERE lineage_fingerprint <> ''
             ),
             lineage_dedup AS (
                 SELECT lineage_fingerprint, codex_dedup_key FROM lineage_ranked WHERE rn = 1
                 UNION ALL
-                SELECT lineage_fingerprint, codex_dedup_key FROM logical_dedup WHERE lineage_fingerprint = ''
+                SELECT lineage_fingerprint, codex_dedup_key FROM temp_logical_events WHERE lineage_fingerprint = ''
             )
             SELECT
-                (SELECT COUNT(*) FROM logical_dedup WHERE lineage_fingerprint <> '')
-                    - (SELECT COUNT(DISTINCT lineage_fingerprint) FROM logical_dedup WHERE lineage_fingerprint <> '') AS collapsed_inherited,
+                (SELECT COUNT(*) FROM temp_logical_events WHERE lineage_fingerprint <> '')
+                    - (SELECT COUNT(DISTINCT lineage_fingerprint) FROM temp_logical_events WHERE lineage_fingerprint <> '') AS collapsed_inherited,
                 (SELECT COUNT(*) FROM lineage_dedup WHERE codex_dedup_key <> '')
                     - (SELECT COUNT(DISTINCT codex_dedup_key) FROM lineage_dedup WHERE codex_dedup_key <> '') AS collapsed_content,
-                (SELECT COUNT(*) FROM logical_dedup WHERE inherited = 1 AND lineage_fingerprint = '') AS unprovable_inherited,
-                (SELECT COUNT(*) FROM (
-                    SELECT source, event_id
-                    FROM top_tier
-                    GROUP BY source, event_id
-                    HAVING COUNT(*) > 1
-                    AND (
-                        COUNT(DISTINCT session_hash) > 1
-                        OR COUNT(DISTINCT CASE WHEN model <> 'unknown' THEN model END) > 1
-                        OR COUNT(DISTINCT CASE WHEN project <> 'unknown' THEN project END) > 1
-                    )
-                )) AS identity_conflicts
+                (SELECT COUNT(*) FROM temp_logical_events WHERE inherited = 1 AND lineage_fingerprint = '') AS unprovable_inherited,
+                (SELECT COALESCE(SUM(has_identity_conflict), 0) FROM temp_logical_events) AS identity_conflicts
             """
-        let collapseStmt = try prepare(collapseCountSQL)
-        defer { sqlite3_finalize(collapseStmt) }
-        try bind(collapseStmt, 1, hostname)
         var collapsedInheritedEvents = 0
         var collapsedContentDuplicates = 0
         var unprovableInherited = 0
         var identityConflicts = 0
-        if sqlite3_step(collapseStmt) == SQLITE_ROW {
-            collapsedInheritedEvents = Int(sqlite3_column_int64(collapseStmt, 0))
-            collapsedContentDuplicates = Int(sqlite3_column_int64(collapseStmt, 1))
-            unprovableInherited = Int(sqlite3_column_int64(collapseStmt, 2))
-            identityConflicts = Int(sqlite3_column_int64(collapseStmt, 3))
+        do {
+            let collapseStmt = try prepare(collapseCountSQL)
+            defer { sqlite3_finalize(collapseStmt) }
+            if sqlite3_step(collapseStmt) == SQLITE_ROW {
+                collapsedInheritedEvents = Int(sqlite3_column_int64(collapseStmt, 0))
+                collapsedContentDuplicates = Int(sqlite3_column_int64(collapseStmt, 1))
+                unprovableInherited = Int(sqlite3_column_int64(collapseStmt, 2))
+                identityConflicts = Int(sqlite3_column_int64(collapseStmt, 3))
+            }
         }
 
         // 不可证明的继承回放：inherited 但无 total snapshot（无 lineage 指纹），无法证明是否重复。
@@ -756,9 +727,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
             let eventID: String
             let model: String
             let project: String
+            let sessionHash: String
             let timestampMs: Int64
             let inherited: Bool
-            let totalTokens: Int64
+            let billableTotal: Int64
             let lineageFingerprint: String
             let codexDedupKey: String
             let skillCounts: [String: Int]
@@ -766,8 +738,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
             let tier: Int
         }
         let skillEventSQL = """
-            SELECT e.source, e.event_id, e.model, e.project, e.timestamp_ms,
-                   e.inherited, e.total_tokens, e.lineage_fingerprint, e.codex_dedup_key,
+            SELECT e.source, e.event_id, e.model, e.project, e.session_hash, e.timestamp_ms,
+                   e.inherited,
+                   (e.input_tokens + e.output_tokens + e.cached_input_tokens
+                    + e.cache_creation_input_tokens + e.reasoning_output_tokens) AS billable_total,
+                   e.lineage_fingerprint, e.codex_dedup_key,
                    e.skill_counts_json, e.mcp_counts_json,
                    CASE
                        WHEN e.source_file_hash = '' THEN 0
@@ -787,14 +762,15 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 eventID: text(skillEventStmt, 1),
                 model: text(skillEventStmt, 2),
                 project: text(skillEventStmt, 3),
-                timestampMs: sqlite3_column_int64(skillEventStmt, 4),
-                inherited: sqlite3_column_int64(skillEventStmt, 5) != 0,
-                totalTokens: sqlite3_column_int64(skillEventStmt, 6),
-                lineageFingerprint: text(skillEventStmt, 7),
-                codexDedupKey: text(skillEventStmt, 8),
-                skillCounts: decodeStringIntMap(text(skillEventStmt, 9)),
-                mcpCounts: decodeStringIntMap(text(skillEventStmt, 10)),
-                tier: Int(sqlite3_column_int64(skillEventStmt, 11))
+                sessionHash: text(skillEventStmt, 4),
+                timestampMs: sqlite3_column_int64(skillEventStmt, 5),
+                inherited: sqlite3_column_int64(skillEventStmt, 6) != 0,
+                billableTotal: sqlite3_column_int64(skillEventStmt, 7),
+                lineageFingerprint: text(skillEventStmt, 8),
+                codexDedupKey: text(skillEventStmt, 9),
+                skillCounts: decodeStringIntMap(text(skillEventStmt, 10)),
+                mcpCounts: decodeStringIntMap(text(skillEventStmt, 11)),
+                tier: Int(sqlite3_column_int64(skillEventStmt, 12))
             ))
         }
 
@@ -809,8 +785,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     logicalByKey[key] = SkillMergeEvent(
                         source: existing.source, eventID: existing.eventID,
                         model: existing.model, project: existing.project,
+                        sessionHash: existing.sessionHash,
                         timestampMs: existing.timestampMs, inherited: existing.inherited,
-                        totalTokens: max(existing.totalTokens, ev.totalTokens),
+                        billableTotal: max(existing.billableTotal, ev.billableTotal),
                         lineageFingerprint: existing.lineageFingerprint.isEmpty ? ev.lineageFingerprint : existing.lineageFingerprint,
                         codexDedupKey: existing.codexDedupKey.isEmpty ? ev.codexDedupKey : existing.codexDedupKey,
                         skillCounts: maximumCounts(existing.skillCounts, ev.skillCounts),
@@ -834,8 +811,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 lineageByFP[ev.lineageFingerprint] = SkillMergeEvent(
                     source: keep.source, eventID: keep.eventID,
                     model: keep.model, project: keep.project,
+                    sessionHash: keep.sessionHash,
                     timestampMs: keep.timestampMs, inherited: keep.inherited,
-                    totalTokens: keep.totalTokens,
+                    billableTotal: keep.billableTotal,
                     lineageFingerprint: keep.lineageFingerprint,
                     codexDedupKey: keep.codexDedupKey,
                     skillCounts: maximumCounts(existing.skillCounts, ev.skillCounts),
@@ -856,12 +834,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
         for ev in afterLineage where !ev.codexDedupKey.isEmpty {
             if let existing = contentByKey[ev.codexDedupKey] {
                 contentCollapsed += 1
-                let keep = ev.totalTokens > existing.totalTokens ? ev : existing
+                let keep = ev.billableTotal > existing.billableTotal ? ev : existing
                 contentByKey[ev.codexDedupKey] = SkillMergeEvent(
                     source: keep.source, eventID: keep.eventID,
                     model: keep.model, project: keep.project,
+                    sessionHash: keep.sessionHash,
                     timestampMs: keep.timestampMs, inherited: keep.inherited,
-                    totalTokens: keep.totalTokens,
+                    billableTotal: keep.billableTotal,
                     lineageFingerprint: keep.lineageFingerprint,
                     codexDedupKey: keep.codexDedupKey,
                     skillCounts: maximumCounts(existing.skillCounts, ev.skillCounts),
@@ -914,195 +893,48 @@ public final class UsageLedgerStore: @unchecked Sendable {
         var sessionProject: [String: (project: String, timestampMs: Int64)] = [:]
         var sessionSkillCounts: [String: [String: Int]] = [:]
 
-        // session project 必须从全量 raw 事件取（经 tier+logical 去重），不能从 lineage/content 去重后的
+        // session skills 使用 tier→logical 结果但不做 lineage/content 合并：继承回放携带的 skill
+        // 属于子 session，不能通过 lineage 并入原 session。这样既避免 SQL MAX(JSON) 漏计，
+        // 又保持原聚合器「仅非 inherited token 事件贡献 session skills」的口径。
+        for event in logicalDeduped where !event.inherited && !event.skillCounts.isEmpty {
+            let key = "\(event.source)\u{1}\(event.sessionHash)"
+            sessionSkillCounts[key] = UsageToolMetrics.mergeCounts(
+                sessionSkillCounts[key] ?? [:],
+                event.skillCounts
+            )
+        }
+
+        // session project 必须从 tier+logical 去重结果取，不能从 lineage/content 去重后的
         // temp_deduped_events 取——被血缘折叠的事件可能携带另一个 session 的 project，去重后会丢失。
+        // 顺序扫描已物化的 logical 行，在 Swift 仅保留每个 session 的最新 project（约 2.7K 项），
+        // 比再次对 4.4M 原始行执行 GROUP BY + window sort 更省磁盘 I/O。
         let sessionProjSQL = """
-            WITH active_files AS (
-                SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
-            ),
-            tiered AS (
-                SELECT event_id, source, session_hash, project, timestamp_ms,
-                    CASE
-                        WHEN source_file_hash = '' THEN 0
-                        WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
-                        ELSE 1
-                    END AS tier
-                FROM usage_events
-                WHERE hostname = ? AND project <> ''
-            ),
-            max_tier AS (
-                SELECT source, event_id, MAX(tier) AS max_tier
-                FROM tiered GROUP BY source, event_id
-            ),
-            top_tier AS (
-                SELECT t.* FROM tiered t
-                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
-            ),
-            ranked AS (
-                SELECT source, session_hash, project, timestamp_ms,
-                       ROW_NUMBER() OVER (PARTITION BY source, session_hash ORDER BY timestamp_ms DESC) AS rn
-                FROM top_tier
-            )
             SELECT source, session_hash, project, timestamp_ms
-            FROM ranked WHERE rn = 1;
+            FROM temp_logical_events
+            WHERE project <> '';
             """
-        let sessionProjStmt = try prepare(sessionProjSQL)
-        defer { sqlite3_finalize(sessionProjStmt) }
-        try bind(sessionProjStmt, 1, hostname)
-        while sqlite3_step(sessionProjStmt) == SQLITE_ROW {
-            let source = text(sessionProjStmt, 0)
-            let sessionHash = text(sessionProjStmt, 1)
-            let project = text(sessionProjStmt, 2)
-            let timestampMs = sqlite3_column_int64(sessionProjStmt, 3)
-            let key = "\(source)\u{1}\(sessionHash)"
-            if let current = sessionProject[key], current.timestampMs >= timestampMs { continue }
-            sessionProject[key] = (project, timestampMs)
-        }
-
-        let sessionSkillSQL = """
-            SELECT source, session_hash, skill_counts_json
-            FROM temp_deduped_events
-            WHERE inherited = 0 AND skill_counts_json <> '{}';
-            """
-        let sessionSkillStmt = try prepare(sessionSkillSQL)
-        defer { sqlite3_finalize(sessionSkillStmt) }
-        while sqlite3_step(sessionSkillStmt) == SQLITE_ROW {
-            let source = text(sessionSkillStmt, 0)
-            let sessionHash = text(sessionSkillStmt, 1)
-            let skillCounts = decodeStringIntMap(text(sessionSkillStmt, 2))
-            let key = "\(source)\u{1}\(sessionHash)"
-            sessionSkillCounts[key] = UsageToolMetrics.mergeCounts(sessionSkillCounts[key] ?? [:], skillCounts)
-        }
-
-        let sessionAggSQL = """
-            WITH active_files AS (
-                SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
-            ),
-            tiered AS (
-                SELECT event_id, source, session_hash, role, timestamp_ms,
-                    CASE
-                        WHEN source_file_hash = '' THEN 0
-                        WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
-                        ELSE 1
-                    END AS tier
-                FROM usage_session_events
-                WHERE hostname = ?
-            ),
-            max_tier AS (
-                SELECT source, event_id, MAX(tier) AS max_tier
-                FROM tiered GROUP BY source, event_id
-            ),
-            deduped AS (
-                SELECT t.event_id, t.source, t.session_hash, t.role, t.timestamp_ms
-                FROM tiered t
-                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
-            ),
-            logical_dedup AS (
-                SELECT source, event_id,
-                    MIN(session_hash) AS session_hash,
-                    MIN(role) AS role,
-                    MIN(timestamp_ms) AS timestamp_ms
-                FROM deduped
-                GROUP BY source, event_id
-            ),
-            ranked AS (
-                SELECT *,
-                    SUM(CASE WHEN role IN ('user', 'synthetic_user') THEN 1 ELSE 0 END)
-                        OVER (PARTITION BY source, session_hash
-                              ORDER BY timestamp_ms, CASE role WHEN 'user' THEN 0 WHEN 'synthetic_user' THEN 1 ELSE 2 END) AS seg_id
-                FROM logical_dedup
-            ),
-            segments AS (
-                SELECT source, session_hash, seg_id,
-                    MIN(CASE WHEN role = 'assistant' THEN timestamp_ms END) AS seg_start,
-                    MAX(CASE WHEN role = 'assistant' THEN timestamp_ms END) AS seg_end
-                FROM ranked
-                GROUP BY source, session_hash, seg_id
-            ),
-            session_active AS (
-                SELECT source, session_hash,
-                    CAST(SUM(CASE WHEN seg_id > 0 AND seg_start IS NOT NULL AND seg_end IS NOT NULL AND seg_end > seg_start THEN seg_end - seg_start ELSE 0 END) / 1000 AS INTEGER) AS active_seconds
-                FROM segments
-                GROUP BY source, session_hash
-            ),
-            session_stats AS (
-                SELECT source, session_hash,
-                    COUNT(*) AS message_count,
-                    SUM(CASE WHEN role = 'user' THEN 1 ELSE 0 END) AS user_message_count,
-                    SUM(CASE WHEN role = 'assistant' THEN 1 ELSE 0 END) AS assistant_events,
-                    MIN(timestamp_ms) AS first_activity,
-                    MAX(timestamp_ms) AS last_activity
-                FROM ranked
-                GROUP BY source, session_hash
-            ),
-            session_hist AS (
-                SELECT source, session_hash,
-                    GROUP_CONCAT(hour || ':' || cnt, ',') AS histogram
-                FROM (
-                    SELECT source, session_hash,
-                        CAST(strftime('%H', datetime(timestamp_ms/1000, 'unixepoch')) AS INTEGER) AS hour,
-                        COUNT(*) AS cnt
-                    FROM ranked
-                    WHERE role = 'user'
-                    GROUP BY source, session_hash, hour
-                )
-                GROUP BY source, session_hash
-            )
-            SELECT st.source, st.session_hash, s.active_seconds,
-                   st.message_count, st.user_message_count, st.assistant_events,
-                   st.first_activity, st.last_activity,
-                   COALESCE(sh.histogram, '') AS histogram
-            FROM session_stats st
-            JOIN session_active s ON s.source = st.source AND s.session_hash = st.session_hash
-            LEFT JOIN session_hist sh ON sh.source = st.source AND sh.session_hash = st.session_hash
-            ORDER BY st.source, st.session_hash;
-            """
-        let sessionAggStmt = try prepare(sessionAggSQL)
-        defer { sqlite3_finalize(sessionAggStmt) }
-        try bind(sessionAggStmt, 1, hostname)
-
-        var sessions: [UsageSession] = []
-        while sqlite3_step(sessionAggStmt) == SQLITE_ROW {
-            let source = text(sessionAggStmt, 0)
-            let sessionHash = text(sessionAggStmt, 1)
-            let activeSeconds = sqlite3_column_int64(sessionAggStmt, 2)
-            let messageCount = sqlite3_column_int64(sessionAggStmt, 3)
-            let userMessageCount = sqlite3_column_int64(sessionAggStmt, 4)
-            let assistantEvents = sqlite3_column_int64(sessionAggStmt, 5)
-            let firstActivity = date(sqlite3_column_int64(sessionAggStmt, 6))
-            let lastActivity = date(sqlite3_column_int64(sessionAggStmt, 7))
-            let histogramStr = text(sessionAggStmt, 8)
-
-            var histogram = [Int64](repeating: 0, count: 24)
-            if !histogramStr.isEmpty {
-                for pair in histogramStr.split(separator: ",") {
-                    let parts = pair.split(separator: ":")
-                    if parts.count == 2, let hour = Int(parts[0]), let cnt = Int64(parts[1]), hour >= 0 && hour < 24 {
-                        histogram[hour] = cnt
-                    }
-                }
+        do {
+            let sessionProjStmt = try prepare(sessionProjSQL)
+            defer { sqlite3_finalize(sessionProjStmt) }
+            while sqlite3_step(sessionProjStmt) == SQLITE_ROW {
+                let source = text(sessionProjStmt, 0)
+                let sessionHash = text(sessionProjStmt, 1)
+                let project = text(sessionProjStmt, 2)
+                let timestampMs = sqlite3_column_int64(sessionProjStmt, 3)
+                let key = "\(source)\u{1}\(sessionHash)"
+                if let current = sessionProject[key], current.timestampMs >= timestampMs { continue }
+                sessionProject[key] = (project, timestampMs)
             }
-
-            let projKey = "\(source)\u{1}\(sessionHash)"
-            let project = sessionProject[projKey]?.project ?? ""
-            let skills = UsageToolMetrics.skillNames(sessionSkillCounts[projKey] ?? [:])
-
-            sessions.append(UsageSession(
-                hostname: hostname,
-                source: source,
-                sessionHash: sessionHash,
-                project: project,
-                skills: skills,
-                firstActivity: firstActivity,
-                lastActivity: lastActivity,
-                activeSeconds: activeSeconds,
-                messageCount: messageCount,
-                userMessageCount: userMessageCount,
-                assistantEvents: assistantEvents,
-                hourHistogramUTC: histogram
-            ))
         }
+
+        let sessions = try aggregateSessionsStreamingUnlocked(
+            hostname: hostname,
+            sessionProject: sessionProject,
+            sessionSkillCounts: sessionSkillCounts
+        )
         advanceStage() // 6) session 聚合完成
+
+        try exec("DROP TABLE IF EXISTS temp_logical_events;")
 
 
         // 差异写入：仅对内容变化的行提升 revision，未变行保持原 revision/synced。
@@ -1156,7 +988,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try setIntUnlocked(key: revisionKey(hostname), value: newRevision - 1)
         }
 
-        let eligible = blockingReasons.isEmpty && identityConflicts == 0
+        let eligible = identityConflicts == 0
         try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
         advanceStage() // 8) session 差异写完成
 
@@ -1595,6 +1427,168 @@ public final class UsageLedgerStore: @unchecked Sendable {
             ))
         }
         return result
+    }
+
+    /// 只物化重复 logical id 的赢家；唯一事件不进入字典。随后沿现有 session 时间索引
+    /// 顺序扫描，Swift 端始终只保留当前 session 的累计状态。
+    private func aggregateSessionsStreamingUnlocked(
+        hostname: String,
+        sessionProject: [String: (project: String, timestampMs: Int64)],
+        sessionSkillCounts: [String: [String: Int]]
+    ) throws -> [UsageSession] {
+        let duplicateWinners = try duplicateSessionEventWinnersUnlocked(hostname: hostname)
+        let statement = try prepare("""
+            SELECT event_id,source,session_hash,role,timestamp_ms,source_file_hash
+            FROM usage_session_events INDEXED BY idx_session_events_host_group
+            WHERE hostname=?
+            ORDER BY source,session_hash,timestamp_ms,
+                     CASE role WHEN 'user' THEN 0 WHEN 'synthetic_user' THEN 1 ELSE 2 END,
+                     event_id,source_file_hash;
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+
+        var sessions: [UsageSession] = []
+        var currentSource = ""
+        var currentSessionHash = ""
+        var firstActivityMs: Int64 = 0
+        var lastActivityMs: Int64 = 0
+        var activeSeconds: Double = 0
+        var messageCount: Int64 = 0
+        var userMessageCount: Int64 = 0
+        var assistantEvents: Int64 = 0
+        var histogram = [Int64](repeating: 0, count: 24)
+        var anchoredByUser = false
+        var segmentStartMs: Int64?
+        var segmentEndMs: Int64?
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = TimeZone(identifier: "UTC") ?? .gmt
+
+        func closeSegment() {
+            if let start = segmentStartMs, let end = segmentEndMs, end > start {
+                activeSeconds += Double(end - start) / 1_000
+            }
+            segmentStartMs = nil
+            segmentEndMs = nil
+        }
+
+        func appendCurrentSession() {
+            guard !currentSource.isEmpty else { return }
+            closeSegment()
+            let key = "\(currentSource)\u{1}\(currentSessionHash)"
+            sessions.append(UsageSession(
+                hostname: hostname,
+                source: currentSource,
+                sessionHash: currentSessionHash,
+                project: sessionProject[key]?.project ?? "",
+                skills: UsageToolMetrics.skillNames(sessionSkillCounts[key] ?? [:]),
+                firstActivity: date(firstActivityMs),
+                lastActivity: date(lastActivityMs),
+                activeSeconds: Int64(activeSeconds.rounded()),
+                messageCount: messageCount,
+                userMessageCount: userMessageCount,
+                assistantEvents: assistantEvents,
+                hourHistogramUTC: histogram
+            ))
+        }
+
+        func reset(source: String, sessionHash: String, timestampMs: Int64) {
+            currentSource = source
+            currentSessionHash = sessionHash
+            firstActivityMs = timestampMs
+            lastActivityMs = timestampMs
+            activeSeconds = 0
+            messageCount = 0
+            userMessageCount = 0
+            assistantEvents = 0
+            histogram = [Int64](repeating: 0, count: 24)
+            anchoredByUser = false
+            segmentStartMs = nil
+            segmentEndMs = nil
+        }
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let eventID = text(statement, 0)
+            let source = text(statement, 1)
+            let sessionHash = text(statement, 2)
+            let logicalKey = "\(source)\u{1}\(eventID)"
+            if let winner = duplicateWinners[logicalKey], winner != text(statement, 5) { continue }
+            guard let role = UsageSessionEvent.Role(rawValue: text(statement, 3)) else { continue }
+            let timestampMs = sqlite3_column_int64(statement, 4)
+
+            if source != currentSource || sessionHash != currentSessionHash {
+                appendCurrentSession()
+                reset(source: source, sessionHash: sessionHash, timestampMs: timestampMs)
+            }
+            messageCount += 1
+            lastActivityMs = max(lastActivityMs, timestampMs)
+            switch role {
+            case .user:
+                userMessageCount += 1
+                let hour = utcCalendar.component(.hour, from: date(timestampMs))
+                if (0..<24).contains(hour) { histogram[hour] += 1 }
+                closeSegment()
+                anchoredByUser = true
+            case .syntheticUser:
+                closeSegment()
+                anchoredByUser = true
+            case .assistant:
+                assistantEvents += 1
+                if anchoredByUser {
+                    if segmentStartMs == nil { segmentStartMs = timestampMs }
+                    segmentEndMs = timestampMs
+                }
+            }
+        }
+        appendCurrentSession()
+        return sessions
+    }
+
+    private func duplicateSessionEventWinnersUnlocked(hostname: String) throws -> [String: String] {
+        let duplicateStatement = try prepare("""
+            SELECT source,event_id
+            FROM usage_session_events INDEXED BY idx_session_events_host
+            WHERE hostname=?
+            GROUP BY source,event_id
+            HAVING COUNT(*)>1;
+            """)
+        defer { sqlite3_finalize(duplicateStatement) }
+        try bind(duplicateStatement, 1, hostname)
+
+        let candidateStatement = try prepare("""
+            SELECT source_file_hash
+            FROM usage_session_events
+            WHERE hostname=? AND source=? AND event_id=?
+            ORDER BY source_file_hash;
+            """)
+        defer { sqlite3_finalize(candidateStatement) }
+        let activeFiles = try ownedActiveFileIDsUnlocked()
+        var winners: [String: String] = [:]
+
+        while sqlite3_step(duplicateStatement) == SQLITE_ROW {
+            let source = text(duplicateStatement, 0)
+            let eventID = text(duplicateStatement, 1)
+            sqlite3_reset(candidateStatement)
+            sqlite3_clear_bindings(candidateStatement)
+            try bind(candidateStatement, 1, hostname)
+            try bind(candidateStatement, 2, source)
+            try bind(candidateStatement, 3, eventID)
+
+            var winner = ""
+            var winnerTier = AttributionTier.legacy
+            var hasWinner = false
+            while sqlite3_step(candidateStatement) == SQLITE_ROW {
+                let fileID = text(candidateStatement, 0)
+                let tier = attributionTier(sourceFileHash: fileID, activeFiles: activeFiles)
+                if !hasWinner || tier.rawValue > winnerTier.rawValue {
+                    winner = fileID
+                    winnerTier = tier
+                    hasWinner = true
+                }
+            }
+            if hasWinner { winners["\(source)\u{1}\(eventID)"] = winner }
+        }
+        return winners
     }
 
     private func readAllRawEvents(hostname: String, overwriteConflicts: inout [String]) throws -> [RawEvent] {
@@ -2518,23 +2512,18 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    /// 性能索引:消除 finalize 里 `readAll*`（WHERE hostname=? ORDER BY ...）的外部排序,
-    /// 并为增量 finalize 的按 codex_dedup_key 反取全副本提供索引。列顺序 = hostname 等值前缀 +
-    /// 匹配各 readAll 的 ORDER BY,使 SQLite 直接顺序走索引、无 external sort。纯 CREATE INDEX
-    /// IF NOT EXISTS,不改 schema 版本、不改 parserVersion、不触发重建。
+    /// 性能索引：为 hostname 范围扫描、session 流式聚合及按 codex_dedup_key 反取副本提供索引。
+    /// 不改 schema/parser 版本。
     private static func performanceIndexSQL(for table: String) -> String {
         switch table {
         case "usage_events":
-            // 列顺序 (hostname, source, event_id, source_file_hash):
-            // WHERE hostname=? 后直接按 (source, event_id) 顺序走索引,
-            // 消除 finalize 去重阶段 GROUP BY source,event_id 的临时排序。
+            // source/event 索引会让 logical 聚合按索引顺序扫描后对每行回表；真实 10GB 账本上比顺序扫描
+            // 更慢。恢复 hostname/time 顺序索引并换稳定名字：旧名字只清理一次，后续启动全部为 no-op。
             return "DROP INDEX IF EXISTS idx_usage_events_host;"
-                + "CREATE INDEX IF NOT EXISTS idx_usage_events_host ON usage_events(hostname,source,event_id,source_file_hash);"
+                + "DROP INDEX IF EXISTS idx_usage_events_host_logical;"
+                + "CREATE INDEX IF NOT EXISTS idx_usage_events_host_time ON usage_events(hostname,timestamp_ms,event_id,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_dedup ON usage_events(codex_dedup_key);"
         case "usage_session_events":
-            // idx_session_events_host 支撑去重 GROUP BY (source, event_id);
-            // idx_session_events_host_group 支撑会话窗口函数 PARTITION BY source, session_hash ORDER BY timestamp_ms,
-            // 消除 8.1M 行的临时排序。
             return "CREATE INDEX IF NOT EXISTS idx_session_events_host ON usage_session_events(hostname,source,event_id,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_group ON usage_session_events(hostname,source,session_hash,timestamp_ms);"
         case "usage_edit_entries":

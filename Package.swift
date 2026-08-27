@@ -120,6 +120,11 @@ let package = Package(
             path: "Tests/ProductionDatabasePreflightVerification"
         ),
         .executableTarget(
+            name: "UsageLedgerMemoryVerification",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/UsageLedgerMemoryVerification"
+        ),
+        .executableTarget(
             name: "SecureConfigVerification",
             dependencies: ["AgentPulseCore"],
             path: "Tests/SecureConfigVerification"
