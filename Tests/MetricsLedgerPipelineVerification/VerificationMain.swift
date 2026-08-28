@@ -77,6 +77,9 @@ private struct MetricsLedgerPipelineVerifier {
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='usage_edit_entries';") == 1, "raw edit table must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM pragma_table_info('usage_session_events') WHERE name='source_file_hash';") == 1, "session event file-attribution column must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_session_events WHERE event_id='legacy-se';") == 1, "v8 rebuild must retain legacy session events")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_time';") == 1, "stable hostname/time index must exist")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_usage_events_host','idx_usage_events_host_logical');") == 0, "legacy usage host indexes must be removed after one-time migration")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_session_events_host_group';") == 1, "hostname-prefixed session streaming index must exist")
         }
     }
 
@@ -233,7 +236,8 @@ private struct MetricsLedgerPipelineVerifier {
         let ledger3 = try UsageLedgerStore(path: db3.path)
         let smallFirst = UsageEvent(
             id: "event-small", source: source, model: "model-a", project: "project-a",
-            timestamp: timestamp, counts: UsageTokenCounts(input: 10, output: 2, reportedTotal: 12),
+            // reportedTotal 故意大于后一份，证明 winner 只按五分量 billableTotal，而不是 reportedTotal。
+            timestamp: timestamp, counts: UsageTokenCounts(input: 10, output: 2, reportedTotal: 10_000),
             sessionHash: "session-fork", sourceFileHash: "file-a", hasTotalSnapshot: true,
             lineageFingerprint: "", codexDedupKey: sharedKey
         )
