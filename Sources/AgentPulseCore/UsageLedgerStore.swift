@@ -1,5 +1,6 @@
 import Foundation
 import SQLite3
+import Darwin
 
 private let usageSQLiteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
@@ -422,7 +423,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
             var didCompact = false
             try transaction {
                 try claimLegacyRawRowsIfUnambiguousUnlocked(hostname: hostname)
-                result = try recomputeDerivedUnlocked(hostname: hostname, progress: progress)
+                result = try withThrottledDiskIO {
+                    try recomputeDerivedUnlocked(hostname: hostname, progress: progress)
+                }
                 // 只有显式 finalize 表示调用方已经成功完成整轮来源扫描。其它内部重算
                 // （例如 hostname 对齐）不能清除此门禁，否则部分扫描失败后会 fail-open。
                 try deleteKeyUnlocked(Self.rawDerivationPendingKey)
@@ -443,6 +446,23 @@ public final class UsageLedgerStore: @unchecked Sendable {
             if didCompact { try? exec("VACUUM;") }
             return result
         }
+    }
+
+    /// 全量派生会顺序读写数 GB SQLite 临时数据。把当前 ledger worker 线程标为磁盘节流，
+    /// 让前台应用和用户交互 I/O 优先；重算结束（含抛错）后恢复调用线程原策略。
+    private func withThrottledDiskIO<T>(_ operation: () throws -> T) rethrows -> T {
+        let previous = getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD)
+        let changed = setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE) == 0
+        defer {
+            if changed {
+                _ = setiopolicy_np(
+                    IOPOL_TYPE_DISK,
+                    IOPOL_SCOPE_THREAD,
+                    previous >= 0 ? previous : IOPOL_DEFAULT
+                )
+            }
+        }
+        return try operation()
     }
 
     private struct RawEvent {
