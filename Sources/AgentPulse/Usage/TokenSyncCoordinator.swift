@@ -1035,7 +1035,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 同时不使用 Task.detached 分叉。以 Result 返回，保留取消/错误语义。
     /// GCD worker 上没有 Task 上下文，Task.checkCancellation() 在其中恒为 false；
     /// 通过 withTaskCancellationHandler 把取消桥接到显式闸门，worker 内逐文件检查。
-    nonisolated private static let workerQueue = DispatchQueue(label: "com.agentpulse.token-sync.worker", qos: .utility)
+    // 扫描会解析大型 JSONL 并批量更新账本，属于可延后的缓存维护工作。
+    // 使用 background QoS，避免应用冷启动时与菜单栏交互及其它前台进程争抢 CPU。
+    nonisolated private static let workerQueue = DispatchQueue(label: "com.agentpulse.token-sync.worker", qos: .background)
 
     /// 线程安全的取消闸门：由 Task 取消回调置位，GCD worker 在每个文件边界检查。
     private final class CancellationGate: @unchecked Sendable {

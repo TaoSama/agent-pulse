@@ -153,7 +153,9 @@ public final class MetricsStore: ObservableObject {
     public func start() {
         guard refreshTask == nil else { return }
         isRunning = true
-        refreshTask = Task { [weak self] in
+        // 首轮可能需要解析体积很大的活跃 rollout；整个刷新循环都属于后台采样，
+        // 从源头使用 background 优先级，避免继承 MainActor 的前台优先级。
+        refreshTask = Task(priority: .background) { [weak self] in
             guard let self else { return }
             await restoreCachedDisplayState()
             let clock = ContinuousClock()
