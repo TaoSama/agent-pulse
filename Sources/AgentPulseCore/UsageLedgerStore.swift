@@ -232,16 +232,19 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     /// 只写原始 token 事件（网络主动拉取的来源，如 cliproxy），并写一条合成 checkpoint。
     ///
-    /// 网络来源不是「文件」：每个事件自带稳定的 per-event sourceFileHash（幂等键的一部分），
-    /// 不存在单一 fileID 的原子替换语义，因此不走 record() 的文件级 replace 路径，只做
-    /// 基于 (source_file_hash, event_id) 的幂等 upsert。仍写一条合成 checkpoint，原因有二：
+    /// 网络来源不是「文件」：同一 source 的事件统一归属到一个合成 fileID，
+    /// 不走 record() 的文件级 replace 路径，只做基于 (source_file_hash, event_id) 的幂等 upsert。
+    /// 仍写一条合成 checkpoint，原因有二：
     /// 1) requiresParserRebuild 把「有数据却无任何 checkpoint」判为需重建；纯网络来源账本
     ///    若不写 checkpoint 会每轮被 resetForRebuild 清空。
     /// 2) checkpoint 的 parser_version 取一个足够大的稳定值，保证不小于任何本地 JSONL 解析器
     ///    版本，从而永不触发 parser 升级重建。
-    /// 扫描结束后仍须调用 finalizeDerived(hostname:)。
+    /// 网络事件为 append-only，因此在同一事务内只精确重算受影响的
+    /// 30 分钟 bucket，不置位全库 raw_derivation_pending。本地文件扫描若已
+    /// 置位 pending，该标志保持不变，仍由常规 finalize 收口。
     public func recordNetworkEvents(_ events: [UsageEvent], source: String, hostname: String) throws {
         guard !events.isEmpty else { return }
+        guard events.allSatisfy({ $0.source == source }) else { throw UsageLedgerError.invalidCheckpoint }
         let fileID = "network\u{1}\(source)"
         let checkpoint = UsageFileCheckpoint(
             fileID: fileID,
@@ -255,15 +258,117 @@ public final class UsageLedgerStore: @unchecked Sendable {
         )
         try queue.sync {
             try transaction {
-                try insertRawEvents(events, fileID: fileID, hostname: hostname)
+                let frozen = try frozenBeforeMsUnlocked(hostname)
+                let keptEvents = frozen > 0 ? events.filter { millis($0.timestamp) >= frozen } : events
+                try insertRawEvents(keptEvents, fileID: fileID, hostname: hostname)
                 try writeCheckpoint(checkpoint)
-                // 网络来源有新事件同样令派生 dirty（与文件 record 对称），使无变化轮跳过 finalize
-                // 时 cliproxy 新增仍触发一次重算。空事件已在方法入口 guard 提前返回，不会置位。
-                try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
+                try recomputeNetworkBucketsUnlocked(events: keptEvents, source: source, hostname: hostname)
                 if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
                     try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
                 }
             }
+        }
+    }
+
+    /// Network events have no lineage/content replay semantics and all share one authoritative
+    /// synthetic file attribution. Re-aggregate only their affected natural keys; comparing the
+    /// complete bucket value keeps retries idempotent and preserves the revision/ACK contract.
+    private func recomputeNetworkBucketsUnlocked(events: [UsageEvent], source: String, hostname: String) throws {
+        struct BucketMeta {
+            let source: String
+            let model: String
+            let project: String
+            let start: Int64
+        }
+
+        var affected: [String: BucketMeta] = [:]
+        for event in events where event.source == source {
+            let start = (millis(event.timestamp) / Self.bucketMilliseconds) * Self.bucketMilliseconds
+            let key = "\(event.source)\u{1}\(event.model)\u{1}\(event.project)\u{1}\(start)"
+            affected[key] = BucketMeta(source: event.source, model: event.model, project: event.project, start: start)
+        }
+        guard !affected.isEmpty else { return }
+
+        let existing = try readBucketRowsUnlocked(hostname: hostname)
+        var changed: [UsageBucket] = []
+        for (key, meta) in affected {
+            let statement = try prepare("""
+                SELECT input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,
+                       reasoning_output_tokens,total_tokens,skill_counts_json,mcp_counts_json
+                FROM usage_events
+                WHERE hostname=? AND source=? AND model=? AND project=?
+                  AND timestamp_ms>=? AND timestamp_ms<?;
+                """)
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            try bind(statement, 2, meta.source)
+            try bind(statement, 3, meta.model)
+            try bind(statement, 4, meta.project)
+            try bind(statement, 5, meta.start)
+            try bind(statement, 6, meta.start + Self.bucketMilliseconds)
+
+            var counts = UsageTokenCounts()
+            var skillCounts: [String: Int] = [:]
+            var mcpCounts: [String: Int] = [:]
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let row = UsageTokenCounts(
+                    input: sqlite3_column_int64(statement, 0),
+                    output: sqlite3_column_int64(statement, 1),
+                    cachedInput: sqlite3_column_int64(statement, 2),
+                    cacheCreationInput: sqlite3_column_int64(statement, 3),
+                    reasoningOutput: sqlite3_column_int64(statement, 4),
+                    reportedTotal: sqlite3_column_int64(statement, 5)
+                )
+                counts = UsageTokenCounts(
+                    input: saturatedAdd(counts.input, row.input),
+                    output: saturatedAdd(counts.output, row.output),
+                    cachedInput: saturatedAdd(counts.cachedInput, row.cachedInput),
+                    cacheCreationInput: saturatedAdd(counts.cacheCreationInput, row.cacheCreationInput),
+                    reasoningOutput: saturatedAdd(counts.reasoningOutput, row.reasoningOutput),
+                    reportedTotal: saturatedAdd(counts.reportedTotal, row.total)
+                )
+                skillCounts = UsageToolMetrics.mergeCounts(skillCounts, decodeStringIntMap(text(statement, 6)))
+                mcpCounts = UsageToolMetrics.mergeCounts(mcpCounts, decodeStringIntMap(text(statement, 7)))
+            }
+
+            let bucket = UsageBucket(
+                hostname: hostname,
+                source: meta.source,
+                model: meta.model,
+                project: meta.project,
+                bucketStart: date(meta.start),
+                counts: counts,
+                skillCounts: skillCounts,
+                mcpCounts: mcpCounts
+            )
+            if existing[key]?.bucket != bucket { changed.append(bucket) }
+        }
+
+        guard !changed.isEmpty else { return }
+        let revision = try nextRevisionUnlocked(hostname: hostname)
+        for bucket in changed { try upsertBucketUnlocked(bucket, revision: revision) }
+    }
+
+    /// 返回指定网络来源身份已入库事件的最新毫秒时间戳。先从小型派生表定位
+    /// 最后一个 bucket，再通过 timestamp 索引只扫描该 bucket，避免遍历大型原始表。
+    public func latestNetworkEventTimestampMS(project: String, source: String, hostname: String) throws -> Int64? {
+        try queue.sync {
+            let bucket = try prepare("SELECT MAX(bucket_start_ms) FROM usage_buckets WHERE hostname=? AND source=? AND project=?;")
+            defer { sqlite3_finalize(bucket) }
+            try bind(bucket, 1, hostname)
+            try bind(bucket, 2, source)
+            try bind(bucket, 3, project)
+            guard sqlite3_step(bucket) == SQLITE_ROW, sqlite3_column_type(bucket, 0) != SQLITE_NULL else { return nil }
+            let bucketStart = sqlite3_column_int64(bucket, 0)
+
+            let statement = try prepare("SELECT MAX(timestamp_ms) FROM usage_events WHERE hostname=? AND timestamp_ms>=? AND source=? AND project=?;")
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            try bind(statement, 2, bucketStart)
+            try bind(statement, 3, source)
+            try bind(statement, 4, project)
+            guard sqlite3_step(statement) == SQLITE_ROW, sqlite3_column_type(statement, 0) != SQLITE_NULL else { return nil }
+            return sqlite3_column_int64(statement, 0)
         }
     }
 

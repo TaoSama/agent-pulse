@@ -47,6 +47,23 @@ private struct FakeScanner: ProcessScanning {
     }
 }
 
+private final class RequestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [String: Int] = [:]
+
+    func increment(_ key: String) {
+        lock.lock()
+        counts[key, default: 0] += 1
+        lock.unlock()
+    }
+
+    func value(_ key: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts[key, default: 0]
+    }
+}
+
 private final class SequencedScanner: ProcessScanning, @unchecked Sendable {
     private let lock = NSLock()
     private var snapshots: [[RunningProcess]]
@@ -118,6 +135,7 @@ struct AgentPulseCoreVerification {
         try await verifyColdStartModelSeeding()
         try verifySparklineAnalysis()
         try verifyCliProxyUsageParser()
+        try await verifyCliProxyAnalytics()
         try await verifyCliProxyMultipleSources()
         print("AgentPulseCoreVerification: PASS")
     }
@@ -3718,26 +3736,203 @@ struct AgentPulseCoreVerification {
         try require(CliProxyUsageParser.parse(data: Data("not json".utf8), targetAPIKey: targetKey).isEmpty, "invalid json must yield empty")
         try require(CliProxyUsageParser.parse(data: data, targetAPIKey: "").isEmpty, "empty target key must yield empty")
 
-        // 账本闭环：recordNetworkEvents（无 checkpoint）+ finalizeDerived → cliproxy bucket。
+        // 账本闭环：recordNetworkEvents 在同一事务内局部派生 cliproxy bucket。
         let databaseURL = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString + ".sqlite3")
         defer { try? FileManager.default.removeItem(at: databaseURL) }
         let ledger = try UsageLedgerStore(path: databaseURL.path)
         let hostname = "device"
         try ledger.recordNetworkEvents(events, source: CliProxyUsageParser.source, hostname: hostname)
+        let incrementalBatch = try ledger.pendingBatch(hostname: hostname, maxBuckets: nil, maxSessions: nil)
+        try require(incrementalBatch.buckets.count == 2, "network ingest must derive only its two affected buckets")
+        try require(incrementalBatch.sessions.isEmpty, "network token events must not synthesize sessions")
+        let initialRevision = incrementalBatch.buckets.map(\.revision).max() ?? 0
+        try ledger.acknowledge(incrementalBatch)
         // 重复 record 不应重复计数（幂等）。
         try ledger.recordNetworkEvents(again, source: CliProxyUsageParser.source, hostname: hostname)
+        let afterDuplicate = try ledger.pendingBatch(hostname: hostname, maxBuckets: nil, maxSessions: nil)
+        try require(afterDuplicate.isEmpty, "identical network retry must not bump bucket revision")
+
+        // 已 ACK 的历史 bucket 收到迟到事件后必须提升 revision，再次变 dirty。
+        let lateEvent = UsageEvent(
+            id: "cliproxy-late-event",
+            source: CliProxyUsageParser.source,
+            model: modelA.model,
+            project: identity,
+            timestamp: modelA.timestamp.addingTimeInterval(60),
+            counts: UsageTokenCounts(input: 5, output: 2, reportedTotal: 7),
+            sessionHash: identity,
+            sourceFileHash: identity
+        )
+        try ledger.recordNetworkEvents([lateEvent], source: CliProxyUsageParser.source, hostname: hostname)
+        let afterLate = try ledger.pendingBatch(hostname: hostname, maxBuckets: nil, maxSessions: nil)
+        try require(afterLate.buckets.count == 1, "late network event must re-dirty exactly one bucket")
+        try require(afterLate.buckets[0].revision > initialRevision, "late network event must advance revision")
+        try require(afterLate.buckets[0].bucket.counts.total == 147, "late network event must update the complete bucket total")
+        try ledger.acknowledge(afterLate)
+
+        // 与全量 finalize 逐维度对齐：全量重算不得再改内容或 revision。
+        let beforeFull = try ledger.buckets(hostname: hostname).filter { $0.source == CliProxyUsageParser.source }
         _ = try ledger.finalizeDerived(hostname: hostname)
+        let afterFull = try ledger.buckets(hostname: hostname).filter { $0.source == CliProxyUsageParser.source }
+        try require(beforeFull == afterFull, "incremental network buckets must equal full finalize output")
+        let afterFullBatch = try ledger.pendingBatch(hostname: hostname, maxBuckets: nil, maxSessions: nil)
+        try require(afterFullBatch.isEmpty, "equivalent full finalize must not re-dirty incremental buckets")
         let buckets = try ledger.buckets(hostname: hostname)
         let cliProxyBuckets = buckets.filter { $0.source == CliProxyUsageParser.source }
         try require(!cliProxyBuckets.isEmpty, "cliproxy buckets must be produced")
         let cliProxyTotal = cliProxyBuckets.reduce(Int64(0)) { $0 + $1.counts.total }
-        try require(cliProxyTotal == 210, "cliproxy bucket total must equal 140+70=210, got \(cliProxyTotal)")
+        try require(cliProxyTotal == 217, "cliproxy bucket total must include the 7-token late event, got \(cliProxyTotal)")
         let ledgerEventCount = try ledger.eventCount()
-        try require(ledgerEventCount == 2, "duplicate recordNetworkEvents must remain idempotent")
+        try require(ledgerEventCount == 3, "duplicate network retries must remain idempotent while retaining the late event")
+        let latestNetworkTimestamp = try ledger.latestNetworkEventTimestampMS(
+            project: identity,
+            source: CliProxyUsageParser.source,
+            hostname: hostname
+        )
+        try require(latestNetworkTimestamp == 1_786_352_400_000, "network watermark must use the latest event for that CPA identity: \(String(describing: latestNetworkTimestamp))")
+
+        let foreignTimestamp: Int64 = 1_900_000_000_000
+        let foreignEvent = UsageEvent(
+            id: "cliproxy-foreign-host-event",
+            source: CliProxyUsageParser.source,
+            model: modelA.model,
+            project: identity,
+            timestamp: Date(timeIntervalSince1970: Double(foreignTimestamp) / 1_000),
+            counts: UsageTokenCounts(output: 1),
+            sessionHash: identity,
+            sourceFileHash: identity
+        )
+        try ledger.recordNetworkEvents([foreignEvent], source: CliProxyUsageParser.source, hostname: "other-device")
+        let otherHostTimestamp = try ledger.latestNetworkEventTimestampMS(
+            project: identity,
+            source: CliProxyUsageParser.source,
+            hostname: "other-device"
+        )
+        let localTimestampAfterForeignInsert = try ledger.latestNetworkEventTimestampMS(
+            project: identity,
+            source: CliProxyUsageParser.source,
+            hostname: hostname
+        )
+        try require(otherHostTimestamp == foreignTimestamp, "other hostname must retain its own network watermark")
+        try require(localTimestampAfterForeignInsert == latestNetworkTimestamp, "network watermark must not leak across imported hostnames")
 
         // recordNetworkEvents 不得写入 usage_files checkpoint（网络来源无 parser 版本轴）。
         let needsRebuild = try ledger.requiresParserRebuild(currentParserVersion: UsageJSONLParser.parserVersion)
         try require(!needsRebuild, "cliproxy events must not trigger parser rebuild")
+    }
+
+    private static func verifyCliProxyAnalytics() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "cliproxy-analytics-verify-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appending(path: "agent-pulse.env")
+        let targetKey = "sk-analytics-verification"
+        let targetHash = CliProxyUsageParser.apiKeyHash(for: targetKey)
+        try EnvFile.writeBack([
+            MergedEnvKeys.cliProxyBaseURL: "https://analytics.example",
+            MergedEnvKeys.cliProxyManagementKey: "management",
+            MergedEnvKeys.cliProxyTargetAPIKey: targetKey,
+        ], to: file)
+
+        func page(_ timestamp: Int64, nextMS: Int64, nextID: Int64, hasMore: Bool) throws -> Data {
+            try JSONSerialization.data(withJSONObject: [
+                "events": [
+                    "items": [[
+                        "event_hash": "verification-\(timestamp)",
+                        "timestamp_ms": timestamp,
+                        "api_key_hash": targetHash,
+                        "resolved_model": "model-a",
+                        "input_tokens": 100,
+                        "output_tokens": 40,
+                        "cache_read_tokens": 30,
+                        "cache_creation_tokens": 5,
+                        "reasoning_tokens": 10,
+                        "total_tokens": 140,
+                    ]],
+                    "next_before_ms": nextMS,
+                    "next_before_id": nextID,
+                    "has_more": hasMore,
+                    "total_count": 2,
+                ],
+            ])
+        }
+        let firstPage = try page(2_000, nextMS: 2_000, nextID: 9, hasMore: true)
+        let secondPage = try page(1_000, nextMS: 0, nextID: 0, hasMore: false)
+        let requests = RequestCounter()
+        let service = CliProxyUsageService { request in
+            if request.url?.path == "/v0/management/monitoring/analytics" {
+                requests.increment("analytics")
+                let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+                let include = body?["include"] as? [String: Any]
+                let eventsPage = include?["events_page"] as? [String: Any]
+                let filters = body?["filters"] as? [String: Any]
+                try require((filters?["api_key_hashes"] as? [String]) == [targetHash], "analytics must filter by target hash")
+                let data = eventsPage?["before_id"] == nil ? firstPage : secondPage
+                return (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+            }
+            requests.increment("legacy")
+            return (Data(), HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+        }
+        let result = try await service.fetchUsage(atPath: file.path)
+        try require(result.events.count == 2, "analytics pagination must collect both pages")
+        try require(requests.value("analytics") == 2 && requests.value("legacy") == 0, "successful analytics must not call legacy usage")
+        try require(result.events.allSatisfy { $0.counts.total == 140 }, "analytics token mapping must preserve reported total")
+
+        let sameMillisecond = try JSONSerialization.data(withJSONObject: [
+            "events": [
+                "items": [
+                    [
+                        "event_hash": "same-shape-a", "timestamp_ms": 3_000,
+                        "api_key_hash": targetHash, "resolved_model": "model-a",
+                        "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+                    ],
+                    [
+                        "event_hash": "same-shape-b", "timestamp_ms": 3_000,
+                        "api_key_hash": targetHash, "resolved_model": "model-a",
+                        "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+                    ],
+                ],
+                "next_before_ms": 0, "next_before_id": 0, "has_more": false, "total_count": 2,
+            ],
+        ])
+        let sameMillisecondPage = try CliProxyUsageParser.parseAnalyticsPage(
+            data: sameMillisecond,
+            targetAPIKey: targetKey
+        )
+        try require(
+            sameMillisecondPage.events.count == 2 && Set(sameMillisecondPage.events.map(\.id)).count == 2,
+            "distinct upstream analytics events with identical millisecond/token dimensions must not collide"
+        )
+
+        let incremental = CliProxyUsageService { request in
+            let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+            try require((body?["from_ms"] as? NSNumber)?.int64Value == 1_235, "analytics must start one millisecond after the persisted watermark")
+            return (secondPage, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let identity = CliProxyUsageService.configuredSourceIdentities(atPath: file.path).first!
+        _ = try await incremental.fetchUsage(atPath: file.path, latestTimestampMSByIdentity: [identity: 1_234])
+
+        let legacyPayload = try JSONSerialization.data(withJSONObject: [
+            "apis": ["endpoint": ["models": ["model-a": ["details": [[
+                "timestamp": "2026-08-27T00:00:00Z",
+                "api_key_hash": targetHash,
+                "resolved_model": "model-a",
+                "tokens": ["input_tokens": 10, "output_tokens": 5, "total_tokens": 15],
+            ]]]]]],
+        ])
+        let fallbackRequests = RequestCounter()
+        let fallback = CliProxyUsageService { request in
+            if request.httpMethod == "POST" {
+                fallbackRequests.increment("analytics")
+                return (Data(), HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
+            }
+            fallbackRequests.increment("legacy")
+            return (legacyPayload, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let fallbackResult = try await fallback.fetchUsage(atPath: file.path)
+        try require(fallbackResult.events.count == 1, "404 analytics must fall back to legacy usage")
+        try require(fallbackRequests.value("analytics") == 1 && fallbackRequests.value("legacy") == 1, "fallback must make exactly one request per endpoint")
     }
 
     private static func verifyCliProxyMultipleSources() async throws {

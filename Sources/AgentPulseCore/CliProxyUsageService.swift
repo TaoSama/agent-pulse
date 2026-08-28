@@ -27,6 +27,9 @@ public struct CliProxyUsageService: Sendable {
 
     /// management API 用量端点路径（相对 base URL）。
     private static let usagePath = "/v0/management/usage"
+    private static let analyticsPath = "/v0/management/monitoring/analytics"
+    private static let analyticsPageSize = 5_000
+    private static let maxAnalyticsPages = 1_000
 
     /// 鉴权 header：`Authorization: Bearer <management-key>`（实测该部署接受此形式）。
     private static let authorizationHeader = "Authorization"
@@ -70,6 +73,11 @@ public struct CliProxyUsageService: Sendable {
         (try? loadConfigurationSet(atPath: path).configurations.count) ?? 0
     }
 
+    /// 配置中各 CPA 来源的不可逆账本身份，用于按来源读取增量水位。
+    public static func configuredSourceIdentities(atPath path: String) -> [String] {
+        (try? loadConfigurationSet(atPath: path).configurations.map(\.identity)) ?? []
+    }
+
     // MARK: - 采集
 
     /// 拉取并解析目标 apikey 的用量事件。
@@ -82,7 +90,10 @@ public struct CliProxyUsageService: Sendable {
     }
 
     /// 拉取全部已配置来源。来源级 HTTP / 网络失败相互隔离；只要一个来源成功就返回其数据。
-    public func fetchUsage(atPath path: String) async throws -> FetchResult {
+    public func fetchUsage(
+        atPath path: String,
+        latestTimestampMSByIdentity: [String: Int64] = [:]
+    ) async throws -> FetchResult {
         let loaded = try Self.loadConfigurationSet(atPath: path)
         let configurations = loaded.configurations
         var events: [UsageEvent] = []
@@ -92,7 +103,10 @@ public struct CliProxyUsageService: Sendable {
             for configuration in configurations {
                 group.addTask {
                     do {
-                        return .success(try await fetch(configuration))
+                        return .success(try await fetch(
+                            configuration,
+                            fromMS: latestTimestampMSByIdentity[configuration.identity].map { $0 + 1 }
+                        ))
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch let error as URLError where error.code == .cancelled || Task.isCancelled {
@@ -126,26 +140,101 @@ public struct CliProxyUsageService: Sendable {
         )
     }
 
-    private func fetch(_ configuration: Configuration) async throws -> [UsageEvent] {
-        var request = URLRequest(url: configuration.usageURL)
-        request.httpMethod = "GET"
+    private func fetch(_ configuration: Configuration, fromMS: Int64?) async throws -> [UsageEvent] {
+        do {
+            return try await fetchAnalytics(configuration, fromMS: fromMS)
+        } catch AnalyticsFallback.unsupported {
+            return try await fetchLegacyUsage(configuration)
+        }
+    }
+
+    private func fetchAnalytics(_ configuration: Configuration, fromMS: Int64?) async throws -> [UsageEvent] {
+        var beforeMS: Int64?
+        var beforeID: Int64?
+        var pageCount = 0
+        var events: [UsageEvent] = []
+        var seenCursors = Set<String>()
+        let targetHash = CliProxyUsageParser.apiKeyHash(for: configuration.targetAPIKey)
+        let toMS = Int64(Date().timeIntervalSince1970 * 1_000) + 60_000
+
+        while true {
+            try Task.checkCancellation()
+            pageCount += 1
+            guard pageCount <= Self.maxAnalyticsPages else { throw CliProxyUsageError.responseTooLarge }
+            var eventsPage: [String: Any] = ["limit": Self.analyticsPageSize]
+            if let beforeMS, let beforeID {
+                eventsPage["before_ms"] = beforeMS
+                eventsPage["before_id"] = beforeID
+            }
+            let payload: [String: Any] = [
+                "from_ms": fromMS ?? 1,
+                "to_ms": toMS,
+                "filters": ["api_key_hashes": [targetHash]],
+                "include": ["events_page": eventsPage],
+            ]
+            var request = authorizedRequest(url: configuration.analyticsURL, method: "POST", managementKey: configuration.managementKey)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+            let (data, http) = try await perform(request)
+            if [404, 405, 501].contains(http.statusCode) { throw AnalyticsFallback.unsupported }
+            try validate(http: http, data: data)
+            let page: CliProxyUsageParser.AnalyticsPage
+            do {
+                page = try CliProxyUsageParser.parseAnalyticsPage(
+                    data: data,
+                    targetAPIKey: configuration.targetAPIKey,
+                    sourceIdentifier: configuration.sourceIdentifier
+                )
+            } catch CliProxyUsageParser.AnalyticsParseError.incompatibleSchema {
+                throw AnalyticsFallback.unsupported
+            }
+            events.append(contentsOf: page.events)
+            guard page.hasMore else { return events }
+            guard page.nextBeforeMS > 0, page.nextBeforeID > 0 else { throw CliProxyUsageError.network }
+            let cursor = "\(page.nextBeforeMS):\(page.nextBeforeID)"
+            guard seenCursors.insert(cursor).inserted else { throw CliProxyUsageError.network }
+            beforeMS = page.nextBeforeMS
+            beforeID = page.nextBeforeID
+        }
+    }
+
+    private func fetchLegacyUsage(_ configuration: Configuration) async throws -> [UsageEvent] {
+        let request = authorizedRequest(url: configuration.usageURL, method: "GET", managementKey: configuration.managementKey)
+        let (data, http) = try await perform(request)
+        try validate(http: http, data: data)
+        return CliProxyUsageParser.parse(
+            data: data,
+            targetAPIKey: configuration.targetAPIKey,
+            sourceIdentifier: configuration.sourceIdentifier
+        )
+    }
+
+    private func authorizedRequest(url: URL, method: String, managementKey: String) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
         request.timeoutInterval = Self.requestTimeout
         request.setValue(
-            "\(Self.authorizationScheme) \(configuration.managementKey)",
+            "\(Self.authorizationScheme) \(managementKey)",
             forHTTPHeaderField: Self.authorizationHeader
         )
+        return request
+    }
 
-        let data: Data
-        let response: URLResponse
+    private func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         do {
-            (data, response) = try await transport(request)
+            let (data, response) = try await transport(request)
+            guard let http = response as? HTTPURLResponse else { throw CliProxyUsageError.network }
+            return (data, http)
         } catch is CancellationError {
             throw CancellationError()
+        } catch let error as CliProxyUsageError {
+            throw error
         } catch {
             throw CliProxyUsageError.network
         }
+    }
 
-        guard let http = response as? HTTPURLResponse else { throw CliProxyUsageError.network }
+    private func validate(http: HTTPURLResponse, data: Data) throws {
         guard (200...299).contains(http.statusCode) else {
             switch http.statusCode {
             case 401, 403: throw CliProxyUsageError.unauthorized
@@ -153,12 +242,6 @@ public struct CliProxyUsageService: Sendable {
             }
         }
         guard data.count <= Self.maxResponseBytes else { throw CliProxyUsageError.responseTooLarge }
-
-        return CliProxyUsageParser.parse(
-            data: data,
-            targetAPIKey: configuration.targetAPIKey,
-            sourceIdentifier: configuration.sourceIdentifier
-        )
     }
 
     // MARK: - 配置解析
@@ -168,8 +251,15 @@ public struct CliProxyUsageService: Sendable {
         /// nil 为历史默认来源；非 nil 为具名来源标识。
         let sourceIdentifier: String?
         let usageURL: URL
+        let analyticsURL: URL
         let managementKey: String
         let targetAPIKey: String
+        var identity: String {
+            CliProxyUsageParser.sourceIdentity(
+                apiKeyHash: CliProxyUsageParser.apiKeyHash(for: targetAPIKey),
+                sourceIdentifier: sourceIdentifier
+            )
+        }
     }
 
     public struct FetchResult: Sendable, Equatable {
@@ -253,12 +343,15 @@ public struct CliProxyUsageService: Sendable {
     }
 
     private static func configuration(sourceIdentifier: String?, values: [String]) -> Configuration? {
-        guard values.count == 3, values.allSatisfy({ !$0.isEmpty }), let usageURL = usageURL(base: values[0]) else {
+        guard values.count == 3, values.allSatisfy({ !$0.isEmpty }),
+              let usageURL = endpointURL(base: values[0], path: usagePath),
+              let analyticsURL = endpointURL(base: values[0], path: analyticsPath) else {
             return nil
         }
         return Configuration(
             sourceIdentifier: sourceIdentifier,
             usageURL: usageURL,
+            analyticsURL: analyticsURL,
             managementKey: values[1],
             targetAPIKey: values[2]
         )
@@ -283,7 +376,9 @@ public struct CliProxyUsageService: Sendable {
     }
 
     /// 由 base URL 组装 usage 端点 URL；校验传输安全（生产只允许 https，http 仅限 loopback）。
-    static func usageURL(base: String) -> URL? {
+    static func usageURL(base: String) -> URL? { endpointURL(base: base, path: usagePath) }
+
+    private static func endpointURL(base: String, path: String) -> URL? {
         guard let base = URL(string: base),
               var components = URLComponents(url: base, resolvingAgainstBaseURL: false),
               let scheme = components.scheme?.lowercased(),
@@ -294,10 +389,10 @@ public struct CliProxyUsageService: Sendable {
         guard scheme == "https" || (scheme == "http" && isLoopback) else {
             // 内网 IP 场景：允许 http（该部署为内网地址，无 TLS）。仅拒绝明显不安全的公网 http。
             guard scheme == "http", isPrivateHost(host) else { return nil }
-            components.path = usagePath
+            components.path = path
             return components.url
         }
-        components.path = usagePath
+        components.path = path
         return components.url
     }
 
@@ -352,4 +447,8 @@ extension CliProxyUsageError: LocalizedError {
         case .network: return "cliproxyapi 网络异常，采集未完成，请检查网络连接。"
         }
     }
+}
+
+private enum AnalyticsFallback: Error {
+    case unsupported
 }

@@ -293,10 +293,10 @@ enum CoordinatorVerification {
     }
 
     /// A3：无变化轮跳过全库重算。
-    /// - 契约信号：`requiresDerivationCompletion()`（读 raw 派生 dirty 位）——record/网络事件置位，
+    /// - 契约信号：`requiresDerivationCompletion()`（读 raw 派生 dirty 位）——文件 record 置位，
     ///   一次成功 finalizeDerived 清除。协调层据此在 finalize 前 gate，跳过时不做 O(全库) 重算。
     /// - 行为断言（真实 ledger）：record→finalize 后 dirty 清除（可跳过）；重复 finalize 后仍清除；
-    ///   非空 recordNetworkEvents 重新置位（cliproxy 新增仍触发 finalize）；空事件不置位。
+    ///   网络事件同事务局部派生、不置位全库 dirty；空事件也不置位。
     /// - 源文断言：scanNow 闭包用 requiresDerivationCompletion() 门禁 finalizeDerived，跳过分支从
     ///   reportingEligible 读回资格而非重算。
     private static func verifyNoChangeRoundSkipsFinalize(_ source: String) throws {
@@ -334,14 +334,16 @@ enum CoordinatorVerification {
         try ledger.recordNetworkEvents([], source: CliProxyUsageParser.source, hostname: hostname)
         try require(!(try ledger.requiresDerivationCompletion()), "空 recordNetworkEvents 不应置位 dirty（不该触发无谓 finalize）")
 
-        // 非空网络事件：重新置位，使 cliproxy 新增在无文件变化轮仍触发 finalize。
+        // 非空网络事件：同事务局部派生，不得触发全库 finalize。
         let networkEvent = UsageEvent(
             id: "skip-net-1", source: CliProxyUsageParser.source, model: "model", project: "project",
             timestamp: Date(timeIntervalSince1970: 1_700_000_100), counts: UsageTokenCounts(output: 3),
             sessionHash: "session-net", sourceFileHash: "network\u{1}\(CliProxyUsageParser.source)"
         )
         try ledger.recordNetworkEvents([networkEvent], source: CliProxyUsageParser.source, hostname: hostname)
-        try require(try ledger.requiresDerivationCompletion(), "非空 recordNetworkEvents 未置位 dirty，cliproxy 新增会被无变化轮误跳过")
+        try require(!(try ledger.requiresDerivationCompletion()), "网络局部派生不应置位全库 dirty")
+        let networkBuckets = try ledger.buckets(hostname: hostname).filter { $0.source == CliProxyUsageParser.source }
+        try require(networkBuckets.count == 1 && networkBuckets[0].counts.total == 3, "网络局部派生未写入完整 bucket")
 
         // 源文断言：scanNow 闭包必须以 requiresDerivationCompletion() 门禁 finalize，跳过时读 reportingEligible。
         let scanNowBody = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
