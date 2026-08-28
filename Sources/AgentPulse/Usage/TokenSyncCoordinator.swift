@@ -41,6 +41,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         static let ingestBaseURL = "tokenSync.ingestBaseURL"
         static let canonicalHostname = "tokenSync.canonicalHostname"
         static let autoReportInterval = "tokenSync.autoReportIntervalSeconds"
+        static let lastScanAt = "tokenSync.lastScanAt"
+        static let lastReportAt = "tokenSync.lastReportAt"
+        static let lastReportSucceeded = "tokenSync.lastReportSucceeded"
         /// 冻结压实开关：开启后，每轮 finalize 会推进冻结水位并物理删除已固化历史的原始行以省磁盘。
         /// 不可逆操作，默认关闭；仅在用户显式开启时生效（谁开谁删）。
         static let compactionEnabled = "tokenSync.compactionEnabled"
@@ -140,6 +143,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let reportInterval = TokenReportInterval.from(
             seconds: defaults.object(forKey: DefaultsKey.autoReportInterval) as? Int ?? TokenReportInterval.default.rawValue
         )
+        let persistedLastScanAt = defaults.object(forKey: DefaultsKey.lastScanAt) as? Date
+        let persistedLastReportAt = defaults.object(forKey: DefaultsKey.lastReportAt) as? Date
+        let persistedLastReportSucceeded = defaults.object(forKey: DefaultsKey.lastReportSucceeded) as? Bool
         self.autoReportInterval = reportInterval
         // base URL 权威改为合并 env 的 REPORT_BASE_URL；env 缺失时回落到旧 UserDefaults 值（平滑迁移）。
         let baseURL = Self.envBaseURL(url: self.mergedEnvURL) ?? (defaults.string(forKey: DefaultsKey.ingestBaseURL) ?? "")
@@ -195,8 +201,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             reportingEnabled: reporting,
             ingestBaseURL: baseURL,
             canonicalHostname: effectiveHostname.isEmpty ? nil : effectiveHostname,
-            lastScanAt: nil,
-            lastReportAt: nil,
+            lastScanAt: persistedLastScanAt,
+            lastReportAt: persistedLastReportAt,
             configurationStatus: Self.presentationStatus(authority.status),
             configurationError: authority.errorText,
             scanningInProgress: false,
@@ -206,7 +212,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             reportingBlockedReasons: [],
             pendingBuckets: pending.0,
             pendingSessions: pending.1,
-            lastReportSucceeded: nil
+            lastReportSucceeded: persistedLastReportSucceeded
         ))
         // status literal 未显式列出的字段走默认值；间隔与压实开关单独回填以回显持久化档位。
         var initialStatus = statusSubject.value
@@ -639,11 +645,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
         switch result {
         case let .success(outcome):
+            let completedAt = Date()
+            defaults.set(completedAt, forKey: DefaultsKey.lastScanAt)
             publish(outcome.summary)
             // 看板停在 1 天视图时，随本轮扫描顺带刷新账本曲线（30min 粒度，实时性要求低）。
             if dashboardDayActive { refreshDashboardDaySeries(active: true) }
             updateStatus { status in
-                status.lastScanAt = Date()
+                status.lastScanAt = completedAt
                 Self.clearScanProgress(&status)
                 status.configurationError = nil
                 status.reportingEligible = outcome.finalize.reportingEligible
@@ -766,13 +774,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             let succeeded = !report.hasPartialFailures
                 && report.bucketsPending == 0
                 && report.sessionsPending == 0
+            defaults.set(succeeded, forKey: DefaultsKey.lastReportSucceeded)
             updateStatus { status in
                 status.reportingInProgress = false
                 status.pendingBuckets = report.bucketsPending
                 status.pendingSessions = report.sessionsPending
                 status.lastReportSucceeded = succeeded
                 if succeeded {
-                    status.lastReportAt = Date()
+                    let completedAt = Date()
+                    self.defaults.set(completedAt, forKey: DefaultsKey.lastReportAt)
+                    status.lastReportAt = completedAt
                     status.reportingError = nil
                 } else {
                     status.reportingError = Self.partialFailureText(report)
@@ -782,6 +793,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             // 取消：恢复状态，不写错误。
             updateStatus { $0.reportingInProgress = false }
         case let .failure(error):
+            defaults.set(false, forKey: DefaultsKey.lastReportSucceeded)
             updateStatus { status in
                 status.reportingInProgress = false
                 status.lastReportSucceeded = false

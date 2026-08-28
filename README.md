@@ -296,7 +296,7 @@ chmod 600 ~/.claude/.credentials/env/agent-pulse.env
 - **每项双源**：可选「从 env 读取」或「手动填写」。手填经「编辑 → 完成」提交，原子写回该 `0600` 文件（同目录临时文件 + rename，创建即 `0600`，绝不跟随 symlink）。
 - **密钥掩码**：`R2_SECRET_ACCESS_KEY`、`R2_ACCESS_KEY_ID`、`CLIPROXY_MANAGEMENT_KEY`、`CLIPROXY_TARGET_API_KEY` 一律中间星号回显（如 `abcd****wxyz`）；`R2_ACCOUNT_ID`、`R2_ENDPOINT`、`R2_BUCKET`、`R2_PUBLIC_BASE_URL`、`REPORT_BASE_URL`、`REPORT_CANONICAL_HOSTNAME` 明文回显。即便来源是 env，输入框也会回显读到的值（密钥仍掩码）。
 - **API 地址填好不自动开启上报**：`REPORT_BASE_URL` / `REPORT_CANONICAL_HOSTNAME` 就绪只是让上报可被启用，仍需你手动打开上报开关。
-- 应用只把 `.env` 的**路径**与每项**来源（env/手填）**保存到 UserDefaults；所有密钥、base URL、目标 apikey 只在使用时读入内存，绝不写入 UserDefaults、SQLite 或日志。请勿把 `.env`、访问密钥、签名请求或预签名 URL 写入仓库或日志。
+- 凭证配置只把 `.env` 的**路径**与每项**来源（env/手填）**保存到 UserDefaults；另保存不含凭证的 UI 偏好与最近扫描/上报状态。所有密钥、base URL、目标 apikey 只在使用时读入内存，绝不写入 UserDefaults、SQLite 或日志。请勿把 `.env`、访问密钥、签名请求或预签名 URL 写入仓库或日志。
 
 ### R2 剪贴板上传
 
@@ -378,7 +378,7 @@ swift run AgentPulseCollectorSmoke
 - 默认仅本地；未显式开启或配置不完整时不发起上报。
 - 只解析统计所需的日志字段；不保存、不上传、不展示会话正文、标题或完整 cwd。
 - 不在仓库或日志中写入 credential、签名请求或预签名 URL；凭证值仅在使用时读入内存。
-- 凭证与上报简单值只落合并 `.env`（强制 `0600`，写回原子且不跟随 symlink）；密钥在设置页中间星号回显，绝不进 UserDefaults、SQLite 或日志。UserDefaults 只存 `.env` 路径与每项来源（env/手填）。
+- 凭证与上报简单值只落合并 `.env`（强制 `0600`，写回原子且不跟随 symlink）；密钥在设置页中间星号回显，绝不进 UserDefaults、SQLite 或日志。UserDefaults 的配置数据只含 `.env` 路径与每项来源（env/手填），另保存不含凭证的 UI 偏好与最近扫描/上报状态。
 - SQLite 仅保存聚合数值、hash 标识与不含路径/正文的快照。
 - `reporting.json` 只含纯协议结构，不含 API 地址、canonical hostname 或凭证；取 token 命令的 token 不写入 SQLite、UserDefaults 或日志。
 

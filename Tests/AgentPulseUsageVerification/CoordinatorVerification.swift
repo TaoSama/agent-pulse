@@ -21,8 +21,38 @@ enum CoordinatorVerification {
         try verifyReportingAuthorityFromEnv(source)
         try verifyScanProgressReporting(source)
         try verifyAutoReportIntervalIsConfigurable(source)
+        try verifyOperationTimestampsPersistAcrossLaunches(source)
         try verifyNoChangeRoundSkipsFinalize(source)
         print("TokenSyncCoordinator verification passed")
+    }
+
+    /// 设置页展示的最近扫描/上报状态必须跨进程恢复，同时保持既有语义：
+    /// 扫描成功才更新时间；上报失败只更新结果，不覆盖最近一次成功上报时间。
+    private static func verifyOperationTimestampsPersistAcrossLaunches(_ source: String) throws {
+        let initializer = try functionBody(matching: "init(", in: source)
+        try require(
+            initializer.contains("defaults.object(forKey: DefaultsKey.lastScanAt) as? Date")
+                && initializer.contains("defaults.object(forKey: DefaultsKey.lastReportAt) as? Date")
+                && initializer.contains("defaults.object(forKey: DefaultsKey.lastReportSucceeded) as? Bool")
+                && initializer.contains("lastScanAt: persistedLastScanAt")
+                && initializer.contains("lastReportAt: persistedLastReportAt")
+                && initializer.contains("lastReportSucceeded: persistedLastReportSucceeded"),
+            "init 未恢复最近扫描/上报状态"
+        )
+
+        let finishScan = try functionBody(matching: "private func finishScan(", in: source)
+        try require(
+            finishScan.contains("defaults.set(completedAt, forKey: DefaultsKey.lastScanAt)"),
+            "成功扫描未持久化完成时间"
+        )
+
+        let finishReport = try functionBody(matching: "private func finishReport(", in: source)
+        try require(
+            finishReport.contains("defaults.set(succeeded, forKey: DefaultsKey.lastReportSucceeded)")
+                && finishReport.contains("self.defaults.set(completedAt, forKey: DefaultsKey.lastReportAt)")
+                && finishReport.contains("defaults.set(false, forKey: DefaultsKey.lastReportSucceeded)"),
+            "上报完成状态未持久化"
+        )
     }
 
     /// 扫描进度上报契约（E1）：
