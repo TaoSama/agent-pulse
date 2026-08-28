@@ -423,7 +423,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             var didCompact = false
             try transaction {
                 try claimLegacyRawRowsIfUnambiguousUnlocked(hostname: hostname)
-                result = try withThrottledDiskIO {
+                result = try withBackgroundResourcePriority {
                     try recomputeDerivedUnlocked(hostname: hostname, progress: progress)
                 }
                 // 只有显式 finalize 表示调用方已经成功完成整轮来源扫描。其它内部重算
@@ -448,17 +448,22 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    /// 全量派生会顺序读写数 GB SQLite 临时数据。把当前 ledger worker 线程标为磁盘节流，
-    /// 让前台应用和用户交互 I/O 优先；重算结束（含抛错）后恢复调用线程原策略。
-    private func withThrottledDiskIO<T>(_ operation: () throws -> T) rethrows -> T {
-        let previous = getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD)
-        let changed = setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE) == 0
+    /// 全量派生会顺序读写数 GB SQLite 临时数据并持续占用一个核心。把当前 ledger worker
+    /// 线程的 CPU 与磁盘均降为后台优先级，让前台应用和用户交互优先；重算结束（含抛错）后恢复。
+    private func withBackgroundResourcePriority<T>(_ operation: () throws -> T) rethrows -> T {
+        let previousDisk = getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD)
+        let diskChanged = setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE) == 0
+        let previousCPU = getpriority(PRIO_DARWIN_THREAD, 0)
+        let cpuChanged = setpriority(PRIO_DARWIN_THREAD, 0, PRIO_DARWIN_BG) == 0
         defer {
-            if changed {
+            if cpuChanged {
+                _ = setpriority(PRIO_DARWIN_THREAD, 0, previousCPU >= 0 ? previousCPU : 0)
+            }
+            if diskChanged {
                 _ = setiopolicy_np(
                     IOPOL_TYPE_DISK,
                     IOPOL_SCOPE_THREAD,
-                    previous >= 0 ? previous : IOPOL_DEFAULT
+                    previousDisk >= 0 ? previousDisk : IOPOL_DEFAULT
                 )
             }
         }
