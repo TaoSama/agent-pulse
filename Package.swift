@@ -36,9 +36,12 @@ let package = Package(
             name: "AgentPulseReconcileParity",
             dependencies: ["AgentPulseCore", "AgentPulseReporting", "AgentPulseUsage"]
         ),
+        .target(
+            name: "AgentPulseUI"
+        ),
         .executableTarget(
             name: "AgentPulse",
-            dependencies: ["AgentPulseCore", "AgentPulseR2", "AgentPulseReporting", "AgentPulseUsage"]
+            dependencies: ["AgentPulseCore", "AgentPulseR2", "AgentPulseReporting", "AgentPulseUI", "AgentPulseUsage"]
         ),
         .executableTarget(
             name: "AgentPulseCollectorSmoke",
@@ -94,6 +97,11 @@ let package = Package(
         .executableTarget(
             name: "AgentPulseReportingVerification",
             dependencies: ["AgentPulseReporting"]
+        ),
+        .executableTarget(
+            name: "ScanProgressSmootherVerification",
+            dependencies: ["AgentPulseUI"],
+            path: "Tests/ScanProgressSmootherVerification"
         ),
         .executableTarget(
             name: "AgentPulseUsageVerification",

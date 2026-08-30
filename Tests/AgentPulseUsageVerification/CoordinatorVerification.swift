@@ -436,6 +436,8 @@ enum CoordinatorVerification {
             "reportTask?.cancel()",
             "scanGeneration &+= 1",
             "reportGeneration &+= 1",
+            "Self.clearScanProgress(&status)",
+            "status.reportingInProgress = false",
         ] {
             try require(body.contains(required), "stop() 缺少取消/失效保护：\(required)")
         }
