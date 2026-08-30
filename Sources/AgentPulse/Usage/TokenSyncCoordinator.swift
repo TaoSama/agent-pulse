@@ -777,6 +777,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             defaults.set(succeeded, forKey: DefaultsKey.lastReportSucceeded)
             updateStatus { status in
                 status.reportingInProgress = false
+                Self.clearScanProgress(&status)
                 status.pendingBuckets = report.bucketsPending
                 status.pendingSessions = report.sessionsPending
                 status.lastReportSucceeded = succeeded
@@ -791,17 +792,19 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             }
         case let .failure(error) where error is CancellationError:
             // 取消：恢复状态，不写错误。
-            updateStatus { $0.reportingInProgress = false }
+            updateStatus { status in
+                status.reportingInProgress = false
+                Self.clearScanProgress(&status)
+            }
         case let .failure(error):
             defaults.set(false, forKey: DefaultsKey.lastReportSucceeded)
             updateStatus { status in
                 status.reportingInProgress = false
+                Self.clearScanProgress(&status)
                 status.lastReportSucceeded = false
                 status.reportingError = Self.errorText(error)
             }
         }
-        // 上报结束：清除 .reporting 阶段的进度字段，避免残留状态泄漏到后续读取。
-        updateStatus { Self.clearScanProgress(&$0) }
     }
 
     /// 应用启动：触发首轮 scan（本地采集开启时）并按需串接上报；
@@ -867,6 +870,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         reportTask?.cancel()
         reportTask = nil
         reportGeneration &+= 1
+        updateStatus { status in
+            Self.clearScanProgress(&status)
+            status.reportingInProgress = false
+        }
     }
 
     /// 触发扫描并在扫描完成后按当前上报开关串接一次上报（scan 已在跑则直接尝试上报）。

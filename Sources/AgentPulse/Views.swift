@@ -1,5 +1,6 @@
 import AppKit
 import AgentPulseCore
+import AgentPulseUI
 import SwiftUI
 
 let modelTPSPalette: [Color] = [
@@ -81,15 +82,7 @@ private struct TokenScanProgressFooter: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .onAppear {
-            smoother.setTarget(inProgress ? status.scanProgress : nil, phaseCeiling: status.scanPhase?.overallCeiling)
-        }
-        .onChange(of: status.scanProgress) { _, newValue in
-            smoother.setTarget(inProgress ? newValue : nil, phaseCeiling: status.scanPhase?.overallCeiling)
-        }
-        .onChange(of: inProgress) { _, running in
-            smoother.setTarget(running ? status.scanProgress : nil, phaseCeiling: status.scanPhase?.overallCeiling)
-        }
+        .scanProgressAnimation(smoother, progress: status.scanProgress, isRunning: inProgress)
     }
 }
 
