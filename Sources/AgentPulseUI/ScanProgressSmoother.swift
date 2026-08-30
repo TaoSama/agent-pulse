@@ -85,9 +85,29 @@ package final class ScanProgressSmoother: ObservableObject {
         }
     }
 
-    deinit {
-        MainActor.assumeIsolated {
-            ticker?.invalidate()
+    isolated deinit {
+        ticker?.invalidate()
+    }
+}
+
+package extension View {
+    /// 用真实扫描状态驱动平滑器，并在视图离开层级时立即停帧。
+    func scanProgressAnimation(
+        _ smoother: ScanProgressSmoother,
+        progress: Double?,
+        isRunning: Bool
+    ) -> some View {
+        onAppear {
+            smoother.setTarget(isRunning ? progress : nil)
+        }
+        .onChange(of: progress) { _, newValue in
+            smoother.setTarget(isRunning ? newValue : nil)
+        }
+        .onChange(of: isRunning) { _, running in
+            smoother.setTarget(running ? progress : nil)
+        }
+        .onDisappear {
+            smoother.cancelAnimation()
         }
     }
 }

@@ -82,18 +82,7 @@ private struct TokenScanProgressFooter: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .onAppear {
-            smoother.setTarget(inProgress ? status.scanProgress : nil)
-        }
-        .onChange(of: status.scanProgress) { _, newValue in
-            smoother.setTarget(inProgress ? newValue : nil)
-        }
-        .onChange(of: inProgress) { _, running in
-            smoother.setTarget(running ? status.scanProgress : nil)
-        }
-        .onDisappear {
-            smoother.cancelAnimation()
-        }
+        .scanProgressAnimation(smoother, progress: status.scanProgress, isRunning: inProgress)
     }
 }
 
