@@ -519,32 +519,33 @@ enum CategoryFormatting {
 }
 
 struct OrbView: View {
-    @ObservedObject var model: ApplicationModel
+    @ObservedObject var viewModel: OrbViewModel
 
     private static let selectedShell = Color.white
     private static let shellThickness: CGFloat = 4
 
     var body: some View {
-        let trend = model.sparklineRegression.trend
+        let snap = viewModel.snapshot
+        let trend = snap.trend
         ZStack {
-            Circle().fill(model.isOrbExpanded ? Self.selectedShell : Color.black)
+            Circle().fill(snap.isExpanded ? Self.selectedShell : Color.black)
             Circle()
                 .fill(Color.black)
                 .padding(Self.shellThickness)
             VStack(spacing: 1) {
                 SparklineView(
-                    points: model.sparklinePoints,
+                    points: snap.sparklinePoints,
                     trend: trend,
-                    colorMode: model.trendColorMode,
+                    colorMode: snap.trendColorMode,
                     lineWidth: 1.35
                 )
                     .frame(width: 30, height: 12)
-                Text(formatTPS(model.tps))
+                Text(formatTPS(snap.tps))
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(Color.white)
                 // 今日 token 总数：至多两位有效数字 + 单位 + 至多一位小数（1.2M / 15K）。
-                Text(TokenUsageFormatting.compactTokens(model.tokenSummary.day?.totalTokens))
+                Text(TokenUsageFormatting.compactTokens(snap.dayTotalTokens))
                     .font(.system(size: 8, weight: .medium, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(Color.white)
@@ -553,8 +554,8 @@ struct OrbView: View {
         .contentShape(Circle())
         .accessibilityLabel("Agent Pulse 悬浮球")
         .accessibilityValue(
-            model.tps.map {
-                "实时输出每秒 \(String(format: "%.1f", $0)) token，\(model.sparklineRegression.trend.accessibilityText)"
+            snap.tps.map {
+                "实时输出每秒 \(String(format: "%.1f", $0)) token，\(snap.trend.accessibilityText)"
             } ?? "实时输出不可用"
         )
     }

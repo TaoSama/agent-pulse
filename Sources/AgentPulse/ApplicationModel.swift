@@ -18,6 +18,35 @@ enum TrendColorMode: String, CaseIterable, Identifiable {
     }
 }
 
+/// 悬浮球渲染所需的最小状态快照。
+/// 只包含 OrbView 真正读取的字段；Equatable 用于在值未变时跳过发布，
+/// 避免与悬浮球无关的 @Published 变化触发 OrbView 重建与 SwiftUI keypath 重订阅。
+struct OrbSnapshot: Equatable {
+    let tps: Double?
+    let sparklinePoints: [SparklinePoint]
+    let trend: SparklineTrend
+    let trendColorMode: TrendColorMode
+    let dayTotalTokens: Int64?
+    let isExpanded: Bool
+}
+
+/// 悬浮球专用的可观察对象。ApplicationModel 每秒刷新的 20+ 个 @Published 字段
+/// 不会触发它；只有当 OrbSnapshot 真正变化时才发布，从根上切断观察抖动回路。
+@MainActor
+final class OrbViewModel: ObservableObject {
+    @Published private(set) var snapshot: OrbSnapshot
+
+    init(snapshot: OrbSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    /// 仅在快照真正变化时发布，no-op 赋值不触发 objectWillChange。
+    func update(_ newSnapshot: OrbSnapshot) {
+        guard newSnapshot != snapshot else { return }
+        snapshot = newSnapshot
+    }
+}
+
 @MainActor
 final class ApplicationModel: ObservableObject {
     static let shared = ApplicationModel()
@@ -55,6 +84,8 @@ final class ApplicationModel: ObservableObject {
     @Published private(set) var toast: ToastState?
     @Published var isOrbVisible = true
     @Published private(set) var isOrbExpanded = false
+    /// 悬浮球专用观察模型：只在 OrbSnapshot 变化时发布，隔离其余 @Published 的抖动。
+    let orbViewModel: OrbViewModel
 
     /// 合并 env 的双源字段状态与写回（R2 / cliproxy / 上报简单值同源）。
     let envSettings = EnvSettingsModel()
@@ -73,7 +104,8 @@ final class ApplicationModel: ObservableObject {
         // 历史遗留路径键平滑迁移到规范键（见 MergedEnvPreferences）。
         let path = MergedEnvPreferences.resolvePath()
         let savedColorMode = UserDefaults.standard.string(forKey: "trendColorMode")
-        trendColorMode = TrendColorMode(rawValue: savedColorMode ?? "") ?? .risingGreen
+        let initialColorMode = TrendColorMode(rawValue: savedColorMode ?? "") ?? .risingGreen
+        trendColorMode = initialColorMode
         uploadService = UploadService(configPath: path)
         let tokenCoordinator = TokenSyncCoordinator()
         tokenCoordinator.hostnameRenamePrompt = { old, new, decide in
@@ -83,10 +115,20 @@ final class ApplicationModel: ObservableObject {
             }
         }
         tokenSyncCoordinator = tokenCoordinator
-        tokenSummary = tokenCoordinator.summary
+        let initialSummary = tokenCoordinator.summary
+        tokenSummary = initialSummary
         tokenSyncStatus = tokenCoordinator.status
+        orbViewModel = OrbViewModel(snapshot: OrbSnapshot(
+            tps: nil,
+            sparklinePoints: [],
+            trend: .insufficient,
+            trendColorMode: initialColorMode,
+            dayTotalTokens: initialSummary.day?.totalTokens,
+            isExpanded: false
+        ))
         tokenCoordinator.summaryPublisher.sink { [weak self] value in
             self?.tokenSummary = value
+            self?.refreshOrbSnapshot()
         }.store(in: &cancellables)
         tokenCoordinator.statusPublisher.sink { [weak self] value in
             self?.tokenSyncStatus = value
@@ -122,6 +164,7 @@ final class ApplicationModel: ObservableObject {
         }.store(in: &cancellables)
         metricsStore.$tps.sink { [weak self] value in
             self?.tps = value.displayValue
+            self?.refreshOrbSnapshot()
         }.store(in: &cancellables)
         metricsStore.$tpsState.sink { [weak self] in
             self?.tpsState = $0
@@ -131,9 +174,11 @@ final class ApplicationModel: ObservableObject {
         }.store(in: &cancellables)
         metricsStore.$sparklinePoints.sink { [weak self] in
             self?.sparklinePoints = $0
+            self?.refreshOrbSnapshot()
         }.store(in: &cancellables)
         metricsStore.$sparklineRegression.sink { [weak self] in
             self?.sparklineRegression = $0
+            self?.refreshOrbSnapshot()
         }.store(in: &cancellables)
         metricsStore.$modelTPSHistory.sink { [weak self] in
             self?.modelTPSHistory = $0
@@ -163,14 +208,30 @@ final class ApplicationModel: ObservableObject {
         $trendColorMode
             .dropFirst()
             .removeDuplicates()
-            .sink { mode in
+            .sink { [weak self] mode in
                 UserDefaults.standard.set(mode.rawValue, forKey: "trendColorMode")
+                self?.refreshOrbSnapshot()
             }
             .store(in: &cancellables)
     }
 
     var compactSummary: String {
         "Tasks \(format(totalTasks)) · Active \(format(activeTasks)) · TPS \(format(tps))"
+    }
+
+    /// 用当前悬浮球相关字段重建快照并推送给 OrbViewModel。
+    /// 仅在快照真正变化时发布（OrbViewModel.update 内部 Equatable 守卫），
+    /// 与悬浮球无关的 @Published 变化不会走到这里。
+    private func refreshOrbSnapshot() {
+        let snapshot = OrbSnapshot(
+            tps: tps,
+            sparklinePoints: sparklinePoints,
+            trend: sparklineRegression.trend,
+            trendColorMode: trendColorMode,
+            dayTotalTokens: tokenSummary.day?.totalTokens,
+            isExpanded: isOrbExpanded
+        )
+        orbViewModel.update(snapshot)
     }
 
     func start() {
@@ -188,6 +249,7 @@ final class ApplicationModel: ObservableObject {
 
     func setOrbExpanded(_ expanded: Bool) {
         isOrbExpanded = expanded
+        refreshOrbSnapshot()
     }
 
     func toggleOrb() {
