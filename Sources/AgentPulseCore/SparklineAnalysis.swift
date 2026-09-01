@@ -181,6 +181,29 @@ public enum DashboardTPSSpan: String, Sendable, Equatable, CaseIterable, Identif
     }
 }
 
+/// 一次曲线计算的完整结果。点与回归同源，必须整体消费：
+/// 分开发布会让订阅方看到「新点配旧趋势」的中间态。
+public struct Sparkline: Sendable, Equatable {
+    public let points: [SparklinePoint]
+    public let regression: SparklineRegression
+
+    public init(points: [SparklinePoint], regression: SparklineRegression) {
+        self.points = points
+        self.regression = regression
+    }
+
+    /// 空曲线：趋势为数据不足。用作订阅方的初始值。
+    public static let empty = Sparkline(
+        points: [],
+        regression: SparklineRegression(
+            slopePerSecond: nil,
+            normalizedSlope: nil,
+            sampleCount: 0,
+            trend: .insufficient
+        )
+    )
+}
+
 /// 趋势回归结果。
 public struct SparklineRegression: Sendable, Equatable {
     /// 最小二乘斜率，单位为 TPS/秒（可正可负）。数据不足时为 nil。
@@ -634,7 +657,7 @@ public enum SparklineAnalysis {
         windowSeconds: TimeInterval = defaultWindowSeconds,
         stepSeconds: TimeInterval = defaultStepSeconds,
         kernel: SparklineSmoothingKernel = .gaussian(radius: 2)
-    ) -> (points: [SparklinePoint], regression: SparklineRegression) {
+    ) -> Sparkline {
         let resampled = resample(samples, end: end, windowSeconds: windowSeconds, stepSeconds: stepSeconds)
         let interpolated = interpolateGaps(resampled)
         let smoothed = smooth(interpolated, kernel: kernel)
@@ -645,7 +668,7 @@ public enum SparklineAnalysis {
         let points = zip(resampled, normalizedSmoothed).map { raw, smooth in
             SparklinePoint(time: raw.time, value: raw.value, normalized: smooth.normalized)
         }
-        return (points, regressionResult)
+        return Sparkline(points: points, regression: regressionResult)
     }
 
     /// 看板专用总曲线：每点为该秒前 5s 滑窗真实速率，点粒度仍每秒一点；

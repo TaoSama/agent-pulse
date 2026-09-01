@@ -1922,7 +1922,7 @@ struct AgentPulseCoreVerification {
             )
         }
 
-        func series(_ values: [Double]) -> (points: [SparklinePoint], regression: SparklineRegression) {
+        func series(_ values: [Double]) -> Sparkline {
             SparklineAnalysis.makeSparkline(
                 from: values.enumerated().map { liveSample(minute: $0.offset, tps: $0.element) },
                 end: end,
@@ -1932,6 +1932,17 @@ struct AgentPulseCoreVerification {
         }
 
         try require(SparklineAnalysis.defaultWindowSeconds == 15 * 60, "sparkline window must be fifteen minutes")
+
+        // 点与趋势必须是一个原子值：分成两个字段发布会让订阅方读到新点配旧趋势的中间态。
+        // Equatable 让发布侧能在整体未变时跳过发布；两条不同曲线必须整体不等。
+        let atomicRising = series((1...16).map(Double.init))
+        let atomicFalling = series((1...16).reversed().map(Double.init))
+        try require(atomicRising == series((1...16).map(Double.init)), "same input must yield an equal Sparkline value")
+        try require(atomicRising != atomicFalling, "different series must not compare equal")
+        try require(
+            Sparkline.empty.points.isEmpty && Sparkline.empty.regression.trend == .insufficient,
+            "Sparkline.empty must carry no points and an insufficient trend"
+        )
 
         let rising = series((1...16).map(Double.init))
         try require(rising.points.count == 16, "fifteen-minute minute-step resampling count mismatch")

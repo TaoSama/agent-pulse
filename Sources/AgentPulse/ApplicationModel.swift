@@ -64,13 +64,10 @@ final class ApplicationModel: ObservableObject {
     @Published private(set) var tps: Double?
     @Published private(set) var tpsState: LiveRateState = .noData
     @Published private(set) var tpsHistory: [TPSPoint] = []
-    @Published private(set) var sparklinePoints: [SparklinePoint] = []
-    @Published private(set) var sparklineRegression = SparklineRegression(
-        slopePerSecond: nil,
-        normalizedSlope: nil,
-        sampleCount: 0,
-        trend: .insufficient
-    )
+    /// 点与趋势同源，作为一个值镜像，避免视图看到新点配旧趋势的中间态。
+    @Published private(set) var sparkline: Sparkline = .empty
+    var sparklinePoints: [SparklinePoint] { sparkline.points }
+    var sparklineRegression: SparklineRegression { sparkline.regression }
     @Published private(set) var modelTPSHistory: [ModelTPSHistory] = []
     /// 看板不重叠桶曲线（前三档跨度，来自每秒样本）。1 天跨度改用 dashboardDaySeries。
     @Published private(set) var dashboardSparklinePoints: [SparklinePoint] = []
@@ -170,11 +167,8 @@ final class ApplicationModel: ObservableObject {
         metricsStore.$tpsHistory.sink { [weak self] in
             self?.tpsHistory = $0
         }.store(in: &cancellables)
-        metricsStore.$sparklinePoints.sink { [weak self] in
-            self?.sparklinePoints = $0
-        }.store(in: &cancellables)
-        metricsStore.$sparklineRegression.sink { [weak self] in
-            self?.sparklineRegression = $0
+        metricsStore.$sparkline.sink { [weak self] in
+            self?.sparkline = $0
         }.store(in: &cancellables)
         metricsStore.$modelTPSHistory.sink { [weak self] in
             self?.modelTPSHistory = $0
@@ -211,13 +205,12 @@ final class ApplicationModel: ObservableObject {
         subscribeOrbSnapshotInputs()
     }
 
-    /// 悬浮球的输入分布在多个 @Published 上，其中曲线的点与趋势是连续两次赋值。
-    /// 合成一路订阅后，同一轮采集只重建并发布一次快照，也不会出现新点配旧趋势的中间态。
+    /// 悬浮球的输入分布在多个 @Published 上。曲线的点与趋势已合成 Sparkline 单值，
+    /// 一轮采集只会各赋值一次；合成一路订阅后同一轮只重建并发布一次快照。
     private func subscribeOrbSnapshotInputs() {
-        let metrics = Publishers.CombineLatest3(
+        let metrics = Publishers.CombineLatest(
             metricsStore.$tps,
-            metricsStore.$sparklinePoints,
-            metricsStore.$sparklineRegression
+            metricsStore.$sparkline
         ).map { _ in () }
         let presentation = Publishers.CombineLatest(
             $tokenSummary,

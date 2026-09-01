@@ -42,8 +42,7 @@ public struct ModelTPSHistory: Sendable, Equatable, Identifiable {
 /// 每秒刷新时由样本历史派生的曲线集合。全部为纯计算结果，可在后台线程算好后
 /// 一次性回主线程赋值，避免每秒在主线程重跑总曲线 + 每模型曲线 ×2 套口径。
 private struct DerivedSeries: Sendable {
-    var sparklinePoints: [SparklinePoint]
-    var sparklineRegression: SparklineRegression
+    var sparkline: Sparkline
     var modelTPSHistory: [ModelTPSHistory]
     var dashboardSparklinePoints: [SparklinePoint]
     var dashboardModelTPSHistory: [ModelTPSHistory]
@@ -96,13 +95,8 @@ public final class MetricsStore: ObservableObject {
     @Published public private(set) var tps: MetricValue<Double> = .unavailable(reason: "正在读取会话")
     @Published public private(set) var tpsState: LiveRateState = .noData
     @Published public private(set) var tpsHistory: [TPSPoint] = []
-    @Published public private(set) var sparklinePoints: [SparklinePoint] = []
-    @Published public private(set) var sparklineRegression = SparklineRegression(
-        slopePerSecond: nil,
-        normalizedSlope: nil,
-        sampleCount: 0,
-        trend: .insufficient
-    )
+    /// 点与趋势同源，合成一个值一次发布：分开发布会让订阅方看到新点配旧趋势的中间态。
+    @Published public private(set) var sparkline: Sparkline = .empty
     @Published public private(set) var modelTPSHistory: [ModelTPSHistory] = []
     /// 看板专用曲线：不重叠桶（按当前跨度）的平均 TPS，前三档来自每秒逐秒净增量。
     /// 1 天跨度不走这里（改用 coordinator 的 day series）。
@@ -219,8 +213,7 @@ public final class MetricsStore: ObservableObject {
                 model: makeModelTPSHistory,
                 dashboardModel: makeDashboardModelTPSHistory
             )
-            publish(derived.sparklinePoints, to: \.sparklinePoints)
-            publish(derived.sparklineRegression, to: \.sparklineRegression)
+            publish(derived.sparkline, to: \.sparkline)
             modelTPSHistory = derived.modelTPSHistory
             dashboardSparklinePoints = derived.dashboardSparklinePoints
             dashboardModelTPSHistory = derived.dashboardModelTPSHistory
@@ -307,8 +300,7 @@ public final class MetricsStore: ObservableObject {
             from: restored.history,
             end: snapshot.timestamp
         )
-        publish(sparkline.points, to: \.sparklinePoints)
-        publish(sparkline.regression, to: \.sparklineRegression)
+        publish(sparkline, to: \.sparkline)
         modelTPSHistory = makeModelTPSHistory(from: restored.history, end: snapshot.timestamp)
         // 看板不重叠桶：用恢复的较长历史（最多 3600s）按当前跨度重算并缓存。
         dashboardSampleCache = restored.dashboardHistory
@@ -344,8 +336,7 @@ public final class MetricsStore: ObservableObject {
                 dashboardModelHistory = []
             }
             return DerivedSeries(
-                sparklinePoints: sparkline.points,
-                sparklineRegression: sparkline.regression,
+                sparkline: sparkline,
                 modelTPSHistory: modelHistory,
                 dashboardSparklinePoints: dashboardPoints,
                 dashboardModelTPSHistory: dashboardModelHistory
