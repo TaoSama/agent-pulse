@@ -10,7 +10,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "AgentPulse", targets: ["AgentPulse"]),
-        .executable(name: "AgentPulseCollectorSmoke", targets: ["AgentPulseCollectorSmoke"]),
+        .executable(name: "AgentPulseCollectorVerification", targets: ["AgentPulseCollectorVerification"]),
         .executable(name: "AgentPulseUsageSmoke", targets: ["AgentPulseUsageSmoke"]),
         .library(name: "AgentPulseCore", targets: ["AgentPulseCore"]),
         .library(name: "AgentPulseR2", targets: ["AgentPulseR2"]),
@@ -44,8 +44,9 @@ let package = Package(
             dependencies: ["AgentPulseCore", "AgentPulseR2", "AgentPulseReporting", "AgentPulseUI", "AgentPulseUsage"]
         ),
         .executableTarget(
-            name: "AgentPulseCollectorSmoke",
-            dependencies: ["AgentPulseCore"]
+            name: "AgentPulseCollectorVerification",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/AgentPulseCollectorVerification"
         ),
         .executableTarget(
             name: "AgentPulseUsageSmoke",
