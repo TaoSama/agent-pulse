@@ -299,6 +299,36 @@ public actor CodexRuntimeMetricsCollector {
         let resourceIdentifier: String?
     }
 
+    private struct FileStatus {
+        let modifiedAt: Date?
+        let createdAt: Date?
+        let size: Int?
+        /// device:inode, so a path silently replaced by a different file is
+        /// detected even when size and timestamps happen to match.
+        let resourceIdentifier: String?
+    }
+
+    /// Single stat(2) for the fields FileSignature needs, with no extended
+    /// attribute traffic and no URL-level caching.
+    private static func fileStatus(atPath path: String) -> FileStatus? {
+        var info = stat()
+        guard stat(path, &info) == 0 else { return nil }
+        return FileStatus(
+            modifiedAt: Self.date(from: info.st_mtimespec),
+            createdAt: Self.date(from: info.st_birthtimespec),
+            size: Int(info.st_size),
+            resourceIdentifier: "\(info.st_dev):\(info.st_ino)"
+        )
+    }
+
+    private static func date(from time: timespec) -> Date? {
+        guard time.tv_sec > 0 else { return nil }
+        return Date(
+            timeIntervalSince1970: Double(time.tv_sec)
+                + Double(time.tv_nsec) / Double(NSEC_PER_SEC)
+        )
+    }
+
     private struct FileSummary {
         let completedIdentities: Set<String>
         let desktopTask: SessionTaskState?
@@ -950,9 +980,9 @@ public actor CodexRuntimeMetricsCollector {
                     continue
                 }
                 guard !liveTrackedPaths.contains(canonicalURL.path) else { continue }
-                guard let attributes = try? fileManager.attributesOfItem(atPath: canonicalURL.path),
-                      let size = (attributes[.size] as? NSNumber)?.intValue,
-                      let modifiedAt = attributes[.modificationDate] as? Date else {
+                guard let values = try? canonicalURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+                      let size = values.fileSize,
+                      let modifiedAt = values.contentModificationDate else {
                     continue
                 }
                 guard size > 0 else {
@@ -1034,25 +1064,21 @@ public actor CodexRuntimeMetricsCollector {
             return
         }
 
-        let attributes: [FileAttributeKey: Any]
-        do {
-            attributes = try FileManager.default.attributesOfItem(atPath: file.path)
-        } catch {
+        // stat(2) directly: FileManager.attributesOfItem additionally pulls every
+        // extended attribute (listxattr plus one getxattr per key), which is pure
+        // overhead for the four fields the signature needs. URL.resourceValues is
+        // not usable here either, because tracked URLs are reused across scans and
+        // it caches the first values it read, so an appended file would keep its
+        // stale signature and be wrongly served from cache.
+        guard let status = Self.fileStatus(atPath: file.path) else {
             accumulator.unreadableFiles += 1
             return
         }
-        let device = (attributes[.systemNumber] as? NSNumber)?.uint64Value
-        let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value
-        let resourceIdentifier: String? = if let device, let inode {
-            "\(device):\(inode)"
-        } else {
-            nil
-        }
         let signature = FileSignature(
-            modifiedAt: attributes[.modificationDate] as? Date,
-            createdAt: attributes[.creationDate] as? Date,
-            size: (attributes[.size] as? NSNumber)?.intValue,
-            resourceIdentifier: resourceIdentifier
+            modifiedAt: status.modifiedAt,
+            createdAt: status.createdAt,
+            size: status.size,
+            resourceIdentifier: status.resourceIdentifier
         )
         if let cached = fileCache[file.path], cached.signature == signature {
             accumulator.filesReusedFromCache += 1

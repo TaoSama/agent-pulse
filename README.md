@@ -347,6 +347,7 @@ chmod 600 ~/.claude/.credentials/env/agent-pulse.env
 
 ```bash
 swift run AgentPulseCoreVerification   # 核心采集 / TPS / 曲线逻辑
+swift run AgentPulseCollectorVerification   # 采集器发现 / 缓存复用 / 排除与不可读兜底
 swift run AgentPulseR2Verification     # R2 签名 / Key / URL
 swift run AgentPulseReportingVerification # 通用上报传输层
 swift run AgentPulseUsageVerification     # 账本到上报 payload 的离线组装
@@ -363,12 +364,6 @@ swift run ReconcileParityVerification       # 本地账本聚合与 upstream rec
 AGENT_PULSE_PREFLIGHT_DB=/absolute/path/to/offline-usage.sqlite3 \
 AGENT_PULSE_PREFLIGHT_HOSTNAME=your-device-name \
 swift run ProductionDatabasePreflightVerification
-```
-
-读取本机真实数据的脱敏 smoke，只输出聚合数与状态，不输出会话 ID、标题、cwd、正文或凭证：
-
-```bash
-swift run AgentPulseCollectorSmoke
 ```
 
 ---

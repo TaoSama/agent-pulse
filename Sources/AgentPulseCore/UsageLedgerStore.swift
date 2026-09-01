@@ -640,6 +640,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // logical ID 结果会被 lineage/content 去重、冲突统计和 session project 共同使用，只物化一次，
         // 避免每个消费者都重新扫描和排序完整 usage_events 历史。
         try exec("DROP TABLE IF EXISTS temp_logical_events;")
+        try exec("DROP TABLE IF EXISTS temp_lineage_events;")
         try exec("DROP TABLE IF EXISTS temp_deduped_events;")
         let bucketMs = Self.bucketMilliseconds
         let logicalSQL = """
@@ -709,15 +710,16 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try done(logicalStmt)
         }
 
-        let dedupSQL = """
-            CREATE TEMP TABLE temp_deduped_events AS
+        // lineage 去重的中间结果单独物化：content 去重和折叠数统计都要用它，
+        // 否则两处各自重跑一遍 PARTITION BY lineage_fingerprint 的窗口排序。
+        let lineageSQL = """
+            CREATE TEMP TABLE temp_lineage_events AS
             WITH
             lineage_ranked AS (
                 SELECT *, ROW_NUMBER() OVER (PARTITION BY lineage_fingerprint ORDER BY inherited ASC, timestamp_ms ASC) AS rn
                 FROM temp_logical_events
                 WHERE lineage_fingerprint <> ''
-            ),
-            lineage_dedup AS (
+            )
                 SELECT source, event_id, model, project, timestamp_ms,
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                        reasoning_output_tokens, total_tokens, session_hash,
@@ -730,15 +732,20 @@ public final class UsageLedgerStore: @unchecked Sendable {
                        reasoning_output_tokens, total_tokens, session_hash,
                        inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
                        skill_counts_json, mcp_counts_json, merge_strategy
-                FROM temp_logical_events WHERE lineage_fingerprint = ''
-            ),
+                FROM temp_logical_events WHERE lineage_fingerprint = '';
+            """
+        try exec(lineageSQL)
+
+        let dedupSQL = """
+            CREATE TEMP TABLE temp_deduped_events AS
+            WITH
             content_ranked AS (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY codex_dedup_key
                     ORDER BY (input_tokens + output_tokens + cached_input_tokens
                               + cache_creation_input_tokens + reasoning_output_tokens) DESC
                 ) AS rn
-                FROM lineage_dedup
+                FROM temp_lineage_events
                 WHERE codex_dedup_key <> ''
             ),
             content_dedup AS (
@@ -754,7 +761,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                        reasoning_output_tokens, total_tokens, session_hash,
                        inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
                        skill_counts_json, mcp_counts_json, merge_strategy
-                FROM lineage_dedup WHERE codex_dedup_key = ''
+                FROM temp_lineage_events WHERE codex_dedup_key = ''
             )
             SELECT * FROM content_dedup;
             """
@@ -764,22 +771,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // 计算 lineage / content 去重折叠数：从原始事件经 tier+logical 去重后，
         // 按 lineage_fingerprint / codex_dedup_key 统计被折叠的事件数。
         let collapseCountSQL = """
-            WITH lineage_ranked AS (
-                SELECT lineage_fingerprint, codex_dedup_key,
-                       ROW_NUMBER() OVER (PARTITION BY lineage_fingerprint ORDER BY inherited ASC, timestamp_ms ASC) AS rn
-                FROM temp_logical_events
-                WHERE lineage_fingerprint <> ''
-            ),
-            lineage_dedup AS (
-                SELECT lineage_fingerprint, codex_dedup_key FROM lineage_ranked WHERE rn = 1
-                UNION ALL
-                SELECT lineage_fingerprint, codex_dedup_key FROM temp_logical_events WHERE lineage_fingerprint = ''
-            )
             SELECT
                 (SELECT COUNT(*) FROM temp_logical_events WHERE lineage_fingerprint <> '')
                     - (SELECT COUNT(DISTINCT lineage_fingerprint) FROM temp_logical_events WHERE lineage_fingerprint <> '') AS collapsed_inherited,
-                (SELECT COUNT(*) FROM lineage_dedup WHERE codex_dedup_key <> '')
-                    - (SELECT COUNT(DISTINCT codex_dedup_key) FROM lineage_dedup WHERE codex_dedup_key <> '') AS collapsed_content,
+                (SELECT COUNT(*) FROM temp_lineage_events WHERE codex_dedup_key <> '')
+                    - (SELECT COUNT(DISTINCT codex_dedup_key) FROM temp_lineage_events WHERE codex_dedup_key <> '') AS collapsed_content,
                 (SELECT COUNT(*) FROM temp_logical_events WHERE inherited = 1 AND lineage_fingerprint = '') AS unprovable_inherited,
                 (SELECT COALESCE(SUM(has_identity_conflict), 0) FROM temp_logical_events) AS identity_conflicts
             """
@@ -1065,6 +1061,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         advanceStage() // 6) session 聚合完成
 
         try exec("DROP TABLE IF EXISTS temp_logical_events;")
+        try exec("DROP TABLE IF EXISTS temp_lineage_events;")
 
 
         // 差异写入：仅对内容变化的行提升 revision，未变行保持原 revision/synced。
@@ -2282,14 +2279,23 @@ public final class UsageLedgerStore: @unchecked Sendable {
         guard !fileIDs.isEmpty else { return }
         try queue.sync {
             try transaction {
-                let statement = try prepare("UPDATE usage_files SET scan_status=?, updated_at_ms=? WHERE file_id=?;")
+                // 只更新真正还不是 missing 的行：未登记的 fileID 与已经 missing 的行都不存在 tier 变化，
+                // 若也置脏位就会让下一轮扫描白跑一次全库重算。
+                let statement = try prepare("UPDATE usage_files SET scan_status=?, updated_at_ms=? WHERE file_id=? AND scan_status<>'missing';")
                 defer { sqlite3_finalize(statement) }
                 let nowMs = millis(Date())
+                var changedRows = 0
                 for fileID in fileIDs {
                     sqlite3_reset(statement); sqlite3_clear_bindings(statement)
                     try bind(statement, 1, "missing"); try bind(statement, 2, nowMs); try bind(statement, 3, fileID)
                     try done(statement)
+                    changedRows += Int(sqlite3_changes(db))
                 }
+                // scan_status 参与派生：tier 由文件是否 active 决定，转 missing 会把其事件
+                // 从 ownedActive 降为 ownedHistory，可能改变 logical dedup 选中的行。
+                // 不置脏位则派生表会一直沿用旧 tier 的结果。
+                guard changedRows > 0 else { return }
+                try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
             }
         }
     }
@@ -2322,6 +2328,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     try bind(update, 1, nowMs); try bind(update, 2, normalizedSource); try bind(update, 3, fileID)
                     try done(update)
                 }
+                // 只有真的有文件转 missing 时才置脏位（上面已 guard 空集提前返回），
+                // 否则每轮扫描都会退化成全库重算。
+                try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
             }
         }
     }
