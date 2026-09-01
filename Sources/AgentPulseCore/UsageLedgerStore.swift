@@ -2279,17 +2279,22 @@ public final class UsageLedgerStore: @unchecked Sendable {
         guard !fileIDs.isEmpty else { return }
         try queue.sync {
             try transaction {
-                let statement = try prepare("UPDATE usage_files SET scan_status=?, updated_at_ms=? WHERE file_id=?;")
+                // 只更新真正还不是 missing 的行：未登记的 fileID 与已经 missing 的行都不存在 tier 变化，
+                // 若也置脏位就会让下一轮扫描白跑一次全库重算。
+                let statement = try prepare("UPDATE usage_files SET scan_status=?, updated_at_ms=? WHERE file_id=? AND scan_status<>'missing';")
                 defer { sqlite3_finalize(statement) }
                 let nowMs = millis(Date())
+                var changedRows = 0
                 for fileID in fileIDs {
                     sqlite3_reset(statement); sqlite3_clear_bindings(statement)
                     try bind(statement, 1, "missing"); try bind(statement, 2, nowMs); try bind(statement, 3, fileID)
                     try done(statement)
+                    changedRows += Int(sqlite3_changes(db))
                 }
                 // scan_status 参与派生：tier 由文件是否 active 决定，转 missing 会把其事件
                 // 从 ownedActive 降为 ownedHistory，可能改变 logical dedup 选中的行。
                 // 不置脏位则派生表会一直沿用旧 tier 的结果。
+                guard changedRows > 0 else { return }
                 try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
             }
         }

@@ -391,6 +391,18 @@ enum CoordinatorVerification {
         )
         _ = try ledger.finalizeDerived(hostname: hostname)
 
+        // fileIDs 重载：未登记的 fileID 与已经 missing 的行都没有 tier 变化，同样不得置位。
+        try ledger.markFilesMissing(fileIDs: ["never-registered-file"])
+        try require(
+            !(try ledger.requiresDerivationCompletion()),
+            "未登记的 fileID 不应置位 dirty（无 tier 变化）"
+        )
+        try ledger.markFilesMissing(fileIDs: ["skip-file"])
+        try require(
+            !(try ledger.requiresDerivationCompletion()),
+            "已经 missing 的文件重复标记不应置位 dirty（无 tier 变化）"
+        )
+
         // 源文断言：scanNow 闭包必须以 requiresDerivationCompletion() 门禁 finalize，跳过时读 reportingEligible。
         let scanNowBody = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
         try require(
