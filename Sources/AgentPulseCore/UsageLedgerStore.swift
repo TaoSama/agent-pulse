@@ -2287,6 +2287,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     try bind(statement, 1, "missing"); try bind(statement, 2, nowMs); try bind(statement, 3, fileID)
                     try done(statement)
                 }
+                // scan_status 参与派生：tier 由文件是否 active 决定，转 missing 会把其事件
+                // 从 ownedActive 降为 ownedHistory，可能改变 logical dedup 选中的行。
+                // 不置脏位则派生表会一直沿用旧 tier 的结果。
+                try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
             }
         }
     }
@@ -2319,6 +2323,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     try bind(update, 1, nowMs); try bind(update, 2, normalizedSource); try bind(update, 3, fileID)
                     try done(update)
                 }
+                // 只有真的有文件转 missing 时才置脏位（上面已 guard 空集提前返回），
+                // 否则每轮扫描都会退化成全库重算。
+                try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
             }
         }
     }
