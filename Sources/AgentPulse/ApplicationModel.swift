@@ -128,7 +128,6 @@ final class ApplicationModel: ObservableObject {
         ))
         tokenCoordinator.summaryPublisher.sink { [weak self] value in
             self?.tokenSummary = value
-            self?.refreshOrbSnapshot()
         }.store(in: &cancellables)
         tokenCoordinator.statusPublisher.sink { [weak self] value in
             self?.tokenSyncStatus = value
@@ -164,7 +163,6 @@ final class ApplicationModel: ObservableObject {
         }.store(in: &cancellables)
         metricsStore.$tps.sink { [weak self] value in
             self?.tps = value.displayValue
-            self?.refreshOrbSnapshot()
         }.store(in: &cancellables)
         metricsStore.$tpsState.sink { [weak self] in
             self?.tpsState = $0
@@ -174,11 +172,9 @@ final class ApplicationModel: ObservableObject {
         }.store(in: &cancellables)
         metricsStore.$sparklinePoints.sink { [weak self] in
             self?.sparklinePoints = $0
-            self?.refreshOrbSnapshot()
         }.store(in: &cancellables)
         metricsStore.$sparklineRegression.sink { [weak self] in
             self?.sparklineRegression = $0
-            self?.refreshOrbSnapshot()
         }.store(in: &cancellables)
         metricsStore.$modelTPSHistory.sink { [weak self] in
             self?.modelTPSHistory = $0
@@ -208,10 +204,27 @@ final class ApplicationModel: ObservableObject {
         $trendColorMode
             .dropFirst()
             .removeDuplicates()
-            .sink { [weak self] mode in
+            .sink { mode in
                 UserDefaults.standard.set(mode.rawValue, forKey: "trendColorMode")
-                self?.refreshOrbSnapshot()
             }
+            .store(in: &cancellables)
+        subscribeOrbSnapshotInputs()
+    }
+
+    /// 悬浮球的输入分布在多个 @Published 上，其中曲线的点与趋势是连续两次赋值。
+    /// 合成一路订阅后，同一轮采集只重建并发布一次快照，也不会出现新点配旧趋势的中间态。
+    private func subscribeOrbSnapshotInputs() {
+        let metrics = Publishers.CombineLatest3(
+            metricsStore.$tps,
+            metricsStore.$sparklinePoints,
+            metricsStore.$sparklineRegression
+        ).map { _ in () }
+        let presentation = Publishers.CombineLatest(
+            $tokenSummary,
+            $trendColorMode
+        ).map { _ in () }
+        Publishers.Merge3(metrics, presentation, $isOrbExpanded.map { _ in () })
+            .sink { [weak self] _ in self?.refreshOrbSnapshot() }
             .store(in: &cancellables)
     }
 
@@ -249,7 +262,6 @@ final class ApplicationModel: ObservableObject {
 
     func setOrbExpanded(_ expanded: Bool) {
         isOrbExpanded = expanded
-        refreshOrbSnapshot()
     }
 
     func toggleOrb() {
