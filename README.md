@@ -359,6 +359,16 @@ swift run ReconcileParityVerification       # 本地账本聚合与 upstream rec
 swift run LedgerRebuildVerification         # 账本重建链路：迁移 / reset / 重扫 / 派生
 ```
 
+`ReconcileParityVerification` 默认只跑离线段：实拉需要 reporting.json + REPORT_BASE_URL + 可用凭证，
+缺任何一项都会打印「跳过实拉」并以 0 退出。发布前要验证与服务端真的对齐，必须显式要求实拉：
+
+```bash
+AGENT_PULSE_RECONCILE_REQUIRE_LIVE=1 swift run ReconcileParityVerification
+```
+
+该模式下配置不全即 exit 2（不再静默跳过）；拉到数据后任一 authoritative 维度不等即 exit 1，
+失败信息只含维度名与数字，不输出 token / 凭证 / 会话正文。
+
 ---
 
 ## 🔒 隐私与安全
