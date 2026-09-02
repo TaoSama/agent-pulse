@@ -6,9 +6,9 @@ import SQLite3
 /// resetForRebuild, full rescan from transcripts, and derived aggregation.
 ///
 /// Everything runs against a purpose-built transcript tree and a throwaway
-/// database under the system temporary directory. The production ledger is
-/// never opened, copied, or read - it is only referenced by path so the
-/// live-database guard itself can be exercised.
+/// database under the system temporary directory. No path outside that
+/// directory is opened, read, or even referenced, so the live ledger cannot be
+/// reached from here at all.
 ///
 /// UsageLedgerStore.resetForRebuild carries the note "生产不调用此路径", so this
 /// target is its only guard. Run with:
@@ -16,68 +16,10 @@ import SQLite3
 @main
 struct LedgerRebuildVerification {
     static func main() throws {
-        try verifyLiveDatabaseGuard()
         try verifyLegacySchemaMigrationPreservesWatermark()
         try verifyRebuildChain()
         print("LedgerRebuildVerification: PASS")
     }
-}
-
-// MARK: - Live database guard
-
-/// The rebuild chain is destructive: it clears every rebuildable table before
-/// rescanning. Pointing it at the live ledger would wipe history that no longer
-/// exists on disk, so the guard must reject both the live path itself and any
-/// hard link to it. Verified by assertion rather than by a startup check that
-/// nobody observes - and without ever opening the live database.
-private func verifyLiveDatabaseGuard() throws {
-    let fixture = try Fixture(label: "live-guard")
-    defer { fixture.cleanUp() }
-
-    let live = try liveDatabaseURL()
-    try require(!isRebuildTarget(live, live: live), "the live ledger path must be rejected")
-
-    let ledgerPath = fixture.root.appendingPathComponent("usage.sqlite3", isDirectory: false)
-    try Data().write(to: ledgerPath)
-    try require(isRebuildTarget(ledgerPath, live: live), "an independent copy must be accepted")
-
-    let link = fixture.root.appendingPathComponent("hardlink.sqlite3", isDirectory: false)
-    try FileManager.default.linkItem(at: ledgerPath, to: link)
-    try require(!isRebuildTarget(link, live: ledgerPath), "a hard link to the ledger must be rejected")
-
-    let absent = fixture.root.appendingPathComponent("missing.sqlite3", isDirectory: false)
-    try require(!isRebuildTarget(absent, live: live), "a non-existent path must be rejected")
-}
-
-/// Accepts a path only when it exists, is not the live ledger, and does not
-/// share an inode with it. Neither database is opened.
-private func isRebuildTarget(_ candidate: URL, live: URL) -> Bool {
-    let target = candidate.resolvingSymlinksInPath().standardizedFileURL
-    let liveTarget = live.resolvingSymlinksInPath().standardizedFileURL
-    guard FileManager.default.fileExists(atPath: target.path) else { return false }
-    guard target != liveTarget else { return false }
-    return !sameFile(target, liveTarget)
-}
-
-private func liveDatabaseURL() throws -> URL {
-    try FileManager.default.url(
-        for: .applicationSupportDirectory,
-        in: .userDomainMask,
-        appropriateFor: nil,
-        create: false
-    ).appending(path: "AgentPulse/usage.sqlite3")
-}
-
-private func sameFile(_ lhs: URL, _ rhs: URL) -> Bool {
-    guard let left = try? FileManager.default.attributesOfItem(atPath: lhs.path),
-          let right = try? FileManager.default.attributesOfItem(atPath: rhs.path),
-          let leftDevice = left[.systemNumber] as? NSNumber,
-          let rightDevice = right[.systemNumber] as? NSNumber,
-          let leftInode = left[.systemFileNumber] as? NSNumber,
-          let rightInode = right[.systemFileNumber] as? NSNumber else {
-        return false
-    }
-    return leftDevice == rightDevice && leftInode == rightInode
 }
 
 // MARK: - Legacy schema migration
@@ -195,7 +137,12 @@ private func verifyRebuildChain() throws {
     )
 
     let databaseURL = fixture.root.appendingPathComponent("usage.sqlite3", isDirectory: false)
-    let ledger = try UsageLedgerStore(path: databaseURL.path)
+    // Held optionally so the connection can be dropped before the WAL
+    // checkpoint below; TRUNCATE reports busy while any connection is attached.
+    var handle: UsageLedgerStore? = try UsageLedgerStore(path: databaseURL.path)
+    guard let ledger = handle else {
+        throw VerificationError.failed("unable to open the fixture ledger")
+    }
 
     // Populate once so reset has something to clear, then verify it cleared.
     var seed = ScanTotals()
@@ -267,6 +214,7 @@ private func verifyRebuildChain() throws {
             + "got \(linesAdded)/\(linesDeleted)"
     )
 
+    handle = nil
     try checkpointWriteAheadLog(databaseURL)
     try verifyStructuralInvariants(databaseURL, expectedHostname: Expected.host)
     try verifyOwnerOnlyFiles(databaseURL)
@@ -690,7 +638,7 @@ private func withDatabase<T>(_ url: URL, readOnly: Bool, _ body: (OpaquePointer?
 private func tableExists(_ db: OpaquePointer?, _ table: String) throws -> Bool {
     try scalarInt(
         db,
-        "SELECT COUNT(*) FROM sqlite_master WHERE type=\"table\" AND name=\(quoted(table));"
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=\(quoted(table));"
     ) == 1
 }
 
