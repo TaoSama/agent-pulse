@@ -9,7 +9,7 @@ import AgentPulseCore
 @main
 enum DerivedFinalizeEquivalence {
     static func main() throws {
-        let rounds = Int(ProcessInfo.processInfo.environment["EQUIV_ROUNDS"] ?? "40") ?? 40
+        let rounds = try parseRounds(ProcessInfo.processInfo.environment["EQUIV_ROUNDS"])
         // UInt64("0xBEEF") 是 nil —— Swift 的十进制初始化器不认 0x 前缀。直接用它会让每个
         // 带前缀的 EQUIV_SEED 都静默落回默认种子，看起来跑了多种子其实只跑了一个。
         let seed = try parseSeed(ProcessInfo.processInfo.environment["EQUIV_SEED"])
@@ -169,6 +169,19 @@ private func fail(_ round: Int, _ field: String, _ a: String, _ b: String) -> Ne
 
 /// 解析 EQUIV_SEED：接受 0x / 0X 十六进制或十进制。无法解析时响亮失败，
 /// 不静默回退——静默回退会让「换了种子」的验证实际上一直跑同一个种子。
+/// 轮数解析。0 会让下面的循环一轮都不跑却照样打印 PASS —— 一个什么都没比对的
+/// 门禁报成功，比直接报错危险得多；负数则会在构造 0..<rounds 时直接陷入 trap。
+/// 两种都当作调用方配置错误，响亮失败。
+private func parseRounds(_ raw: String?) throws -> Int {
+    let fallback = 40
+    guard let raw, !raw.isEmpty else { return fallback }
+    guard let parsed = Int(raw), parsed > 0 else {
+        FileHandle.standardError.write(Data("EQUIV_ROUNDS=\(raw) is not a positive integer\n".utf8))
+        exit(2)
+    }
+    return parsed
+}
+
 private func parseSeed(_ raw: String?) throws -> UInt64 {
     let fallback: UInt64 = 0xC0FFEE
     guard let raw, !raw.isEmpty else { return fallback }

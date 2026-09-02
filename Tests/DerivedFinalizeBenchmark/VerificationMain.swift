@@ -238,6 +238,18 @@ enum DerivedFinalizeBenchmark {
         // 推回全量量级从而在这里失败。绝对秒数不做断言：它随机器和账本规模变化。
         let ratio = d3 / d1
         print("small-append / first = \(String(format: "%.2f", ratio))")
+        // 比值只有在 baseline 本身够大时才有意义。d1 太小的时候，进程启动、SQLite 打开
+        // 库、WAL 建立这些每次调用都要付的固定开销会盖过真实差异，比值退化成噪声，
+        // 断言既可能假过也可能假失败。BENCH_EVENT_COUNT 由调用方给定，小到几百个事件时
+        // 全量本来就是毫秒级 —— 那种规模下这条断言不成立，直接说明原因并跳过，而不是
+        // 拿一个无意义的比值报成功。
+        let minimumBaseline = 0.5
+        guard d1 >= minimumBaseline else {
+            print("DerivedFinalizeBenchmark: SKIP ratio assertion - full recompute took only \(String(format: "%.3f", d1))s,",
+                  "below the \(String(format: "%.1f", minimumBaseline))s needed for the ratio to mean anything.",
+                  "Re-run with a larger BENCH_EVENT_COUNT (currently \(targetEventCount)) to exercise the gate.")
+            return
+        }
         guard ratio < 0.34 else {
             FileHandle.standardError.write(Data("""
                 DerivedFinalizeBenchmark: FAIL small-append costs \(String(format: "%.0f", ratio * 100))% of a \
