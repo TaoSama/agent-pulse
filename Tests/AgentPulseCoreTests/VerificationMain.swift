@@ -1283,7 +1283,7 @@ struct AgentPulseCoreVerification {
             try insertEvent(handle, eventID: "e1", output: 100, fileHash: "")
             sqlite3_close(handle)
             let ledger = try UsageLedgerStore(path: db.path)
-            try ledger.markFilesMissing(fileIDs: ["fileA"]) // active -> missing
+            try ledger.markFilesMissing(fileIDs: ["fileA"], hostname: "h") // active -> missing
             _ = try ledger.finalizeDerived(hostname: "h")
             let outputSum = try outputTotal(ledger, hostname: "h"); try require(outputSum == 100,
                         "ownedHistory (missing file) still supersedes legacy and is retained once")
@@ -1337,7 +1337,7 @@ struct AgentPulseCoreVerification {
             let sessions = try ledger.sessions(hostname: "h")
             try require(sessions.count == 1 && sessions[0].messageCount == 2,
                         "session events must dedup owned over legacy (2 unique events, not 4)")
-            try ledger.markFilesMissing(fileIDs: ["fileA"])
+            try ledger.markFilesMissing(fileIDs: ["fileA"], hostname: "h")
             _ = try ledger.finalizeDerived(hostname: "h")
             let afterMissing = try ledger.sessions(hostname: "h")
             try require(afterMissing.count == 1 && afterMissing[0].messageCount == 2,
@@ -1363,7 +1363,7 @@ struct AgentPulseCoreVerification {
             let (added1, deleted1) = try editTotals(ledger)
             try require(added1 == 10 && deleted1 == 2,
                         "edit entries must dedup owned over legacy (count lines once)")
-            try ledger.markFilesMissing(fileIDs: ["fileA"])
+            try ledger.markFilesMissing(fileIDs: ["fileA"], hostname: "h")
             _ = try ledger.finalizeDerived(hostname: "h")
             let (added2, deleted2) = try editTotals(ledger)
             try require(added2 == 10 && deleted2 == 2,
@@ -1499,7 +1499,7 @@ struct AgentPulseCoreVerification {
 
             // 完成目标版本 rebuild 并把该文件标 missing：历史坏时间不再触发。
             try ledger.beginParserRebuild(targetParserVersion: currentVersion)
-            try ledger.markFilesMissing(fileIDs: [invalidCheckpoint.fileID])
+            try ledger.markFilesMissing(fileIDs: [invalidCheckpoint.fileID], hostname: "h")
             try ledger.markRebuildCompleted()
             let missingRequiresRebuild = try ledger.requiresParserRebuild(currentParserVersion: currentVersion)
             try require(!missingRequiresRebuild, "missing file's historical bad timestamp must not require rebuild after completed rebuild")

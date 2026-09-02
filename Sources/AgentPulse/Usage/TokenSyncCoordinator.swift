@@ -505,11 +505,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 // 归档会话不属于运行中 task 口径，但其已产生的 token 仍属于累计用量。
                 codexPresentFileIDs += try Self.scan(root: Self.codexArchivedSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate, progress: progressReporter)
                 try gate.throwIfCancelled()
-                try ledger.markFilesMissing(source: "codex", presentFileIDs: codexPresentFileIDs)
+                try ledger.markFilesMissing(source: "codex", presentFileIDs: codexPresentFileIDs, hostname: hostname)
                 try gate.throwIfCancelled()
                 let claudePresentFileIDs = try Self.scan(root: Self.claudeProjectsRoot, source: "claude-code", includeSubagents: true, ledger: ledger, hostname: hostname, cancellation: gate, progress: progressReporter)
                 try gate.throwIfCancelled()
-                try ledger.markFilesMissing(source: "claude-code", presentFileIDs: claudePresentFileIDs)
+                try ledger.markFilesMissing(source: "claude-code", presentFileIDs: claudePresentFileIDs, hostname: hostname)
                 try gate.throwIfCancelled()
                 // 可选的用户声明本地来源（Claude-compatible transcript）。配置缺失/非法不影响内建来源。
                 // 每个自定义 source 独立聚合 present 集合，再各自按 source 标 missing。
@@ -520,7 +520,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     try gate.throwIfCancelled()
                 }
                 for (source, present) in localPresentBySource {
-                    try ledger.markFilesMissing(source: source, presentFileIDs: present)
+                    try ledger.markFilesMissing(source: source, presentFileIDs: present, hostname: hostname)
                     try gate.throwIfCancelled()
                 }
                 progressReporter.completePhase(.scanning)
