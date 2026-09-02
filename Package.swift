@@ -133,6 +133,16 @@ let package = Package(
             dependencies: ["AgentPulseReconcileParity"],
             path: "Tests/ReconcileParityVerification"
         ),
+        .executableTarget(
+            name: "DerivedFinalizeBenchmark",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/DerivedFinalizeBenchmark"
+        ),
+        .executableTarget(
+            name: "DerivedFinalizeEquivalence",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/DerivedFinalizeEquivalence"
+        ),
     ],
     swiftLanguageModes: [.v6]
 )

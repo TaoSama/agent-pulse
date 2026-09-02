@@ -376,7 +376,7 @@ enum CoordinatorVerification {
         try require(networkBuckets.count == 1 && networkBuckets[0].counts.total == 3, "网络局部派生未写入完整 bucket")
 
         // 文件全部仍在：markFilesMissing 无事可做，不得置位（否则每轮都退化成全库重算）。
-        try ledger.markFilesMissing(source: "verification", presentFileIDs: ["skip-file"])
+        try ledger.markFilesMissing(source: "verification", presentFileIDs: ["skip-file"], hostname: hostname)
         try require(
             !(try ledger.requiresDerivationCompletion()),
             "无文件转 missing 时 markFilesMissing 不应置位 dirty（会导致每轮全库重算）"
@@ -384,7 +384,7 @@ enum CoordinatorVerification {
 
         // 文件消失：scan_status 转 missing 会改变事件 tier，进而可能改变 logical dedup 结果，
         // 必须置位 dirty，否则派生表沿用旧 tier 的陈旧结论。
-        try ledger.markFilesMissing(source: "verification", presentFileIDs: [])
+        try ledger.markFilesMissing(source: "verification", presentFileIDs: [], hostname: hostname)
         try require(
             try ledger.requiresDerivationCompletion(),
             "文件转 missing 后未置位 dirty（tier 变化不会反映到派生表）"
@@ -392,12 +392,12 @@ enum CoordinatorVerification {
         _ = try ledger.finalizeDerived(hostname: hostname)
 
         // fileIDs 重载：未登记的 fileID 与已经 missing 的行都没有 tier 变化，同样不得置位。
-        try ledger.markFilesMissing(fileIDs: ["never-registered-file"])
+        try ledger.markFilesMissing(fileIDs: ["never-registered-file"], hostname: hostname)
         try require(
             !(try ledger.requiresDerivationCompletion()),
             "未登记的 fileID 不应置位 dirty（无 tier 变化）"
         )
-        try ledger.markFilesMissing(fileIDs: ["skip-file"])
+        try ledger.markFilesMissing(fileIDs: ["skip-file"], hostname: hostname)
         try require(
             !(try ledger.requiresDerivationCompletion()),
             "已经 missing 的文件重复标记不应置位 dirty（无 tier 变化）"

@@ -213,12 +213,17 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     keptSessionEvents = sessionEvents
                 }
                 // 先删除该 fileID 的旧归属原始行，再插入本批新行：同事务实现「对该文件的原子替换」。
+                // 增量 finalize 的前提：旧行马上要被删掉，其 logical/lineage/content 键必须先记下来。
+                // 否则一旦某个被删的行原本是某个去重组的胜者，我们就再也无法知道该组还有谁需要重算。
+                try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
                 try deleteRawForFileUnlocked(fileID: fileID)
                 try insertRawEvents(keptEvents, fileID: fileID, hostname: hostname)
                 try insertRawSessionEvents(keptSessionEvents, fileID: fileID, hostname: hostname)
                 try insertRawEditEntries(editEntries, fileID: fileID, hostname: hostname)
+                // 新行落库后再记一次：本批带来的键（可能是全新的 lineage/content 组）同样要重算。
+                try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
                 if editMetricsSupported && checkpoint.status == "complete" {
-                    try markEditMetricSourceUnlocked(checkpoint.source)
+                    try markEditMetricSourceUnlocked(checkpoint.source, hostname: hostname)
                 }
                 try writeCheckpoint(checkpoint)
                 // 每次 raw replace 都令派生 dirty：直到一次成功 finalizeDerived 才清除。
@@ -260,7 +265,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try transaction {
                 let frozen = try frozenBeforeMsUnlocked(hostname)
                 let keptEvents = frozen > 0 ? events.filter { millis($0.timestamp) >= frozen } : events
+                // 网络来源同样走文件级归属（合成 fileID），旧行会被 upsert 覆盖：与本地扫描一样，
+                // 必须在覆盖前后各记一次脏键，否则增量 finalize 无法还原受影响的去重组与 session。
+                try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
                 try insertRawEvents(keptEvents, fileID: fileID, hostname: hostname)
+                try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
                 try writeCheckpoint(checkpoint)
                 try recomputeNetworkBucketsUnlocked(events: keptEvents, source: source, hostname: hostname)
                 if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
@@ -390,6 +399,135 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - 增量 finalize 脏键（record 事务内记录，finalizeDerived 消费后清空）
+
+    /// 脏键种类。增量重算靠这三类键把「受影响的去重组」还原成「需要重算的 bucket/session」。
+    enum DirtyKeyKind: String {
+        /// (source, event_id)：logical ID 去重组。
+        case logical
+        /// lineage_fingerprint：血缘去重组。
+        case lineage
+        /// codex_dedup_key：内容去重组。
+        case content
+        /// (source, session_hash)：session 聚合单元。
+        case session
+        /// source：该来源刚被标记支持 edit 指标，其全部 bucket 的 codeMetricVersion 都要更新。
+        case editMetricSource
+        /// tool_use_id：edit 条目按此跨文件去重。胜者易主会把行数归属挪到另一个 bucket，
+        /// 所以变更文件里出现过的每个 tool_use_id 当前在册的全部 bucket 都要重算。
+        case editTool
+        /// bucket 自然键 (source, model, project, bucketStart)。
+        ///
+        /// 前四类都是「去重组」的键，闭包展开时要靠原始行还原出 bucket。但当一个 bucket 的
+        /// 全部贡献行都被删光时（文件被替换成更少的行），原始层已经查不到它们，闭包再也
+        /// 还原不出这个 bucket —— 它既不会被重算，也不会被删除，陈旧值会永久残留。
+        /// 所以删行之前必须把行当时所在的 bucket 键直接记下来。
+        case bucket
+    }
+
+    /// 记录一批脏键。同键重复写入由主键吸收。
+    private func insertDirtyKeysUnlocked(
+        _ keys: some Sequence<String>,
+        kind: DirtyKeyKind,
+        hostname: String
+    ) throws {
+        let statement = try prepare(
+            "INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms) VALUES(?,?,?,?);"
+        )
+        defer { sqlite3_finalize(statement) }
+        let nowMs = millis(Date())
+        for key in keys where !key.isEmpty {
+            sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+            try bind(statement, 1, hostname)
+            try bind(statement, 2, kind.rawValue)
+            try bind(statement, 3, key)
+            try bind(statement, 4, nowMs)
+            try done(statement)
+        }
+    }
+
+    /// 把某 fileID 当前在册的原始行的去重键与 session 键全部登记为脏。
+    ///
+    /// 必须在 deleteRawForFileUnlocked 之前调用一次（捕获即将消失的旧行），插入新行之后再调用一次
+    /// （捕获本批带来的新键）。只登记「这些行参与了哪些去重组」，组内其余成员由 finalize 时的闭包
+    /// 展开负责补齐——这里不做展开，因为 record 在扫描热路径上，每个文件都要跑。
+    private func recordDirtyKeysForFileUnlocked(fileID: String, hostname: String) throws {
+        guard try tableExistsUnlocked("usage_events") else { return }
+        var logical: Set<String> = []
+        var lineage: Set<String> = []
+        var content: Set<String> = []
+        var sessions: Set<String> = []
+        var buckets: Set<String> = []
+        let bucketMs = Self.bucketMilliseconds
+        do {
+            let statement = try prepare("""
+                SELECT source, event_id, lineage_fingerprint, codex_dedup_key, session_hash,
+                       model, project, timestamp_ms
+                FROM usage_events WHERE hostname=? AND source_file_hash=?;
+                """)
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname); try bind(statement, 2, fileID)
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let source = text(statement, 0)
+                logical.insert(compositeKey(source, text(statement, 1)))
+                lineage.insert(text(statement, 2))
+                content.insert(text(statement, 3))
+                sessions.insert(compositeKey(source, text(statement, 4)))
+                // 行当前所在的 bucket：删行后就再也算不出来了，必须此刻记下。
+                let start = (sqlite3_column_int64(statement, 7) / bucketMs) * bucketMs
+                buckets.insert(compositeKey(source, text(statement, 5), text(statement, 6), String(start)))
+            }
+        }
+        // session 活动事件独立于 token 事件：同一文件可能只贡献 session 行。
+        if try tableExistsUnlocked("usage_session_events") {
+            let statement = try prepare(
+                "SELECT DISTINCT source, session_hash FROM usage_session_events WHERE hostname=? AND source_file_hash=?;"
+            )
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname); try bind(statement, 2, fileID)
+            while sqlite3_step(statement) == SQLITE_ROW {
+                sessions.insert(compositeKey(text(statement, 0), text(statement, 1)))
+            }
+        }
+        // edit 条目可能是该文件的唯一产物（纯 edit 文件没有任何 token 事件），此时上面两个
+        // 循环一个键都收集不到，所以这里独立收集。
+        //
+        // 记录 edit 条目当前所在的 bucket 自然键：若这些行随文件替换被删，之后就再也查不到
+        // 它们曾落在哪个 bucket，那个 bucket 既不会被重算也不会被删，陈旧值永久残留。
+        // 与 token 侧的 DirtyKeyKind.bucket 同理。
+        //
+        // 同时记录 tool_use_id：edit 按它跨文件去重，胜者易主会把行数归属挪到另一个文件的
+        // bucket，那个 bucket 无法从本文件的行还原，只能靠 tool_use_id 反查。登记 tool_use_id
+        // 而不是整个 source —— 后者会把该来源的每一个 edit bucket 都拖进闭包（实测追加
+        // 10 个事件就拉进 80 个 bucket，再经 session / bucket_map 两条边雪崩到两万多行）。
+        var editTools: Set<String> = []
+        if try tableExistsUnlocked("usage_edit_entries") {
+            let statement = try prepare("""
+                SELECT DISTINCT source, model, project, timestamp_ms, tool_use_id
+                FROM usage_edit_entries WHERE hostname=? AND source_file_hash=?;
+                """)
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname); try bind(statement, 2, fileID)
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let source = text(statement, 0)
+                editTools.insert(text(statement, 4))
+                let start = (sqlite3_column_int64(statement, 3) / bucketMs) * bucketMs
+                buckets.insert(compositeKey(source, text(statement, 1), text(statement, 2), String(start)))
+            }
+        }
+        try insertDirtyKeysUnlocked(logical, kind: .logical, hostname: hostname)
+        try insertDirtyKeysUnlocked(lineage, kind: .lineage, hostname: hostname)
+        try insertDirtyKeysUnlocked(content, kind: .content, hostname: hostname)
+        try insertDirtyKeysUnlocked(sessions, kind: .session, hostname: hostname)
+        try insertDirtyKeysUnlocked(editTools, kind: .editTool, hostname: hostname)
+        try insertDirtyKeysUnlocked(buckets, kind: .bucket, hostname: hostname)
+    }
+
+    /// 复合键分隔符统一用 U+0001，与派生表的 bucket/session key 口径一致。
+    private func compositeKey(_ parts: String...) -> String {
+        parts.joined(separator: "\u{1}")
+    }
+
     /// 删除某 fileID 归属的全部原始行（token/session/edit）。文件级替换的第一步。
     /// 仅删该 fileID：跨文件相同 event/tool ID 的其它文件行不受影响。
     private func deleteRawForFileUnlocked(fileID: String) throws {
@@ -505,22 +643,499 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    private func markEditMetricSourceUnlocked(_ source: String) throws {
+    private func markEditMetricSourceUnlocked(_ source: String, hostname: String) throws {
         let normalized = source.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return }
         let statement = try prepare("INSERT OR IGNORE INTO usage_edit_metric_sources(source,created_at_ms) VALUES(?,?);")
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, normalized); try bind(statement, 2, millis(Date()))
         try done(statement)
+        // 该来源首次被标记为可测：它已有的每个 bucket 都要补写 codeMetricVersion，
+        // 即使那些 bucket 本轮没有任何 edit 条目。登记为脏让增量路径覆盖到它们。
+        guard sqlite3_changes(db) > 0 else { return }
+        try insertDirtyKeysUnlocked([normalized], kind: .editMetricSource, hostname: hostname)
     }
 
 
+    // MARK: - 增量 finalize：脏键闭包展开
+
+    /// 不动点迭代上限。正常 2-3 轮收敛；设上限是防御异常数据把 finalize 拖成长循环。
+    private static let dirtyClosureIterationLimit = 16
+
+    /// 增量重算的作用域：需要重算的 bucket 键与 session 键。
+    private struct DirtyScope {
+        /// bucket 自然键 (source, model, project, bucketStart)。
+        var buckets: Set<String> = []
+        /// session 自然键 (source, sessionHash)。
+        var sessions: Set<String> = []
+    }
+
+    /// 把脏键展开成「必须重算的 bucket / session」闭包。
+    ///
+    /// 三级去重是串联的：logical 组的胜者决定它参与哪个 lineage 组，lineage 组的胜者决定它参与哪个
+    /// content 组。任何一级胜者易主，原胜者所在 bucket 就会失去它的贡献。所以不能只看新事件自己的
+    /// bucket——必须沿 logical → lineage → content 双向传播直到不再产生新键（不动点），再收集闭包内
+    /// 所有成员行的 bucket。
+    ///
+    /// 传播只做这三个键的等值查找，走 idx_usage_events_host_time / _lineage / _dedup 索引，
+    /// 代价与受影响的组规模成正比，与账本总行数无关。
+    private func expandDirtyScopeUnlocked(hostname: String) throws -> DirtyScope {
+        try dropDirtyClosureTablesUnlocked()
+        try exec("CREATE TEMP TABLE temp_dirty_logical(source TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(source,event_id));")
+        try exec("CREATE TEMP TABLE temp_dirty_lineage(fingerprint TEXT PRIMARY KEY);")
+        try exec("CREATE TEMP TABLE temp_dirty_content(dedup_key TEXT PRIMARY KEY);")
+        defer { try? dropDirtyClosureTablesUnlocked() }
+        try seedDirtyKeysUnlocked(hostname: hostname)
+        try propagateDirtyClosureUnlocked(hostname: hostname)
+        return try collectDirtyScopeUnlocked(hostname: hostname)
+    }
+
+    /// 不动点传播：三级去重键互相传播直到不再产生新键。要求 temp_dirty_* 三张表已建好并灌过种子。
+    private func propagateDirtyClosureUnlocked(hostname: String) throws {
+        // 四条传播语句都加 hostname 过滤，避免多机场景下把其它 hostname 的事件拉进作用域。
+        let logicalToLineage = try prepare("""
+            INSERT OR IGNORE INTO temp_dirty_lineage(fingerprint)
+            SELECT DISTINCT e.lineage_fingerprint FROM temp_dirty_logical d
+            CROSS JOIN usage_events e ON e.source = d.source AND e.event_id = d.event_id
+            WHERE e.hostname = ? AND e.lineage_fingerprint <> '';
+            """)
+        let logicalToContent = try prepare("""
+            INSERT OR IGNORE INTO temp_dirty_content(dedup_key)
+            SELECT DISTINCT e.codex_dedup_key FROM temp_dirty_logical d
+            CROSS JOIN usage_events e ON e.source = d.source AND e.event_id = d.event_id
+            WHERE e.hostname = ? AND e.codex_dedup_key <> '';
+            """)
+        let lineageToLogical = try prepare("""
+            INSERT OR IGNORE INTO temp_dirty_logical(source, event_id)
+            SELECT DISTINCT e.source, e.event_id FROM temp_dirty_lineage d
+            CROSS JOIN usage_events e ON e.lineage_fingerprint = d.fingerprint
+            WHERE e.hostname = ? AND e.hostname <> '';
+            """)
+        let contentToLogical = try prepare("""
+            INSERT OR IGNORE INTO temp_dirty_logical(source, event_id)
+            SELECT DISTINCT e.source, e.event_id FROM temp_dirty_content d
+            CROSS JOIN usage_events e ON e.codex_dedup_key = d.dedup_key
+            WHERE e.hostname = ? AND e.hostname <> '';
+            """)
+        defer {
+            sqlite3_finalize(logicalToLineage)
+            sqlite3_finalize(logicalToContent)
+            sqlite3_finalize(lineageToLogical)
+            sqlite3_finalize(contentToLogical)
+        }
+        for _ in 0 ..< Self.dirtyClosureIterationLimit {
+            var added: Int32 = 0
+            sqlite3_reset(logicalToLineage); sqlite3_clear_bindings(logicalToLineage)
+            try bind(logicalToLineage, 1, hostname); try done(logicalToLineage)
+            added += sqlite3_changes(db)
+            sqlite3_reset(logicalToContent); sqlite3_clear_bindings(logicalToContent)
+            try bind(logicalToContent, 1, hostname); try done(logicalToContent)
+            added += sqlite3_changes(db)
+            sqlite3_reset(lineageToLogical); sqlite3_clear_bindings(lineageToLogical)
+            try bind(lineageToLogical, 1, hostname); try done(lineageToLogical)
+            added += sqlite3_changes(db)
+            sqlite3_reset(contentToLogical); sqlite3_clear_bindings(contentToLogical)
+            try bind(contentToLogical, 1, hostname); try done(contentToLogical)
+            added += sqlite3_changes(db)
+            if added == 0 { break }
+        }
+    }
+
+    /// 收集闭包覆盖的 bucket / session 自然键。要求传播已完成。
+    private func collectDirtyScopeUnlocked(hostname: String) throws -> DirtyScope {
+        var scope = DirtyScope()
+        let bucketMs = Self.bucketMilliseconds
+        // 闭包内每一行的 bucket 都要重算：model / project 是 bucket 自然键的一部分，
+        // 同一 logical 组的不同行可能落在不同 bucket，所以逐行收集而不是只看胜者。
+        do {
+            let statement = try prepare("""
+                SELECT DISTINCT e.source, e.model, e.project,
+                       (e.timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start
+                FROM temp_dirty_logical d
+                CROSS JOIN usage_events e ON e.source = d.source AND e.event_id = d.event_id
+                WHERE e.hostname = ? AND e.hostname <> '';
+                """)
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            while sqlite3_step(statement) == SQLITE_ROW {
+                scope.buckets.insert(compositeKey(
+                    text(statement, 0), text(statement, 1), text(statement, 2),
+                    String(sqlite3_column_int64(statement, 3))
+                ))
+            }
+        }
+        // 闭包内成员行所属的 session：project / skills 取自 logical 去重结果，胜者易主即可能变化。
+        do {
+            let statement = try prepare("""
+                SELECT DISTINCT e.source, e.session_hash FROM temp_dirty_logical d
+                CROSS JOIN usage_events e ON e.source = d.source AND e.event_id = d.event_id
+                WHERE e.hostname = ? AND e.session_hash <> '' AND e.hostname <> '';
+                """)
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            while sqlite3_step(statement) == SQLITE_ROW {
+                scope.sessions.insert(compositeKey(text(statement, 0), text(statement, 1)))
+            }
+        }
+        // 直接登记的 session 脏键：只贡献 session 活动行的文件不会出现在上面的 token 事件闭包里。
+        for key in try dirtyKeysUnlocked(kind: .session, hostname: hostname) {
+            scope.sessions.insert(key)
+        }
+        // edit 条目自带 bucket 自然键，且可能创建 token 侧不存在的 bucket。
+        for key in try dirtyEditBucketsUnlocked(hostname: hostname) {
+            scope.buckets.insert(key)
+        }
+        // 直接登记的 bucket 键：贡献行可能已被删光，闭包无从还原，只能靠 record 当时记下的键。
+        for key in try dirtyKeysUnlocked(kind: .bucket, hostname: hostname) {
+            scope.buckets.insert(key)
+        }
+        return scope
+    }
+
+    private func dropDirtyClosureTablesUnlocked() throws {
+        try exec("DROP TABLE IF EXISTS temp_dirty_logical;")
+        try exec("DROP TABLE IF EXISTS temp_dirty_lineage;")
+        try exec("DROP TABLE IF EXISTS temp_dirty_content;")
+    }
+
+    /// 把登记的脏键灌进闭包种子表。logical 键是 source+U+0001+event_id 的复合串，在 SQL 里按分隔符切开。
+    private func seedDirtyKeysUnlocked(hostname: String) throws {
+        do {
+            let statement = try prepare("""
+                INSERT OR IGNORE INTO temp_dirty_logical(source, event_id)
+                SELECT substr(key, 1, instr(key, char(1)) - 1),
+                       substr(key, instr(key, char(1)) + 1)
+                FROM usage_dirty_keys
+                WHERE hostname = ? AND kind = 'logical' AND instr(key, char(1)) > 1;
+                """)
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname); try done(statement)
+        }
+        for (kind, table, column) in [
+            (DirtyKeyKind.lineage, "temp_dirty_lineage", "fingerprint"),
+            (DirtyKeyKind.content, "temp_dirty_content", "dedup_key"),
+        ] {
+            let statement = try prepare("""
+                INSERT OR IGNORE INTO \(table)(\(column))
+                SELECT key FROM usage_dirty_keys
+                WHERE hostname = ? AND kind = ? AND key <> '';
+                """)
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname); try bind(statement, 2, kind.rawValue)
+            try done(statement)
+        }
+    }
+
+    /// 读取某类脏键的全部键值。
+    private func dirtyKeysUnlocked(kind: DirtyKeyKind, hostname: String) throws -> [String] {
+        let statement = try prepare("SELECT key FROM usage_dirty_keys WHERE hostname=? AND kind=? AND key <> '';")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname); try bind(statement, 2, kind.rawValue)
+        var keys: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW { keys.append(text(statement, 0)) }
+        return keys
+    }
+
+    /// 受影响的 edit bucket。
+    ///
+    /// 两个来源，对应两种影响面：
+    ///
+    /// 1. 脏 tool_use_id：edit 按它跨文件去重。某个文件的条目被删或新增后，同 ID 在其它文件里的
+    ///    条目可能晋升为胜者，其 bucket 的行数随之变化。所以该 ID 当前在册的每一行所在的 bucket
+    ///    都要重算。行数由 idx_usage_edit_entries_dedup(tool_use_id) 索引点查界定，与表规模无关。
+    ///
+    /// 2. 脏 editMetricSource：某来源首次被标记支持 edit 指标时，它已有的每个 bucket 都要补写
+    ///    codeMetricVersion，即使那些 bucket 本轮没有任何 edit 条目变化。这才是需要全 source
+    ///    展开的唯一场景，且只在该来源首次标记那一次发生（markEditMetricSourceUnlocked 用
+    ///    sqlite3_changes 守住了重复登记）。
+    private func dirtyEditBucketsUnlocked(hostname: String) throws -> [String] {
+        guard try tableExistsUnlocked("usage_edit_entries") else { return [] }
+        let bucketMs = Self.bucketMilliseconds
+        var keys: [String] = []
+        let tools = try dirtyKeysUnlocked(kind: .editTool, hostname: hostname)
+        if !tools.isEmpty {
+            let statement = try prepare("""
+                SELECT DISTINCT source, model, project,
+                       (timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start
+                FROM usage_edit_entries WHERE hostname = ? AND tool_use_id = ?;
+                """)
+            defer { sqlite3_finalize(statement) }
+            for toolUseID in tools {
+                sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+                try bind(statement, 1, hostname); try bind(statement, 2, toolUseID)
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    keys.append(compositeKey(
+                        text(statement, 0), text(statement, 1), text(statement, 2),
+                        String(sqlite3_column_int64(statement, 3))
+                    ))
+                }
+            }
+        }
+        let sources = try dirtyKeysUnlocked(kind: .editMetricSource, hostname: hostname)
+        if !sources.isEmpty {
+            let statement = try prepare("""
+                SELECT DISTINCT source, model, project,
+                       (timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start
+                FROM usage_edit_entries WHERE hostname = ? AND source = ?;
+                """)
+            defer { sqlite3_finalize(statement) }
+            for source in sources {
+                sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+                try bind(statement, 1, hostname); try bind(statement, 2, source)
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    keys.append(compositeKey(
+                        text(statement, 0), text(statement, 1), text(statement, 2),
+                        String(sqlite3_column_int64(statement, 3))
+                    ))
+                }
+            }
+        }
+        return keys
+    }
+
+
+    // MARK: - 派生去重 SQL（全量与增量共用同一份，避免两套实现漂移）
+
+    /// logical 去重（tier 优先级 -> 按 (source, event_id) 分组）。
+    ///
+    /// scoped 版仅比全量版多一个 JOIN temp_scope_events，把参与去重的原始行限定在脏闭包
+    /// 覆盖的 logical 组内。分组维度与全量逐字相同，所以增量结果等于全量结果在该作用域上的
+    /// 投影——等价性来自共用同一份 SQL，而不是两套实现凑出来的巧合。
+    private static func logicalEventsSQL(scoped: Bool) -> String {
+        scoped ? logicalEventsScopedSQL : logicalEventsFullSQL
+    }
+
+    private static let logicalEventsFullSQL = """
+            CREATE TEMP TABLE temp_logical_events AS
+            WITH active_files AS (
+                SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
+            ),
+            tiered AS (
+                SELECT
+                    event_id, source, model, project, timestamp_ms,
+                    input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                    reasoning_output_tokens, total_tokens, session_hash,
+                    inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
+                    skill_counts_json, mcp_counts_json, merge_strategy,
+                    CASE
+                        WHEN source_file_hash = '' THEN 0
+                        WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
+                        ELSE 1
+                    END AS tier
+                FROM usage_events
+                WHERE hostname = ?
+            ),
+            max_tier AS (
+                SELECT source, event_id, MAX(tier) AS max_tier
+                FROM tiered GROUP BY source, event_id
+            ),
+            top_tier AS (
+                SELECT t.* FROM tiered t
+                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
+            ),
+            logical_dedup AS (
+                SELECT
+                    source, event_id,
+                    COALESCE(MAX(CASE WHEN model <> 'unknown' THEN model END), MAX(model)) AS model,
+                    COALESCE(MAX(CASE WHEN project <> 'unknown' THEN project END), MAX(project)) AS project,
+                    MIN(timestamp_ms) AS timestamp_ms,
+                    MAX(input_tokens) AS input_tokens,
+                    MAX(output_tokens) AS output_tokens,
+                    MAX(cached_input_tokens) AS cached_input_tokens,
+                    MAX(cache_creation_input_tokens) AS cache_creation_input_tokens,
+                    MAX(reasoning_output_tokens) AS reasoning_output_tokens,
+                    MAX(total_tokens) AS total_tokens,
+                    MAX(session_hash) AS session_hash,
+                    MIN(inherited) AS inherited,
+                    MAX(has_total_snapshot) AS has_total_snapshot,
+                    MAX(lineage_fingerprint) AS lineage_fingerprint,
+                    MAX(codex_dedup_key) AS codex_dedup_key,
+                    COALESCE(MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 'cumulativeMax' END), MAX(merge_strategy)) AS merge_strategy,
+                    MAX(skill_counts_json) AS skill_counts_json,
+                    MAX(mcp_counts_json) AS mcp_counts_json,
+                    CASE
+                        WHEN MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 1 ELSE 0 END) = 1 THEN 0
+                        WHEN COUNT(DISTINCT session_hash) > 1 THEN 1
+                        WHEN COUNT(DISTINCT CASE WHEN model <> 'unknown' THEN model END) > 1 THEN 1
+                        WHEN COUNT(DISTINCT CASE WHEN project <> 'unknown' THEN project END) > 1 THEN 1
+                        ELSE 0
+                    END AS has_identity_conflict
+                FROM top_tier
+                GROUP BY source, event_id
+            )
+            SELECT * FROM logical_dedup;
+        """
+
+    private static let logicalEventsScopedSQL = """
+            CREATE TEMP TABLE temp_logical_events AS
+            WITH active_files AS (
+                SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
+            ),
+            tiered AS (
+                SELECT
+                    usage_events.event_id, usage_events.source, usage_events.model, usage_events.project, usage_events.timestamp_ms,
+                    usage_events.input_tokens, usage_events.output_tokens, usage_events.cached_input_tokens, usage_events.cache_creation_input_tokens,
+                    usage_events.reasoning_output_tokens, usage_events.total_tokens, usage_events.session_hash,
+                    usage_events.inherited, usage_events.has_total_snapshot, usage_events.lineage_fingerprint, usage_events.codex_dedup_key,
+                    usage_events.skill_counts_json, usage_events.mcp_counts_json, usage_events.merge_strategy,
+                    CASE
+                        WHEN usage_events.source_file_hash = '' THEN 0
+                        WHEN usage_events.source_file_hash IN (SELECT file_id FROM active_files) THEN 2
+                        ELSE 1
+                    END AS tier
+                FROM temp_scope_events s
+                CROSS JOIN usage_events ON usage_events.source = s.source AND usage_events.event_id = s.event_id
+                WHERE usage_events.hostname = ? AND usage_events.hostname <> ''
+            ),
+            max_tier AS (
+                SELECT source, event_id, MAX(tier) AS max_tier
+                FROM tiered GROUP BY source, event_id
+            ),
+            top_tier AS (
+                SELECT t.* FROM tiered t
+                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
+            ),
+            logical_dedup AS (
+                SELECT
+                    source, event_id,
+                    COALESCE(MAX(CASE WHEN model <> 'unknown' THEN model END), MAX(model)) AS model,
+                    COALESCE(MAX(CASE WHEN project <> 'unknown' THEN project END), MAX(project)) AS project,
+                    MIN(timestamp_ms) AS timestamp_ms,
+                    MAX(input_tokens) AS input_tokens,
+                    MAX(output_tokens) AS output_tokens,
+                    MAX(cached_input_tokens) AS cached_input_tokens,
+                    MAX(cache_creation_input_tokens) AS cache_creation_input_tokens,
+                    MAX(reasoning_output_tokens) AS reasoning_output_tokens,
+                    MAX(total_tokens) AS total_tokens,
+                    MAX(session_hash) AS session_hash,
+                    MIN(inherited) AS inherited,
+                    MAX(has_total_snapshot) AS has_total_snapshot,
+                    MAX(lineage_fingerprint) AS lineage_fingerprint,
+                    MAX(codex_dedup_key) AS codex_dedup_key,
+                    COALESCE(MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 'cumulativeMax' END), MAX(merge_strategy)) AS merge_strategy,
+                    MAX(skill_counts_json) AS skill_counts_json,
+                    MAX(mcp_counts_json) AS mcp_counts_json,
+                    CASE
+                        WHEN MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 1 ELSE 0 END) = 1 THEN 0
+                        WHEN COUNT(DISTINCT session_hash) > 1 THEN 1
+                        WHEN COUNT(DISTINCT CASE WHEN model <> 'unknown' THEN model END) > 1 THEN 1
+                        WHEN COUNT(DISTINCT CASE WHEN project <> 'unknown' THEN project END) > 1 THEN 1
+                        ELSE 0
+                    END AS has_identity_conflict
+                FROM top_tier
+                GROUP BY source, event_id
+            )
+            SELECT * FROM logical_dedup;
+        """
+
+    /// lineage 去重：输入是 temp_logical_events，全量与增量逐字共用。
+    private static let lineageEventsSQL = """
+            CREATE TEMP TABLE temp_lineage_events AS
+            WITH
+            lineage_ranked AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY lineage_fingerprint ORDER BY inherited ASC, timestamp_ms ASC) AS rn
+                FROM temp_logical_events
+                WHERE lineage_fingerprint <> ''
+            )
+                SELECT source, event_id, model, project, timestamp_ms,
+                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                       reasoning_output_tokens, total_tokens, session_hash,
+                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
+                       skill_counts_json, mcp_counts_json, merge_strategy
+                FROM lineage_ranked WHERE rn = 1
+                UNION ALL
+                SELECT source, event_id, model, project, timestamp_ms,
+                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                       reasoning_output_tokens, total_tokens, session_hash,
+                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
+                       skill_counts_json, mcp_counts_json, merge_strategy
+                FROM temp_logical_events WHERE lineage_fingerprint = '';
+        """
+
+    /// content 去重：输入是 temp_lineage_events，全量与增量逐字共用。
+    private static let dedupedEventsSQL = """
+            CREATE TEMP TABLE temp_deduped_events AS
+            WITH
+            content_ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY codex_dedup_key
+                    ORDER BY (input_tokens + output_tokens + cached_input_tokens
+                              + cache_creation_input_tokens + reasoning_output_tokens) DESC
+                ) AS rn
+                FROM temp_lineage_events
+                WHERE codex_dedup_key <> ''
+            ),
+            content_dedup AS (
+                SELECT source, event_id, model, project, timestamp_ms,
+                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                       reasoning_output_tokens, total_tokens, session_hash,
+                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
+                       skill_counts_json, mcp_counts_json, merge_strategy
+                FROM content_ranked WHERE rn = 1
+                UNION ALL
+                SELECT source, event_id, model, project, timestamp_ms,
+                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                       reasoning_output_tokens, total_tokens, session_hash,
+                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
+                       skill_counts_json, mcp_counts_json, merge_strategy
+                FROM temp_lineage_events WHERE codex_dedup_key = ''
+            )
+            SELECT * FROM content_dedup;
+        """
+
+    /// 原始行 -> 最终去重胜者的归属映射（全量与增量逐字共用）。
+    ///
+    /// skill/mcp 计数必须按 key 取 max，SQL 的 MAX(JSON) 做不到，所以计数合并只能在 Swift
+    /// 端做。但「谁是胜者」不该在 Swift 端重算：三级去重的胜者已由 temp_logical_events /
+    /// temp_lineage_events / temp_deduped_events 物化，SQL 用 ROW_NUMBER() OVER (... ORDER BY)
+    /// 定序；Swift 端再跑一遍就要复刻同一套 tie-break，而 Dictionary 遍历顺序不确定，
+    /// 两边必然漂移到不同的 bucket 自然键。全量路径下算错的键会被 bucket 查找静默丢弃。
+    ///
+    /// 这张表把归属关系交给 SQL：每个 logical 行落到它最终所属胜者的 bucket 自然键上。
+    /// Swift 只按 winner 分组累计计数，不再选胜者。
+    private static func skillAttributionSQL(bucketMs: Int64) -> String {
+        """
+            CREATE TEMP TABLE temp_skill_attribution AS
+            WITH lineage_winner AS (
+                SELECT l.source AS member_source, l.event_id AS member_event_id,
+                       w.source AS win_source, w.event_id AS win_event_id
+                FROM temp_logical_events l
+                JOIN temp_lineage_events w ON w.lineage_fingerprint = l.lineage_fingerprint
+                WHERE l.lineage_fingerprint <> ''
+                UNION ALL
+                SELECT l.source, l.event_id, l.source, l.event_id
+                FROM temp_logical_events l
+                WHERE l.lineage_fingerprint = ''
+            ),
+            content_winner AS (
+                SELECT n.source AS member_source, n.event_id AS member_event_id,
+                       d.source AS win_source, d.event_id AS win_event_id
+                FROM temp_lineage_events n
+                JOIN temp_deduped_events d ON d.codex_dedup_key = n.codex_dedup_key
+                WHERE n.codex_dedup_key <> ''
+                UNION ALL
+                SELECT n.source, n.event_id, n.source, n.event_id
+                FROM temp_lineage_events n
+                WHERE n.codex_dedup_key = ''
+            )
+            SELECT lw.member_source AS source, lw.member_event_id AS event_id,
+                   d.source AS winner_source, d.event_id AS winner_event_id,
+                   d.model AS winner_model, d.project AS winner_project,
+                   (d.timestamp_ms / \(bucketMs)) * \(bucketMs) AS winner_bucket_start
+            FROM lineage_winner lw
+            JOIN content_winner cw ON cw.member_source = lw.win_source
+                AND cw.member_event_id = lw.win_event_id
+            JOIN temp_deduped_events d ON d.source = cw.win_source
+                AND d.event_id = cw.win_event_id;
+        """
+    }
     // MARK: - Finalize derived (global dedup + aggregate)
 
     @discardableResult
     public func finalizeDerived(
         hostname: String,
         compactFrozen: Bool = false,
+        strategy: UsageFinalizeStrategy = .automatic,
         progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
     ) throws -> UsageFinalizeResult {
         try queue.sync {
@@ -529,7 +1144,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try transaction {
                 try claimLegacyRawRowsIfUnambiguousUnlocked(hostname: hostname)
                 result = try withBackgroundResourcePriority {
-                    try recomputeDerivedUnlocked(hostname: hostname, progress: progress)
+                    try recomputeDispatchUnlocked(hostname: hostname, strategy: strategy, progress: progress)
                 }
                 // 只有显式 finalize 表示调用方已经成功完成整轮来源扫描。其它内部重算
                 // （例如 hostname 对齐）不能清除此门禁，否则部分扫描失败后会 fail-open。
@@ -593,6 +1208,23 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let hostname: String
     }
 
+    /// skill/mcp 计数合并用的中间表示（携带 tier，供四级去重）。
+    private struct SkillMergeEvent {
+            let source: String
+            let eventID: String
+            let model: String
+            let project: String
+            let sessionHash: String
+            let timestampMs: Int64
+            let inherited: Bool
+            let billableTotal: Int64
+            let lineageFingerprint: String
+            let codexDedupKey: String
+            let skillCounts: [String: Int]
+            let mcpCounts: [String: Int]
+            let tier: Int
+    }
+
     /// v8 归属优先级 tier（数值越大优先级越高）。
     /// - legacy：source_file_hash 为空的历史 append/upsert 行（无文件归属）。
     /// - ownedHistory：source_file_hash 非空，但其文件已从磁盘消失（scan_status='missing'）或无 checkpoint 行。
@@ -643,66 +1275,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try exec("DROP TABLE IF EXISTS temp_lineage_events;")
         try exec("DROP TABLE IF EXISTS temp_deduped_events;")
         let bucketMs = Self.bucketMilliseconds
-        let logicalSQL = """
-            CREATE TEMP TABLE temp_logical_events AS
-            WITH active_files AS (
-                SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
-            ),
-            tiered AS (
-                SELECT
-                    event_id, source, model, project, timestamp_ms,
-                    input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                    reasoning_output_tokens, total_tokens, session_hash,
-                    inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                    skill_counts_json, mcp_counts_json, merge_strategy,
-                    CASE
-                        WHEN source_file_hash = '' THEN 0
-                        WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
-                        ELSE 1
-                    END AS tier
-                FROM usage_events
-                WHERE hostname = ?
-            ),
-            max_tier AS (
-                SELECT source, event_id, MAX(tier) AS max_tier
-                FROM tiered GROUP BY source, event_id
-            ),
-            top_tier AS (
-                SELECT t.* FROM tiered t
-                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
-            ),
-            logical_dedup AS (
-                SELECT
-                    source, event_id,
-                    COALESCE(MAX(CASE WHEN model <> 'unknown' THEN model END), MAX(model)) AS model,
-                    COALESCE(MAX(CASE WHEN project <> 'unknown' THEN project END), MAX(project)) AS project,
-                    MIN(timestamp_ms) AS timestamp_ms,
-                    MAX(input_tokens) AS input_tokens,
-                    MAX(output_tokens) AS output_tokens,
-                    MAX(cached_input_tokens) AS cached_input_tokens,
-                    MAX(cache_creation_input_tokens) AS cache_creation_input_tokens,
-                    MAX(reasoning_output_tokens) AS reasoning_output_tokens,
-                    MAX(total_tokens) AS total_tokens,
-                    MAX(session_hash) AS session_hash,
-                    MIN(inherited) AS inherited,
-                    MAX(has_total_snapshot) AS has_total_snapshot,
-                    MAX(lineage_fingerprint) AS lineage_fingerprint,
-                    MAX(codex_dedup_key) AS codex_dedup_key,
-                    COALESCE(MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 'cumulativeMax' END), MAX(merge_strategy)) AS merge_strategy,
-                    MAX(skill_counts_json) AS skill_counts_json,
-                    MAX(mcp_counts_json) AS mcp_counts_json,
-                    CASE
-                        WHEN MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 1 ELSE 0 END) = 1 THEN 0
-                        WHEN COUNT(DISTINCT session_hash) > 1 THEN 1
-                        WHEN COUNT(DISTINCT CASE WHEN model <> 'unknown' THEN model END) > 1 THEN 1
-                        WHEN COUNT(DISTINCT CASE WHEN project <> 'unknown' THEN project END) > 1 THEN 1
-                        ELSE 0
-                    END AS has_identity_conflict
-                FROM top_tier
-                GROUP BY source, event_id
-            )
-            SELECT * FROM logical_dedup;
-            """
+        let logicalSQL = Self.logicalEventsSQL(scoped: false)
         do {
             let logicalStmt = try prepare(logicalSQL)
             defer { sqlite3_finalize(logicalStmt) }
@@ -712,59 +1285,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
         // lineage 去重的中间结果单独物化：content 去重和折叠数统计都要用它，
         // 否则两处各自重跑一遍 PARTITION BY lineage_fingerprint 的窗口排序。
-        let lineageSQL = """
-            CREATE TEMP TABLE temp_lineage_events AS
-            WITH
-            lineage_ranked AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY lineage_fingerprint ORDER BY inherited ASC, timestamp_ms ASC) AS rn
-                FROM temp_logical_events
-                WHERE lineage_fingerprint <> ''
-            )
-                SELECT source, event_id, model, project, timestamp_ms,
-                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                       reasoning_output_tokens, total_tokens, session_hash,
-                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
-                FROM lineage_ranked WHERE rn = 1
-                UNION ALL
-                SELECT source, event_id, model, project, timestamp_ms,
-                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                       reasoning_output_tokens, total_tokens, session_hash,
-                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
-                FROM temp_logical_events WHERE lineage_fingerprint = '';
-            """
+        let lineageSQL = Self.lineageEventsSQL
         try exec(lineageSQL)
 
-        let dedupSQL = """
-            CREATE TEMP TABLE temp_deduped_events AS
-            WITH
-            content_ranked AS (
-                SELECT *, ROW_NUMBER() OVER (
-                    PARTITION BY codex_dedup_key
-                    ORDER BY (input_tokens + output_tokens + cached_input_tokens
-                              + cache_creation_input_tokens + reasoning_output_tokens) DESC
-                ) AS rn
-                FROM temp_lineage_events
-                WHERE codex_dedup_key <> ''
-            ),
-            content_dedup AS (
-                SELECT source, event_id, model, project, timestamp_ms,
-                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                       reasoning_output_tokens, total_tokens, session_hash,
-                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
-                FROM content_ranked WHERE rn = 1
-                UNION ALL
-                SELECT source, event_id, model, project, timestamp_ms,
-                       input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                       reasoning_output_tokens, total_tokens, session_hash,
-                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
-                FROM temp_lineage_events WHERE codex_dedup_key = ''
-            )
-            SELECT * FROM content_dedup;
-            """
+        let dedupSQL = Self.dedupedEventsSQL
         try exec(dedupSQL)
         advanceStage() // 1-3) 三级去重在 SQLite 内完成
 
@@ -848,21 +1372,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
         // skill/mcp 计数合并：SQL MAX(JSON) 无法按 key 取 max，因此加载所有非空计数事件
         // （约 1.5 万行），在 Swift 端复现 tier→logical ID→lineage→content 四级去重的计数合并。
-        struct SkillMergeEvent {
-            let source: String
-            let eventID: String
-            let model: String
-            let project: String
-            let sessionHash: String
-            let timestampMs: Int64
-            let inherited: Bool
-            let billableTotal: Int64
-            let lineageFingerprint: String
-            let codexDedupKey: String
-            let skillCounts: [String: Int]
-            let mcpCounts: [String: Int]
-            let tier: Int
-        }
         let skillEventSQL = """
             SELECT e.source, e.event_id, e.model, e.project, e.session_hash, e.timestamp_ms,
                    e.inherited,
@@ -900,94 +1409,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
             ))
         }
 
-        // 1) logical ID 去重：同 (source, event_id) 取最高 tier，计数按 key 取 max。
-        var logicalByKey: [String: SkillMergeEvent] = [:]
-        for ev in skillEvents {
-            let key = "\(ev.source)\u{1}\(ev.eventID)"
-            if let existing = logicalByKey[key] {
-                if ev.tier > existing.tier {
-                    logicalByKey[key] = ev
-                } else if ev.tier == existing.tier {
-                    logicalByKey[key] = SkillMergeEvent(
-                        source: existing.source, eventID: existing.eventID,
-                        model: existing.model, project: existing.project,
-                        sessionHash: existing.sessionHash,
-                        timestampMs: existing.timestampMs, inherited: existing.inherited,
-                        billableTotal: max(existing.billableTotal, ev.billableTotal),
-                        lineageFingerprint: existing.lineageFingerprint.isEmpty ? ev.lineageFingerprint : existing.lineageFingerprint,
-                        codexDedupKey: existing.codexDedupKey.isEmpty ? ev.codexDedupKey : existing.codexDedupKey,
-                        skillCounts: maximumCounts(existing.skillCounts, ev.skillCounts),
-                        mcpCounts: maximumCounts(existing.mcpCounts, ev.mcpCounts),
-                        tier: existing.tier
-                    )
-                }
-            } else {
-                logicalByKey[key] = ev
-            }
-        }
-        let logicalDeduped = Array(logicalByKey.values)
-
-        // 2) lineage 去重：同 lineage_fingerprint 保留非 inherited，计数按 key 取 max。
-        var lineageByFP: [String: SkillMergeEvent] = [:]
-        var lineageCollapsed = 0
-        for ev in logicalDeduped where !ev.lineageFingerprint.isEmpty {
-            if let existing = lineageByFP[ev.lineageFingerprint] {
-                lineageCollapsed += 1
-                let keep = existing.inherited && !ev.inherited ? ev : existing
-                lineageByFP[ev.lineageFingerprint] = SkillMergeEvent(
-                    source: keep.source, eventID: keep.eventID,
-                    model: keep.model, project: keep.project,
-                    sessionHash: keep.sessionHash,
-                    timestampMs: keep.timestampMs, inherited: keep.inherited,
-                    billableTotal: keep.billableTotal,
-                    lineageFingerprint: keep.lineageFingerprint,
-                    codexDedupKey: keep.codexDedupKey,
-                    skillCounts: maximumCounts(existing.skillCounts, ev.skillCounts),
-                    mcpCounts: maximumCounts(existing.mcpCounts, ev.mcpCounts),
-                    tier: keep.tier
-                )
-            } else {
-                lineageByFP[ev.lineageFingerprint] = ev
-            }
-        }
-        // 无 lineage 指纹的事件直接保留。
-        var afterLineage = Array(lineageByFP.values)
-        afterLineage.append(contentsOf: logicalDeduped.filter { $0.lineageFingerprint.isEmpty })
-
-        // 3) content 去重：同 codex_dedup_key 保留 total_tokens 更大者，计数按 key 取 max。
-        var contentByKey: [String: SkillMergeEvent] = [:]
-        var contentCollapsed = 0
-        for ev in afterLineage where !ev.codexDedupKey.isEmpty {
-            if let existing = contentByKey[ev.codexDedupKey] {
-                contentCollapsed += 1
-                let keep = ev.billableTotal > existing.billableTotal ? ev : existing
-                contentByKey[ev.codexDedupKey] = SkillMergeEvent(
-                    source: keep.source, eventID: keep.eventID,
-                    model: keep.model, project: keep.project,
-                    sessionHash: keep.sessionHash,
-                    timestampMs: keep.timestampMs, inherited: keep.inherited,
-                    billableTotal: keep.billableTotal,
-                    lineageFingerprint: keep.lineageFingerprint,
-                    codexDedupKey: keep.codexDedupKey,
-                    skillCounts: maximumCounts(existing.skillCounts, ev.skillCounts),
-                    mcpCounts: maximumCounts(existing.mcpCounts, ev.mcpCounts),
-                    tier: keep.tier
-                )
-            } else {
-                contentByKey[ev.codexDedupKey] = ev
-            }
-        }
-        var afterContent = Array(contentByKey.values)
-        afterContent.append(contentsOf: afterLineage.filter { $0.codexDedupKey.isEmpty })
-
-        // 4) 按 bucket 合并 skill/mcp 计数。
-        for ev in afterContent {
-            let start = (ev.timestampMs / bucketMs) * bucketMs
-            let key = "\(ev.source)\u{1}\(ev.model)\u{1}\(ev.project)\u{1}\(start)"
-            if var agg = buckets[key] {
-                agg.skillCounts = UsageToolMetrics.mergeCounts(agg.skillCounts, ev.skillCounts)
-                agg.mcpCounts = UsageToolMetrics.mergeCounts(agg.mcpCounts, ev.mcpCounts)
-                buckets[key] = agg
+        // skill/mcp 计数合并：三级去重后按 bucket 汇总（实现见 mergeSkillCountsByBucketUnlocked）。
+        let logicalDeduped = logicalDedupedSkillEvents(skillEvents)
+        for merged in try mergeSkillCountsByBucketUnlocked(skillEvents, bucketMs: bucketMs) {
+            if var agg = buckets[merged.key] {
+                agg.skillCounts = UsageToolMetrics.mergeCounts(agg.skillCounts, merged.skillCounts)
+                agg.mcpCounts = UsageToolMetrics.mergeCounts(agg.mcpCounts, merged.mcpCounts)
+                buckets[merged.key] = agg
             }
         }
 
@@ -1060,6 +1488,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
         )
         advanceStage() // 6) session 聚合完成
 
+        // 全量收尾：把本轮的完整冲突集落盘。identityConflicts 是 reportingEligible 的唯一门禁，
+        // 增量路径的 updateScopedIdentityConflictsUnlocked 只替换作用域内的键，依赖这里先
+        // 建立全量基线。不写的话表永远为空，作用域外的历史冲突会丢，
+        // 导致 eligible 误判为 true。仅追加持久化写入，不改全量自身的计算。
+        try rebuildIdentityConflictsUnlocked(hostname: hostname)
+
         try exec("DROP TABLE IF EXISTS temp_logical_events;")
         try exec("DROP TABLE IF EXISTS temp_lineage_events;")
 
@@ -1119,6 +1553,18 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
         advanceStage() // 8) session 差异写完成
 
+        // 持久化 logical 组 -> bucket 自然键映射，供增量 finalize 把旧 bucket 纳入作用域。
+        // 必须在 temp_deduped_events 被 drop 之前执行。
+        let bms = Self.bucketMilliseconds
+        try exec("DELETE FROM usage_logical_bucket_map WHERE hostname='\(hostname)';")
+        try exec("""
+            INSERT OR REPLACE INTO usage_logical_bucket_map(
+                hostname,source,event_id,bucket_model,bucket_project,bucket_start)
+            SELECT '\(hostname)', source, event_id, model, project,
+                   (timestamp_ms/\(bms))*\(bms)
+            FROM temp_deduped_events;
+            """)
+
         try? exec("DROP TABLE IF EXISTS temp_deduped_events;")
 
         return UsageFinalizeResult(
@@ -1137,6 +1583,848 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
+
+    // MARK: - 增量 finalize
+
+    /// 派生重算策略。
+    public enum UsageFinalizeStrategy: Sendable {
+        /// 前置条件满足时走增量，否则自动回退全量。生产默认。
+        case automatic
+        /// 强制全量重算。显式 rebuild 与等价性验证使用。
+        case fullRecompute
+    }
+
+    /// 增量作用域的 bucket 数上限。超过说明本轮改动面已接近全量，
+    /// 逐 bucket 差异写反而比一次全表 GROUP BY 慢，直接回退。
+    private static let incrementalBucketLimit = 5000
+
+    /// 作用域事件数占该 hostname 全部事件的比例上限。超过就退回全量。
+    ///
+    /// 增量只有在作用域远小于全表时才划算。作用域大到一定比例后，闭包展开、scoped 去重、
+    /// 胜者反查这些增量独有的开销会超过直接全量重算——scoped SQL 每张临时表都要额外 JOIN，
+    /// 而全量只是裸 WHERE hostname=?。实测 5 万事件的合成库上，作用域 25010 行（半张表）时
+    /// 增量 23.6 秒，全量 4.0 秒。这个阈值把这种情况挡在门外。
+    private static let incrementalScopeFraction = 0.2
+
+    /// 增量基线标志：一次成功的全量重算会置位，表示派生表与 identity 冲突表都已重建完毕。
+    /// 没有基线就不能增量——增量只修补差异，修补一个不存在或不可信的基线毫无意义。
+    private static let incrementalBaselineKey = "incremental_baseline_ready"
+
+    /// identity 冲突键的物化视图。
+    ///
+    /// reportingEligible 是上报门禁，必须精确。全量路径靠一次全表 GROUP BY 数冲突组；
+    /// 增量路径不能这么做，那正是要消掉的 10 秒。所以把「当前处于冲突态的 logical 组」
+    /// 持久化成稀疏表：全量重算整表重建，增量重算只增删作用域内的键。
+    /// 表内该 hostname 无行 <=> 无冲突 <=> eligible。
+    private func ensureIdentityConflictTableUnlocked() throws {
+        try exec("""
+            CREATE TABLE IF NOT EXISTS usage_identity_conflicts(
+              hostname TEXT NOT NULL,
+              source TEXT NOT NULL,
+              event_id TEXT NOT NULL,
+              PRIMARY KEY(hostname,source,event_id)
+            );
+            """)
+    }
+
+    private func identityConflictCountUnlocked(hostname: String) throws -> Int {
+        let statement = try prepare("SELECT COUNT(*) FROM usage_identity_conflicts WHERE hostname=?;")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    /// 全量路径收尾：从刚物化的 temp_logical_events 整表重建该 hostname 的冲突集。
+    private func rebuildIdentityConflictsUnlocked(hostname: String) throws {
+        try ensureIdentityConflictTableUnlocked()
+        do {
+            let statement = try prepare("DELETE FROM usage_identity_conflicts WHERE hostname=?;")
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname); try done(statement)
+        }
+        let statement = try prepare("""
+            INSERT OR IGNORE INTO usage_identity_conflicts(hostname,source,event_id)
+            SELECT ?, source, event_id FROM temp_logical_events WHERE has_identity_conflict = 1;
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname); try done(statement)
+    }
+
+    /// 增量路径：只替换作用域内的冲突键，作用域外的原始行本轮没变，冲突态不会变。
+    private func updateScopedIdentityConflictsUnlocked(hostname: String) throws {
+        try ensureIdentityConflictTableUnlocked()
+        do {
+            let statement = try prepare("""
+                DELETE FROM usage_identity_conflicts
+                WHERE hostname = ?
+                  AND EXISTS (SELECT 1 FROM temp_scope_events s
+                              WHERE s.source = usage_identity_conflicts.source
+                                AND s.event_id = usage_identity_conflicts.event_id);
+                """)
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname); try done(statement)
+        }
+        let statement = try prepare("""
+            INSERT OR IGNORE INTO usage_identity_conflicts(hostname,source,event_id)
+            SELECT ?, source, event_id FROM temp_logical_events WHERE has_identity_conflict = 1;
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname); try done(statement)
+    }
+
+    private func clearDirtyKeysUnlocked(hostname: String) throws {
+        guard try tableExistsUnlocked("usage_dirty_keys") else { return }
+        let statement = try prepare("DELETE FROM usage_dirty_keys WHERE hostname=?;")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname); try done(statement)
+    }
+
+    private func derivedHasAnyRowUnlocked(hostname: String) throws -> Bool {
+        for table in ["usage_buckets", "usage_sessions"] {
+            guard try tableExistsUnlocked(table) else { continue }
+            let statement = try prepare("SELECT 1 FROM \(table) WHERE hostname=? LIMIT 1;")
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            if sqlite3_step(statement) == SQLITE_ROW { return true }
+        }
+        return false
+    }
+
+    /// 增量前置判据。任一不满足即回退全量——回退永远安全，只是慢。
+    ///
+    /// - 脏键表 / 冲突表不存在：老库尚未建表。
+    /// - 无基线标志：上一次成功的全量重算才建立基线；首次 finalize、reset、迁移后都没有。
+    /// - rebuild 挂起：协调层正在整轮重扫，基线不可信。
+    /// - 派生层无行：没有可修补的基线。
+    /// - 冻结水位非 0：冻结区原始行可能已被 compact 物理删除，去重组在原始层已不完整，
+    ///   闭包展开会漏掉被删成员；且全量对冻结区 bucket 跳过差异写，复现这套语义不划算。
+    private func canRecomputeIncrementallyUnlocked(hostname: String) throws -> Bool {
+        guard try tableExistsUnlocked("usage_dirty_keys") else { return false }
+        guard try tableExistsUnlocked("usage_identity_conflicts") else { return false }
+        guard try tableExistsUnlocked("usage_logical_bucket_map") else { return false }
+        guard try readTextUnlocked(key: Self.incrementalBaselineKey) != nil else { return false }
+        guard try readTextUnlocked(key: Self.rebuildPendingKey) == nil else { return false }
+        guard try frozenBeforeMsUnlocked(hostname) == 0 else { return false }
+        return try derivedHasAnyRowUnlocked(hostname: hostname)
+    }
+
+    /// 增量重算：只重算脏闭包覆盖的 bucket / session，其余派生行原样不动。
+    ///
+    /// 返回 nil 表示本轮不适合增量（作用域过大），调用方回退全量。
+    private func recomputeDerivedIncrementalUnlocked(
+        hostname: String,
+        progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
+    ) throws -> UsageFinalizeResult? {
+        let progressTotalStages = 8
+        var progressStage = 0
+        func advanceStage() {
+            progressStage += 1
+            progress?(progressStage, progressTotalStages)
+        }
+
+        // 1) 脏键 -> 不动点闭包 -> 作用域。三张 temp_dirty_* 表要活到 temp_scope_events 物化完，
+        //    所以这里自己管生命周期，不复用 expandDirtyScopeUnlocked 的 defer 清理。
+        try dropDirtyClosureTablesUnlocked()
+        try exec("CREATE TEMP TABLE temp_dirty_logical(source TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(source,event_id));")
+        try exec("CREATE TEMP TABLE temp_dirty_lineage(fingerprint TEXT PRIMARY KEY);")
+        try exec("CREATE TEMP TABLE temp_dirty_content(dedup_key TEXT PRIMARY KEY);")
+        defer { try? dropDirtyClosureTablesUnlocked() }
+        defer { try? exec("DROP TABLE IF EXISTS temp_scope_events;") }
+
+        try seedDirtyKeysUnlocked(hostname: hostname)
+        try propagateDirtyClosureUnlocked(hostname: hostname)
+        var scope = try collectDirtyScopeUnlocked(hostname: hostname)
+        guard scope.buckets.count <= Self.incrementalBucketLimit else { return nil }
+
+        // temp_scope_events 初始化为闭包内的 logical 键。
+        try exec("DROP TABLE IF EXISTS temp_scope_events;")
+        try exec("CREATE TEMP TABLE temp_scope_events(source TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(source,event_id));")
+        try exec("INSERT OR IGNORE INTO temp_scope_events(source,event_id) SELECT source,event_id FROM temp_dirty_logical;")
+
+        // 组补全：lineage / content 两层去重是「全组语义」——胜者由整个 partition 内的相对顺序
+        // 决定。如果作用域只包含某个 lineage 组的部分成员，ROW_NUMBER 选出的胜者可能与全量不一致。
+        // 这里把作用域内任何行所涉及的 lineage 指纹 / content 键下的全部 logical 组都补进
+        // temp_scope_events，循环到不动点，保证闭包性质。
+        let bucketMsForScope = Self.bucketMilliseconds
+        let scopeLineageStmt = try prepare("""
+            INSERT OR IGNORE INTO temp_scope_events(source, event_id)
+            SELECT DISTINCT e2.source, e2.event_id
+            FROM temp_scope_events s
+            CROSS JOIN usage_events e1 ON e1.source = s.source AND e1.event_id = s.event_id
+            CROSS JOIN usage_events e2 ON e2.lineage_fingerprint = e1.lineage_fingerprint
+            WHERE e1.hostname = ? AND e2.hostname = ? AND e1.lineage_fingerprint <> '' AND e1.hostname <> '';
+            """)
+        let scopeContentStmt = try prepare("""
+            INSERT OR IGNORE INTO temp_scope_events(source, event_id)
+            SELECT DISTINCT e2.source, e2.event_id
+            FROM temp_scope_events s
+            CROSS JOIN usage_events e1 ON e1.source = s.source AND e1.event_id = s.event_id
+            CROSS JOIN usage_events e2 ON e2.codex_dedup_key = e1.codex_dedup_key
+            WHERE e1.hostname = ? AND e2.hostname = ? AND e1.codex_dedup_key <> '' AND e1.hostname <> '';
+            """)
+        // bucket / session 共居补全。bucket 与 session 的聚合值是「落进它的全部事件」的和，
+        // 而 scoped 去重只能看见 temp_scope_events 里的行。若某个已在作用域的 bucket
+        // 还有其它（干净）贡献者没进来，重算会丢掉它们的 token，轻则算小、
+        // 重则算成空而误删整个 bucket。不变量：bucket 进作用域 ⇒ 落进它的
+        // 全部事件必须进 temp_scope_events；session 同理（project / skillCounts 取自该
+        // session 全部 logical 胜者）。
+        //
+        // 注意：bucket 进作用域不只来自事件——edit 脏键、直接登记的 bucket 脏键、
+        // 旧 logical→bucket 映射都会把 bucket 放进来，而它们对应的 token 事件可能一行都不在
+        // temp_scope_events 里。所以这里把作用域的 bucket / session 集合也物化成临时表，
+        // 让闭包在「事件 ↔ bucket/session」两侧双向迭代到不动点。
+        try exec("DROP TABLE IF EXISTS temp_scope_buckets;")
+        try exec("DROP TABLE IF EXISTS temp_scope_sessions_seed;")
+        try exec("""
+            CREATE TEMP TABLE temp_scope_buckets(
+                source TEXT NOT NULL, model TEXT NOT NULL, project TEXT NOT NULL,
+                bucket_start INTEGER NOT NULL,
+                PRIMARY KEY(source, model, project, bucket_start));
+            """)
+        try exec("""
+            CREATE TEMP TABLE temp_scope_sessions_seed(
+                source TEXT NOT NULL, session_hash TEXT NOT NULL,
+                PRIMARY KEY(source, session_hash));
+            """)
+        defer {
+            try? exec("DROP TABLE IF EXISTS temp_scope_buckets;")
+            try? exec("DROP TABLE IF EXISTS temp_scope_sessions_seed;")
+        }
+        // 种子：非事件来源的 bucket / session 键（edit 脏键、直接登记的键、旧映射）。
+        for key in scope.buckets {
+            let parts = key.split(separator: "\u{1}", omittingEmptySubsequences: false)
+            guard parts.count == 4, let start = Int64(parts[3]) else { continue }
+            let stmt = try prepare("INSERT OR IGNORE INTO temp_scope_buckets(source,model,project,bucket_start) VALUES(?,?,?,?);")
+            defer { sqlite3_finalize(stmt) }
+            try bind(stmt, 1, String(parts[0])); try bind(stmt, 2, String(parts[1]))
+            try bind(stmt, 3, String(parts[2])); try bind(stmt, 4, start)
+            try done(stmt)
+        }
+        for key in scope.sessions {
+            let parts = key.split(separator: "\u{1}", omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let stmt = try prepare("INSERT OR IGNORE INTO temp_scope_sessions_seed(source,session_hash) VALUES(?,?);")
+            defer { sqlite3_finalize(stmt) }
+            try bind(stmt, 1, String(parts[0])); try bind(stmt, 2, String(parts[1]))
+            try done(stmt)
+        }
+        // 事件 → bucket / session：作用域内事件所在的 bucket / session 全部入集。
+        let scopeBucketFromEventStmt = try prepare("""
+            INSERT OR IGNORE INTO temp_scope_buckets(source, model, project, bucket_start)
+            SELECT DISTINCT e.source, e.model, e.project,
+                   (e.timestamp_ms / \(bucketMsForScope)) * \(bucketMsForScope)
+            FROM temp_scope_events s
+            CROSS JOIN usage_events e ON e.source = s.source AND e.event_id = s.event_id
+            WHERE e.hostname = ? AND e.hostname <> '';
+            """)
+        let scopeSessionFromEventStmt = try prepare("""
+            INSERT OR IGNORE INTO temp_scope_sessions_seed(source, session_hash)
+            SELECT DISTINCT e.source, e.session_hash
+            FROM temp_scope_events s
+            CROSS JOIN usage_events e ON e.source = s.source AND e.event_id = s.event_id
+            WHERE e.hostname = ? AND e.session_hash <> '' AND e.hostname <> '';
+            """)
+        // bucket / session → 事件：作用域内 bucket / session 的全部贡献事件入集。
+        let scopeEventFromBucketStmt = try prepare("""
+            INSERT OR IGNORE INTO temp_scope_events(source, event_id)
+            SELECT DISTINCT e.source, e.event_id
+            FROM temp_scope_buckets b
+            CROSS JOIN usage_events e ON e.source = b.source AND e.model = b.model
+                AND b.project = e.project
+                AND b.bucket_start = (e.timestamp_ms / \(bucketMsForScope)) * \(bucketMsForScope)
+            WHERE e.hostname = ? AND e.hostname <> '';
+            """)
+        // bucket → 事件的第二条路径：沿旧 logical→bucket 映射反查。去重胜者的 model 是
+        // COALESCE(MAX(CASE WHEN model <> 'unknown' THEN model END), MAX(model)) 的产物，可能不等于组内
+        // 任何一行的原始 model；lineage / content 两层去重还会把胜者改判到另一个组的 bucket。
+        // 所以光按原始行的 (model, project, bucket) 匹配会漏掉这类贡献者，必须靠上一轮
+        // 落盘的映射反查才能把它们拉进作用域。
+        let scopeEventFromBucketMapStmt = try prepare("""
+            INSERT OR IGNORE INTO temp_scope_events(source, event_id)
+            SELECT DISTINCT m.source, m.event_id
+            FROM temp_scope_buckets b
+            CROSS JOIN usage_logical_bucket_map m ON m.source = b.source AND m.bucket_model = b.model
+                AND b.project = m.bucket_project AND b.bucket_start = m.bucket_start
+            WHERE m.hostname = ?;
+            """)
+        // 事件 → 旧 bucket。上一轮落盘的映射记录了每个事件当时实际贡献到哪个 bucket。
+        // 去重胜者的 model 是 COALESCE 产物，lineage / content 两层还会把胜者改判到另一个
+        // 组的 bucket，所以旧 bucket 无法从原始行的 (model, project) 还原。胜者易主后旧 bucket
+        // 必须进作用域，否则重算不到它，旧值永久残留。
+        let scopeBucketFromMapStmt = try prepare("""
+            INSERT OR IGNORE INTO temp_scope_buckets(source, model, project, bucket_start)
+            SELECT DISTINCT m.source, m.bucket_model, m.bucket_project, m.bucket_start
+            FROM temp_scope_events s
+            CROSS JOIN usage_logical_bucket_map m ON m.source = s.source AND m.event_id = s.event_id
+            WHERE m.hostname = ?;
+            """)
+        let scopeEventFromSessionStmt = try prepare("""
+            INSERT OR IGNORE INTO temp_scope_events(source, event_id)
+            SELECT DISTINCT e.source, e.event_id
+            FROM temp_scope_sessions_seed t
+            CROSS JOIN usage_events e ON e.source = t.source AND e.session_hash = t.session_hash
+            WHERE e.hostname = ? AND e.hostname <> '';
+            """)
+        defer {
+            sqlite3_finalize(scopeLineageStmt); sqlite3_finalize(scopeContentStmt)
+            sqlite3_finalize(scopeBucketFromEventStmt); sqlite3_finalize(scopeSessionFromEventStmt)
+            sqlite3_finalize(scopeEventFromBucketStmt); sqlite3_finalize(scopeEventFromSessionStmt)
+            sqlite3_finalize(scopeEventFromBucketMapStmt); sqlite3_finalize(scopeBucketFromMapStmt)
+        }
+        // 作用域上限先算出来，循环里每轮检查。不能等循环结束再判：雪崩式增长的代价正是在
+        // 循环内花掉的，实测跑满 16 轮要 54 秒，而这轮本来就注定退回全量（全量只要 4 秒）。
+        let hostEventTotal = try hostEventCountUnlocked(hostname: hostname)
+        let scopeEventCeiling = hostEventTotal > 0
+            ? Int(Double(hostEventTotal) * Self.incrementalScopeFraction)
+            : Int.max
+        var scopeOverflowed = false
+        for _ in 0 ..< Self.dirtyClosureIterationLimit {
+            var added: Int32 = 0
+            sqlite3_reset(scopeLineageStmt); sqlite3_clear_bindings(scopeLineageStmt)
+            try bind(scopeLineageStmt, 1, hostname); try bind(scopeLineageStmt, 2, hostname)
+            try done(scopeLineageStmt)
+            added += sqlite3_changes(db)
+            sqlite3_reset(scopeContentStmt); sqlite3_clear_bindings(scopeContentStmt)
+            try bind(scopeContentStmt, 1, hostname); try bind(scopeContentStmt, 2, hostname)
+            try done(scopeContentStmt)
+            added += sqlite3_changes(db)
+            sqlite3_reset(scopeBucketFromEventStmt); sqlite3_clear_bindings(scopeBucketFromEventStmt)
+            try bind(scopeBucketFromEventStmt, 1, hostname)
+            try done(scopeBucketFromEventStmt)
+            added += sqlite3_changes(db)
+            sqlite3_reset(scopeSessionFromEventStmt); sqlite3_clear_bindings(scopeSessionFromEventStmt)
+            try bind(scopeSessionFromEventStmt, 1, hostname)
+            try done(scopeSessionFromEventStmt)
+            added += sqlite3_changes(db)
+            sqlite3_reset(scopeEventFromBucketStmt); sqlite3_clear_bindings(scopeEventFromBucketStmt)
+            try bind(scopeEventFromBucketStmt, 1, hostname)
+            try done(scopeEventFromBucketStmt)
+            added += sqlite3_changes(db)
+            sqlite3_reset(scopeEventFromSessionStmt); sqlite3_clear_bindings(scopeEventFromSessionStmt)
+            try bind(scopeEventFromSessionStmt, 1, hostname)
+            try done(scopeEventFromSessionStmt)
+            added += sqlite3_changes(db)
+            sqlite3_reset(scopeEventFromBucketMapStmt); sqlite3_clear_bindings(scopeEventFromBucketMapStmt)
+            try bind(scopeEventFromBucketMapStmt, 1, hostname)
+            try done(scopeEventFromBucketMapStmt)
+            added += sqlite3_changes(db)
+            sqlite3_reset(scopeBucketFromMapStmt); sqlite3_clear_bindings(scopeBucketFromMapStmt)
+            try bind(scopeBucketFromMapStmt, 1, hostname)
+            try done(scopeBucketFromMapStmt)
+            added += sqlite3_changes(db)
+            if added == 0 { break }
+            if try Int(scalar("SELECT COUNT(*) FROM temp_scope_events;")) > scopeEventCeiling {
+                scopeOverflowed = true
+                break
+            }
+        }
+        // 作用域太大就退回全量：增量的开销随作用域线性增长，而全量是固定成本。
+        if scopeOverflowed { return nil }
+        advanceStage() // 1) 闭包展开 + 组补全完成
+
+        // 组补全后，scope.buckets / scope.sessions 需要按补全后的 temp_scope_events 重新收集，
+        // 否则新补进的 logical 组所在的 bucket 不会被重算（也不会被删）。
+        do {
+            let bucketMs = Self.bucketMilliseconds
+            let stmt = try prepare("""
+                SELECT DISTINCT e.source, e.model, e.project,
+                       (e.timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start
+                FROM temp_scope_events s
+                CROSS JOIN usage_events e ON e.source = s.source AND e.event_id = s.event_id
+                WHERE e.hostname = ? AND e.hostname <> '';
+                """)
+            defer { sqlite3_finalize(stmt) }
+            try bind(stmt, 1, hostname)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                scope.buckets.insert(compositeKey(
+                    text(stmt, 0), text(stmt, 1), text(stmt, 2),
+                    String(sqlite3_column_int64(stmt, 3))
+                ))
+            }
+        }
+        do {
+            let stmt = try prepare("""
+                SELECT DISTINCT e.source, e.session_hash FROM temp_scope_events s
+                CROSS JOIN usage_events e ON e.source = s.source AND e.event_id = s.event_id
+                WHERE e.hostname = ? AND e.session_hash <> '' AND e.hostname <> '';
+                """)
+            defer { sqlite3_finalize(stmt) }
+            try bind(stmt, 1, hostname)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                scope.sessions.insert(compositeKey(text(stmt, 0), text(stmt, 1)))
+            }
+        }
+        // 把作用域内 logical 组上一轮贡献到的旧 bucket 键并入 scope.buckets。
+        // 胜者易主后旧 bucket 的贡献行可能已不在 usage_events 里，无法从原始行还原 bucket 键，
+        // 必须靠这张映射表把旧 bucket 纳入作用域，重算后若无贡献就走删除分支。
+        do {
+            let stmt = try prepare("""
+                SELECT DISTINCT m.source, m.bucket_model, m.bucket_project, m.bucket_start
+                FROM temp_scope_events s
+                CROSS JOIN usage_logical_bucket_map m ON m.source = s.source AND m.event_id = s.event_id
+                WHERE m.hostname = ?;
+                """)
+            defer { sqlite3_finalize(stmt) }
+            try bind(stmt, 1, hostname)
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                scope.buckets.insert(compositeKey(
+                    text(stmt, 0), text(stmt, 1), text(stmt, 2),
+                    String(sqlite3_column_int64(stmt, 3))
+                ))
+            }
+        }
+        guard scope.buckets.count <= Self.incrementalBucketLimit else { return nil }
+
+        // 2) 作用域内三级去重。SQL 与全量共用同一份常量，只有 logical 种子多一个 JOIN。
+        let bucketMs = Self.bucketMilliseconds
+        try exec("DROP TABLE IF EXISTS temp_logical_events;")
+        try exec("DROP TABLE IF EXISTS temp_lineage_events;")
+        try exec("DROP TABLE IF EXISTS temp_deduped_events;")
+        defer {
+            try? exec("DROP TABLE IF EXISTS temp_logical_events;")
+            try? exec("DROP TABLE IF EXISTS temp_lineage_events;")
+            try? exec("DROP TABLE IF EXISTS temp_deduped_events;")
+        }
+        // 胜者 bucket 无法从原始行反向枚举。logical 去重逐列取 MAX / COALESCE，同一
+        // (source, event_id) 的多行可能分处不同文件、不同 model / project / 时间戳，合成的胜者
+        // 会落进一个「组内没有任何一行在里面」的第三个 bucket。所以不存在从 bucket 自然键
+        // 反查「所有可能贡献者」的 SQL——能表达这层关系的只有上一轮落盘的
+        // usage_logical_bucket_map。
+        //
+        // 因此作用域必须以 logical 组为单位，在「logical 组 ↔ bucket」二部图上迭代：
+        // 跑完 scoped 去重拿到新胜者 bucket 后，再拿这些 bucket 反查映射表，把同样贡献到
+        // 它们的其它 logical 组拉进作用域，然后重跑去重。新拉进的组又可能带出新 bucket，
+        // 所以要循环到不动点。temp_scope_events 只增不减且上界是全表，循环必终止。
+        for _ in 0 ..< Self.dirtyClosureIterationLimit {
+            // 每轮从头重建三张去重临时表（上一轮的作用域可能已变大）。
+            // 循环退出时表一定存在，后续聚合阶段直接用。
+            try exec("DROP TABLE IF EXISTS temp_logical_events;")
+            try exec("DROP TABLE IF EXISTS temp_lineage_events;")
+            try exec("DROP TABLE IF EXISTS temp_deduped_events;")
+            do {
+                let statement = try prepare(Self.logicalEventsSQL(scoped: true))
+                defer { sqlite3_finalize(statement) }
+                try bind(statement, 1, hostname)
+                try done(statement)
+            }
+            try exec(Self.lineageEventsSQL)
+            try exec(Self.dedupedEventsSQL)
+            // 拿新胜者 bucket 反查映射表。该语句引用 temp_deduped_events，必须在该表
+            // 建好之后才能 prepare，所以放在循环体内。
+            // 先把胜者 bucket 键物化成一张小表：直接 JOIN 时 (timestamp_ms/N)*N 是表达式，
+            // 用不上 idx_logical_bucket_map_bucket，会退化成 21k x 50k 的嵌套循环。
+            try exec("DROP TABLE IF EXISTS temp_winner_buckets;")
+            try exec("""
+                CREATE TEMP TABLE temp_winner_buckets AS
+                SELECT DISTINCT source, model, project,
+                       (timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start
+                FROM temp_deduped_events;
+                """)
+            let winnerBucketStmt = try prepare("""
+                INSERT OR IGNORE INTO temp_scope_events(source, event_id)
+                SELECT DISTINCT m.source, m.event_id
+                FROM usage_logical_bucket_map m
+                JOIN temp_winner_buckets w ON w.source = m.source
+                    AND w.model = m.bucket_model AND w.project = m.bucket_project
+                    AND w.bucket_start = m.bucket_start
+                WHERE m.hostname = ?;
+                """)
+            try bind(winnerBucketStmt, 1, hostname)
+            try done(winnerBucketStmt)
+            let grew = sqlite3_changes(db)
+            sqlite3_finalize(winnerBucketStmt)
+            try exec("DROP TABLE IF EXISTS temp_winner_buckets;")
+            if grew == 0 { break }
+        }
+        advanceStage() // 2-3) 三级去重完成
+
+        // 去重胜者的 model 可能是 COALESCE(MAX(CASE WHEN model <> 'unknown' THEN model END), MAX(model))
+        // 的结果，不等于组内任何一行的原始 model。因此胜者实际落进的 bucket 自然键可能不在
+        // scope.buckets（它是按原始行的 model/project 收集的）。这里把去重结果真实的 bucket 键
+        // 并入作用域，避免 token 聚合阶段被 guard scope.buckets.contains 误丢。
+        do {
+            let statement = try prepare("""
+                SELECT DISTINCT source, model, project,
+                       (timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start
+                FROM temp_deduped_events;
+                """)
+            defer { sqlite3_finalize(statement) }
+            while sqlite3_step(statement) == SQLITE_ROW {
+                scope.buckets.insert(compositeKey(
+                    text(statement, 0), text(statement, 1), text(statement, 2),
+                    String(sqlite3_column_int64(statement, 3))
+                ))
+            }
+        }
+        // 外层不动点循环可能又把新的 logical 组拉进了 temp_scope_events，而 scope.sessions
+        // 是循环之前收集的。这里按最终的作用域重新补齐，否则新拉进的行所属 session
+        // 不会被重算（也不会被删）。
+        do {
+            let statement = try prepare("""
+                SELECT DISTINCT e.source, e.session_hash FROM temp_scope_events s
+                CROSS JOIN usage_events e ON e.source = s.source AND e.event_id = s.event_id
+                WHERE e.hostname = ? AND e.session_hash <> '' AND e.hostname <> '';
+                """)
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            while sqlite3_step(statement) == SQLITE_ROW {
+                scope.sessions.insert(compositeKey(text(statement, 0), text(statement, 1)))
+            }
+        }
+        // 旧 bucket 也要按最终作用域重新并入：循环新拉进的 logical 组上一轮可能贡献到
+        // 另一个 bucket，胜者易主后那个 bucket 必须进作用域才能被重算或删除。
+        do {
+            let statement = try prepare("""
+                SELECT DISTINCT m.source, m.bucket_model, m.bucket_project, m.bucket_start
+                FROM temp_scope_events s
+                CROSS JOIN usage_logical_bucket_map m ON m.source = s.source AND m.event_id = s.event_id
+                WHERE m.hostname = ?;
+                """)
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            while sqlite3_step(statement) == SQLITE_ROW {
+                scope.buckets.insert(compositeKey(
+                    text(statement, 0), text(statement, 1), text(statement, 2),
+                    String(sqlite3_column_int64(statement, 3))
+                ))
+            }
+        }
+        // 3) identity 冲突：只替换作用域内的键，其余不动。eligible 由整表是否为空判定，仍然精确。
+        try updateScopedIdentityConflictsUnlocked(hostname: hostname)
+
+        var blockedReasons: [String] = []
+        var unprovableInherited = 0
+        do {
+            let statement = try prepare(
+                "SELECT COUNT(*) FROM temp_logical_events WHERE inherited = 1 AND lineage_fingerprint = '';"
+            )
+            defer { sqlite3_finalize(statement) }
+            if sqlite3_step(statement) == SQLITE_ROW {
+                unprovableInherited = Int(sqlite3_column_int64(statement, 0))
+            }
+        }
+        if unprovableInherited > 0 {
+            blockedReasons.append("\(unprovableInherited) inherited replay event(s) without total snapshot cannot be proven duplicate; reporting proceeds (idempotent upsert self-heals)")
+        }
+        let identityConflicts = try identityConflictCountUnlocked(hostname: hostname)
+        if identityConflicts > 0 {
+            blockedReasons.append("\(identityConflicts) logical event(s) have conflicting identity (session/model/project) across same-tier files; reporting blocked")
+        }
+
+        // 4) 折叠统计只覆盖作用域内的组。这两个数是遥测/信息性输出（生产无消费者），
+        //    语义相应收窄为「本轮重算的组里折叠了多少」，与增量口径一致。
+        var collapsedInheritedEvents = 0
+        var collapsedContentDuplicates = 0
+        do {
+            let statement = try prepare("""
+                SELECT
+                    (SELECT COUNT(*) FROM temp_logical_events WHERE lineage_fingerprint <> '')
+                        - (SELECT COUNT(DISTINCT lineage_fingerprint) FROM temp_logical_events WHERE lineage_fingerprint <> ''),
+                    (SELECT COUNT(*) FROM temp_lineage_events WHERE codex_dedup_key <> '')
+                        - (SELECT COUNT(DISTINCT codex_dedup_key) FROM temp_lineage_events WHERE codex_dedup_key <> '');
+                """)
+            defer { sqlite3_finalize(statement) }
+            if sqlite3_step(statement) == SQLITE_ROW {
+                collapsedInheritedEvents = Int(sqlite3_column_int64(statement, 0))
+                collapsedContentDuplicates = Int(sqlite3_column_int64(statement, 1))
+            }
+        }
+
+        // 5) bucket token 聚合：只聚合作用域覆盖的 bucket。
+        struct BucketAgg {
+            var counts = UsageTokenCounts()
+            var skillCounts: [String: Int] = [:]
+            var mcpCounts: [String: Int] = [:]
+            var linesAdded: Int64 = 0
+            var linesDeleted: Int64 = 0
+            var codeMetricVersion = 0
+        }
+        var buckets: [String: BucketAgg] = [:]
+        var bucketMeta: [String: (source: String, model: String, project: String, start: Int64)] = [:]
+        do {
+            let statement = try prepare("""
+                SELECT source, model, project, (timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start,
+                       SUM(input_tokens), SUM(output_tokens), SUM(cached_input_tokens),
+                       SUM(cache_creation_input_tokens), SUM(reasoning_output_tokens), SUM(total_tokens)
+                FROM temp_deduped_events
+                GROUP BY source, model, project, bucket_start;
+                """)
+            defer { sqlite3_finalize(statement) }
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let source = text(statement, 0)
+                let model = text(statement, 1)
+                let project = text(statement, 2)
+                let start = sqlite3_column_int64(statement, 3)
+                let key = compositeKey(source, model, project, String(start))
+                // 作用域外的 bucket 不能在这里写入：它的聚合只含作用域内的行，是残缺值。
+                // 正常情况下不会出现——闭包已把所有成员行的 bucket 都收进 scope——
+                // 这里是防御性丢弃，宁可不动也不写错。
+                guard scope.buckets.contains(key) else { continue }
+                buckets[key] = BucketAgg(counts: UsageTokenCounts(
+                    input: sqlite3_column_int64(statement, 4),
+                    output: sqlite3_column_int64(statement, 5),
+                    cachedInput: sqlite3_column_int64(statement, 6),
+                    cacheCreationInput: sqlite3_column_int64(statement, 7),
+                    reasoningOutput: sqlite3_column_int64(statement, 8),
+                    reportedTotal: sqlite3_column_int64(statement, 9)
+                ))
+                bucketMeta[key] = (source, model, project, start)
+            }
+        }
+        advanceStage() // 4) bucket token 聚合完成
+
+        // 6) skill/mcp 四级去重合并：SQL 的 MAX(JSON) 无法按 key 取 max，必须在 Swift 端重做
+        //    tier -> logical -> lineage -> content 四级。只取作用域内的事件。
+        let scopedSkillEvents = try readScopedSkillMergeEventsUnlocked(hostname: hostname)
+        for ev in try mergeSkillCountsByBucketUnlocked(scopedSkillEvents, bucketMs: bucketMs) {
+            guard var agg = buckets[ev.key] else { continue }
+            agg.skillCounts = UsageToolMetrics.mergeCounts(agg.skillCounts, ev.skillCounts)
+            agg.mcpCounts = UsageToolMetrics.mergeCounts(agg.mcpCounts, ev.mcpCounts)
+            buckets[ev.key] = agg
+        }
+        advanceStage() // 4.5) skill/mcp 合并完成
+
+        // 7) edit 聚合：edit 表按 tool_use_id 全局去重，胜者可能在作用域外的文件里，
+        //    所以读全量 edit 条目（该表行数远小于 usage_events），只把落在作用域内的 bucket 计入。
+        let editMetricSources = try readEditMetricSourcesUnlocked()
+        for key in bucketMeta.keys {
+            guard let meta = bucketMeta[key], editMetricSources.contains(meta.source) else { continue }
+            buckets[key]?.codeMetricVersion = UsageEditLines.codeMetricVersion
+        }
+        for edit in try readAllRawEditEntries(hostname: hostname) {
+            let start = (edit.timestampMs / bucketMs) * bucketMs
+            let key = compositeKey(edit.source, edit.model, edit.project, String(start))
+            guard scope.buckets.contains(key) else { continue }
+            var agg = buckets[key] ?? BucketAgg()
+            agg.linesAdded = saturatedAdd(agg.linesAdded, edit.added)
+            agg.linesDeleted = saturatedAdd(agg.linesDeleted, edit.deleted)
+            agg.codeMetricVersion = UsageEditLines.codeMetricVersion
+            buckets[key] = agg
+            bucketMeta[key] = (edit.source, edit.model, edit.project, start)
+        }
+        advanceStage() // 5) edit 聚合完成
+
+        // 8) session 聚合：project / skills 取自 logical 去重结果（不做 lineage/content 合并——
+        //    继承回放携带的 skill 属于子 session，不能并入原 session）。
+        var sessionProject: [String: (project: String, timestampMs: Int64)] = [:]
+        var sessionSkillCounts: [String: [String: Int]] = [:]
+        for ev in logicalDedupedSkillEvents(scopedSkillEvents) where !ev.inherited && !ev.skillCounts.isEmpty {
+            let key = compositeKey(ev.source, ev.sessionHash)
+            sessionSkillCounts[key] = UsageToolMetrics.mergeCounts(sessionSkillCounts[key] ?? [:], ev.skillCounts)
+        }
+        do {
+            let statement = try prepare("""
+                SELECT source, session_hash, project, timestamp_ms
+                FROM temp_logical_events WHERE project <> '';
+                """)
+            defer { sqlite3_finalize(statement) }
+            while sqlite3_step(statement) == SQLITE_ROW {
+                let key = compositeKey(text(statement, 0), text(statement, 1))
+                let timestampMs = sqlite3_column_int64(statement, 3)
+                if let current = sessionProject[key], current.timestampMs >= timestampMs { continue }
+                sessionProject[key] = (text(statement, 2), timestampMs)
+            }
+        }
+        let sessions = try aggregateSessionsScopedUnlocked(
+            hostname: hostname,
+            sessionKeys: scope.sessions,
+            sessionProject: sessionProject,
+            sessionSkillCounts: sessionSkillCounts
+        )
+        advanceStage() // 6) session 聚合完成
+
+        // 9) 差异写。作用域外的派生行完全不碰——这正是增量省下时间的地方。
+        let newRevision = try nextRevisionUnlocked(hostname: hostname)
+        var changed = false
+
+        let existingBuckets = try readBucketRowsUnlocked(hostname: hostname)
+        for key in scope.buckets {
+            guard let meta = bucketMeta[key], let aggregate = buckets[key] else {
+                // 作用域内但本轮聚合无结果：该 bucket 的全部贡献都没了（源文件被删/行被替换/
+                // 去重胜者移出该 bucket）。必须删除，留着就是永远不会再更新的陈旧值。
+                if existingBuckets[key] != nil {
+                    try deleteBucketUnlocked(hostname: hostname, key: key)
+                    changed = true
+                }
+                continue
+            }
+            // 空聚合：token 六分量全 0、lines 全 0、skill/mcp 都空。通常是 edit 循环用
+            // `buckets[key] ?? BucketAgg()` 给一个无 token 贡献的 key 凭空建了全 0 agg，
+            // 而该 edit 的 added/deleted 也恰好为 0。这种 bucket 不该存在，走删除分支。
+            // 注意：纯 edit bucket（token 全 0 但 lines 非 0）是合法的，不会被误删。
+            let c = aggregate.counts
+            let isEmpty = c.input == 0 && c.output == 0 && c.cachedInput == 0
+                && c.cacheCreationInput == 0 && c.reasoningOutput == 0 && c.reportedTotal == 0
+                && aggregate.linesAdded == 0 && aggregate.linesDeleted == 0
+                && aggregate.skillCounts.isEmpty && aggregate.mcpCounts.isEmpty
+            if isEmpty {
+                if existingBuckets[key] != nil {
+                    try deleteBucketUnlocked(hostname: hostname, key: key)
+                    changed = true
+                }
+                continue
+            }
+            let bucket = UsageBucket(
+                hostname: hostname, source: meta.source, model: meta.model, project: meta.project,
+                bucketStart: date(meta.start), counts: aggregate.counts,
+                skillCounts: aggregate.skillCounts, mcpCounts: aggregate.mcpCounts,
+                linesAdded: aggregate.linesAdded, linesDeleted: aggregate.linesDeleted,
+                codeMetricVersion: aggregate.codeMetricVersion
+            )
+            if existingBuckets[key]?.bucket != bucket {
+                try upsertBucketUnlocked(bucket, revision: newRevision)
+                changed = true
+            }
+        }
+
+        let existingSessions = try readSessionRowsUnlocked(hostname: hostname)
+        advanceStage() // 7) bucket 差异写完成
+        var producedSessionKeys: Set<String> = []
+        for session in sessions {
+            let key = compositeKey(session.source, session.sessionHash)
+            producedSessionKeys.insert(key)
+            if existingSessions[key]?.session != session {
+                try upsertSessionUnlocked(session, revision: newRevision)
+                changed = true
+            }
+        }
+        // 作用域内但本轮没聚合出来的 session：其活动行已全部消失，删掉。
+        for key in scope.sessions where !producedSessionKeys.contains(key) {
+            if existingSessions[key] != nil {
+                try deleteSessionUnlocked(hostname: hostname, key: key)
+                changed = true
+            }
+        }
+
+        if !changed {
+            try setIntUnlocked(key: revisionKey(hostname), value: newRevision - 1)
+        }
+
+        let eligible = identityConflicts == 0
+        try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
+        advanceStage() // 8) session 差异写完成
+
+        // 更新作用域内 logical 组的 bucket 映射：先删旧映射，再从 temp_deduped_events 写入新的。
+        // 必须在 defer DROP temp_deduped_events 之前执行。
+        let bms = Self.bucketMilliseconds
+        try exec("""
+            DELETE FROM usage_logical_bucket_map
+            WHERE hostname='\(hostname)' AND EXISTS (
+                SELECT 1 FROM temp_scope_events s
+                WHERE s.source = usage_logical_bucket_map.source
+                  AND s.event_id = usage_logical_bucket_map.event_id
+            );
+            """)
+        try exec("""
+            INSERT OR REPLACE INTO usage_logical_bucket_map(
+                hostname,source,event_id,bucket_model,bucket_project,bucket_start)
+            SELECT '\(hostname)', source, event_id, model, project,
+                   (timestamp_ms/\(bms))*\(bms)
+            FROM temp_deduped_events;
+            """)
+
+        return UsageFinalizeResult(
+            reportingEligible: eligible,
+            blockedReasons: blockedReasons,
+            collapsedInheritedEvents: collapsedInheritedEvents,
+            collapsedContentDuplicates: collapsedContentDuplicates
+        )
+    }
+
+    /// 读取作用域内带 skill/mcp 计数的原始事件（含 tier）。与全量的 skillEventSQL 同构，
+    /// 只多一个 JOIN temp_scope_events。
+    private func readScopedSkillMergeEventsUnlocked(hostname: String) throws -> [SkillMergeEvent] {
+        let statement = try prepare("""
+            SELECT e.source, e.event_id, e.model, e.project, e.session_hash, e.timestamp_ms,
+                   e.inherited,
+                   (e.input_tokens + e.output_tokens + e.cached_input_tokens
+                    + e.cache_creation_input_tokens + e.reasoning_output_tokens) AS billable_total,
+                   e.lineage_fingerprint, e.codex_dedup_key,
+                   e.skill_counts_json, e.mcp_counts_json,
+                   CASE
+                       WHEN e.source_file_hash = '' THEN 0
+                       WHEN EXISTS (SELECT 1 FROM usage_files f WHERE f.file_id = e.source_file_hash AND f.scan_status <> 'missing') THEN 2
+                       ELSE 1
+                   END AS tier
+            FROM temp_scope_events s
+            CROSS JOIN usage_events e ON e.source = s.source AND e.event_id = s.event_id
+            WHERE e.hostname = ? AND (e.skill_counts_json <> '{}' OR e.mcp_counts_json <> '{}') AND e.hostname <> '';
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        var events: [SkillMergeEvent] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            events.append(SkillMergeEvent(
+                source: text(statement, 0), eventID: text(statement, 1),
+                model: text(statement, 2), project: text(statement, 3),
+                sessionHash: text(statement, 4),
+                timestampMs: sqlite3_column_int64(statement, 5),
+                inherited: sqlite3_column_int64(statement, 6) != 0,
+                billableTotal: sqlite3_column_int64(statement, 7),
+                lineageFingerprint: text(statement, 8), codexDedupKey: text(statement, 9),
+                skillCounts: decodeStringIntMap(text(statement, 10)),
+                mcpCounts: decodeStringIntMap(text(statement, 11)),
+                tier: Int(sqlite3_column_int64(statement, 12))
+            ))
+        }
+        return events
+    }
+
+    /// session 聚合的作用域版：只重算 sessionKeys 里的 session。
+    ///
+    /// 与全量版共用同一个流式聚合器，只是把驱动 SQL 的 WHERE 收窄到目标 session。
+    /// 单个 session 的聚合只依赖它自己的活动行，所以按 session 切分是无损的。
+    private func aggregateSessionsScopedUnlocked(
+        hostname: String,
+        sessionKeys: Set<String>,
+        sessionProject: [String: (project: String, timestampMs: Int64)],
+        sessionSkillCounts: [String: [String: Int]]
+    ) throws -> [UsageSession] {
+        guard !sessionKeys.isEmpty else { return [] }
+        try exec("DROP TABLE IF EXISTS temp_scope_sessions;")
+        try exec("CREATE TEMP TABLE temp_scope_sessions(source TEXT NOT NULL, session_hash TEXT NOT NULL, PRIMARY KEY(source,session_hash));")
+        defer { try? exec("DROP TABLE IF EXISTS temp_scope_sessions;") }
+        do {
+            let insert = try prepare("INSERT OR IGNORE INTO temp_scope_sessions(source,session_hash) VALUES(?,?);")
+            defer { sqlite3_finalize(insert) }
+            for key in sessionKeys {
+                let parts = key.components(separatedBy: "\u{1}")
+                guard parts.count == 2 else { continue }
+                sqlite3_reset(insert); sqlite3_clear_bindings(insert)
+                try bind(insert, 1, parts[0]); try bind(insert, 2, parts[1])
+                try done(insert)
+            }
+        }
+        return try aggregateSessionsStreamingUnlocked(
+            hostname: hostname,
+            sessionProject: sessionProject,
+            sessionSkillCounts: sessionSkillCounts,
+            scopedToTempSessions: true
+        )
+    }
+
+    /// finalizeDerived 的重算调度：先试增量，不满足前置或作用域过大就回退全量。
+    ///
+    /// 两条路径都在同一个事务里，脏键的清除与派生写入原子提交——绝不允许「清了脏键但派生没写」。
+    private func recomputeDispatchUnlocked(
+        hostname: String,
+        strategy: UsageFinalizeStrategy,
+        progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
+    ) throws -> UsageFinalizeResult {
+        try ensureIdentityConflictTableUnlocked()
+        if strategy == .automatic, try canRecomputeIncrementallyUnlocked(hostname: hostname) {
+            if let result = try recomputeDerivedIncrementalUnlocked(hostname: hostname, progress: progress) {
+                try clearDirtyKeysUnlocked(hostname: hostname)
+                return result
+            }
+        }
+        let result = try recomputeDerivedUnlocked(hostname: hostname, progress: progress)
+        // 全量重算刚刚重建了完整基线（含 identity 冲突表），下一轮起可以走增量。
+        try setTextUnlocked(key: Self.incrementalBaselineKey, value: "1")
+        try clearDirtyKeysUnlocked(hostname: hostname)
+        return result
+    }
     // MARK: - Frozen watermark (compaction, unlocked; called inside finalizeDerived transaction)
 
     /// 冻结静默期：只固化「早于 now - 此值」且已对齐 30 分钟 bucket 边界的历史。取 30 天，远大于
@@ -1500,6 +2788,16 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return found ? UsageSummary(updatedAt: newest.map(date), counts: total, estimatedCostUSD: cost) : nil
     }
 
+    /// 单 hostname 的原始事件行数。增量作用域的相对大小判据。
+    /// 调用方已持有队列，所以这里不再 queue.sync（会死锁）。
+    private func hostEventCountUnlocked(hostname: String) throws -> Int {
+        let statement = try prepare("SELECT COUNT(*) FROM usage_events WHERE hostname=?;")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw error() }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
     public func eventCount() throws -> Int {
         try queue.sync {
             let statement = try prepare("SELECT COUNT(*) FROM usage_events;"); defer { sqlite3_finalize(statement) }
@@ -1561,17 +2859,32 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private func aggregateSessionsStreamingUnlocked(
         hostname: String,
         sessionProject: [String: (project: String, timestampMs: Int64)],
-        sessionSkillCounts: [String: [String: Int]]
+        sessionSkillCounts: [String: [String: Int]],
+        scopedToTempSessions: Bool = false
     ) throws -> [UsageSession] {
         let duplicateWinners = try duplicateSessionEventWinnersUnlocked(hostname: hostname)
-        let statement = try prepare("""
+        // scoped 模式只聚合 temp_scope_sessions 里的 session。单个 session 的聚合只依赖它
+        // 自己的活动行，所以按 session 切分是无损的。scoped 分支不强制 INDEXED BY：加了
+        // EXISTS 子查询后让查询规划器自己选，避免与强制索引冲突。
+        let sessionScanSQL = scopedToTempSessions ? """
+            SELECT event_id,source,session_hash,role,timestamp_ms,source_file_hash
+            FROM usage_session_events
+            WHERE hostname=?
+              AND EXISTS (SELECT 1 FROM temp_scope_sessions t
+                          WHERE t.source = usage_session_events.source
+                            AND t.session_hash = usage_session_events.session_hash)
+            ORDER BY source,session_hash,timestamp_ms,
+                     CASE role WHEN 'user' THEN 0 WHEN 'synthetic_user' THEN 1 ELSE 2 END,
+                     event_id,source_file_hash;
+            """ : """
             SELECT event_id,source,session_hash,role,timestamp_ms,source_file_hash
             FROM usage_session_events INDEXED BY idx_session_events_host_group
             WHERE hostname=?
             ORDER BY source,session_hash,timestamp_ms,
                      CASE role WHEN 'user' THEN 0 WHEN 'synthetic_user' THEN 1 ELSE 2 END,
                      event_id,source_file_hash;
-            """)
+            """
+        let statement = try prepare(sessionScanSQL)
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, hostname)
 
@@ -1917,6 +3230,139 @@ public final class UsageLedgerStore: @unchecked Sendable {
     }
 
 
+
+    // MARK: - skill/mcp 计数的四级去重（全量与增量共用）
+
+    /// 第 1 级：logical ID 去重。同 (source, event_id) 取最高 tier，同 tier 内计数按 key 取 max。
+    ///
+    /// session skills 只用到这一级 —— 继承回放携带的 skill 属于子 session，
+    /// 不能通过 lineage 并入原 session，所以不能用后面几级的结果。
+    /// 与 logicalEventsSQL 的 COALESCE(MAX(CASE WHEN x <> 'unknown' THEN x END), MAX(x)) 同语义：
+    /// 优先取非 unknown 中的最大值，全是 unknown 时取最大值。
+    private static func coalescedDedupField(_ lhs: String, _ rhs: String) -> String {
+        let unknown = "unknown"
+        switch (lhs == unknown, rhs == unknown) {
+        case (false, false): return max(lhs, rhs)
+        case (false, true): return lhs
+        case (true, false): return rhs
+        case (true, true): return lhs
+        }
+    }
+    private func logicalDedupedSkillEvents(_ events: [SkillMergeEvent]) -> [SkillMergeEvent] {
+            // 1) logical ID 去重：同 (source, event_id) 取最高 tier，计数按 key 取 max。
+            var logicalByKey: [String: SkillMergeEvent] = [:]
+            for ev in events {
+                let key = "\(ev.source)\u{1}\(ev.eventID)"
+                if let existing = logicalByKey[key] {
+                    if ev.tier > existing.tier {
+                        logicalByKey[key] = ev
+                    } else if ev.tier == existing.tier {
+                        // 同 tier 合并必须与 logicalEventsSQL 逐列对齐，不能取「遍历到的第一行」。
+                        // 两条喂数据的 SQL 都没有 ORDER BY，全量读全表、增量读子集，返回顺序不同；
+                        // 若取首行字段，胜者的 model / project / timestamp 会随顺序漂移，算出不同的
+                        // bucket 自然键。全量路径下算错的键被 bucket 查找静默丢弃，所以一直没暴露。
+                        // 对齐口径：model / project 用 COALESCE(MAX(非 unknown), MAX(全部))，
+                        // timestamp / inherited 取 MIN。
+                        let mergedModel = Self.coalescedDedupField(existing.model, ev.model)
+                        let mergedProject = Self.coalescedDedupField(existing.project, ev.project)
+                        logicalByKey[key] = SkillMergeEvent(
+                            source: existing.source, eventID: existing.eventID,
+                            model: mergedModel, project: mergedProject,
+                            sessionHash: max(existing.sessionHash, ev.sessionHash),
+                            timestampMs: min(existing.timestampMs, ev.timestampMs),
+                            inherited: existing.inherited && ev.inherited,
+                            billableTotal: max(existing.billableTotal, ev.billableTotal),
+                            lineageFingerprint: max(existing.lineageFingerprint, ev.lineageFingerprint),
+                            codexDedupKey: max(existing.codexDedupKey, ev.codexDedupKey),
+                            skillCounts: maximumCounts(existing.skillCounts, ev.skillCounts),
+                            mcpCounts: maximumCounts(existing.mcpCounts, ev.mcpCounts),
+                            tier: existing.tier
+                        )
+                    }
+                } else {
+                    logicalByKey[key] = ev
+                }
+            }
+            let logicalDeduped = Array(logicalByKey.values)
+        return logicalDeduped
+    }
+
+    /// 三级去重后按 bucket 自然键合并 skill/mcp 计数。
+    ///
+    /// 分工：胜者选择全部交给 SQL（temp_skill_attribution），Swift 只做 SQL 做不到的两件事——
+    /// logical 组内按 key 取 max，以及同一胜者下多个 logical 组按 key 取 max。
+    /// 落到同一 bucket 的不同胜者之间是求和，与 token 侧的 GROUP BY 语义一致。
+    ///
+    /// 前置条件：temp_logical_events / temp_lineage_events / temp_deduped_events 均已物化。
+    private func mergeSkillCountsByBucketUnlocked(
+        _ events: [SkillMergeEvent],
+        bucketMs: Int64
+    ) throws -> [(key: String, skillCounts: [String: Int], mcpCounts: [String: Int])] {
+        let logicalDeduped = logicalDedupedSkillEvents(events)
+        guard !logicalDeduped.isEmpty else { return [] }
+
+        let attribution = try readSkillAttributionUnlocked(bucketMs: bucketMs)
+
+        // 每个胜者先把归属到它的 logical 组按 key 取 max —— 这一步复现 lineage / content
+        // 两级「计数按 key 取 max」的语义，但不再由 Swift 决定谁是胜者。
+        var byWinner: [String: (bucketKey: String, skillCounts: [String: Int], mcpCounts: [String: Int])] = [:]
+        for ev in logicalDeduped {
+            guard let target = attribution[compositeKey(ev.source, ev.eventID)] else { continue }
+            if let existing = byWinner[target.winnerKey] {
+                byWinner[target.winnerKey] = (
+                    target.bucketKey,
+                    maximumCounts(existing.skillCounts, ev.skillCounts),
+                    maximumCounts(existing.mcpCounts, ev.mcpCounts)
+                )
+            } else {
+                byWinner[target.winnerKey] = (target.bucketKey, ev.skillCounts, ev.mcpCounts)
+            }
+        }
+
+        // 再按 bucket 求和。遍历顺序不影响结果：mergeCounts 逐 key 相加，可交换可结合。
+        var merged: [String: (skillCounts: [String: Int], mcpCounts: [String: Int])] = [:]
+        for (_, entry) in byWinner {
+            if let existing = merged[entry.bucketKey] {
+                merged[entry.bucketKey] = (
+                    UsageToolMetrics.mergeCounts(existing.skillCounts, entry.skillCounts),
+                    UsageToolMetrics.mergeCounts(existing.mcpCounts, entry.mcpCounts)
+                )
+            } else {
+                merged[entry.bucketKey] = (entry.skillCounts, entry.mcpCounts)
+            }
+        }
+        // 键升序返回，保证调用方看到的顺序稳定。
+        return merged.keys.sorted().compactMap { key in
+            merged[key].map { (key: key, skillCounts: $0.skillCounts, mcpCounts: $0.mcpCounts) }
+        }
+    }
+
+    /// 物化并读取「logical 行 -> 最终胜者 + 胜者 bucket 自然键」的归属映射。
+    private func readSkillAttributionUnlocked(
+        bucketMs: Int64
+    ) throws -> [String: (winnerKey: String, bucketKey: String)] {
+        try exec("DROP TABLE IF EXISTS temp_skill_attribution;")
+        defer { try? exec("DROP TABLE IF EXISTS temp_skill_attribution;") }
+        try exec(Self.skillAttributionSQL(bucketMs: bucketMs))
+
+        let statement = try prepare("""
+            SELECT source, event_id, winner_source, winner_event_id,
+                   winner_model, winner_project, winner_bucket_start
+            FROM temp_skill_attribution;
+            """)
+        defer { sqlite3_finalize(statement) }
+        var result: [String: (winnerKey: String, bucketKey: String)] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let memberKey = compositeKey(text(statement, 0), text(statement, 1))
+            let winnerKey = compositeKey(text(statement, 2), text(statement, 3))
+            let bucketKey = compositeKey(
+                text(statement, 2), text(statement, 4), text(statement, 5),
+                String(sqlite3_column_int64(statement, 6))
+            )
+            result[memberKey] = (winnerKey, bucketKey)
+        }
+        return result
+    }
     // MARK: - Derived row helpers (unlocked; inside transaction)
 
     private struct BucketRow: Equatable { let bucket: UsageBucket; let revision: Int64; let synced: Int64 }
@@ -2275,7 +3721,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 标记一批磁盘上已消失的文件为 checkpoint missing，但绝不删除其原始行或派生历史。
     /// 删除源文件不应由 record 自动删历史；本 API 仅把这些 fileID 的 scan_status 置 "missing"，
     /// 保留 raw 以维持历史与去重口径。未登记的 fileID 忽略。
-    public func markFilesMissing(fileIDs: [String]) throws {
+    public func markFilesMissing(fileIDs: [String], hostname: String) throws {
         guard !fileIDs.isEmpty else { return }
         try queue.sync {
             try transaction {
@@ -2284,17 +3730,21 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 let statement = try prepare("UPDATE usage_files SET scan_status=?, updated_at_ms=? WHERE file_id=? AND scan_status<>'missing';")
                 defer { sqlite3_finalize(statement) }
                 let nowMs = millis(Date())
-                var changedRows = 0
+                var transitioned: [String] = []
                 for fileID in fileIDs {
                     sqlite3_reset(statement); sqlite3_clear_bindings(statement)
                     try bind(statement, 1, "missing"); try bind(statement, 2, nowMs); try bind(statement, 3, fileID)
                     try done(statement)
-                    changedRows += Int(sqlite3_changes(db))
+                    if sqlite3_changes(db) > 0 { transitioned.append(fileID) }
                 }
                 // scan_status 参与派生：tier 由文件是否 active 决定，转 missing 会把其事件
                 // 从 ownedActive 降为 ownedHistory，可能改变 logical dedup 选中的行。
                 // 不置脏位则派生表会一直沿用旧 tier 的结果。
-                guard changedRows > 0 else { return }
+                guard !transitioned.isEmpty else { return }
+                // raw 行仍在（本方法只改 checkpoint 状态），所以此刻还能读出它们的去重键。
+                for fileID in transitioned {
+                    try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
+                }
                 try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
             }
         }
@@ -2302,7 +3752,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     /// 以 source 为原子作用域，把本轮未出现的 checkpoint 标为 missing；只改 checkpoint，
     /// 不删除任何 raw。调用方必须先合并同 source 的全部 root（例如 Codex sessions + archive）。
-    public func markFilesMissing(source: String, presentFileIDs: [String]) throws {
+    public func markFilesMissing(source: String, presentFileIDs: [String], hostname: String) throws {
         let normalizedSource = source.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedSource.isEmpty else { throw UsageLedgerError.invalidCheckpoint }
         let present = Set(presentFileIDs)
@@ -2327,6 +3777,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     sqlite3_reset(update); sqlite3_clear_bindings(update)
                     try bind(update, 1, nowMs); try bind(update, 2, normalizedSource); try bind(update, 3, fileID)
                     try done(update)
+                }
+                // raw 行仍在（本方法只改 checkpoint 状态），此刻还能读出这些文件的去重键，
+                // 供增量 finalize 还原受 tier 变化影响的 bucket/session。
+                for fileID in missing {
+                    try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
                 }
                 // 只有真的有文件转 missing 时才置脏位（上面已 guard 空集提前返回），
                 // 否则每轮扫描都会退化成全库重算。
@@ -2662,11 +4117,31 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 + "DROP INDEX IF EXISTS idx_usage_events_host_logical;"
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_host_time ON usage_events(hostname,timestamp_ms,event_id,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_dedup ON usage_events(codex_dedup_key);"
+                // 增量闭包的两条正向边（logical→lineage、logical→content）把脏键表 JOIN 回
+                // usage_events，连接列是 (source, event_id)。缺索引时每条边都全表扫描，50k 行
+                // fixture 上两条边合计 0.25 秒，且随账本线性恶化——大库上增量会比全量还慢。
+                //
+                // 这里用**部分索引**而非普通索引，是为了不碰全量路径。普通的
+                // (source, event_id) 索引会被全量 logical 聚合的 GROUP BY source, event_id 拿去
+                // 替代排序，退化成「按索引序扫描 + 逐行回表」：实测把全量从 3.9 秒推到 52.5 秒。
+                // 带 WHERE 谓词后计划器无法证明它覆盖全部行，那个 GROUP BY 就用不上它；而两条
+                // 正向边的 SQL 本身带着同样的谓词，等值查找照样命中。
+                + "CREATE INDEX IF NOT EXISTS idx_usage_events_dirty_lineage ON usage_events(source,event_id,lineage_fingerprint) WHERE lineage_fingerprint <> '';"
+                + "CREATE INDEX IF NOT EXISTS idx_usage_events_dirty_content ON usage_events(source,event_id,codex_dedup_key) WHERE codex_dedup_key <> '';"
+                // 其余增量边不带 lineage / content 谓词，需要一个通用的 (source, event_id) 入口。
+                // 谓词 hostname <> '' 在真实数据上恒真（record 总是写入采集机名），所以覆盖面
+                // 与普通索引一致；但计划器无法静态证明这一点，全量 GROUP BY 依旧走顺序扫描。
+                // 代价是增量侧的 SQL 必须显式带上同一个谓词，否则匹配不到——见 dirtyScopeGuard。
+                + "CREATE INDEX IF NOT EXISTS idx_usage_events_dirty_logical ON usage_events(source,event_id) WHERE hostname <> '';"
         case "usage_session_events":
             return "CREATE INDEX IF NOT EXISTS idx_session_events_host ON usage_session_events(hostname,source,event_id,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_group ON usage_session_events(hostname,source,session_hash,timestamp_ms);"
         case "usage_edit_entries":
             return "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_host ON usage_edit_entries(hostname,timestamp_ms,tool_use_id,source_file_hash);"
+                // 增量 finalize 按脏 tool_use_id 反查该 ID 当前在册的全部 bucket。v8 rebuild 路径
+                // 建过同名索引，但 v10 存量库不走那条路径，只能在这里补建。少了它这次反查会退化成
+                // 全表扫描，脏 ID 数量一多就把增量的成本推回全量量级。
+                + "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_dedup ON usage_edit_entries(tool_use_id);"
         default: return ""
         }
     }
@@ -2690,6 +4165,27 @@ public final class UsageLedgerStore: @unchecked Sendable {
               created_at_ms INTEGER NOT NULL,
               PRIMARY KEY(hostname,kind,key)
             );
+            """)
+        // logical 组 (source, event_id) 上一轮实际贡献到的 bucket 自然键。
+        // 增量 finalize 时用它把旧 bucket 纳入作用域——胜者易主后旧 bucket 的贡献行可能已不在
+        // usage_events 里，无法从原始行还原出 bucket 键，必须靠这张映射表。
+        try exec("""
+            CREATE TABLE IF NOT EXISTS usage_logical_bucket_map(
+              hostname TEXT NOT NULL,
+              source TEXT NOT NULL,
+              event_id TEXT NOT NULL,
+              bucket_model TEXT NOT NULL,
+              bucket_project TEXT NOT NULL,
+              bucket_start INTEGER NOT NULL,
+              PRIMARY KEY(hostname,source,event_id)
+            );
+            """)
+        // 反向索引：闭包按 bucket 自然键反查贡献者，去重循环也拿新胜者 bucket 反查这张表。
+        // 主键 (hostname,source,event_id) 对这个方向用不上，缺了它两条语句都退化成嵌套全表
+        // 扫描——5 万事件的合成库上，单次胜者反查实测 171 秒。
+        try exec("""
+            CREATE INDEX IF NOT EXISTS idx_logical_bucket_map_bucket
+            ON usage_logical_bucket_map(hostname,bucket_model,bucket_project,bucket_start,source);
             """)
     }
 
