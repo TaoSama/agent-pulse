@@ -127,7 +127,7 @@ enum ReconcileParityVerification {
             checkAggregateInvariants(agg),
             "聚合口径不自洽（详见 checkAggregateInvariants 的三条不变量）"
         )
-        let componentSum = componentSumOf(agg)
+        let componentSum = componentSumOf(agg).sum
         // total = max(reportedTotal, 五分量和)，所以两者相等是常态，不等则说明该 hostname 下
         // 存在 upstream 直接给了 total_tokens 且大于分量之和的事件（cliproxy 口径），需要点明，
         // 否则「total 比分量和大」会被误读成聚合出错。
@@ -140,20 +140,32 @@ enum ReconcileParityVerification {
         print("")
     }
 
-    /// 五分量之和。饱和加法，与账本聚合口径一致。
-    private static func componentSumOf(_ agg: LocalHostnameAggregate) -> Int64 {
-        [agg.inputSubtotal, agg.outputSubtotal, agg.cachedInputSubtotal,
-         agg.reasoningOutputSubtotal, agg.cacheCreationInputSubtotal]
-            .reduce(Int64(0)) { partial, value in
-                let (sum, overflow) = partial.addingReportingOverflow(value)
-                return overflow ? Int64.max : sum
+    /// 五分量之和，并回报是否溢出。
+    ///
+    /// 这里**不能**像账本聚合那样把溢出饱和成 Int64.max 就完事：totalTokens 同样是饱和的，
+    /// 两边一起顶到 Int64.max 之后「分量和 ≤ total」会恒成立，溢出的坏聚合反而被放行。
+    /// 溢出本身就说明这份聚合已经不可信，必须让调用方看见而不是被吞掉。
+    private static func componentSumOf(_ agg: LocalHostnameAggregate) -> (sum: Int64, overflow: Bool) {
+        var total: Int64 = 0
+        var overflowed = false
+        for value in [agg.inputSubtotal, agg.outputSubtotal, agg.cachedInputSubtotal,
+                      agg.reasoningOutputSubtotal, agg.cacheCreationInputSubtotal] {
+            let (partial, overflow) = total.addingReportingOverflow(value)
+            if overflow {
+                overflowed = true
+                total = Int64.max
+            } else {
+                total = partial
             }
+        }
+        return (total, overflowed)
     }
 
-    /// 聚合结果必须满足的三条不变量。抽成纯函数，好让离线自检直接喂反例验证它真的会拒。
+    /// 聚合结果必须满足的四条不变量。抽成纯函数，好让离线自检直接喂反例验证它真的会拒。
     ///  1. 五分量之和 ≤ 唯一 total —— total 定义为 max(reportedTotal, 分量和)，反过来说明聚合丢了量。
     ///  2. upstream 应回值 ≤ 唯一 total —— 它是 total 减去 cacheCreation，不可能更大。
     ///  3. 分量与计数均非负 —— 负值意味着 Int64 回绕或 parser 输出了负数，这份聚合不可用。
+    ///  4. 五分量相加不溢出 —— 溢出后任何比较都失去意义，不能靠饱和值继续判断。
     private static func checkAggregateInvariants(_ agg: LocalHostnameAggregate) -> Bool {
         let components = [
             agg.inputSubtotal, agg.outputSubtotal, agg.cachedInputSubtotal,
@@ -161,7 +173,9 @@ enum ReconcileParityVerification {
         ]
         guard components.allSatisfy({ $0 >= 0 }), agg.totalTokens >= 0,
               agg.bucketCount >= 0, agg.sessionCount >= 0 else { return false }
-        guard componentSumOf(agg) <= agg.totalTokens else { return false }
+        // 溢出直接判不可用：饱和后的分量和与饱和后的 total 比大小毫无意义。
+        let (componentSum, overflow) = componentSumOf(agg)
+        guard !overflow, componentSum <= agg.totalTokens else { return false }
         let upstreamExpected = LocalHostnameAggregate.upstreamBasisFromTotal(
             agg.totalTokens, cacheCreation: agg.cacheCreationInputSubtotal
         )
@@ -214,23 +228,34 @@ enum ReconcileParityVerification {
             sessions: [makeSession(hostname: "dev-a")]
         )
         try require(checkAggregateInvariants(healthy), "正常聚合必须通过不变量")
-        try require(componentSumOf(healthy) == healthy.totalTokens, "无 reportedTotal 时分量和应恰等于 total")
+        try require(componentSumOf(healthy).sum == healthy.totalTokens, "无 reportedTotal 时分量和应恰等于 total")
 
         // reportedTotal 大于分量和（cliproxy 口径）：total 被抬高，分量和严格小于 total，仍属合法。
         var reportedDominant = healthy
         reportedDominant.totalTokens = healthy.totalTokens + 500
         try require(checkAggregateInvariants(reportedDominant), "reportedTotal 抬高 total 属合法，不得误判")
-        try require(componentSumOf(reportedDominant) < reportedDominant.totalTokens, "该场景下分量和应严格小于 total")
+        try require(componentSumOf(reportedDominant).sum < reportedDominant.totalTokens, "该场景下分量和应严格小于 total")
 
         // 分量和超过 total：聚合丢了量，必须拒。
         var inflated = healthy
-        inflated.totalTokens = componentSumOf(healthy) - 1
+        inflated.totalTokens = componentSumOf(healthy).sum - 1
         try require(!checkAggregateInvariants(inflated), "分量和大于 total 必须被拒")
 
         // 负分量：Int64 回绕或 parser 输出负数，必须拒。
         var negative = healthy
         negative.outputSubtotal = -1
         try require(!checkAggregateInvariants(negative), "负分量必须被拒")
+
+        // 分量和溢出：aggregate 对 total 和每个分量小计各自饱和，于是两个合法 bucket 就能
+        // 造出 total == Int64.max 而分量和实际超过 Int64.max 的聚合。若 componentSumOf 也把
+        // 溢出饱和掉，「分量和 ≤ total」两边同为 Int64.max 恒成立，坏聚合就被放行了。
+        var overflowing = healthy
+        overflowing.totalTokens = Int64.max
+        overflowing.inputSubtotal = Int64.max
+        overflowing.outputSubtotal = Int64.max
+        try require(componentSumOf(overflowing).overflow, "该构造必须真的触发分量和溢出")
+        try require(componentSumOf(overflowing).sum == Int64.max, "溢出时仍应回报饱和值供打印")
+        try require(!checkAggregateInvariants(overflowing), "分量和溢出必须被拒，不能靠饱和值蒙混过关")
     }
 
     /// 实拉判决必须真的会失败。这是本 target 的存在理由：拿到 upstream 数据后发现不对齐
@@ -516,7 +541,15 @@ enum ReconcileParityVerification {
         }
         let aggregate = LocalHostnameAggregate.aggregate(hostname: hostname, buckets: localBuckets, sessions: localSessions)
 
-        // 8) 逐维度对齐 + 渲染。
+        // 8) 先验本地聚合自身的不变量，再谈与 upstream 的对齐。一份分量和超过 total、含负值
+        //    或相加溢出的聚合，拿去比对得出的「一致」没有意义 —— 两边都错也会判等。这里要报的
+        //    是本地口径坏了，而不是含糊地说成两侧不一致。
+        guard checkAggregateInvariants(aggregate) else {
+            let (componentSum, overflow) = componentSumOf(aggregate)
+            return .misaligned("本地聚合口径不自洽（分量和 \(componentSum)" + (overflow ? " 已溢出" : "") + "，total \(aggregate.totalTokens)，bucketCount \(aggregate.bucketCount)，sessionCount \(aggregate.sessionCount)）")
+        }
+
+        // 9) 逐维度对齐 + 渲染。
         let comparison = ReconcileComparison.compare(local: aggregate, upstream: response.stats(forHostname: hostname))
         print("=== AP vs upstream 逐维度对齐 ===")
         print(ReconcileReportRenderer.render(comparison))
