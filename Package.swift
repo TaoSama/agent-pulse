@@ -119,14 +119,9 @@ let package = Package(
             path: "Tests/NaturalKeyGuardVerification"
         ),
         .executableTarget(
-            name: "ProductionDatabasePreflightVerification",
+            name: "LedgerRebuildVerification",
             dependencies: ["AgentPulseCore"],
-            path: "Tests/ProductionDatabasePreflightVerification"
-        ),
-        .executableTarget(
-            name: "UsageLedgerMemoryVerification",
-            dependencies: ["AgentPulseCore"],
-            path: "Tests/UsageLedgerMemoryVerification"
+            path: "Tests/LedgerRebuildVerification"
         ),
         .executableTarget(
             name: "SecureConfigVerification",
