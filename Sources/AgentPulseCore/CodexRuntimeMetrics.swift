@@ -421,6 +421,11 @@ public actor CodexRuntimeMetricsCollector {
         let summary: ClaudeDesktopSessionSummary
     }
 
+    private struct ProcessSnapshot {
+        let sampledAt: Date
+        let processes: [RunningProcess]
+    }
+
     private let configuration: CodexRuntimeMetricsConfiguration
     private let processScanner: any ProcessScanning
     private let canonicalSessionDirectories: [URL]
@@ -443,6 +448,8 @@ public actor CodexRuntimeMetricsCollector {
     private var cachedClaudeDesktopMetric: RuntimeTaskCategoryMetric?
     private var lastClaudeDesktopMetricAt: Date?
     private var claudeDesktopFileCache: [String: ClaudeDesktopFileCacheEntry] = [:]
+    private var cachedProcessSnapshot: ProcessSnapshot?
+    private var lastSnapshotMaintenanceAt: Date?
     private let fractionalISO8601: ISO8601DateFormatter
     private let basicISO8601: ISO8601DateFormatter
 
@@ -552,7 +559,7 @@ public actor CodexRuntimeMetricsCollector {
             desktopMetric = .unavailable
         }
         do {
-            let processes = try processScanner.scan()
+            let processes = try processSnapshot(at: sampledAt)
             let codexProcesses = processes.filter {
                 CodexProcessClassifier.isCodexCLI(executablePath: $0.executablePath)
             }
@@ -769,6 +776,17 @@ public actor CodexRuntimeMetricsCollector {
             present: true,
             quality: degraded ? .partial : .complete
         )
+    }
+
+    private func processSnapshot(at now: Date) throws -> [RunningProcess] {
+        if let cachedProcessSnapshot,
+           now.timeIntervalSince(cachedProcessSnapshot.sampledAt) >= 0,
+           now.timeIntervalSince(cachedProcessSnapshot.sampledAt) < Self.processSnapshotInterval {
+            return cachedProcessSnapshot.processes
+        }
+        let processes = try processScanner.scan()
+        cachedProcessSnapshot = ProcessSnapshot(sampledAt: now, processes: processes)
+        return processes
     }
 
     /// Claude 桌面版为每个对话在 ~/.claude/projects/<slug>/<sessionId>.jsonl 追加事件流。
@@ -2105,6 +2123,12 @@ public actor CodexRuntimeMetricsCollector {
         try store.upsert(displaySnapshot)
         restoredDisplaySnapshot = displaySnapshot
 
+        let maintenanceDue = lastSnapshotMaintenanceAt.map {
+            now.timeIntervalSince($0) >= Self.snapshotMaintenanceInterval
+        } ?? true
+        guard maintenanceDue else { return }
+        lastSnapshotMaintenanceAt = now
+
         let cutoff = now.addingTimeInterval(-CodexRuntimeMetricsConfiguration.retentionSeconds)
         _ = try store.deleteSnapshots(olderThan: cutoff)
         _ = try store.enforceRetention(maxCount: Self.retainedLimit)
@@ -2159,6 +2183,8 @@ public actor CodexRuntimeMetricsCollector {
     private static let activeTaskTimeout = CodexRuntimeMetricsConfiguration.activeTaskTimeoutSeconds
     private static let recentFileInterval: TimeInterval = 15 * 60
     private static let discoveryInterval: TimeInterval = 10
+    private static let processSnapshotInterval: TimeInterval = 5
+    private static let snapshotMaintenanceInterval: TimeInterval = 5 * 60
     private static let fullReconcileInterval: TimeInterval = 5 * 60
     private static let trackedFileRetention: TimeInterval = 30 * 60
     private static let messageRetention: TimeInterval = 10 * 60

@@ -67,6 +67,7 @@ private final class RequestCounter: @unchecked Sendable {
 private final class SequencedScanner: ProcessScanning, @unchecked Sendable {
     private let lock = NSLock()
     private var snapshots: [[RunningProcess]]
+    private(set) var scanCount = 0
 
     init(snapshots: [[RunningProcess]]) {
         self.snapshots = snapshots
@@ -75,6 +76,7 @@ private final class SequencedScanner: ProcessScanning, @unchecked Sendable {
     func scan() throws -> [RunningProcess] {
         lock.lock()
         defer { lock.unlock() }
+        scanCount += 1
         guard snapshots.count > 1 else { return snapshots.first ?? [] }
         return snapshots.removeFirst()
     }
@@ -2862,11 +2864,17 @@ struct AgentPulseCoreVerification {
         try require(active.completed.value == 1, "archive or automation completion leaked into current completed count")
         try require(!active.activeCountsArePartial, "healthy active sources were marked partial")
 
-        let exited = try await collector.scan(at: base.addingTimeInterval(1))
-        try require(exited.terminalActive == 0, "exited terminal process did not disappear on the next scan")
-        try require(exited.taskBreakdown.codexCLI.totalTasks == 0, "closed Codex CLI remained in total")
-        try require(exited.taskBreakdown.claudeCLI.totalTasks == 0, "closed Claude CLI remained in total")
+        let cachedProcessSnapshot = try await collector.scan(at: base.addingTimeInterval(1))
+        try require(cachedProcessSnapshot.taskBreakdown.codexCLI.totalTasks == 2, "process snapshot was not reused inside the cache window")
+        try require(cachedProcessSnapshot.taskBreakdown.claudeCLI.totalTasks == 4, "Claude process snapshot was not reused inside the cache window")
+        try require(scanner.scanCount == 1, "process scanner ran again inside the cache window")
+
+        let exited = try await collector.scan(at: base.addingTimeInterval(6))
+        try require(exited.terminalActive == 0, "exited terminal process did not disappear after process cache expiry")
+        try require(exited.taskBreakdown.codexCLI.totalTasks == 0, "closed Codex CLI remained in total after process cache expiry")
+        try require(exited.taskBreakdown.claudeCLI.totalTasks == 0, "closed Claude CLI remained in total after process cache expiry")
         try require(exited.desktopActive == 3, "unchanged recent Desktop tasks did not survive cache reuse")
+        try require(scanner.scanCount == 2, "process scanner did not refresh after cache expiry")
 
         let timedOut = try await collector.scan(
             at: base.addingTimeInterval(CodexRuntimeMetricsConfiguration.activeTaskTimeoutSeconds + 1)
@@ -3043,10 +3051,15 @@ struct AgentPulseCoreVerification {
         try require(running.taskBreakdown.claudeDesktop.totalTasks == 2, "Claude Desktop total task count mismatch")
         try require(running.taskBreakdown.claudeDesktop.activeTasks == 1, "Claude Desktop active tail detection mismatch")
 
-        let closed = try await collector.scan(at: base.addingTimeInterval(1))
+        let cachedRunning = try await collector.scan(at: base.addingTimeInterval(1))
+        try require(cachedRunning.taskBreakdown.claudeDesktop.present, "Claude Desktop process snapshot was not reused inside the cache window")
+        try require(scanner.scanCount == 1, "Claude Desktop process scanner ran again inside the cache window")
+
+        let closed = try await collector.scan(at: base.addingTimeInterval(6))
         try require(!closed.taskBreakdown.claudeDesktop.present, "closed Claude Desktop remained present")
         try require(closed.taskBreakdown.claudeDesktop.totalTasks == 0, "closed Claude Desktop retained historical tasks")
         try require(closed.taskBreakdown.claudeDesktop.activeTasks == 0, "closed Claude Desktop retained active tasks")
+        try require(scanner.scanCount == 2, "Claude Desktop process scanner did not refresh after cache expiry")
     }
 
     private static func verifyClaudeTPSIntegration() async throws {

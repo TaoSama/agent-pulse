@@ -229,7 +229,7 @@ public enum CodexProcessClassifier {
 
     private static func isIndependentCLI(named name: String, executablePath: String) -> Bool {
         let path = executablePath
-        let executableName = URL(fileURLWithPath: path).lastPathComponent
+        let executableName = lastPathComponent(of: path)
         guard executableName == name else { return false }
         // Desktop bundles launch their own native codex helper. It is implementation
         // detail of the app, not an independent terminal task.
@@ -247,9 +247,15 @@ public enum CodexProcessClassifier {
     /// Claude 桌面应用主进程（Anthropic Claude.app，bundle id com.anthropic.claudefordesktop）。
     /// 仅识别 app bundle 内的进程，用作桌面会话统计的存活门控；独立 claude CLI 不在此列。
     public static func isClaudeDesktopApp(executablePath: String) -> Bool {
-        let url = URL(fileURLWithPath: executablePath)
-        return url.lastPathComponent == "Claude"
+        lastPathComponent(of: executablePath) == "Claude"
             && executablePath.contains("/Claude.app/Contents/MacOS/")
+    }
+
+    private static func lastPathComponent(of path: String) -> String {
+        guard let component = path.split(separator: "/", omittingEmptySubsequences: true).last else {
+            return path
+        }
+        return String(component)
     }
 
     /// 针对给定来源，判断某进程是否为该来源的“存活证据”。
