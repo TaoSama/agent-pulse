@@ -1135,13 +1135,9 @@ public actor CodexRuntimeMetricsCollector {
             }()
             : nil
         var crossedInheritedPrefix = (metaStartedAt == nil)
-        let completed = (meta != nil && !readIsTailOnly) ?
-            CodexSessionParser.completedTasks(
-                inSessionContents: contents,
-                automationRoots: configuration.automationRoots
-            ) : .empty
         let source = meta.flatMap { CodexSessionParser.source(forOriginator: $0.originator) }
-        let lifecycleStarted = CodexSessionParser.lastLifecycle(inSessionContents: contents) == .started
+        var completedIdentities = Set<String>()
+        var lifecycleStarted = false
         var previousTotal: Int?
         var previousTimestamp: Date?
         var currentModel: String?
@@ -1161,15 +1157,48 @@ public actor CodexRuntimeMetricsCollector {
         } else {
             currentModel = latestKnownModel(in: fileData)
         }
+        let isNonAutomationTopLevel = meta.map { meta in
+            meta.isTopLevel && meta.cwd.map {
+                !CodexSessionParser.isUnderAutomation(
+                    cwd: $0,
+                    automationRoots: configuration.automationRoots
+                )
+            } == true
+        } ?? false
         if liveTrackedPaths.contains(file.path) {
             let baseline = baselineData(from: fileData)
-            for line in completeLines(in: baseline.data, skippingLeadingPartialLine: baseline.skipsLeadingPartialLine) {
+            for (lineIndex, line) in completeLines(in: baseline.data, skippingLeadingPartialLine: baseline.skipsLeadingPartialLine).enumerated() {
                 if let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] {
                     if let model = turnContextModel(object) {
                         currentModel = model
                         hasSeenTurnContext = true
                     } else if !hasSeenTurnContext, let model = knownModelName(object) {
                         currentModel = model
+                    }
+                    if (object["type"] as? String) == "event_msg",
+                       let payload = object["payload"] as? [String: Any],
+                       let eventType = payload["type"] as? String,
+                       let meta {
+                        if meta.isTopLevel {
+                            switch eventType {
+                            case "task_started":
+                                lifecycleStarted = true
+                            case "task_complete", "turn_aborted":
+                                lifecycleStarted = false
+                            default:
+                                break
+                            }
+                        }
+                        if eventType == "task_complete", isNonAutomationTopLevel {
+                            if let turnID = payload["turn_id"] as? String, !turnID.isEmpty {
+                                completedIdentities.insert(meta.sessionID + "\u{0}" + turnID)
+                            } else {
+                                completedIdentities.insert(
+                                    meta.sessionID + CodexSessionParser.missingTurnMarker
+                                        + "baseline-\(lineIndex)"
+                                )
+                            }
+                        }
                     }
                 }
                 guard let parsed = parseTokenLine(line, now: now) else { continue }
@@ -1207,17 +1236,17 @@ public actor CodexRuntimeMetricsCollector {
                 }
             }
             pruneMessageUsage(&messageUsage, now: now)
+        } else if !readIsTailOnly {
+            let completed = meta != nil ?
+                CodexSessionParser.completedTasks(
+                    inSessionContents: contents,
+                    automationRoots: configuration.automationRoots
+                ) : .empty
+            completedIdentities = completed.identities
+            lifecycleStarted = CodexSessionParser.lastLifecycle(inSessionContents: contents) == .started
         }
 
         let taskActivityAt = [signature.modifiedAt, latestOutputSignal].compactMap { $0 }.max()
-        let isNonAutomationTopLevel = meta.map { meta in
-            meta.isTopLevel && meta.cwd.map {
-                !CodexSessionParser.isUnderAutomation(
-                    cwd: $0,
-                    automationRoots: configuration.automationRoots
-                )
-            } == true
-        } ?? false
         let desktopTask: SessionTaskState? = if let meta, source == .desktop, isNonAutomationTopLevel {
             SessionTaskState(
                 sessionID: meta.sessionID,
@@ -1237,7 +1266,7 @@ public actor CodexRuntimeMetricsCollector {
             nil
         }
         let summary = FileSummary(
-            completedIdentities: completed.identities,
+            completedIdentities: completedIdentities,
             desktopTask: desktopTask,
             codexCLITask: codexCLITask,
             latestOutputSignal: latestOutputSignal,
@@ -1609,8 +1638,8 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     private func baselineData(from data: Data) -> (data: Data, skipsLeadingPartialLine: Bool) {
-        guard data.count > Self.maximumAppendReadBytes else { return (data, false) }
-        return (Data(data.suffix(Self.maximumAppendReadBytes)), true)
+        guard data.count > Self.maximumInitialBaselineBytes else { return (data, false) }
+        return (Data(data.suffix(Self.maximumInitialBaselineBytes)), true)
     }
 
     private func completeLines(in data: Data, skippingLeadingPartialLine: Bool) -> [Data] {
@@ -1623,8 +1652,8 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     private func parseTokenLine(_ line: Data, now: Date) -> ParsedTokenLine? {
-        let lowercased = String(decoding: line, as: UTF8.self).lowercased()
-        guard lowercased.contains("token") || lowercased.contains("usage"),
+        guard line.containsASCIIKeyword(Self.tokenKeyword)
+                || line.containsASCIIKeyword(Self.usageKeyword),
               let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
             return nil
         }
@@ -2138,7 +2167,27 @@ public actor CodexRuntimeMetricsCollector {
     private static let inheritedPrefixClusterTolerance: TimeInterval = 2
     private static let maximumAppendReadBytes = 64 * 1024 * 1024
     private static let maximumFullInitialReadBytes = 96 * 1024 * 1024
+    private static let maximumInitialBaselineBytes = 8 * 1024 * 1024
     private static let maximumInitialHeaderBytes = 256 * 1024
     private static let maximumTrackedFiles = 96
     private static let maximumMessageIdentities = 2_048
+    private static let tokenKeyword = Array("token".utf8)
+    private static let usageKeyword = Array("usage".utf8)
+}
+
+private extension Data {
+    func containsASCIIKeyword(_ keyword: [UInt8]) -> Bool {
+        guard !keyword.isEmpty, count >= keyword.count else { return false }
+        var matched = 0
+        for byte in self {
+            let lowercased = (byte >= 65 && byte <= 90) ? byte + 32 : byte
+            if lowercased == keyword[matched] {
+                matched += 1
+                if matched == keyword.count { return true }
+            } else {
+                matched = lowercased == keyword[0] ? 1 : 0
+            }
+        }
+        return false
+    }
 }

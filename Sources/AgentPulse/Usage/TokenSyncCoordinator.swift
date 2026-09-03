@@ -1418,6 +1418,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             throw TokenSyncScanError.sourceRootNotEnumerable(source: source)
         }
         var presentFileIDs: [String] = []
+        var parserBackfillsRemaining = maximumParserBackfillsPerSourceScan
         for case let url as URL in enumerator where url.pathExtension == "jsonl" {
             try cancellation.throwIfCancelled()
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
@@ -1432,9 +1433,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             if let checkpoint = try ledger.checkpoint(fileID: fileID),
                checkpoint.status == "complete",
                checkpoint.size == fileSize,
-               abs(checkpoint.modifiedAt.timeIntervalSince(modifiedAt)) < 0.001,
-               checkpoint.parserVersion == UsageJSONLParser.parserVersion {
-                continue
+               abs(checkpoint.modifiedAt.timeIntervalSince(modifiedAt)) < 0.001 {
+                if checkpoint.parserVersion == UsageJSONLParser.parserVersion {
+                    continue
+                }
+                if parserBackfillsRemaining <= 0 {
+                    continue
+                }
+                parserBackfillsRemaining -= 1
             }
             if shouldDeferLargeActiveFile(size: fileSize, modifiedAt: modifiedAt) {
                 continue
@@ -1466,6 +1472,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     nonisolated private static let maximumImmediateUsageParseBytes: Int64 = 96 * 1024 * 1024
     nonisolated private static let largeActiveFileDeferralInterval: TimeInterval = 30 * 60
+    nonisolated private static let maximumParserBackfillsPerSourceScan = 64
 
     /// Claude Task 子代理转录的稳定磁盘布局：`subagents/agent-*.jsonl`。
     /// 子代理用量计入总量，但不会生成独立 session 聚合。
