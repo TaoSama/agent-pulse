@@ -33,6 +33,7 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyCalendarWindowSummariesUseDerivedBucketsAndHostname()
         try verifier.verifyFinalizeIsScopedToHostname()
         try verifier.verifyLegacyRawRowsAreClaimedOnlyByCanonicalHostname()
+        try verifier.verifyRecoveredIncrementalBaselineClearsPendingWithoutFullRecompute()
         try verifier.verifyFrozenCompactionPreservesTotalsAndDropsRaw()
         try verifier.verifyFrozenLateEventsAreDropped()
         try verifier.verifyFrozenWatermarkIsMonotonicAndBucketAligned()
@@ -381,6 +382,42 @@ private struct MetricsLedgerPipelineVerifier {
         try withDatabase(database) { db in
             try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='legacy' AND hostname='host-a';") == 1, "canonical finalize must persist legacy ownership")
         }
+    }
+
+    func verifyRecoveredIncrementalBaselineClearsPendingWithoutFullRecompute() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let host = "host-a"
+        let source = "codex"
+        let ts = try date("2026-08-14T02:05:00Z")
+
+        let event = tokenEvent(id: "e1", source: source, session: "s1", file: "file-a", ts: ts, input: 10)
+        try ledger.record(events: [event], checkpoint: completeCheckpoint("file-a", source: source, ts: ts), hostname: host)
+        _ = try ledger.finalizeDerived(hostname: host)
+
+        try withDatabase(database) { db in
+            try execute(db, "DELETE FROM sync_state WHERE key='incremental_baseline_ready';")
+            try execute(db, "DELETE FROM usage_identity_conflicts;")
+            try execute(db, "DELETE FROM usage_logical_bucket_map;")
+            try execute(db, "INSERT OR REPLACE INTO sync_state(key,value,updated_at_ms) VALUES('raw_derivation_pending','1',0);")
+            try execute(db, "INSERT OR REPLACE INTO sync_state(key,value,updated_at_ms) VALUES('rebuild_completed_parser_version','\(UsageJSONLParser.parserVersion)',0);")
+            try execute(db, "INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms) VALUES('host-a','bucket','codex\u{1}model-a\u{1}project-a\u{1}\(Int64((ts.timeIntervalSince1970 * 1_000).rounded()))',0);")
+        }
+
+        try require(try ledger.recoverIncrementalBaselineIfSafe(hostname: host, currentParserVersion: UsageJSONLParser.parserVersion), "safe legacy ledger should recover an incremental baseline")
+        try withDatabase(database) { db in
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sync_state WHERE key='raw_derivation_pending';") == 1, "baseline recovery must not clear pending before finalize")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sync_state WHERE key='incremental_baseline_ready';") == 1, "baseline flag must be restored")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_logical_bucket_map WHERE hostname='host-a';") == 1, "logical bucket map baseline must be rebuilt")
+        }
+
+        _ = try ledger.finalizeDerived(hostname: host)
+        try withDatabase(database) { db in
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sync_state WHERE key='raw_derivation_pending';") == 0, "incremental finalize must clear pending")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname='host-a';") == 0, "incremental finalize must consume dirty keys")
+        }
+        _ = try ledger.pendingBatch(hostname: host)
     }
 
     // MARK: - Frozen watermark (v3) 场景

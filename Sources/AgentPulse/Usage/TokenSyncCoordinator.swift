@@ -531,6 +531,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 // 无变化轮（raw 派生 dirty 位未置 且 无 rebuild 待完成）跳过 O(全库) 重算：
                 // 派生已是最新，仅从持久标志读回上报资格，避免每轮全表读+排序（9.4G 库约 90s）。
                 progressReporter.enterPhase(.finalizing)
+                _ = try ledger.recoverIncrementalBaselineIfSafe(hostname: hostname, currentParserVersion: currentParserVersion)
                 let needsFinalize = try ledger.requiresDerivationCompletion() || ledger.requiresRebuildCompletion()
                 let finalize: UsageFinalizeResult
                 if needsFinalize {

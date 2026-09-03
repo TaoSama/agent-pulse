@@ -1709,6 +1709,131 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return try derivedHasAnyRowUnlocked(hostname: hostname)
     }
 
+    /// One-time recovery for ledgers migrated before the incremental finalize baseline was
+    /// persisted. v10 migration marks raw derivation as pending because hostname was added to
+    /// raw rows. If that migration already backfilled every raw row and existing derived rows
+    /// match the current parser generation, a later scan may only have a small dirty-key set
+    /// (for example files transitioning to missing). Without this baseline, automatic finalize
+    /// falls back to a full recompute over very large local ledgers.
+    ///
+    /// This does not clear raw_derivation_pending. It only creates the metadata required for
+    /// the normal incremental path to safely consume the existing dirty keys.
+    @discardableResult
+    public func recoverIncrementalBaselineIfSafe(hostname: String, currentParserVersion: Int) throws -> Bool {
+        guard currentParserVersion > 0 else { return false }
+        return try queue.sync {
+            var recovered = false
+            try transaction {
+                guard try readTextUnlocked(key: Self.incrementalBaselineKey) == nil else { return }
+                guard try readTextUnlocked(key: Self.rawDerivationPendingKey) != nil else { return }
+                guard try readTextUnlocked(key: Self.rebuildPendingKey) == nil else { return }
+                guard try readTextUnlocked(key: Self.unresolvedLegacyRawHostnameKey) == nil else { return }
+                guard try (readIntUnlocked(key: Self.rebuildCompletedParserVersionKey) ?? 0) >= Int64(currentParserVersion) else { return }
+                guard try !hasEmptyRawHostnameUnlocked() else { return }
+                guard try !hasActiveCheckpointOlderThanParserUnlocked(currentParserVersion) else { return }
+                guard try derivedHasAnyRowUnlocked(hostname: hostname) else { return }
+
+                try ensureIdentityConflictTableUnlocked()
+                try ensureLogicalBucketMapUnlocked()
+                try rebuildIncrementalBaselineTablesUnlocked(hostname: hostname)
+                try setTextUnlocked(key: Self.incrementalBaselineKey, value: "1")
+                recovered = true
+            }
+            return recovered
+        }
+    }
+
+    private func hasEmptyRawHostnameUnlocked() throws -> Bool {
+        for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
+            guard try tableExistsUnlocked(table) else { continue }
+            let statement = try prepare("SELECT 1 FROM \(table) WHERE hostname='' LIMIT 1;")
+            defer { sqlite3_finalize(statement) }
+            if sqlite3_step(statement) == SQLITE_ROW { return true }
+        }
+        return false
+    }
+
+    private func hasActiveCheckpointOlderThanParserUnlocked(_ parserVersion: Int) throws -> Bool {
+        let statement = try prepare("SELECT 1 FROM usage_files WHERE scan_status<>'missing' AND parser_version<? LIMIT 1;")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, Int64(parserVersion))
+        return sqlite3_step(statement) == SQLITE_ROW
+    }
+
+    private func ensureLogicalBucketMapUnlocked() throws {
+        try exec("""
+            CREATE TABLE IF NOT EXISTS usage_logical_bucket_map(
+              hostname TEXT NOT NULL,
+              source TEXT NOT NULL,
+              event_id TEXT NOT NULL,
+              bucket_model TEXT NOT NULL,
+              bucket_project TEXT NOT NULL,
+              bucket_start INTEGER NOT NULL,
+              PRIMARY KEY(hostname,source,event_id)
+            );
+            """)
+        try exec("""
+            CREATE INDEX IF NOT EXISTS idx_logical_bucket_map_bucket
+            ON usage_logical_bucket_map(hostname,bucket_model,bucket_project,bucket_start,source);
+            """)
+    }
+
+    private func clearIdentityConflictsUnlocked(hostname: String) throws {
+        try ensureIdentityConflictTableUnlocked()
+        let statement = try prepare("DELETE FROM usage_identity_conflicts WHERE hostname=?;")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        try done(statement)
+    }
+
+    private func clearLogicalBucketMapUnlocked(hostname: String) throws {
+        try ensureLogicalBucketMapUnlocked()
+        let statement = try prepare("DELETE FROM usage_logical_bucket_map WHERE hostname=?;")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        try done(statement)
+    }
+
+    private func rebuildIncrementalBaselineTablesUnlocked(hostname: String) throws {
+        try clearIdentityConflictsUnlocked(hostname: hostname)
+        try clearLogicalBucketMapUnlocked(hostname: hostname)
+        let bucketMs = Self.bucketMilliseconds
+        try exec("DROP TABLE IF EXISTS temp_logical_events;")
+        try exec("DROP TABLE IF EXISTS temp_lineage_events;")
+        try exec("DROP TABLE IF EXISTS temp_deduped_events;")
+        defer {
+            try? exec("DROP TABLE IF EXISTS temp_logical_events;")
+            try? exec("DROP TABLE IF EXISTS temp_lineage_events;")
+            try? exec("DROP TABLE IF EXISTS temp_deduped_events;")
+        }
+        do {
+            let statement = try prepare(Self.logicalEventsSQL(scoped: false))
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            try done(statement)
+        }
+        let conflicts = try prepare("""
+            INSERT OR IGNORE INTO usage_identity_conflicts(hostname,source,event_id)
+            SELECT ?, source, event_id FROM temp_logical_events WHERE has_identity_conflict = 1;
+            """)
+        defer { sqlite3_finalize(conflicts) }
+        try bind(conflicts, 1, hostname)
+        try done(conflicts)
+        try exec(Self.lineageEventsSQL)
+        try exec(Self.dedupedEventsSQL)
+        let statement = try prepare("""
+            INSERT OR REPLACE INTO usage_logical_bucket_map(
+                hostname,source,event_id,bucket_model,bucket_project,bucket_start
+            )
+            SELECT ?, source, event_id, model, project,
+                   (timestamp_ms / \(bucketMs)) * \(bucketMs)
+            FROM temp_deduped_events;
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        try done(statement)
+    }
+
     /// 增量重算：只重算脏闭包覆盖的 bucket / session，其余派生行原样不动。
     ///
     /// 返回 nil 表示本轮不适合增量（作用域过大），调用方回退全量。
