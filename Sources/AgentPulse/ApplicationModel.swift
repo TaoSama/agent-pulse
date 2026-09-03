@@ -216,7 +216,7 @@ final class ApplicationModel: ObservableObject {
             $tokenSummary,
             $trendColorMode
         ).map { _ in () }
-        Publishers.Merge3(metrics, presentation, $isOrbExpanded.map { _ in () })
+        Publishers.Merge(metrics, presentation)
             .sink { [weak self] _ in self?.refreshOrbSnapshot() }
             .store(in: &cancellables)
     }
@@ -255,6 +255,7 @@ final class ApplicationModel: ObservableObject {
 
     func setOrbExpanded(_ expanded: Bool) {
         isOrbExpanded = expanded
+        refreshOrbSnapshot()
     }
 
     func toggleOrb() {
