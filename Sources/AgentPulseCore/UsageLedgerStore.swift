@@ -2774,26 +2774,36 @@ public final class UsageLedgerStore: @unchecked Sendable {
         calendar: Calendar = .current,
         prices: [UsageModelPrice] = []
     ) throws -> UsageSummary? {
-        try queue.sync {
-            var sql = "SELECT model,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,updated_at_ms FROM usage_buckets"
-            var predicates: [String] = []
-            if hostname != nil { predicates.append("hostname=?") }
-            var interval: DateInterval?
-            if let window {
-                interval = window.interval(containing: date, calendar: calendar)
-                guard interval != nil else { return nil }
-                predicates.append("bucket_start_ms>=? AND bucket_start_ms<?")
+        try queue.sync { () throws -> UsageSummary? in
+            guard let filter = bucketSummaryFilter(window: window, containing: date, hostname: hostname, calendar: calendar) else {
+                return nil
             }
-            if !predicates.isEmpty { sql += " WHERE " + predicates.joined(separator: " AND ") }
-            sql += ";"
+            let sql = """
+                SELECT model,
+                       SUM(input_tokens),
+                       SUM(output_tokens),
+                       SUM(cached_input_tokens),
+                       SUM(cache_creation_input_tokens),
+                       SUM(reasoning_output_tokens),
+                       SUM(MAX(total_tokens, input_tokens + output_tokens + cached_input_tokens + cache_creation_input_tokens + reasoning_output_tokens)),
+                       MAX(updated_at_ms)
+                FROM usage_buckets
+                \(filter.whereClause)
+                GROUP BY model;
+                """
             let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
-            var bindIndex: Int32 = 1
-            if let hostname { try bind(statement, bindIndex, hostname); bindIndex += 1 }
-            if let interval {
-                try bind(statement, bindIndex, millis(interval.start))
-                try bind(statement, bindIndex + 1, millis(interval.end))
+            try bindBucketSummaryFilter(filter, to: statement)
+            var total = UsageTokenCounts(); var cost = 0.0; var newest: Int64?
+            var found = false
+            while sqlite3_step(statement) == SQLITE_ROW {
+                found = true
+                let counts = bucketSummaryCounts(statement)
+                total = sumCounts(total, counts)
+                cost += UsageCostEstimator.cost(model: text(statement, 0), counts: counts, prices: prices)
+                newest = max(newest ?? 0, sqlite3_column_int64(statement, 7))
             }
-            return try summarizeBucketRows(statement, prices: prices)
+            if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
+            return found ? UsageSummary(updatedAt: newest.map { self.date($0) }, counts: total, estimatedCostUSD: cost) : nil
         }
     }
 
@@ -2806,49 +2816,33 @@ public final class UsageLedgerStore: @unchecked Sendable {
         hostname: String? = nil,
         calendar: Calendar = .current
     ) throws -> [UsageModelTokenSummary] {
-        try queue.sync {
-            var sql = "SELECT model,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens FROM usage_buckets"
-            var predicates: [String] = []
-            if hostname != nil { predicates.append("hostname=?") }
-            var interval: DateInterval?
-            if let window {
-                interval = window.interval(containing: date, calendar: calendar)
-                guard interval != nil else { return [] }
-                predicates.append("bucket_start_ms>=? AND bucket_start_ms<?")
+        try queue.sync { () throws -> [UsageModelTokenSummary] in
+            guard let filter = bucketSummaryFilter(window: window, containing: date, hostname: hostname, calendar: calendar) else {
+                return []
             }
-            if !predicates.isEmpty { sql += " WHERE " + predicates.joined(separator: " AND ") }
-            sql += ";"
+            let sql = """
+                SELECT model,
+                       SUM(input_tokens),
+                       SUM(output_tokens),
+                       SUM(cached_input_tokens),
+                       SUM(cache_creation_input_tokens),
+                       SUM(reasoning_output_tokens),
+                       SUM(MAX(total_tokens, input_tokens + output_tokens + cached_input_tokens + cache_creation_input_tokens + reasoning_output_tokens))
+                FROM usage_buckets
+                \(filter.whereClause)
+                GROUP BY model;
+                """
             let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
-            var bindIndex: Int32 = 1
-            if let hostname { try bind(statement, bindIndex, hostname); bindIndex += 1 }
-            if let interval {
-                try bind(statement, bindIndex, millis(interval.start))
-                try bind(statement, bindIndex + 1, millis(interval.end))
-            }
-            var byModel: [String: UsageTokenCounts] = [:]
+            try bindBucketSummaryFilter(filter, to: statement)
+            var rows: [UsageModelTokenSummary] = []
             while sqlite3_step(statement) == SQLITE_ROW {
-                let model = text(statement, 0)
-                let counts = UsageTokenCounts(
-                    input: sqlite3_column_int64(statement, 1), output: sqlite3_column_int64(statement, 2),
-                    cachedInput: sqlite3_column_int64(statement, 3), cacheCreationInput: sqlite3_column_int64(statement, 4),
-                    reasoningOutput: sqlite3_column_int64(statement, 5), reportedTotal: sqlite3_column_int64(statement, 6)
-                )
-                let existing = byModel[model] ?? UsageTokenCounts()
-                byModel[model] = UsageTokenCounts(
-                    input: saturatedAdd(existing.input, counts.input), output: saturatedAdd(existing.output, counts.output),
-                    cachedInput: saturatedAdd(existing.cachedInput, counts.cachedInput),
-                    cacheCreationInput: saturatedAdd(existing.cacheCreationInput, counts.cacheCreationInput),
-                    reasoningOutput: saturatedAdd(existing.reasoningOutput, counts.reasoningOutput),
-                    reportedTotal: saturatedAdd(existing.reportedTotal, counts.total)
-                )
+                rows.append(UsageModelTokenSummary(model: text(statement, 0), counts: bucketSummaryCounts(statement)))
             }
             if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
-            return byModel
-                .map { UsageModelTokenSummary(model: $0.key, counts: $0.value) }
-                .sorted {
-                    if $0.counts.total == $1.counts.total { return $0.model < $1.model }
-                    return $0.counts.total > $1.counts.total
-                }
+            return rows.sorted {
+                if $0.counts.total == $1.counts.total { return $0.model < $1.model }
+                return $0.counts.total > $1.counts.total
+            }
         }
     }
 
@@ -2904,28 +2898,65 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    private func summarizeBucketRows(_ statement: OpaquePointer?, prices: [UsageModelPrice]) throws -> UsageSummary? {
-        var total = UsageTokenCounts(); var cost = 0.0; var newest: Int64?
-        var found = false
-        while sqlite3_step(statement) == SQLITE_ROW {
-            found = true
-            let counts = UsageTokenCounts(
-                input: sqlite3_column_int64(statement, 1), output: sqlite3_column_int64(statement, 2),
-                cachedInput: sqlite3_column_int64(statement, 3), cacheCreationInput: sqlite3_column_int64(statement, 4),
-                reasoningOutput: sqlite3_column_int64(statement, 5), reportedTotal: sqlite3_column_int64(statement, 6)
-            )
-            total = UsageTokenCounts(
-                input: saturatedAdd(total.input, counts.input), output: saturatedAdd(total.output, counts.output),
-                cachedInput: saturatedAdd(total.cachedInput, counts.cachedInput),
-                cacheCreationInput: saturatedAdd(total.cacheCreationInput, counts.cacheCreationInput),
-                reasoningOutput: saturatedAdd(total.reasoningOutput, counts.reasoningOutput),
-                reportedTotal: saturatedAdd(total.reportedTotal, counts.total)
-            )
-            cost += UsageCostEstimator.cost(model: text(statement, 0), counts: counts, prices: prices)
-            newest = max(newest ?? 0, sqlite3_column_int64(statement, 7))
+    private struct BucketSummaryFilter {
+        var whereClause: String
+        var hostname: String?
+        var interval: DateInterval?
+    }
+
+    private func bucketSummaryFilter(
+        window: UsageSummaryWindow?,
+        containing date: Date,
+        hostname: String?,
+        calendar: Calendar
+    ) -> BucketSummaryFilter? {
+        var predicates: [String] = []
+        if hostname != nil { predicates.append("hostname=?") }
+        var interval: DateInterval?
+        if let window {
+            guard let resolved = window.interval(containing: date, calendar: calendar) else { return nil }
+            interval = resolved
+            predicates.append("bucket_start_ms>=? AND bucket_start_ms<?")
         }
-        if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
-        return found ? UsageSummary(updatedAt: newest.map(date), counts: total, estimatedCostUSD: cost) : nil
+        return BucketSummaryFilter(
+            whereClause: predicates.isEmpty ? "" : "WHERE " + predicates.joined(separator: " AND "),
+            hostname: hostname,
+            interval: interval
+        )
+    }
+
+    private func bindBucketSummaryFilter(_ filter: BucketSummaryFilter, to statement: OpaquePointer?) throws {
+        var bindIndex: Int32 = 1
+        if let hostname = filter.hostname {
+            try bind(statement, bindIndex, hostname)
+            bindIndex += 1
+        }
+        if let interval = filter.interval {
+            try bind(statement, bindIndex, millis(interval.start))
+            try bind(statement, bindIndex + 1, millis(interval.end))
+        }
+    }
+
+    private func bucketSummaryCounts(_ statement: OpaquePointer?) -> UsageTokenCounts {
+        UsageTokenCounts(
+            input: sqlite3_column_int64(statement, 1),
+            output: sqlite3_column_int64(statement, 2),
+            cachedInput: sqlite3_column_int64(statement, 3),
+            cacheCreationInput: sqlite3_column_int64(statement, 4),
+            reasoningOutput: sqlite3_column_int64(statement, 5),
+            reportedTotal: sqlite3_column_int64(statement, 6)
+        )
+    }
+
+    private func sumCounts(_ left: UsageTokenCounts, _ right: UsageTokenCounts) -> UsageTokenCounts {
+        UsageTokenCounts(
+            input: saturatedAdd(left.input, right.input),
+            output: saturatedAdd(left.output, right.output),
+            cachedInput: saturatedAdd(left.cachedInput, right.cachedInput),
+            cacheCreationInput: saturatedAdd(left.cacheCreationInput, right.cacheCreationInput),
+            reasoningOutput: saturatedAdd(left.reasoningOutput, right.reasoningOutput),
+            reportedTotal: saturatedAdd(left.reportedTotal, right.total)
+        )
     }
 
     /// 单 hostname 的原始事件行数。增量作用域的相对大小判据。
@@ -4310,6 +4341,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 不再走 v8 rebuild 的建索引路径,存量库要靠这里补上新索引。仅当目标表存在时建索引(兼容极简
     /// fixture)。9.4G 库首次建索引一次性发生在此(WAL + temp_store=FILE),之后每轮省去全表排序。
     private func ensurePerformanceIndexesUnlocked() throws {
+        if try tableExistsUnlocked("usage_buckets") {
+            try exec("""
+                CREATE INDEX IF NOT EXISTS idx_usage_buckets_window
+                ON usage_buckets(bucket_start_ms,model);
+                CREATE INDEX IF NOT EXISTS idx_usage_buckets_host_window
+                ON usage_buckets(hostname,bucket_start_ms,model);
+                """)
+        }
         for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
             guard try tableExistsUnlocked(table) else { continue }
             let sql = Self.performanceIndexSQL(for: table)

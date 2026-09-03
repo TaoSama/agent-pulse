@@ -31,6 +31,7 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyMetricsPersistAggregateAndMapToDerivedRows()
         try verifier.verifyContentDedupKeyCollapsesForkCopies()
         try verifier.verifyCalendarWindowSummariesUseDerivedBucketsAndHostname()
+        try verifier.verifyBucketSummariesPreservePerRowEffectiveTotals()
         try verifier.verifyFinalizeIsScopedToHostname()
         try verifier.verifyLegacyRawRowsAreClaimedOnlyByCanonicalHostname()
         try verifier.verifyRecoveredIncrementalBaselineClearsPendingWithoutFullRecompute()
@@ -307,6 +308,26 @@ private struct MetricsLedgerPipelineVerifier {
         try require(try ledger.summary()?.counts.input == 249, "legacy summary must remain cross-host all-time")
         try require(try ledger.summary(window: .day, containing: localDate(2024, 1, 1, 12, calendar: calendar), hostname: "host-a", calendar: calendar) == nil, "empty summary window must return nil")
         try require(try ledger.summary(window: .day, containing: localDate(2024, 1, 1, 12, calendar: calendar), calendar: calendar) == nil, "empty display summary window must return nil")
+    }
+
+    func verifyBucketSummariesPreservePerRowEffectiveTotals() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let timestamp = try date("2026-08-14T00:00:00Z")
+
+        try insertBucket(database, hostname: "host-a", model: "model-a", at: timestamp, counts: UsageTokenCounts(input: 10, reportedTotal: 100))
+        try insertBucket(database, hostname: "host-a", model: "model-a", at: timestamp.addingTimeInterval(1_800), counts: UsageTokenCounts(input: 20, output: 5, reportedTotal: 0))
+
+        let summary = try unwrap(ledger.summary(window: nil, containing: timestamp, hostname: "host-a"), "summary must exist")
+        try require(summary.counts.input == 30, "summary must aggregate component token counts")
+        try require(summary.counts.reportedTotal == 125, "summary total must add every bucket effective total")
+        try require(summary.counts.total == 125, "summary effective total must preserve per-row total semantics")
+
+        let modelSummary = try unwrap(ledger.modelSummary(window: nil, containing: timestamp, hostname: "host-a").first, "model summary must exist")
+        try require(modelSummary.model == "model-a", "model summary must retain the model name")
+        try require(modelSummary.counts.input == 30, "model summary must aggregate component token counts")
+        try require(modelSummary.counts.total == 125, "model summary must add per-bucket effective totals")
     }
 
     func verifyFinalizeIsScopedToHostname() throws {
