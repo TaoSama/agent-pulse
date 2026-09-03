@@ -1436,6 +1436,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                checkpoint.parserVersion == UsageJSONLParser.parserVersion {
                 continue
             }
+            if shouldDeferLargeActiveFile(size: fileSize, modifiedAt: modifiedAt) {
+                continue
+            }
             let data = try Data(contentsOf: url, options: .mappedIfSafe)
             let parsed = UsageJSONLParser.parse(
                 data: data,
@@ -1455,6 +1458,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
         return presentFileIDs
     }
+
+    nonisolated private static func shouldDeferLargeActiveFile(size: Int64, modifiedAt: Date, now: Date = Date()) -> Bool {
+        size > maximumImmediateUsageParseBytes
+            && now.timeIntervalSince(modifiedAt) < largeActiveFileDeferralInterval
+    }
+
+    nonisolated private static let maximumImmediateUsageParseBytes: Int64 = 96 * 1024 * 1024
+    nonisolated private static let largeActiveFileDeferralInterval: TimeInterval = 30 * 60
 
     /// Claude Task 子代理转录的稳定磁盘布局：`subagents/agent-*.jsonl`。
     /// 子代理用量计入总量，但不会生成独立 session 聚合。
