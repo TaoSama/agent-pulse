@@ -500,14 +500,39 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 // Codex sessions 与 archived_sessions 同为 source="codex"：必须合并两 root 的
                 // present 集合后，对 "codex" 只调用一次 markFilesMissing，否则会互相误标 missing。
                 var codexPresentFileIDs: [String] = []
-                codexPresentFileIDs += try Self.scan(root: Self.codexSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate, progress: progressReporter)
+                codexPresentFileIDs += try Self.scan(
+                    root: Self.codexSessionsRoot,
+                    source: "codex",
+                    budget: .activeSessions,
+                    ledger: ledger,
+                    hostname: hostname,
+                    cancellation: gate,
+                    progress: progressReporter
+                )
                 try gate.throwIfCancelled()
                 // 归档会话不属于运行中 task 口径，但其已产生的 token 仍属于累计用量。
-                codexPresentFileIDs += try Self.scan(root: Self.codexArchivedSessionsRoot, source: "codex", ledger: ledger, hostname: hostname, cancellation: gate, progress: progressReporter)
+                codexPresentFileIDs += try Self.scan(
+                    root: Self.codexArchivedSessionsRoot,
+                    source: "codex",
+                    budget: .backgroundHistory,
+                    ledger: ledger,
+                    hostname: hostname,
+                    cancellation: gate,
+                    progress: progressReporter
+                )
                 try gate.throwIfCancelled()
                 try ledger.markFilesMissing(source: "codex", presentFileIDs: codexPresentFileIDs, hostname: hostname)
                 try gate.throwIfCancelled()
-                let claudePresentFileIDs = try Self.scan(root: Self.claudeProjectsRoot, source: "claude-code", includeSubagents: true, ledger: ledger, hostname: hostname, cancellation: gate, progress: progressReporter)
+                let claudePresentFileIDs = try Self.scan(
+                    root: Self.claudeProjectsRoot,
+                    source: "claude-code",
+                    includeSubagents: true,
+                    budget: .backgroundHistory,
+                    ledger: ledger,
+                    hostname: hostname,
+                    cancellation: gate,
+                    progress: progressReporter
+                )
                 try gate.throwIfCancelled()
                 try ledger.markFilesMissing(source: "claude-code", presentFileIDs: claudePresentFileIDs, hostname: hostname)
                 try gate.throwIfCancelled()
@@ -515,7 +540,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 // 每个自定义 source 独立聚合 present 集合，再各自按 source 标 missing。
                 var localPresentBySource: [String: [String]] = [:]
                 for local in localSources {
-                    let present = try Self.scan(root: local.root, source: local.source, includeSubagents: local.includeSubagents, ledger: ledger, hostname: hostname, cancellation: gate, progress: progressReporter)
+                    let present = try Self.scan(
+                        root: local.root,
+                        source: local.source,
+                        includeSubagents: local.includeSubagents,
+                        budget: .backgroundHistory,
+                        ledger: ledger,
+                        hostname: hostname,
+                        cancellation: gate,
+                        progress: progressReporter
+                    )
                     localPresentBySource[local.source, default: []] += present
                     try gate.throwIfCancelled()
                 }
@@ -1405,7 +1439,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 返回本次在磁盘上实际枚举到的该来源文件 fileID 列表（present set）。调用方据此在扫描
     /// 全部 root 后按 source 聚合，交给 Ledger 标记「磁盘已消失」文件为 missing（保留 raw 历史）。
     @discardableResult
-    nonisolated private static func scan(root: URL, source: String, includeSubagents: Bool = false, ledger: UsageLedgerStore, hostname: String, cancellation: CancellationGate, progress: ScanProgressReporter) throws -> [String] {
+    nonisolated private static func scan(
+        root: URL,
+        source: String,
+        includeSubagents: Bool = false,
+        budget: SourceScanBudget,
+        ledger: UsageLedgerStore,
+        hostname: String,
+        cancellation: CancellationGate,
+        progress: ScanProgressReporter
+    ) throws -> [String] {
         // 不存在的来源根目录：无需扫描，视作该来源“无内容”（非失败）。
         // 但根目录存在却无法枚举，属致命失败：绝不能当作扫描成功静默吞掉，
         // 否则会在数据缺失的情况下清除 rebuild pending / 误判“全量成功”。
@@ -1420,6 +1463,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         var presentFileIDs: [String] = []
         var parserBackfillsRemaining = maximumParserBackfillsPerSourceScan
         var parserBackfillBytesRemaining = maximumParserBackfillBytesPerSourceScan
+        var firstTimeBytesRemaining = budget.firstTimeBytes
+        let startedAt = Date()
         for case let url as URL in enumerator where url.pathExtension == "jsonl" {
             try cancellation.throwIfCancelled()
             let values = try url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
@@ -1431,6 +1476,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             presentFileIDs.append(fileID)
             // 每个枚举到的 jsonl 文件（无论跳过还是解析）都推进一格进度，与预扫总数对齐。
             progress.advanceItem(.scanning)
+            let exhaustedTimeBudget = Date().timeIntervalSince(startedAt) >= budget.maxDurationSeconds
+            let deferLargeActiveFile = shouldDeferLargeActiveFile(size: fileSize, modifiedAt: modifiedAt)
             if let checkpoint = try ledger.checkpoint(fileID: fileID),
                checkpoint.status == "complete",
                checkpoint.size == fileSize,
@@ -1440,14 +1487,18 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 }
                 if parserBackfillsRemaining <= 0
                     || fileSize > maximumParserBackfillFileBytes
-                    || fileSize > parserBackfillBytesRemaining {
+                    || fileSize > parserBackfillBytesRemaining
+                    || exhaustedTimeBudget {
                     continue
                 }
                 parserBackfillsRemaining -= 1
                 parserBackfillBytesRemaining -= fileSize
-            }
-            if shouldDeferLargeActiveFile(size: fileSize, modifiedAt: modifiedAt) {
+            } else if deferLargeActiveFile {
                 continue
+            } else if fileSize > firstTimeBytesRemaining || exhaustedTimeBudget {
+                continue
+            } else {
+                firstTimeBytesRemaining -= fileSize
             }
             let data = try Data(contentsOf: url, options: .mappedIfSafe)
             let parsed = UsageJSONLParser.parse(
@@ -1479,6 +1530,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     nonisolated private static let maximumParserBackfillsPerSourceScan = 64
     nonisolated private static let maximumParserBackfillFileBytes: Int64 = 16 * 1024 * 1024
     nonisolated private static let maximumParserBackfillBytesPerSourceScan: Int64 = 32 * 1024 * 1024
+
+    private struct SourceScanBudget: Sendable {
+        let firstTimeBytes: Int64
+        let maxDurationSeconds: TimeInterval
+
+        static let activeSessions = SourceScanBudget(firstTimeBytes: 32 * 1024 * 1024, maxDurationSeconds: 10)
+        static let backgroundHistory = SourceScanBudget(firstTimeBytes: 4 * 1024 * 1024, maxDurationSeconds: 5)
+    }
 
     /// Claude Task 子代理转录的稳定磁盘布局：`subagents/agent-*.jsonl`。
     /// 子代理用量计入总量，但不会生成独立 session 聚合。

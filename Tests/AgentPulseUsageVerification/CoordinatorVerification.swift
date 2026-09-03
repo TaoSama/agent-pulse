@@ -76,11 +76,16 @@ enum CoordinatorVerification {
         )
         // scanning 阶段：预扫总数在逐文件 scan 之前。
         let totalOffset = try offset(of: "progressReporter.setPhaseTotal(.scanning, total: totalFiles)", in: scanBody)
-        let firstScanOffset = try offset(of: "Self.scan(root: Self.codexSessionsRoot", in: scanBody)
+        let firstScanOffset = try offset(of: "root: Self.codexSessionsRoot", in: scanBody)
         try require(totalOffset < firstScanOffset, "预扫文件总数必须在逐文件扫描之前登记")
         try require(
             scanBody.contains("Self.countJSONLFiles(root: $1)"),
             "scanning 阶段未预扫来源 root 的 jsonl 总数作为进度分母"
+        )
+        try require(
+            scanBody.contains("budget: .activeSessions")
+                && scanBody.contains("budget: .backgroundHistory"),
+            "内建活跃来源与历史来源未使用分级扫描预算"
         )
         // 各阶段边界均报点。
         for marker in [
@@ -95,6 +100,12 @@ enum CoordinatorVerification {
         // scan 逐文件推进进度。
         let scanFn = try functionBody(matching: "nonisolated private static func scan(", in: source)
         try require(scanFn.contains("progress.advanceItem(.scanning)"), "scan 未逐文件推进进度")
+        try require(
+            scanFn.contains("firstTimeBytesRemaining")
+                && scanFn.contains("maxDurationSeconds")
+                && source.contains("maximumParserBackfillBytesPerSourceScan"),
+            "scan 未对首次历史采集和 parser-only 回填设置字节/时间预算"
+        )
 
         // applyScanProgress：generation + scanningInProgress 双重门禁。
         let apply = try functionBody(named: "applyScanProgress", in: source)
