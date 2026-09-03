@@ -972,9 +972,6 @@ public actor CodexRuntimeMetricsCollector {
                     continue
                 }
                 tokenFileProviders[canonicalURL.path] = provider
-                if includesCodexCompleted, canonicalURL.lastPathComponent.hasPrefix("rollout-") {
-                    completedMetricFiles[canonicalURL.path] = canonicalURL
-                }
                 guard shouldTrackLiveJSONL(canonicalURL) else {
                     diagnostics.excludedAggregateFiles += 1
                     continue
@@ -988,6 +985,11 @@ public actor CodexRuntimeMetricsCollector {
                 guard size > 0 else {
                     diagnostics.excludedEmptyFiles += 1
                     continue
+                }
+                if includesCodexCompleted,
+                   canonicalURL.lastPathComponent.hasPrefix("rollout-"),
+                   size <= Self.maximumFullInitialReadBytes {
+                    completedMetricFiles[canonicalURL.path] = canonicalURL
                 }
                 guard now.timeIntervalSince(modifiedAt) <= Self.recentFileInterval else {
                     diagnostics.excludedStaleFiles += 1

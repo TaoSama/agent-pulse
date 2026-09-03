@@ -3282,6 +3282,7 @@ struct AgentPulseCoreVerification {
             sessionsDirectories: [sessions],
             automationRoots: [],
             databaseURL: database,
+            claudeSessionsDirectory: root.appendingPathComponent("missing-claude-sessions"),
             claudeProjectsDirectory: root.appendingPathComponent("missing-claude-projects")
         ))
         _ = try await collectorA.scan(at: base)  // 冷扫：seed currentModel = nil
@@ -3308,6 +3309,7 @@ struct AgentPulseCoreVerification {
             sessionsDirectories: [sessions],
             automationRoots: [],
             databaseURL: root.appendingPathComponent("Application Support/AgentPulse/agent-pulse-b.sqlite"),
+            claudeSessionsDirectory: root.appendingPathComponent("missing-claude-sessions"),
             claudeProjectsDirectory: root.appendingPathComponent("missing-claude-projects")
         ))
         _ = try await collectorB.scan(at: base)
@@ -3336,6 +3338,7 @@ struct AgentPulseCoreVerification {
             sessionsDirectories: [sessions],
             automationRoots: [root.appendingPathComponent("automations").path],
             databaseURL: database,
+            claudeSessionsDirectory: root.appendingPathComponent("missing-claude-sessions"),
             claudeProjectsDirectory: root.appendingPathComponent("missing-claude-projects")
         )
 
@@ -3444,6 +3447,7 @@ struct AgentPulseCoreVerification {
             sessionsDirectories: [promotedSessions],
             automationRoots: [],
             databaseURL: root.appendingPathComponent("promoted.sqlite"),
+            claudeSessionsDirectory: root.appendingPathComponent("missing-promoted-claude-sessions"),
             claudeProjectsDirectory: root.appendingPathComponent("missing-promoted-claude")
         )
         let promotedCollector = try CodexRuntimeMetricsCollector(configuration: promotedConfiguration)
@@ -3470,6 +3474,7 @@ struct AgentPulseCoreVerification {
             sessionsDirectories: [root.appendingPathComponent("missing-sessions")],
             automationRoots: [],
             databaseURL: root.appendingPathComponent("unavailable.sqlite"),
+            claudeSessionsDirectory: root.appendingPathComponent("missing-unavailable-claude-sessions"),
             claudeProjectsDirectory: root.appendingPathComponent("missing-claude-projects")
         )
         let unavailableCollector = try CodexRuntimeMetricsCollector(configuration: unavailableConfiguration)
