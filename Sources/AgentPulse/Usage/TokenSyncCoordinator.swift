@@ -565,8 +565,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 // 无变化轮（raw 派生 dirty 位未置 且 无 rebuild 待完成）跳过 O(全库) 重算：
                 // 派生已是最新，仅从持久标志读回上报资格，避免每轮全表读+排序（9.4G 库约 90s）。
                 progressReporter.enterPhase(.finalizing)
-                _ = try ledger.recoverIncrementalBaselineIfSafe(hostname: hostname, currentParserVersion: currentParserVersion)
-                let needsFinalize = try ledger.requiresDerivationCompletion() || ledger.requiresRebuildCompletion()
+                let baselineRecovery = try ledger.recoverIncrementalBaselineIfSafe(
+                    hostname: hostname,
+                    currentParserVersion: currentParserVersion
+                )
+                let needsDerivation = try ledger.requiresDerivationCompletion()
+                let needsRebuild = try ledger.requiresRebuildCompletion()
+                let needsFinalize = baselineRecovery != .deferred && (needsDerivation || needsRebuild)
                 let finalize: UsageFinalizeResult
                 if needsFinalize {
                     // 冻结压实开关（默认关闭，不可逆）：开启后 finalize 同事务推进冻结水位并删除已固化历史原始行。
@@ -574,6 +579,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                         // 重算内部子阶段回调：映射到 .finalizing 段的 done/total（8 步），显示「3/8 步」。
                         progressReporter.advance(.finalizing, done: done, total: total)
                     }
+                } else if baselineRecovery == .deferred {
+                    finalize = UsageFinalizeResult(
+                        reportingEligible: false,
+                        blockedReasons: ["incremental baseline recovery deferred for large local ledger"],
+                        collapsedInheritedEvents: 0,
+                        collapsedContentDuplicates: 0
+                    )
                 } else {
                     // 跳过重算：collapsed 计数本轮为 0（无新折叠工作），eligible 读持久标志，
                     // blocked 原因沿用上轮（raw 未变则不变）。
@@ -600,7 +612,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     calendar: summaryCalendar,
                     mergedEnvURL: summaryEnvURL
                 )
-                let pending = try ledger.pendingCounts(hostname: hostname)
+                let pending = baselineRecovery == .deferred ? (buckets: 0, sessions: 0) : try ledger.pendingCounts(hostname: hostname)
                 progressReporter.completePhase(.summarizing)
                 return ScanOutcome(summary: summary, finalize: finalize, pending: pending)
             }

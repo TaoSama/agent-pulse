@@ -80,6 +80,12 @@ public struct UsageFinalizeResult: Sendable, Equatable {
     }
 }
 
+public enum UsageIncrementalBaselineRecovery: Sendable, Equatable {
+    case notNeeded
+    case recovered
+    case deferred
+}
+
 
 /// 持久化 append-only 用量账本。
 ///
@@ -100,6 +106,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
     public static let bucketMilliseconds: Int64 = 30 * 60 * 1_000
     public static let defaultMaxBucketsPerBatch = 500
     public static let defaultMaxSessionsPerBatch = 1_000
+    public static let defaultMaxEventsForBaselineRecovery: Int64 = 200_000
 
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "com.agentpulse.usage-ledger")
@@ -1719,10 +1726,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// This does not clear raw_derivation_pending. It only creates the metadata required for
     /// the normal incremental path to safely consume the existing dirty keys.
     @discardableResult
-    public func recoverIncrementalBaselineIfSafe(hostname: String, currentParserVersion: Int) throws -> Bool {
-        guard currentParserVersion > 0 else { return false }
+    public func recoverIncrementalBaselineIfSafe(
+        hostname: String,
+        currentParserVersion: Int,
+        maxEvents: Int64 = UsageLedgerStore.defaultMaxEventsForBaselineRecovery
+    ) throws -> UsageIncrementalBaselineRecovery {
+        guard currentParserVersion > 0 else { return .notNeeded }
         return try queue.sync {
-            var recovered = false
+            var recovery: UsageIncrementalBaselineRecovery = .notNeeded
             try transaction {
                 guard try readTextUnlocked(key: Self.incrementalBaselineKey) == nil else { return }
                 guard try readTextUnlocked(key: Self.rawDerivationPendingKey) != nil else { return }
@@ -1732,14 +1743,18 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 guard try !hasEmptyRawHostnameUnlocked() else { return }
                 guard try !hasActiveCheckpointOlderThanParserUnlocked(currentParserVersion) else { return }
                 guard try derivedHasAnyRowUnlocked(hostname: hostname) else { return }
+                guard try !hostEventCountExceedsUnlocked(hostname: hostname, limit: maxEvents) else {
+                    recovery = .deferred
+                    return
+                }
 
                 try ensureIdentityConflictTableUnlocked()
                 try ensureLogicalBucketMapUnlocked()
                 try rebuildIncrementalBaselineTablesUnlocked(hostname: hostname)
                 try setTextUnlocked(key: Self.incrementalBaselineKey, value: "1")
-                recovered = true
+                recovery = .recovered
             }
-            return recovered
+            return recovery
         }
     }
 
@@ -2921,6 +2936,20 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try bind(statement, 1, hostname)
         guard sqlite3_step(statement) == SQLITE_ROW else { throw error() }
         return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private func hostEventCountExceedsUnlocked(hostname: String, limit: Int64) throws -> Bool {
+        guard limit >= 0 else { return true }
+        let statement = try prepare("""
+            SELECT COUNT(*) FROM (
+              SELECT 1 FROM usage_events WHERE hostname=? LIMIT ?
+            );
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        try bind(statement, 2, limit + 1)
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw error() }
+        return sqlite3_column_int64(statement, 0) > limit
     }
 
     public func eventCount() throws -> Int {
