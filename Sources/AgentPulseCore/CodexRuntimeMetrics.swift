@@ -1096,8 +1096,15 @@ public actor CodexRuntimeMetricsCollector {
         }
 
         let fileData: Data
+        let readIsTailOnly: Bool
         do {
-            fileData = try Data(contentsOf: file, options: [.mappedIfSafe])
+            if let size = signature.size, size > Self.maximumFullInitialReadBytes {
+                fileData = try readInitialRuntimeWindow(from: file, size: size)
+                readIsTailOnly = true
+            } else {
+                fileData = try Data(contentsOf: file, options: [.mappedIfSafe])
+                readIsTailOnly = false
+            }
         } catch {
             accumulator.unreadableFiles += 1
             return
@@ -1128,12 +1135,11 @@ public actor CodexRuntimeMetricsCollector {
             }()
             : nil
         var crossedInheritedPrefix = (metaStartedAt == nil)
-        let completed = meta.map { _ in
+        let completed = (meta != nil && !readIsTailOnly) ?
             CodexSessionParser.completedTasks(
                 inSessionContents: contents,
                 automationRoots: configuration.automationRoots
-            )
-        } ?? .empty
+            ) : .empty
         let source = meta.flatMap { CodexSessionParser.source(forOriginator: $0.originator) }
         let lifecycleStarted = CodexSessionParser.lastLifecycle(inSessionContents: contents) == .started
         var previousTotal: Int?
@@ -1241,7 +1247,7 @@ public actor CodexRuntimeMetricsCollector {
             signature: signature,
             summary: summary,
             lastSeen: now,
-            readOffset: UInt64(fileData.count),
+            readOffset: UInt64(signature.size ?? fileData.count),
             meta: meta,
             previousTotalOutput: previousTotal,
             previousOutputTimestamp: previousTimestamp,
@@ -1256,6 +1262,27 @@ public actor CodexRuntimeMetricsCollector {
             tailGuard: tailGuard(for: fileData)
         )
         apply(summary, now: now, accumulator: &accumulator)
+    }
+
+    private func readInitialRuntimeWindow(from file: URL, size: Int) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: file)
+        defer { try? handle.close() }
+        let firstLine = try handle.read(upToCount: Self.maximumInitialHeaderBytes) ?? Data()
+        let tailOffset = UInt64(max(0, size - Self.maximumAppendReadBytes))
+        try handle.seek(toOffset: tailOffset)
+        var tail = try handle.readToEnd() ?? Data()
+        if tailOffset == 0 { return tail }
+        if let firstNewline = tail.firstIndex(of: 0x0A) {
+            tail = Data(tail[tail.index(after: firstNewline)...])
+        } else {
+            tail.removeAll(keepingCapacity: true)
+        }
+        var data = Data()
+        data.reserveCapacity(firstLine.count + 1 + tail.count)
+        data.append(firstLine.prefix { $0 != 0x0A })
+        data.append(0x0A)
+        data.append(tail)
+        return data
     }
 
     private func canReadIncrementally(from cached: FileCacheEntry, to signature: FileSignature) -> Bool {
@@ -2110,6 +2137,8 @@ public actor CodexRuntimeMetricsCollector {
     /// 本会话真实产出在其后 17-37s 的大 gap 之后，2s 阈值有充足安全边际。
     private static let inheritedPrefixClusterTolerance: TimeInterval = 2
     private static let maximumAppendReadBytes = 64 * 1024 * 1024
+    private static let maximumFullInitialReadBytes = 96 * 1024 * 1024
+    private static let maximumInitialHeaderBytes = 256 * 1024
     private static let maximumTrackedFiles = 96
     private static let maximumMessageIdentities = 2_048
 }
