@@ -4241,6 +4241,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
             return "DROP INDEX IF EXISTS idx_usage_events_host;"
                 + "DROP INDEX IF EXISTS idx_usage_events_host_logical;"
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_host_time ON usage_events(hostname,timestamp_ms,event_id,source_file_hash);"
+                // record() asks for the old raw rows of exactly one file before replacing them.
+                // The existing single-column file index is not selective enough on multi-host,
+                // multi-GB ledgers; SQLite can spend the scan hot path walking unrelated rows.
+                + "CREATE INDEX IF NOT EXISTS idx_usage_events_host_file ON usage_events(hostname,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_dedup ON usage_events(codex_dedup_key);"
                 // 增量闭包的两条正向边（logical→lineage、logical→content）把脏键表 JOIN 回
                 // usage_events，连接列是 (source, event_id)。缺索引时每条边都全表扫描，50k 行
@@ -4261,8 +4265,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
         case "usage_session_events":
             return "CREATE INDEX IF NOT EXISTS idx_session_events_host ON usage_session_events(hostname,source,event_id,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_group ON usage_session_events(hostname,source,session_hash,timestamp_ms);"
+                + "CREATE INDEX IF NOT EXISTS idx_session_events_host_file_dirty ON usage_session_events(hostname,source_file_hash,source,session_hash);"
         case "usage_edit_entries":
             return "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_host ON usage_edit_entries(hostname,timestamp_ms,tool_use_id,source_file_hash);"
+                + "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_host_file_dirty ON usage_edit_entries(hostname,source_file_hash,source,model,project,timestamp_ms,tool_use_id);"
                 // 增量 finalize 按脏 tool_use_id 反查该 ID 当前在册的全部 bucket。v8 rebuild 路径
                 // 建过同名索引，但 v10 存量库不走那条路径，只能在这里补建。少了它这次反查会退化成
                 // 全表扫描，脏 ID 数量一多就把增量的成本推回全量量级。

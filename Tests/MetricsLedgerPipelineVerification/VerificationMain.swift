@@ -34,6 +34,7 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyFinalizeIsScopedToHostname()
         try verifier.verifyLegacyRawRowsAreClaimedOnlyByCanonicalHostname()
         try verifier.verifyRecoveredIncrementalBaselineClearsPendingWithoutFullRecompute()
+        try verifier.verifyRawFileDirtyQueriesUseHostFileIndexes()
         try verifier.verifyFrozenCompactionPreservesTotalsAndDropsRaw()
         try verifier.verifyFrozenLateEventsAreDropped()
         try verifier.verifyFrozenWatermarkIsMonotonicAndBucketAligned()
@@ -420,6 +421,35 @@ private struct MetricsLedgerPipelineVerifier {
         _ = try ledger.pendingBatch(hostname: host)
     }
 
+    func verifyRawFileDirtyQueriesUseHostFileIndexes() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        _ = try UsageLedgerStore(path: database.path)
+
+        try withDatabase(database) { db in
+            let eventPlan = try queryPlanDetails(db, """
+                EXPLAIN QUERY PLAN
+                SELECT source,event_id,lineage_fingerprint,codex_dedup_key,session_hash,model,project,timestamp_ms
+                FROM usage_events WHERE hostname='host-a' AND source_file_hash='file-a';
+                """)
+            try require(eventPlan.contains { $0.contains("idx_usage_events_host_file") }, "usage event dirty lookup must use the host/file index; plan=\(eventPlan)")
+
+            let sessionPlan = try queryPlanDetails(db, """
+                EXPLAIN QUERY PLAN
+                SELECT DISTINCT source,session_hash
+                FROM usage_session_events WHERE hostname='host-a' AND source_file_hash='file-a';
+                """)
+            try require(sessionPlan.contains { $0.contains("idx_session_events_host_file_dirty") }, "session dirty lookup must use the host/file index; plan=\(sessionPlan)")
+
+            let editPlan = try queryPlanDetails(db, """
+                EXPLAIN QUERY PLAN
+                SELECT DISTINCT source,model,project,timestamp_ms,tool_use_id
+                FROM usage_edit_entries WHERE hostname='host-a' AND source_file_hash='file-a';
+                """)
+            try require(editPlan.contains { $0.contains("idx_usage_edit_entries_host_file_dirty") }, "edit dirty lookup must use the host/file index; plan=\(editPlan)")
+        }
+    }
+
     // MARK: - Frozen watermark (v3) 场景
 
     /// 30 分钟 bucket 边界对齐的相对时间：把「距今 daysAgo 天」floor 到 30 分钟边界，
@@ -633,6 +663,20 @@ private struct MetricsLedgerPipelineVerifier {
         defer { sqlite3_finalize(statement) }
         guard sqlite3_step(statement) == SQLITE_ROW else { throw VerificationFailure.sqlite(String(cString: sqlite3_errmsg(db))) }
         return sqlite3_column_int64(statement, 0)
+    }
+
+    private func queryPlanDetails(_ db: OpaquePointer, _ sql: String) throws -> [String] {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw VerificationFailure.sqlite(String(cString: sqlite3_errmsg(db)))
+        }
+        defer { sqlite3_finalize(statement) }
+        var details: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let value = sqlite3_column_text(statement, 3) else { continue }
+            details.append(String(cString: value))
+        }
+        return details
     }
 
     private func insertBucket(_ url: URL, hostname: String, model: String, at date: Date, counts: UsageTokenCounts) throws {
