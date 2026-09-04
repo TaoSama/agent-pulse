@@ -14,15 +14,19 @@ concurrency:
 jobs:
   verify:
     name: macOS arm64 offline verification
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: '6.3'
+      - name: Verify Xcode toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          swift package dump-package >/dev/null
       - name: Verify runtime and fixture gates
         run: python3 scripts/verify.py
       - name: Verify distributable app

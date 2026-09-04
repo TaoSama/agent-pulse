@@ -17,8 +17,10 @@ concurrency:
 jobs:
   release:
     if: github.ref == 'refs/heads/main'
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 180
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
     permissions:
       contents: write
     steps:
@@ -27,9 +29,11 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      - uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: '6.3'
+      - name: Verify Xcode toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          swift package dump-package >/dev/null
       - name: Publish all pending main revisions
         env:
           GH_TOKEN: ${{ github.token }}
