@@ -431,6 +431,10 @@ enum CoordinatorVerification {
             "scanNow deferred baseline 恢复必须跳过冻结压实，避免大账本上报门禁长期不解除"
         )
         try require(
+            !scanNowBody.contains("compactFrozen: compactionEnabled"),
+            "scanNow 的扫描/上报关键路径不应执行冻结压实；压实应拆成独立维护任务"
+        )
+        try require(
             !scanNowBody.contains("baselineRecovery == .deferred ? (buckets: 0, sessions: 0) : try ledger.pendingCounts"),
             "scanNow deferred 分支不应伪造 pendingCounts；full finalize 后应读取真实 pending"
         )

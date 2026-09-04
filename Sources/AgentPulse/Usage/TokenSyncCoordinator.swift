@@ -472,8 +472,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             // 无变化轮跳过全库重算时，上报资格布尔从账本持久标志读回，blocked 原因（未持久化）
             // 沿用上轮：raw 未变则派生不变，原因列表必与上次 finalize 一致。
             let priorBlockedReasons = self?.status.reportingBlockedReasons ?? []
-            // 冻结压实开关（默认关闭，不可逆）：主线程读定值后进入 worker，避免并发捕获 self。
-            let compactionEnabled = self?.defaults.object(forKey: DefaultsKey.compactionEnabled) as? Bool ?? false
             // 阻塞式 SQLite/文件扫描在后台队列执行（不阻塞主线程），不使用 detached 分叉。
             let result = await Self.runOffMain { gate in
                 try gate.throwIfCancelled()
@@ -582,8 +580,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                         progressReporter.advance(.finalizing, done: done, total: total)
                     }
                 } else if needsFinalize {
-                    // 冻结压实开关（默认关闭，不可逆）：开启后 finalize 同事务推进冻结水位并删除已固化历史原始行。
-                    finalize = try ledger.finalizeDerived(hostname: hostname, compactFrozen: compactionEnabled) { done, total in
+                    // 扫描/上报的关键路径只负责把派生账本推进到可上报状态。冻结压实会对大表做
+                    // 不可逆删除和 VACUUM，不能绑进同一个“正在扫描”事务，否则 25GB 级账本会让
+                    // UI 长时间卡在扫描中。磁盘回收应由独立维护任务处理。
+                    finalize = try ledger.finalizeDerived(hostname: hostname, compactFrozen: false) { done, total in
                         // 重算内部子阶段回调：映射到 .finalizing 段的 done/total（8 步），显示「3/8 步」。
                         progressReporter.advance(.finalizing, done: done, total: total)
                     }

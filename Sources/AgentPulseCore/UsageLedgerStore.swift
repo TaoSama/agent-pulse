@@ -1605,6 +1605,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 逐 bucket 差异写反而比一次全表 GROUP BY 慢，直接回退。
     private static let incrementalBucketLimit = 5000
 
+    /// 增量 dirty key 数上限。闭包传播必须先把所有 dirty logical/lineage/content 键展开；
+    /// 当文件重扫一次性产生大量脏键时，传播自身就会比全量重算更慢，甚至长时间占住扫描事务。
+    /// 超过该值直接走全量，保持扫描/上报关键路径可预期。
+    private static let incrementalDirtyKeyLimit = 50_000
+
     /// 作用域事件数占该 hostname 全部事件的比例上限。超过就退回全量。
     ///
     /// 增量只有在作用域远小于全表时才划算。作用域大到一定比例后，闭包展开、scoped 去重、
@@ -1687,6 +1692,20 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try bind(statement, 1, hostname); try done(statement)
     }
 
+    private func dirtyKeyCountExceedsUnlocked(hostname: String, limit: Int) throws -> Bool {
+        guard try tableExistsUnlocked("usage_dirty_keys") else { return false }
+        let statement = try prepare("""
+            SELECT COUNT(*) FROM (
+              SELECT 1 FROM usage_dirty_keys WHERE hostname=? LIMIT ?
+            );
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        try bind(statement, 2, Int64(limit + 1))
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw error() }
+        return sqlite3_column_int64(statement, 0) > Int64(limit)
+    }
+
     private func derivedHasAnyRowUnlocked(hostname: String) throws -> Bool {
         for table in ["usage_buckets", "usage_sessions"] {
             guard try tableExistsUnlocked(table) else { continue }
@@ -1713,6 +1732,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         guard try readTextUnlocked(key: Self.incrementalBaselineKey) != nil else { return false }
         guard try readTextUnlocked(key: Self.rebuildPendingKey) == nil else { return false }
         guard try frozenBeforeMsUnlocked(hostname) == 0 else { return false }
+        guard try !dirtyKeyCountExceedsUnlocked(hostname: hostname, limit: Self.incrementalDirtyKeyLimit) else { return false }
         return try derivedHasAnyRowUnlocked(hostname: hostname)
     }
 
