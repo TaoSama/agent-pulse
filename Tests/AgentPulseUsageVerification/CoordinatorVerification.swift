@@ -116,11 +116,16 @@ enum CoordinatorVerification {
                 && source.contains("maximumParserBackfillBytesPerSourceScan"),
             "scan 未对首次历史采集和 parser-only 回填设置字节/时间预算"
         )
-        let prepareUsageScanOffset = try offset(of: "try ledger.prepareForUsageScan()", in: scanBody)
+        let prepareUsageScanOffset = try offset(of: "try ledger.prepareForUsageScan {", in: scanBody)
         let scanRootsOffset = try offset(of: "var scanRoots:", in: scanBody)
         try require(
             prepareUsageScanOffset < scanRootsOffset,
             "scanNow 必须在后台扫描路径、文件枚举前补齐 raw 性能索引，避免 App 初始化阻塞"
+        )
+        try require(
+            scanBody.contains("progressReporter.enterPhase(.scanning, detail: \"准备扫描索引\")")
+                && scanBody.contains("progressReporter.advance(.scanning, done: 0, total: 0, detail: \"准备扫描索引\")"),
+            "扫描索引准备阶段缺少可见进度心跳"
         )
 
         // applyScanProgress：generation + scanningInProgress 双重门禁。
@@ -495,6 +500,20 @@ enum CoordinatorVerification {
             try ledgerSource().contains("incrementalDirtyKeyLimit")
                 && ledgerSource().contains("dirtyKeyCountUnlocked(hostname: hostname) <= Self.incrementalDirtyKeyLimit"),
             "增量派生缺少 dirty-key 数量门禁，大量脏键会在闭包传播阶段长时间无进度"
+        )
+        try require(
+            try ledgerSource().contains("incrementalDedupKeyLimit")
+                && ledgerSource().contains("dirtyKeyCountUnlocked(hostname: hostname, kinds: [.lineage, .content]) <= Self.incrementalDedupKeyLimit")
+                && ledgerSource().contains("guard try dirtyKeysAllowIncrementalRecomputeUnlocked(hostname: hostname) else { return nil }"),
+            "增量派生缺少 lineage/content 去重组门禁，大去重脏集必须回退全量并显示分阶段进度"
+        )
+        let dirtyGateOffset = try offset(of: "let allowIncrementalDirtyKeys = try dirtyKeysAllowIncrementalRecomputeUnlocked", in: ledgerSource())
+        let redundantDiscardOffset = try offset(of: "try discardRedundantGroupDirtyKeysUnlocked(hostname: hostname)", in: ledgerSource())
+        try require(
+            dirtyGateOffset < redundantDiscardOffset
+                && ledgerSource().contains("allowIncrementalDirtyKeys: allowIncrementalDirtyKeys")
+                && ledgerSource().contains("if strategy == .automatic, allowIncrementalDirtyKeys, try canRecomputeIncrementallyUnlocked"),
+            "lineage/content 门禁必须在冗余脏键清理前计算，否则清理会掩盖大去重脏集并误入增量闭包"
         )
     }
 

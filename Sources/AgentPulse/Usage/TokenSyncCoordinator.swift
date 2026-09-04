@@ -490,7 +490,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 }
                 try gate.throwIfCancelled()
                 progressReporter.enterPhase(.scanning, detail: "准备扫描索引")
-                try ledger.prepareForUsageScan()
+                try ledger.prepareForUsageScan {
+                    progressReporter.advance(.scanning, done: 0, total: 0, detail: "准备扫描索引")
+                }
                 try gate.throwIfCancelled()
                 // 进入 scanning 阶段：先枚举全部来源 root 的 jsonl 总数作为进度分母，
                 // 再逐文件处理并回报（已处理/总数）。totalFiles 为 0 时进度按阶段权重阶跃。
@@ -1242,11 +1244,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
 
         private func heartbeatDetail(_ detail: String?, phase: TokenScanPhase) -> String? {
-            guard phase == .finalizing || phase == .compacting else { return detail }
+            guard phase == .scanning || phase == .finalizing || phase == .compacting else { return detail }
+            guard let detail, !detail.isEmpty else { return detail }
             let elapsed = (DispatchTime.now().uptimeNanoseconds - phaseStartedAt) / 1_000_000_000
             guard elapsed >= 2 else { return detail }
             let running = "执行中 \(elapsed)s"
-            guard let detail, !detail.isEmpty else { return running }
             return "\(detail) · \(running)"
         }
     }

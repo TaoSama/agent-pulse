@@ -1266,37 +1266,44 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private static func skillAttributionSQL(bucketMs: Int64) -> String {
         """
             CREATE TEMP TABLE temp_skill_attribution AS
-            WITH lineage_winner AS (
-                SELECT l.source AS member_source, l.event_id AS member_event_id,
-                       w.source AS win_source, w.event_id AS win_event_id
-                FROM temp_logical_events l
-                JOIN temp_lineage_events w ON w.lineage_fingerprint = l.lineage_fingerprint
-                WHERE l.lineage_fingerprint <> ''
+            WITH target_logical AS (
+                SELECT l.source, l.event_id, l.lineage_fingerprint, l.codex_dedup_key
+                FROM temp_skill_members m
+                JOIN temp_logical_events l ON l.source = m.source AND l.event_id = m.event_id
+            ),
+            lineage_winner AS (
+                SELECT t.source AS member_source, t.event_id AS member_event_id,
+                       w.source AS win_source, w.event_id AS win_event_id,
+                       w.codex_dedup_key
+                FROM target_logical t
+                JOIN temp_lineage_events w ON w.lineage_fingerprint = t.lineage_fingerprint
+                WHERE t.lineage_fingerprint <> ''
                 UNION ALL
-                SELECT l.source, l.event_id, l.source, l.event_id
-                FROM temp_logical_events l
-                WHERE l.lineage_fingerprint = ''
+                SELECT t.source, t.event_id, t.source, t.event_id,
+                       t.codex_dedup_key
+                FROM target_logical t
+                WHERE t.lineage_fingerprint = ''
             ),
             content_winner AS (
-                SELECT n.source AS member_source, n.event_id AS member_event_id,
-                       d.source AS win_source, d.event_id AS win_event_id
-                FROM temp_lineage_events n
-                JOIN temp_deduped_events d ON d.codex_dedup_key = n.codex_dedup_key
-                WHERE n.codex_dedup_key <> ''
+                SELECT lw.member_source, lw.member_event_id,
+                       d.source AS winner_source, d.event_id AS winner_event_id,
+                       d.model AS winner_model, d.project AS winner_project,
+                       (d.timestamp_ms / \(bucketMs)) * \(bucketMs) AS winner_bucket_start
+                FROM lineage_winner lw
+                JOIN temp_deduped_events d ON d.codex_dedup_key = lw.codex_dedup_key
+                WHERE lw.codex_dedup_key <> ''
                 UNION ALL
-                SELECT n.source, n.event_id, n.source, n.event_id
-                FROM temp_lineage_events n
-                WHERE n.codex_dedup_key = ''
+                SELECT lw.member_source, lw.member_event_id,
+                       d.source AS winner_source, d.event_id AS winner_event_id,
+                       d.model AS winner_model, d.project AS winner_project,
+                       (d.timestamp_ms / \(bucketMs)) * \(bucketMs) AS winner_bucket_start
+                FROM lineage_winner lw
+                JOIN temp_deduped_events d ON d.source = lw.win_source AND d.event_id = lw.win_event_id
+                WHERE lw.codex_dedup_key = ''
             )
-            SELECT lw.member_source AS source, lw.member_event_id AS event_id,
-                   d.source AS winner_source, d.event_id AS winner_event_id,
-                   d.model AS winner_model, d.project AS winner_project,
-                   (d.timestamp_ms / \(bucketMs)) * \(bucketMs) AS winner_bucket_start
-            FROM lineage_winner lw
-            JOIN content_winner cw ON cw.member_source = lw.win_source
-                AND cw.member_event_id = lw.win_event_id
-            JOIN temp_deduped_events d ON d.source = cw.win_source
-                AND d.event_id = cw.win_event_id;
+            SELECT member_source AS source, member_event_id AS event_id,
+                   winner_source, winner_event_id, winner_model, winner_project, winner_bucket_start
+            FROM content_winner;
         """
     }
     // MARK: - Finalize derived (global dedup + aggregate)
@@ -1315,9 +1322,15 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try transaction {
                 try claimLegacyRawRowsIfUnambiguousUnlocked(hostname: hostname)
                 try discardLegacyNetworkDirtyKeysUnlocked(hostname: hostname)
+                let allowIncrementalDirtyKeys = try dirtyKeysAllowIncrementalRecomputeUnlocked(hostname: hostname)
                 try discardRedundantGroupDirtyKeysUnlocked(hostname: hostname)
                 result = try withBackgroundResourcePriority {
-                    try recomputeDispatchUnlocked(hostname: hostname, strategy: strategy, progress: progress)
+                    try recomputeDispatchUnlocked(
+                        hostname: hostname,
+                        strategy: strategy,
+                        allowIncrementalDirtyKeys: allowIncrementalDirtyKeys,
+                        progress: progress
+                    )
                 }
                 // 只有显式 finalize 表示调用方已经成功完成整轮来源扫描。其它内部重算
                 // （例如 hostname 对齐）不能清除此门禁，否则部分扫描失败后会 fail-open。
@@ -1330,7 +1343,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 if compactFrozen {
                     let advancedTo = try advanceFrozenWatermarkUnlocked(hostname: hostname)
                     if advancedTo > 0 {
-                        didCompact = try compactFrozenRawUnlocked(hostname: hostname, frozen: advancedTo) > 0
+                        didCompact = try compactFrozenRawBatchUnlocked(
+                            hostname: hostname,
+                            frozen: advancedTo,
+                            limit: Self.frozenCompactionBatchSize
+                        ) > 0
                     }
                 }
             }
@@ -1775,6 +1792,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 脏键种子数量上限。超过时闭包传播本身会退化成长时间 B-Tree 随机查找，
     /// 还没机会算出 bucket 作用域就卡住；直接全量重算更可预测，并且能正常回报 8 步进度。
     private static let incrementalDirtyKeyLimit = 50_000
+    private static let incrementalDedupKeyLimit = 0
 
     /// 作用域事件数占该 hostname 全部事件的比例上限。超过就退回全量。
     ///
@@ -1944,17 +1962,21 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// - 冻结水位非 0：冻结区原始行可能已被 compact 物理删除，去重组在原始层已不完整，
     ///   闭包展开会漏掉被删成员；且全量对冻结区 bucket 跳过差异写，复现这套语义不划算。
     ///
-    /// 不再用 dirty-key 数量做前置早退：missing 文件和文件级 replace 会一次性登记大量
-    /// lineage/content/logical 键，但真实受影响的 bucket / session 可能很小。增量路径内部
-    /// 会在闭包展开过程中按事件作用域比例和 bucket 数上限回退，全量重算只应由真实作用域决定。
-    private func canRecomputeIncrementallyUnlocked(hostname: String) throws -> Bool {
+    /// 大量 dirty key 或 lineage/content 去重键会让闭包传播退化成大范围 fan-out；
+    /// 这类场景直接全量重算更可预测，也能更早进入分阶段进度。
+    private func dirtyKeysAllowIncrementalRecomputeUnlocked(hostname: String) throws -> Bool {
         guard try tableExistsUnlocked("usage_dirty_keys") else { return false }
+        guard try dirtyKeyCountUnlocked(hostname: hostname) <= Self.incrementalDirtyKeyLimit else { return false }
+        return try dirtyKeyCountUnlocked(hostname: hostname, kinds: [.lineage, .content]) <= Self.incrementalDedupKeyLimit
+    }
+
+    private func canRecomputeIncrementallyUnlocked(hostname: String) throws -> Bool {
         guard try tableExistsUnlocked("usage_identity_conflicts") else { return false }
         guard try tableExistsUnlocked("usage_logical_bucket_map") else { return false }
         guard try readTextUnlocked(key: Self.incrementalBaselineKey) != nil else { return false }
         guard try readTextUnlocked(key: Self.rebuildPendingKey) == nil else { return false }
         guard try frozenBeforeMsUnlocked(hostname) == 0 else { return false }
-        guard try dirtyKeyCountUnlocked(hostname: hostname) <= Self.incrementalDirtyKeyLimit else { return false }
+        guard try dirtyKeysAllowIncrementalRecomputeUnlocked(hostname: hostname) else { return false }
         return try derivedHasAnyRowUnlocked(hostname: hostname)
     }
 
@@ -2098,8 +2120,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
         hostname: String,
         progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
     ) throws -> UsageFinalizeResult? {
+        guard try dirtyKeysAllowIncrementalRecomputeUnlocked(hostname: hostname) else { return nil }
         let progressTotalStages = 8
         var progressStage = 0
+        func heartbeat() {
+            progress?(progressStage, progressTotalStages)
+        }
         func advanceStage() {
             progressStage += 1
             progress?(progressStage, progressTotalStages)
@@ -2115,8 +2141,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
         defer { try? exec("DROP TABLE IF EXISTS temp_scope_events;") }
 
         try seedDirtyKeysUnlocked(hostname: hostname)
-        try propagateDirtyClosureUnlocked(hostname: hostname)
-        var scope = try collectDirtyScopeUnlocked(hostname: hostname)
+        try withSQLiteProgressHeartbeat(heartbeat) {
+            try propagateDirtyClosureUnlocked(hostname: hostname)
+        }
+        var scope = try withSQLiteProgressHeartbeat(heartbeat) {
+            try collectDirtyScopeUnlocked(hostname: hostname)
+        }
         guard scope.buckets.count <= Self.incrementalBucketLimit else { return nil }
 
         // temp_scope_events 初始化为闭包内的 logical 键。
@@ -2276,7 +2306,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
             ? Int(Double(hostEventTotal) * Self.incrementalScopeFraction)
             : Int.max
         var scopeOverflowed = false
-        for _ in 0 ..< Self.dirtyClosureIterationLimit {
+        try withSQLiteProgressHeartbeat(heartbeat) {
+            for _ in 0 ..< Self.dirtyClosureIterationLimit {
             var added: Int32 = 0
             sqlite3_reset(scopeLineageStmt); sqlite3_clear_bindings(scopeLineageStmt)
             try bind(scopeLineageStmt, 1, hostname); try bind(scopeLineageStmt, 2, hostname)
@@ -2314,6 +2345,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             if try Int(scalar("SELECT COUNT(*) FROM temp_scope_events;")) > scopeEventCeiling {
                 scopeOverflowed = true
                 break
+            }
             }
         }
         // 作用域太大就退回全量：增量的开销随作用域线性增长，而全量是固定成本。
@@ -2395,7 +2427,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // 跑完 scoped 去重拿到新胜者 bucket 后，再拿这些 bucket 反查映射表，把同样贡献到
         // 它们的其它 logical 组拉进作用域，然后重跑去重。新拉进的组又可能带出新 bucket，
         // 所以要循环到不动点。temp_scope_events 只增不减且上界是全表，循环必终止。
-        for _ in 0 ..< Self.dirtyClosureIterationLimit {
+        try withSQLiteProgressHeartbeat(heartbeat) {
+            for _ in 0 ..< Self.dirtyClosureIterationLimit {
             // 每轮从头重建三张去重临时表（上一轮的作用域可能已变大）。
             // 循环退出时表一定存在，后续聚合阶段直接用。
             try exec("DROP TABLE IF EXISTS temp_logical_events;")
@@ -2435,6 +2468,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             sqlite3_finalize(winnerBucketStmt)
             try exec("DROP TABLE IF EXISTS temp_winner_buckets;")
             if grew == 0 { break }
+            }
         }
         advanceStage() // 2-3) 三级去重完成
 
@@ -2809,10 +2843,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private func recomputeDispatchUnlocked(
         hostname: String,
         strategy: UsageFinalizeStrategy,
+        allowIncrementalDirtyKeys: Bool,
         progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
     ) throws -> UsageFinalizeResult {
         try ensureIdentityConflictTableUnlocked()
-        if strategy == .automatic, try canRecomputeIncrementallyUnlocked(hostname: hostname) {
+        if strategy == .automatic, allowIncrementalDirtyKeys, try canRecomputeIncrementallyUnlocked(hostname: hostname) {
             if let result = try recomputeDerivedIncrementalUnlocked(hostname: hostname, progress: progress) {
                 try clearDirtyKeysUnlocked(hostname: hostname)
                 return result
@@ -2829,6 +2864,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 冻结静默期：只固化「早于 now - 此值」且已对齐 30 分钟 bucket 边界的历史。取 30 天，远大于
     /// codex fork / claude resume 的常见回放窗口，把跨区去重折叠的偏差压到可忽略（已接受的"稍不准"）。
     static let frozenSilenceMs: Int64 = 30 * 24 * 60 * 60 * 1_000
+    private static let frozenCompactionBatchSize = 1_000
 
     /// 推进冻结水位线（单调不减、永不回退），返回推进后的 frozen（未推进返回 0，表示本轮不 compact）。
     /// 目标 = floor((now - 静默期) / bucketMs) * bucketMs，与当前 frozen 取 max。
@@ -2863,29 +2899,44 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// **跨所有 hostname 删除**：hostname 下沉在原始事件层只是「采集机痕迹」，派生已由 rebuildForHostname +
     /// recompute 统一归属到当前 canonical hostname（包含所有采集机的贡献）。冻结边界是全局时间概念，
     /// 若只删 canonical hostname 的行，旧机器名（改名前/多机同步）的历史原始行会成为永不可回收的死数据。
-    /// 必须在 finalizeDerived 事务内、frozen 推进之后同事务调用；VACUUM 由调用方在事务外执行。
-    func compactFrozenRawUnlocked(hostname: String, frozen: Int64) throws -> Int64 {
+    /// 调用方负责在独立事务中提交每个批次；VACUUM 由调用方在事务外执行。
+    func compactFrozenRawBatchUnlocked(hostname: String, frozen: Int64, limit: Int) throws -> Int64 {
         guard frozen > 0 else { return 0 }
-        let delEvents = try prepare("DELETE FROM usage_events WHERE timestamp_ms < ?;")
+        let delEvents = try prepare("""
+            DELETE FROM usage_events
+            WHERE rowid IN (
+              SELECT rowid FROM usage_events INDEXED BY idx_usage_events_time
+              WHERE timestamp_ms < ?
+              LIMIT ?
+            );
+            """)
         defer { sqlite3_finalize(delEvents) }
-        try bind(delEvents, 1, frozen); try done(delEvents)
+        try bind(delEvents, 1, frozen); try bind(delEvents, 2, Int64(limit)); try done(delEvents)
         let deletedEvents = Int64(sqlite3_changes(db))
+        if deletedEvents > 0 { return deletedEvents }
 
         // 只删完全冻结 session 的 session_events：排除任何仍有 timestamp>=frozen 事件的 (source,session_hash)。
         // 按 (source,session_hash) 复合匹配（与聚合器 session 自然键一致），且跨 hostname 判定——
         // 同一逻辑 session 可能被不同采集机记录，只要任一机器仍有活跃事件就整体保留。
         let delSessions = try prepare("""
             DELETE FROM usage_session_events
-            WHERE timestamp_ms < ?
-              AND (source, session_hash) NOT IN (
-                SELECT source, session_hash FROM usage_session_events
-                WHERE timestamp_ms >= ?
+            WHERE rowid IN (
+              SELECT old.rowid
+              FROM usage_session_events old INDEXED BY idx_session_events_time
+              WHERE old.timestamp_ms < ?
+                AND NOT EXISTS (
+                  SELECT 1 FROM usage_session_events newer INDEXED BY idx_session_events_group
+                  WHERE newer.source = old.source
+                    AND newer.session_hash = old.session_hash
+                    AND newer.timestamp_ms >= ?
+                )
+              LIMIT ?
               );
             """)
         defer { sqlite3_finalize(delSessions) }
-        try bind(delSessions, 1, frozen); try bind(delSessions, 2, frozen)
+        try bind(delSessions, 1, frozen); try bind(delSessions, 2, frozen); try bind(delSessions, 3, Int64(limit))
         try done(delSessions)
-        return deletedEvents + Int64(sqlite3_changes(db))
+        return Int64(sqlite3_changes(db))
     }
 
     // MARK: - Reads
@@ -3809,7 +3860,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let logicalDeduped = logicalDedupedSkillEvents(events)
         guard !logicalDeduped.isEmpty else { return [] }
 
-        let attribution = try readSkillAttributionUnlocked(bucketMs: bucketMs)
+        let attribution = try readSkillAttributionUnlocked(events: logicalDeduped, bucketMs: bucketMs)
 
         // 每个胜者先把归属到它的 logical 组按 key 取 max —— 这一步复现 lineage / content
         // 两级「计数按 key 取 max」的语义，但不再由 Swift 决定谁是胜者。
@@ -3847,8 +3898,19 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     /// 物化并读取「logical 行 -> 最终胜者 + 胜者 bucket 自然键」的归属映射。
     private func readSkillAttributionUnlocked(
+        events: [SkillMergeEvent],
         bucketMs: Int64
     ) throws -> [String: (winnerKey: String, bucketKey: String)] {
+        try exec("DROP TABLE IF EXISTS temp_skill_members;")
+        try exec("CREATE TEMP TABLE temp_skill_members(source TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(source,event_id));")
+        defer { try? exec("DROP TABLE IF EXISTS temp_skill_members;") }
+        let insert = try prepare("INSERT OR IGNORE INTO temp_skill_members(source, event_id) VALUES(?,?);")
+        defer { sqlite3_finalize(insert) }
+        for ev in events {
+            sqlite3_reset(insert); sqlite3_clear_bindings(insert)
+            try bind(insert, 1, ev.source); try bind(insert, 2, ev.eventID)
+            try done(insert)
+        }
         try exec("DROP TABLE IF EXISTS temp_skill_attribution;")
         defer { try? exec("DROP TABLE IF EXISTS temp_skill_attribution;") }
         try exec(Self.skillAttributionSQL(bucketMs: bucketMs))
@@ -4122,15 +4184,36 @@ public final class UsageLedgerStore: @unchecked Sendable {
             progress?(.advanceFrozenWatermark, 0, UsageCompactionStep.total)
             try transaction {
                 advancedTo = try advanceFrozenWatermarkUnlocked(hostname: hostname)
-                progress?(.advanceFrozenWatermark, UsageCompactionStep.advanceFrozenWatermark.rawValue, UsageCompactionStep.total)
-                if advancedTo > 0 {
-                    didCompact = try compactFrozenRawUnlocked(hostname: hostname, frozen: advancedTo) > 0
-                }
-                progress?(.deleteFrozenRaw, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
             }
+            progress?(.advanceFrozenWatermark, UsageCompactionStep.advanceFrozenWatermark.rawValue, UsageCompactionStep.total)
+            if advancedTo > 0 {
+                while true {
+                    let deleted = try withSQLiteProgressHeartbeat({
+                        progress?(.deleteFrozenRaw, UsageCompactionStep.advanceFrozenWatermark.rawValue, UsageCompactionStep.total)
+                    }) {
+                        var batchDeleted: Int64 = 0
+                        try transaction {
+                            batchDeleted = try compactFrozenRawBatchUnlocked(
+                                hostname: hostname,
+                                frozen: advancedTo,
+                                limit: Self.frozenCompactionBatchSize
+                            )
+                        }
+                        return batchDeleted
+                    }
+                    guard deleted > 0 else { break }
+                    didCompact = true
+                    progress?(.deleteFrozenRaw, UsageCompactionStep.advanceFrozenWatermark.rawValue, UsageCompactionStep.total)
+                }
+            }
+            progress?(.deleteFrozenRaw, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
             if didCompact {
                 progress?(.vacuum, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
-                try exec("VACUUM;")
+                try withSQLiteProgressHeartbeat({
+                    progress?(.vacuum, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
+                }) {
+                    try exec("VACUUM;")
+                }
             } else {
                 progress?(.skippedVacuum, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
             }
@@ -4148,6 +4231,19 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private func dirtyKeyCountUnlocked(hostname: String) throws -> Int {
         guard try tableExistsUnlocked("usage_dirty_keys") else { return 0 }
         return try countUnlocked("SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname=?;", hostname)
+    }
+
+    private func dirtyKeyCountUnlocked(hostname: String, kinds: [DirtyKeyKind]) throws -> Int {
+        guard try tableExistsUnlocked("usage_dirty_keys"), !kinds.isEmpty else { return 0 }
+        let placeholders = Array(repeating: "?", count: kinds.count).joined(separator: ",")
+        let statement = try prepare("SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname=? AND kind IN (\(placeholders));")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        for (offset, kind) in kinds.enumerated() {
+            try bind(statement, Int32(offset + 2), kind.rawValue)
+        }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int64(statement, 0))
     }
 
 
@@ -4278,8 +4374,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
     }
 
     /// 准备后台扫描所需的大表性能索引。调用方应在后台队列执行，避免阻塞 App 初始化。
-    public func prepareForUsageScan() throws {
-        try queue.sync { try ensurePerformanceIndexesUnlocked() }
+    public func prepareForUsageScan(progress: (@Sendable () -> Void)? = nil) throws {
+        try queue.sync {
+            try withSQLiteProgressHeartbeat(progress) {
+                try ensurePerformanceIndexesUnlocked()
+            }
+        }
     }
 
     /// 标记一批磁盘上已消失的文件为 checkpoint missing，但绝不删除其原始行或派生历史。
@@ -4710,6 +4810,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             return "CREATE INDEX IF NOT EXISTS idx_session_events_host ON usage_session_events(hostname,source,event_id,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_group ON usage_session_events(hostname,source,session_hash,timestamp_ms);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_group_covering ON usage_session_events(hostname,source,session_hash,timestamp_ms,role,event_id,source_file_hash);"
+                + "CREATE INDEX IF NOT EXISTS idx_session_events_time ON usage_session_events(timestamp_ms);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_file_dirty ON usage_session_events(hostname,source_file_hash,source,session_hash);"
         case "usage_edit_entries":
             return "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_host ON usage_edit_entries(hostname,timestamp_ms,tool_use_id,source_file_hash);"
