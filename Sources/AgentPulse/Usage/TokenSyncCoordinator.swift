@@ -489,6 +489,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     try ledger.beginParserRebuild(targetParserVersion: currentParserVersion)
                 }
                 try gate.throwIfCancelled()
+                progressReporter.enterPhase(.scanning, detail: "准备扫描索引")
                 try ledger.prepareForUsageScan()
                 try gate.throwIfCancelled()
                 // 进入 scanning 阶段：先枚举全部来源 root 的 jsonl 总数作为进度分母，
@@ -1183,6 +1184,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         // 阶段切换时清零重置，供 scanDetail 统一显示「done/total 单位」。
         private var total = 0
         private var done = 0
+        private var currentPhase: TokenScanPhase?
+        private var phaseStartedAt = DispatchTime.now().uptimeNanoseconds
 
         init(_ emit: @escaping @Sendable (ScanProgressUpdate) -> Void) {
             self.emit = emit
@@ -1193,6 +1196,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         func enterPhase(_ phase: TokenScanPhase, total: Int = 0, detail: String? = nil) {
             self.total = max(0, total)
             self.done = 0
+            self.currentPhase = phase
+            self.phaseStartedAt = DispatchTime.now().uptimeNanoseconds
             send(phase: phase, fraction: 0, detail: detail)
         }
 
@@ -1232,8 +1237,17 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 done: done,
                 total: total,
                 overall: overall,
-                detail: detail
+                detail: heartbeatDetail(detail, phase: phase)
             ))
+        }
+
+        private func heartbeatDetail(_ detail: String?, phase: TokenScanPhase) -> String? {
+            guard phase == .finalizing || phase == .compacting else { return detail }
+            let elapsed = (DispatchTime.now().uptimeNanoseconds - phaseStartedAt) / 1_000_000_000
+            guard elapsed >= 2 else { return detail }
+            let running = "执行中 \(elapsed)s"
+            guard let detail, !detail.isEmpty else { return running }
+            return "\(detail) · \(running)"
         }
     }
 

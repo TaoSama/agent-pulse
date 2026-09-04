@@ -1094,13 +1094,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 FROM usage_events
                 WHERE hostname = ?
             ),
-            max_tier AS (
-                SELECT source, event_id, MAX(tier) AS max_tier
-                FROM tiered GROUP BY source, event_id
+            ranked AS (
+                SELECT *,
+                    DENSE_RANK() OVER (PARTITION BY source, event_id ORDER BY tier DESC) AS tier_rank
+                FROM tiered
             ),
             top_tier AS (
-                SELECT t.* FROM tiered t
-                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
+                SELECT * FROM ranked WHERE tier_rank = 1
             ),
             logical_dedup AS (
                 SELECT
@@ -1157,13 +1157,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
                   ON usage_events.source = s.source AND usage_events.event_id = s.event_id
                 WHERE usage_events.hostname = ? AND usage_events.hostname <> ''
             ),
-            max_tier AS (
-                SELECT source, event_id, MAX(tier) AS max_tier
-                FROM tiered GROUP BY source, event_id
+            ranked AS (
+                SELECT *,
+                    DENSE_RANK() OVER (PARTITION BY source, event_id ORDER BY tier DESC) AS tier_rank
+                FROM tiered
             ),
             top_tier AS (
-                SELECT t.* FROM tiered t
-                JOIN max_tier m ON t.source = m.source AND t.event_id = m.event_id AND t.tier = m.max_tier
+                SELECT * FROM ranked WHERE tier_rank = 1
             ),
             logical_dedup AS (
                 SELECT
@@ -1427,6 +1427,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
     ) throws -> UsageFinalizeResult {
         let progressTotalStages = 8
         var progressStage = 0
+        func heartbeat() {
+            progress?(progressStage, progressTotalStages)
+        }
         func advanceStage() {
             progressStage += 1
             progress?(progressStage, progressTotalStages)
@@ -1444,16 +1447,22 @@ public final class UsageLedgerStore: @unchecked Sendable {
             let logicalStmt = try prepare(logicalSQL)
             defer { sqlite3_finalize(logicalStmt) }
             try bind(logicalStmt, 1, hostname)
-            try done(logicalStmt)
+            try withSQLiteProgressHeartbeat(heartbeat) {
+                try done(logicalStmt)
+            }
         }
 
         // lineage 去重的中间结果单独物化：content 去重和折叠数统计都要用它，
         // 否则两处各自重跑一遍 PARTITION BY lineage_fingerprint 的窗口排序。
         let lineageSQL = Self.lineageEventsSQL
-        try exec(lineageSQL)
+        try withSQLiteProgressHeartbeat(heartbeat) {
+            try exec(lineageSQL)
+        }
 
         let dedupSQL = Self.dedupedEventsSQL
-        try exec(dedupSQL)
+        try withSQLiteProgressHeartbeat(heartbeat) {
+            try exec(dedupSQL)
+        }
         advanceStage() // 1-3) 三级去重在 SQLite 内完成
 
         // 计算 lineage / content 去重折叠数：从原始事件经 tier+logical 去重后，
@@ -1645,11 +1654,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
             }
         }
 
-        let sessions = try aggregateSessionsStreamingUnlocked(
-            hostname: hostname,
-            sessionProject: sessionProject,
-            sessionSkillCounts: sessionSkillCounts
-        )
+        let sessions = try withSQLiteProgressHeartbeat(heartbeat) {
+            try aggregateSessionsStreamingUnlocked(
+                hostname: hostname,
+                sessionProject: sessionProject,
+                sessionSkillCounts: sessionSkillCounts
+            )
+        }
         advanceStage() // 6) session 聚合完成
 
         // 全量收尾：把本轮的完整冲突集落盘。identityConflicts 是 reportingEligible 的唯一门禁，
@@ -3375,7 +3386,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                      event_id,source_file_hash;
             """ : """
             SELECT event_id,source,session_hash,role,timestamp_ms,source_file_hash
-            FROM usage_session_events INDEXED BY idx_session_events_host_group
+            FROM usage_session_events INDEXED BY idx_session_events_host_group_covering
             WHERE hostname=?
             ORDER BY source,session_hash,timestamp_ms,
                      CASE role WHEN 'user' THEN 0 WHEN 'synthetic_user' THEN 1 ELSE 2 END,
@@ -3482,49 +3493,49 @@ public final class UsageLedgerStore: @unchecked Sendable {
     }
 
     private func duplicateSessionEventWinnersUnlocked(hostname: String) throws -> [String: String] {
-        let duplicateStatement = try prepare("""
-            SELECT source,event_id
-            FROM usage_session_events INDEXED BY idx_session_events_host
-            WHERE hostname=?
-            GROUP BY source,event_id
-            HAVING COUNT(*)>1;
-            """)
-        defer { sqlite3_finalize(duplicateStatement) }
-        try bind(duplicateStatement, 1, hostname)
-
-        let candidateStatement = try prepare("""
-            SELECT source_file_hash
-            FROM usage_session_events
-            WHERE hostname=? AND source=? AND event_id=?
-            ORDER BY source_file_hash;
-            """)
-        defer { sqlite3_finalize(candidateStatement) }
         let activeFiles = try ownedActiveFileIDsUnlocked()
         var winners: [String: String] = [:]
+        let statement = try prepare("""
+            SELECT source,event_id,source_file_hash
+            FROM usage_session_events INDEXED BY idx_session_events_host
+            WHERE hostname=?
+            ORDER BY source,event_id,source_file_hash;
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
 
-        while sqlite3_step(duplicateStatement) == SQLITE_ROW {
-            let source = text(duplicateStatement, 0)
-            let eventID = text(duplicateStatement, 1)
-            sqlite3_reset(candidateStatement)
-            sqlite3_clear_bindings(candidateStatement)
-            try bind(candidateStatement, 1, hostname)
-            try bind(candidateStatement, 2, source)
-            try bind(candidateStatement, 3, eventID)
+        var currentSource = ""
+        var currentEventID = ""
+        var currentCount = 0
+        var currentWinner = ""
+        var currentWinnerTier = AttributionTier.legacy
 
-            var winner = ""
-            var winnerTier = AttributionTier.legacy
-            var hasWinner = false
-            while sqlite3_step(candidateStatement) == SQLITE_ROW {
-                let fileID = text(candidateStatement, 0)
-                let tier = attributionTier(sourceFileHash: fileID, activeFiles: activeFiles)
-                if !hasWinner || tier.rawValue > winnerTier.rawValue {
-                    winner = fileID
-                    winnerTier = tier
-                    hasWinner = true
-                }
-            }
-            if hasWinner { winners["\(source)\u{1}\(eventID)"] = winner }
+        func flushCurrent() {
+            guard currentCount > 1 else { return }
+            winners["\(currentSource)\u{1}\(currentEventID)"] = currentWinner
         }
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let source = text(statement, 0)
+            let eventID = text(statement, 1)
+            let fileID = text(statement, 2)
+            let tier = attributionTier(sourceFileHash: fileID, activeFiles: activeFiles)
+            if currentCount == 0 || source != currentSource || eventID != currentEventID {
+                flushCurrent()
+                currentSource = source
+                currentEventID = eventID
+                currentCount = 1
+                currentWinner = fileID
+                currentWinnerTier = tier
+                continue
+            }
+            currentCount += 1
+            if tier.rawValue > currentWinnerTier.rawValue {
+                currentWinner = fileID
+                currentWinnerTier = tier
+            }
+        }
+        flushCurrent()
         return winners
     }
 
@@ -4698,6 +4709,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         case "usage_session_events":
             return "CREATE INDEX IF NOT EXISTS idx_session_events_host ON usage_session_events(hostname,source,event_id,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_group ON usage_session_events(hostname,source,session_hash,timestamp_ms);"
+                + "CREATE INDEX IF NOT EXISTS idx_session_events_host_group_covering ON usage_session_events(hostname,source,session_hash,timestamp_ms,role,event_id,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_file_dirty ON usage_session_events(hostname,source_file_hash,source,session_hash);"
         case "usage_edit_entries":
             return "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_host ON usage_edit_entries(hostname,timestamp_ms,tool_use_id,source_file_hash);"
@@ -4976,6 +4988,35 @@ public final class UsageLedgerStore: @unchecked Sendable {
     // MARK: - SQLite plumbing
 
     private func transaction(_ body: () throws -> Void) throws { try exec("BEGIN IMMEDIATE;"); do { try body(); try exec("COMMIT;") } catch { _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil); throw error } }
+    private final class SQLiteProgressHeartbeat {
+        private let callback: () -> Void
+        private var lastEmit = DispatchTime.now().uptimeNanoseconds
+
+        init(callback: @escaping () -> Void) {
+            self.callback = callback
+        }
+
+        func tick() -> Int32 {
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard now >= lastEmit + 1_000_000_000 else { return 0 }
+            lastEmit = now
+            callback()
+            return 0
+        }
+    }
+
+    private func withSQLiteProgressHeartbeat<T>(_ heartbeat: (() -> Void)?, _ body: () throws -> T) throws -> T {
+        guard let heartbeat else { return try body() }
+        let box = SQLiteProgressHeartbeat(callback: heartbeat)
+        let pointer = Unmanaged.passUnretained(box).toOpaque()
+        sqlite3_progress_handler(db, 50_000, { rawPointer in
+            guard let rawPointer else { return 0 }
+            return Unmanaged<SQLiteProgressHeartbeat>.fromOpaque(rawPointer).takeUnretainedValue().tick()
+        }, pointer)
+        defer { sqlite3_progress_handler(db, 0, nil, nil) }
+        return try body()
+    }
+
     private func exec(_ sql: String) throws { guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw error() } }
     private func scalar(_ sql: String) throws -> Int32 { let s = try prepare(sql); defer { sqlite3_finalize(s) }; guard sqlite3_step(s) == SQLITE_ROW else { throw error() }; return sqlite3_column_int(s, 0) }
     private func prepare(_ sql: String) throws -> OpaquePointer? { var s: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &s, nil) == SQLITE_OK else { throw error() }; return s }
