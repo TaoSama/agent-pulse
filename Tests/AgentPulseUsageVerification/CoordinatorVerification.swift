@@ -421,12 +421,13 @@ enum CoordinatorVerification {
             "scanNow 未用 requiresDerivationCompletion() 门禁 finalize（无变化轮不会跳过全库重算）"
         )
         try require(
-            scanNowBody.contains("baselineRecovery != .deferred"),
-            "scanNow 未在大账本 baseline recovery deferred 时跳过 finalize"
+            scanNowBody.contains("baselineRecovery == .deferred")
+                && scanNowBody.contains("strategy: .fullRecompute"),
+            "scanNow 未在大账本 baseline recovery deferred 时转入全量 finalize 恢复基线"
         )
         try require(
-            scanNowBody.contains("baselineRecovery == .deferred ? (buckets: 0, sessions: 0) : try ledger.pendingCounts"),
-            "scanNow deferred 分支仍可能调用 pendingCounts 并因 raw_derivation_pending 失败"
+            !scanNowBody.contains("baselineRecovery == .deferred ? (buckets: 0, sessions: 0) : try ledger.pendingCounts"),
+            "scanNow deferred 分支不应伪造 pendingCounts；full finalize 后应读取真实 pending"
         )
         try require(
             scanNowBody.contains("ledger.reportingEligible(hostname:"),
