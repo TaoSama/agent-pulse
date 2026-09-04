@@ -527,6 +527,7 @@ struct OrbView: View {
     var body: some View {
         let snap = viewModel.snapshot
         let trend = snap.trend
+        let points = Self.visibleSparklinePoints(from: snap)
         ZStack {
             Circle().fill(snap.isExpanded ? Self.selectedShell : Color.black)
             Circle()
@@ -534,7 +535,7 @@ struct OrbView: View {
                 .padding(Self.shellThickness)
             VStack(spacing: 1) {
                 SparklineView(
-                    points: snap.sparklinePoints,
+                    points: points,
                     trend: trend,
                     colorMode: snap.trendColorMode,
                     lineWidth: 1.35
@@ -558,6 +559,18 @@ struct OrbView: View {
                 "实时输出每秒 \(String(format: "%.1f", $0)) token，\(snap.trend.accessibilityText)"
             } ?? "实时输出不可用"
         )
+    }
+
+    private static func visibleSparklinePoints(from snapshot: OrbSnapshot) -> [SparklinePoint] {
+        if snapshot.sparklinePoints.contains(where: { $0.normalized?.isFinite == true }) {
+            return snapshot.sparklinePoints
+        }
+        guard let tps = snapshot.tps, tps.isFinite, tps >= 0 else { return snapshot.sparklinePoints }
+        let start = Date(timeIntervalSince1970: 0)
+        return [
+            SparklinePoint(time: start, value: tps, normalized: 0.5),
+            SparklinePoint(time: start.addingTimeInterval(1), value: tps, normalized: 0.5),
+        ]
     }
 }
 

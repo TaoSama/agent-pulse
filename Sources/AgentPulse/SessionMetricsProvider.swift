@@ -193,6 +193,11 @@ public final class MetricsStore: ObservableObject {
             }
             completedScope = result.completed.scope
             completedIsLowerBound = result.completed.isLowerBound
+            let immediateSparkline = SparklineAnalysis.makeSparkline(
+                from: result.history,
+                end: result.sampledAt
+            )
+            publish(immediateSparkline, to: \.sparkline)
             publish(result.liveRate.state, to: \.tpsState)
             publish(metric(from: result.liveRate), to: \.tps)
             tpsHistory = result.history.compactMap { sample in
@@ -213,7 +218,6 @@ public final class MetricsStore: ObservableObject {
                 model: makeModelTPSHistory,
                 dashboardModel: makeDashboardModelTPSHistory
             )
-            publish(derived.sparkline, to: \.sparkline)
             modelTPSHistory = derived.modelTPSHistory
             dashboardSparklinePoints = derived.dashboardSparklinePoints
             dashboardModelTPSHistory = derived.dashboardModelTPSHistory
@@ -290,17 +294,17 @@ public final class MetricsStore: ObservableObject {
         }
         completedScope = snapshot.completed.scope
         completedIsLowerBound = snapshot.completed.isLowerBound
+        let sparkline = SparklineAnalysis.makeSparkline(
+            from: restored.history,
+            end: snapshot.timestamp
+        )
+        publish(sparkline, to: \.sparkline)
         publish(snapshot.liveRate.state, to: \.tpsState)
         publish(metric(from: snapshot.liveRate), to: \.tps)
         tpsHistory = restored.history.compactMap { sample in
             guard let value = sample.tps else { return nil }
             return TPSPoint(timestamp: sample.timestamp, tokensPerSecond: value, state: sample.state)
         }
-        let sparkline = SparklineAnalysis.makeSparkline(
-            from: restored.history,
-            end: snapshot.timestamp
-        )
-        publish(sparkline, to: \.sparkline)
         modelTPSHistory = makeModelTPSHistory(from: restored.history, end: snapshot.timestamp)
         // 看板不重叠桶：用恢复的较长历史（最多 3600s）按当前跨度重算并缓存。
         dashboardSampleCache = restored.dashboardHistory
