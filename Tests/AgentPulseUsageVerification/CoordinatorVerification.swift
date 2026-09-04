@@ -20,6 +20,7 @@ enum CoordinatorVerification {
         try verifyHostnameMismatchPromptNotGatedByAuthority(source)
         try verifyReportingAuthorityFromEnv(source)
         try verifyScanProgressReporting(source)
+        try verifyCodexArchivedRolloutIdentityIsStable(source)
         try verifyAutoReportIntervalIsConfigurable(source)
         try verifyOperationTimestampsPersistAcrossLaunches(source)
         try verifyNoChangeRoundSkipsFinalize(source)
@@ -121,6 +122,25 @@ enum CoordinatorVerification {
                 && clear.contains("status.scanPhase = nil")
                 && clear.contains("status.scanProgress = nil"),
             "clearScanProgress 未把扫描进度字段全部归零"
+        )
+    }
+
+    private static func verifyCodexArchivedRolloutIdentityIsStable(_ source: String) throws {
+        let scanFn = try functionBody(matching: "nonisolated private static func scan(", in: source)
+        try require(
+            scanFn.contains("let fileIdentity = Self.fileIdentity(for: url, source: source)")
+                && scanFn.contains("UsageJSONLParser.fileID(for: fileIdentity)")
+                && scanFn.contains("fileIdentity: fileIdentity"),
+            "scan 必须用来源相关的稳定 file identity，避免 Codex 归档移动后 checkpoint 失效"
+        )
+
+        let identityFn = try functionBody(matching: "nonisolated private static func fileIdentity(for url:", in: source)
+        try require(
+            identityFn.contains("source == UsageJSONLParser.codexSource")
+                && identityFn.contains("url.lastPathComponent.hasPrefix(\"rollout-\")")
+                && identityFn.contains("return url.lastPathComponent")
+                && identityFn.contains("return url.path"),
+            "Codex rollout 文件应按稳定文件名识别，非 Codex 来源继续按路径识别"
         )
     }
 

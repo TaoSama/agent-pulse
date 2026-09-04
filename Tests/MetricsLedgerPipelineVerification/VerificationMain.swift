@@ -88,6 +88,8 @@ private struct MetricsLedgerPipelineVerifier {
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_time';") == 1, "stable hostname/time index must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_tool_counts';") == 1, "tool-count partial index must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_files_source_status';") == 1, "usage file source/status index must exist")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_lineage';") == 1, "host/lineage partial index must exist")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_content';") == 1, "host/content partial index must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_usage_events_host','idx_usage_events_host_logical');") == 0, "legacy usage host indexes must be removed after one-time migration")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_session_events_host_group';") == 1, "hostname-prefixed session streaming index must exist")
         }
@@ -657,6 +659,27 @@ private struct MetricsLedgerPipelineVerifier {
                 WHERE hostname='host-a' AND (skill_counts_json <> '{}' OR mcp_counts_json <> '{}');
                 """)
             try require(toolCountPlan.contains { $0.contains("idx_usage_events_tool_counts") }, "tool-count lookup must use partial index; plan=\(toolCountPlan)")
+
+            try execute(db, "CREATE TEMP TABLE temp_dirty_lineage(fingerprint TEXT PRIMARY KEY);")
+            try execute(db, "CREATE TEMP TABLE temp_dirty_content(dedup_key TEXT PRIMARY KEY);")
+
+            let lineagePlan = try queryPlanDetails(db, """
+                EXPLAIN QUERY PLAN
+                SELECT DISTINCT e.source, e.event_id
+                FROM temp_dirty_lineage d
+                CROSS JOIN usage_events e ON e.lineage_fingerprint = d.fingerprint
+                WHERE e.hostname = 'host-a' AND e.hostname <> '' AND e.lineage_fingerprint <> '';
+                """)
+            try require(lineagePlan.contains { $0.contains("idx_usage_events_host_lineage") }, "lineage dirty expansion must use the host/lineage index; plan=\(lineagePlan)")
+
+            let contentPlan = try queryPlanDetails(db, """
+                EXPLAIN QUERY PLAN
+                SELECT DISTINCT e.source, e.event_id
+                FROM temp_dirty_content d
+                CROSS JOIN usage_events e ON e.codex_dedup_key = d.dedup_key
+                WHERE e.hostname = 'host-a' AND e.hostname <> '' AND e.codex_dedup_key <> '';
+                """)
+            try require(contentPlan.contains { $0.contains("idx_usage_events_host_content") }, "content dirty expansion must use the host/content index; plan=\(contentPlan)")
         }
     }
 

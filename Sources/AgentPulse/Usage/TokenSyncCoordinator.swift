@@ -1485,7 +1485,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
             let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
             let modifiedAt = values.contentModificationDate ?? Date.distantPast
-            let fileID = UsageJSONLParser.fileID(for: url.path)
+            let fileIdentity = Self.fileIdentity(for: url, source: source)
+            let fileID = UsageJSONLParser.fileID(for: fileIdentity)
             presentFileIDs.append(fileID)
             // 每个枚举到的 jsonl 文件（无论跳过还是解析）都推进一格进度，与预扫总数对齐。
             progress.advanceItem(.scanning)
@@ -1517,7 +1518,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             let parsed = UsageJSONLParser.parse(
                 data: data,
                 source: source,
-                fileIdentity: url.path,
+                fileIdentity: fileIdentity,
                 modifiedAt: modifiedAt,
                 isSubagent: includeSubagents && isClaudeSubagentTranscript(url)
             )
@@ -1543,6 +1544,18 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     nonisolated private static let maximumParserBackfillsPerSourceScan = 64
     nonisolated private static let maximumParserBackfillFileBytes: Int64 = 16 * 1024 * 1024
     nonisolated private static let maximumParserBackfillBytesPerSourceScan: Int64 = 32 * 1024 * 1024
+
+    /// Codex moves completed rollouts from sessions/YYYY/MM/DD into archived_sessions. The
+    /// rollout filename is stable across that move, while the absolute path is not. Other sources
+    /// keep path-based identity because their filenames are not guaranteed globally unique.
+    nonisolated private static func fileIdentity(for url: URL, source: String) -> String {
+        if source == UsageJSONLParser.codexSource,
+           url.lastPathComponent.hasPrefix("rollout-"),
+           url.pathExtension == "jsonl" {
+            return url.lastPathComponent
+        }
+        return url.path
+    }
 
     private struct SourceScanBudget: Sendable {
         let firstTimeBytes: Int64

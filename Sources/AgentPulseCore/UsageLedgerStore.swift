@@ -712,13 +712,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
             INSERT OR IGNORE INTO temp_dirty_logical(source, event_id)
             SELECT DISTINCT e.source, e.event_id FROM temp_dirty_lineage d
             CROSS JOIN usage_events e ON e.lineage_fingerprint = d.fingerprint
-            WHERE e.hostname = ? AND e.hostname <> '';
+            WHERE e.hostname = ? AND e.hostname <> '' AND e.lineage_fingerprint <> '';
             """)
         let contentToLogical = try prepare("""
             INSERT OR IGNORE INTO temp_dirty_logical(source, event_id)
             SELECT DISTINCT e.source, e.event_id FROM temp_dirty_content d
             CROSS JOIN usage_events e ON e.codex_dedup_key = d.dedup_key
-            WHERE e.hostname = ? AND e.hostname <> '';
+            WHERE e.hostname = ? AND e.hostname <> '' AND e.codex_dedup_key <> '';
             """)
         defer {
             sqlite3_finalize(logicalToLineage)
@@ -2677,6 +2677,68 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
+    /// Rename a checkpoint/raw attribution key when a source file's stable identity changes but
+    /// its contents have not. This is used for Codex rollout files moved from sessions/ into
+    /// archived_sessions/: the old path hash is a storage location, not a semantic file identity.
+    public func migrateFileIdentityIfCheckpointMatches(
+        from oldFileID: String,
+        to newFileID: String,
+        expectedSource: String,
+        expectedSize: Int64,
+        expectedModifiedAt: Date,
+        expectedParserVersion: Int
+    ) throws -> UsageFileCheckpoint? {
+        guard oldFileID != newFileID else { return try checkpoint(fileID: newFileID) }
+        return try queue.sync {
+            guard try checkpointUnlocked(fileID: newFileID) == nil,
+                  let old = try checkpointUnlocked(fileID: oldFileID),
+                  old.source == expectedSource,
+                  old.status == "complete",
+                  old.size == expectedSize,
+                  old.parserVersion == expectedParserVersion,
+                  abs(old.modifiedAt.timeIntervalSince(expectedModifiedAt)) < 0.001
+            else { return nil }
+
+            try transaction {
+                for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
+                    guard try tableExistsUnlocked(table) else { continue }
+                    let statement = try prepare("UPDATE \(table) SET source_file_hash=? WHERE source_file_hash=?;")
+                    defer { sqlite3_finalize(statement) }
+                    try bind(statement, 1, newFileID)
+                    try bind(statement, 2, oldFileID)
+                    try done(statement)
+                }
+                try deleteCheckpointUnlocked(fileID: oldFileID)
+                try writeCheckpoint(UsageFileCheckpoint(
+                    fileID: newFileID,
+                    source: old.source,
+                    pathHash: newFileID,
+                    offset: old.offset,
+                    size: old.size,
+                    modifiedAt: old.modifiedAt,
+                    parserVersion: old.parserVersion,
+                    status: old.status
+                ))
+            }
+            return try checkpointUnlocked(fileID: newFileID)
+        }
+    }
+
+    private func checkpointUnlocked(fileID: String) throws -> UsageFileCheckpoint? {
+        let statement = try prepare("SELECT source,path_hash,read_offset,file_size,mtime_ms,parser_version,scan_status FROM usage_files WHERE file_id=?;")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, fileID)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return UsageFileCheckpoint(fileID: fileID, source: text(statement, 0), pathHash: text(statement, 1), offset: sqlite3_column_int64(statement, 2), size: sqlite3_column_int64(statement, 3), modifiedAt: date(sqlite3_column_int64(statement, 4)), parserVersion: Int(sqlite3_column_int64(statement, 5)), status: text(statement, 6))
+    }
+
+    private func deleteCheckpointUnlocked(fileID: String) throws {
+        let statement = try prepare("DELETE FROM usage_files WHERE file_id=?;")
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, fileID)
+        try done(statement)
+    }
+
     /// 当前解析器是否必须执行一次显式全量 rebuild。
     ///
     /// 空库或仅含当前/更新 parser checkpoint 的合法库返回 false；以下任一情况返回 true：
@@ -4356,6 +4418,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 // 正向边的 SQL 本身带着同样的谓词，等值查找照样命中。
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_dirty_lineage ON usage_events(source,event_id,lineage_fingerprint) WHERE lineage_fingerprint <> '';"
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_dirty_content ON usage_events(source,event_id,codex_dedup_key) WHERE codex_dedup_key <> '';"
+                + "CREATE INDEX IF NOT EXISTS idx_usage_events_host_lineage ON usage_events(hostname,lineage_fingerprint,source,event_id) WHERE lineage_fingerprint <> '';"
+                + "CREATE INDEX IF NOT EXISTS idx_usage_events_host_content ON usage_events(hostname,codex_dedup_key,source,event_id) WHERE codex_dedup_key <> '';"
                 // Full finalize only needs the small subset of rows carrying tool counters for
                 // skill/MCP aggregation. Without this partial index, that step scans the entire
                 // 25GB token-event table even though most rows have empty JSON counters.
