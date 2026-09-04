@@ -1286,7 +1286,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try transaction {
                 try claimLegacyRawRowsIfUnambiguousUnlocked(hostname: hostname)
                 try discardLegacyNetworkDirtyKeysUnlocked(hostname: hostname)
-                try discardNoOpMissingFileDirtyKeysUnlocked(hostname: hostname)
                 try discardRedundantGroupDirtyKeysUnlocked(hostname: hostname)
                 result = try withBackgroundResourcePriority {
                     try recomputeDispatchUnlocked(hostname: hostname, strategy: strategy, progress: progress)
@@ -1835,98 +1834,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try bind(statement, 1, hostname)
         try bind(statement, 2, Int64(Self.networkParserVersion))
         try done(statement)
-    }
-
-    /// Missing checkpoints do not remove raw rows; they only lower file attribution tier from
-    /// active to history. For a logical event that appears in exactly one raw file, that tier
-    /// change cannot alter the logical winner or any downstream aggregate. Older builds marked
-    /// every row in every missing file dirty, creating huge no-op dirty sets on long-lived
-    /// ledgers. Trim only those provably singleton missing logical keys before propagation.
-    private func discardNoOpMissingFileDirtyKeysUnlocked(hostname: String) throws {
-        guard try tableExistsUnlocked("usage_dirty_keys"),
-              try tableExistsUnlocked("usage_events"),
-              try tableExistsUnlocked("usage_files")
-        else { return }
-
-        try exec("DROP TABLE IF EXISTS temp_noop_missing_logical;")
-        try exec("""
-            CREATE TEMP TABLE temp_noop_missing_logical(
-                source TEXT NOT NULL, event_id TEXT NOT NULL, lineage TEXT NOT NULL, content TEXT NOT NULL,
-                PRIMARY KEY(source,event_id)
-            ) WITHOUT ROWID;
-            """)
-        defer { try? exec("DROP TABLE IF EXISTS temp_noop_missing_logical;") }
-
-        let insert = try prepare("""
-            INSERT OR IGNORE INTO temp_noop_missing_logical(source,event_id,lineage,content)
-            SELECT e.source, e.event_id, e.lineage_fingerprint, e.codex_dedup_key
-            FROM usage_dirty_keys d
-            CROSS JOIN usage_events e ON e.source = substr(d.key, 1, instr(d.key, char(1)) - 1)
-                AND e.event_id = substr(d.key, instr(d.key, char(1)) + 1)
-            JOIN usage_files f ON f.file_id = e.source_file_hash AND f.scan_status = 'missing'
-            WHERE d.hostname = ? AND d.kind = 'logical' AND instr(d.key, char(1)) > 1
-              AND e.hostname = ? AND e.hostname <> ''
-              AND NOT EXISTS (
-                  SELECT 1 FROM usage_events e2 INDEXED BY idx_usage_events_dirty_logical
-                  WHERE e2.hostname = e.hostname AND e2.source = e.source AND e2.event_id = e.event_id
-                    AND e2.hostname <> ''
-                    AND e2.source_file_hash <> e.source_file_hash
-              );
-            """)
-        defer { sqlite3_finalize(insert) }
-        try bind(insert, 1, hostname)
-        try bind(insert, 2, hostname)
-        try done(insert)
-
-        let deleteLogical = try prepare("""
-            DELETE FROM usage_dirty_keys
-            WHERE hostname = ? AND kind = 'logical'
-              AND EXISTS (
-                  SELECT 1 FROM temp_noop_missing_logical n
-                  WHERE usage_dirty_keys.key = n.source || char(1) || n.event_id
-              );
-            """)
-        defer { sqlite3_finalize(deleteLogical) }
-        try bind(deleteLogical, 1, hostname)
-        try done(deleteLogical)
-
-        let deleteLineage = try prepare("""
-            DELETE FROM usage_dirty_keys
-            WHERE hostname = ? AND kind = 'lineage' AND key <> ''
-              AND EXISTS (SELECT 1 FROM temp_noop_missing_logical n WHERE n.lineage = usage_dirty_keys.key)
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM usage_events e INDEXED BY idx_usage_events_host_lineage
-                  JOIN usage_dirty_keys d ON d.hostname = usage_dirty_keys.hostname
-                    AND d.kind = 'logical'
-                    AND d.key = e.source || char(1) || e.event_id
-                  WHERE e.hostname = usage_dirty_keys.hostname
-                    AND e.lineage_fingerprint = usage_dirty_keys.key
-                    AND e.lineage_fingerprint <> ''
-              );
-            """)
-        defer { sqlite3_finalize(deleteLineage) }
-        try bind(deleteLineage, 1, hostname)
-        try done(deleteLineage)
-
-        let deleteContent = try prepare("""
-            DELETE FROM usage_dirty_keys
-            WHERE hostname = ? AND kind = 'content' AND key <> ''
-              AND EXISTS (SELECT 1 FROM temp_noop_missing_logical n WHERE n.content = usage_dirty_keys.key)
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM usage_events e INDEXED BY idx_usage_events_host_content
-                  JOIN usage_dirty_keys d ON d.hostname = usage_dirty_keys.hostname
-                    AND d.kind = 'logical'
-                    AND d.key = e.source || char(1) || e.event_id
-                  WHERE e.hostname = usage_dirty_keys.hostname
-                    AND e.codex_dedup_key = usage_dirty_keys.key
-                    AND e.codex_dedup_key <> ''
-              );
-            """)
-        defer { sqlite3_finalize(deleteContent) }
-        try bind(deleteContent, 1, hostname)
-        try done(deleteContent)
     }
 
     /// Older builds eagerly stored lineage/content dirty keys for every row in files that merely
