@@ -147,9 +147,9 @@ public final class MetricsStore: ObservableObject {
     public func start() {
         guard refreshTask == nil else { return }
         isRunning = true
-        // 首轮可能需要解析体积很大的活跃 rollout；整个刷新循环都属于后台采样，
-        // 从源头使用 background 优先级，避免继承 MainActor 的前台优先级。
-        refreshTask = Task(priority: .background) { [weak self] in
+        // 首轮可能需要解析体积很大的活跃 rollout；使用 utility 避免后台 QoS 的 I/O 限流
+        // 把 1 秒 TPS 心跳拖成多秒级延迟。
+        refreshTask = Task(priority: .utility) { [weak self] in
             guard let self else { return }
             await restoreCachedDisplayState()
             let clock = ContinuousClock()

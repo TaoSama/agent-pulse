@@ -29,7 +29,7 @@ extension SparklineTrend {
         case .rising: mode == .risingGreen ? .green : .red
         case .falling: mode == .risingGreen ? .red : .green
         case .flat: mode == .risingGreen ? .green : .red
-        case .insufficient: Color(nsColor: .secondaryLabelColor)
+        case .insufficient: Color.white.opacity(0.42)
         }
     }
 

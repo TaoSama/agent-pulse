@@ -75,7 +75,8 @@ final class OrbWindowController {
     }
 
     private func installContent() {
-        let host = DraggableHostingView(rootView: OrbView(viewModel: model.orbViewModel))
+        let host = DraggableHostingView(rootView: OrbView(viewModel: model.orbViewModel)
+            .preferredColorScheme(.dark))
         host.sizingOptions = []
         host.frame = NSRect(origin: .zero, size: Constants.orbSize)
         host.autoresizingMask = [.width, .height]
