@@ -1492,7 +1492,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             progress.advanceItem(.scanning)
             let exhaustedTimeBudget = Date().timeIntervalSince(startedAt) >= budget.maxDurationSeconds
             let deferLargeActiveFile = shouldDeferLargeActiveFile(size: fileSize, modifiedAt: modifiedAt)
-            if let checkpoint = try ledger.checkpoint(fileID: fileID),
+            let matchingCheckpoint = try ledger.checkpoint(fileID: fileID)
+                ?? migrateLegacyCheckpointIfPossible(
+                    for: url,
+                    source: source,
+                    fileID: fileID,
+                    fileSize: fileSize,
+                    modifiedAt: modifiedAt,
+                    ledger: ledger
+                )
+            if let checkpoint = matchingCheckpoint,
                checkpoint.status == "complete",
                checkpoint.size == fileSize,
                abs(checkpoint.modifiedAt.timeIntervalSince(modifiedAt)) < 0.001 {
@@ -1555,6 +1564,52 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             return url.lastPathComponent
         }
         return url.path
+    }
+
+    nonisolated private static func migrateLegacyCheckpointIfPossible(
+        for url: URL,
+        source: String,
+        fileID: String,
+        fileSize: Int64,
+        modifiedAt: Date,
+        ledger: UsageLedgerStore
+    ) throws -> UsageFileCheckpoint? {
+        guard source == UsageJSONLParser.codexSource,
+              url.deletingLastPathComponent().standardizedFileURL.path == codexArchivedSessionsRoot.standardizedFileURL.path
+        else { return nil }
+
+        for legacyIdentity in legacyCodexSessionIdentities(forArchivedRollout: url) {
+            let oldFileID = UsageJSONLParser.fileID(for: legacyIdentity)
+            if let migrated = try ledger.migrateFileIdentityIfCheckpointMatches(
+                from: oldFileID,
+                to: fileID,
+                expectedSource: source,
+                expectedSize: fileSize,
+                expectedModifiedAt: modifiedAt,
+                expectedParserVersion: UsageJSONLParser.parserVersion
+            ) {
+                return migrated
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func legacyCodexSessionIdentities(forArchivedRollout url: URL) -> [String] {
+        let name = url.lastPathComponent
+        let prefix = "rollout-"
+        guard name.hasPrefix(prefix), name.hasSuffix(".jsonl"), name.count >= prefix.count + 10 else {
+            return []
+        }
+        let dateStart = name.index(name.startIndex, offsetBy: prefix.count)
+        let dateEnd = name.index(dateStart, offsetBy: 10)
+        let parts = name[dateStart..<dateEnd].split(separator: "-")
+        guard parts.count == 3 else { return [] }
+        let relative = [String(parts[0]), String(parts[1]), String(parts[2]), name]
+            .joined(separator: "/")
+        let symlinkPath = codexSessionsRoot.appending(path: relative).path
+        let resolvedPath = codexSessionsRoot.resolvingSymlinksInPath().appending(path: relative).path
+        if symlinkPath == resolvedPath { return [symlinkPath] }
+        return [symlinkPath, resolvedPath]
     }
 
     private struct SourceScanBudget: Sendable {

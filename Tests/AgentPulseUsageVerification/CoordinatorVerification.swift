@@ -130,6 +130,7 @@ enum CoordinatorVerification {
         try require(
             scanFn.contains("let fileIdentity = Self.fileIdentity(for: url, source: source)")
                 && scanFn.contains("UsageJSONLParser.fileID(for: fileIdentity)")
+                && scanFn.contains("migrateLegacyCheckpointIfPossible")
                 && scanFn.contains("fileIdentity: fileIdentity"),
             "scan 必须用来源相关的稳定 file identity，避免 Codex 归档移动后 checkpoint 失效"
         )
@@ -141,6 +142,13 @@ enum CoordinatorVerification {
                 && identityFn.contains("return url.lastPathComponent")
                 && identityFn.contains("return url.path"),
             "Codex rollout 文件应按稳定文件名识别，非 Codex 来源继续按路径识别"
+        )
+
+        let migrationFn = try functionBody(matching: "nonisolated private static func migrateLegacyCheckpointIfPossible(", in: source)
+        try require(
+            migrationFn.contains("legacyCodexSessionIdentities(forArchivedRollout: url)")
+                && migrationFn.contains("ledger.migrateFileIdentityIfCheckpointMatches"),
+            "archived rollout 必须尝试迁移旧 path-hash checkpoint，避免存量库重新解析历史归档"
         )
     }
 
