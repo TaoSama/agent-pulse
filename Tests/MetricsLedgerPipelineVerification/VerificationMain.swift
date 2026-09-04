@@ -37,6 +37,7 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyRecoveredIncrementalBaselineClearsPendingWithoutFullRecompute()
         try verifier.verifyLargeBaselineRecoveryIsDeferred()
         try verifier.verifyDeferredBaselineFullRecomputeDoesNotCompactFrozenRaw()
+        try verifier.verifyRecordNetworkEventsDoesNotDirtyHistoricalEvents()
         try verifier.verifyLargeDirtyKeySetFallsBackToFullRecompute()
         try verifier.verifyRawFileDirtyQueriesUseHostFileIndexes()
         try verifier.verifyFrozenCompactionPreservesTotalsAndDropsRaw()
@@ -84,6 +85,7 @@ private struct MetricsLedgerPipelineVerifier {
             try require(try scalarInt(db, "SELECT COUNT(*) FROM pragma_table_info('usage_session_events') WHERE name='source_file_hash';") == 1, "session event file-attribution column must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_session_events WHERE event_id='legacy-se';") == 1, "v8 rebuild must retain legacy session events")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_time';") == 1, "stable hostname/time index must exist")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_tool_counts';") == 1, "tool-count partial index must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_usage_events_host','idx_usage_events_host_logical');") == 0, "legacy usage host indexes must be removed after one-time migration")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_session_events_host_group';") == 1, "hostname-prefixed session streaming index must exist")
         }
@@ -519,6 +521,33 @@ private struct MetricsLedgerPipelineVerifier {
         try require(try ledger.reportingEligible(hostname: host), "deferred full recompute must restore reporting eligibility")
     }
 
+    func verifyRecordNetworkEventsDoesNotDirtyHistoricalEvents() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let host = "host-a"
+        let source = CliProxyUsageParser.source
+        let firstTs = try date("2026-08-14T02:05:00Z")
+        let nextTs = try date("2026-08-14T02:35:00Z")
+
+        let historical = (0..<1_000).map { index in
+            tokenEvent(id: "network-old-\(index)", source: source, session: "net-old", file: "ignored", ts: firstTs, input: 1)
+        }
+        try ledger.recordNetworkEvents(historical, source: source, hostname: host)
+        _ = try ledger.finalizeDerived(hostname: host)
+
+        let incremental = (0..<2).map { index in
+            tokenEvent(id: "network-new-\(index)", source: source, session: "net-new", file: "ignored", ts: nextTs, input: 2)
+        }
+        try ledger.recordNetworkEvents(incremental, source: source, hostname: host)
+
+        try withDatabase(database) { db in
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname='host-a';") == 0, "network append must not dirty historical synthetic-file events")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sync_state WHERE key='raw_derivation_pending';") == 0, "network append must not set raw derivation pending")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE source='cliproxy';") == 1_002, "network events must still be stored idempotently")
+        }
+    }
+
     func verifyLargeDirtyKeySetFallsBackToFullRecompute() throws {
         let database = try temporaryDatabaseURL()
         defer { cleanupDatabase(at: database) }
@@ -575,6 +604,14 @@ private struct MetricsLedgerPipelineVerifier {
                 FROM usage_edit_entries WHERE hostname='host-a' AND source_file_hash='file-a';
                 """)
             try require(editPlan.contains { $0.contains("idx_usage_edit_entries_host_file_dirty") }, "edit dirty lookup must use the host/file index; plan=\(editPlan)")
+
+            let toolCountPlan = try queryPlanDetails(db, """
+                EXPLAIN QUERY PLAN
+                SELECT source,event_id,skill_counts_json,mcp_counts_json
+                FROM usage_events
+                WHERE hostname='host-a' AND (skill_counts_json <> '{}' OR mcp_counts_json <> '{}');
+                """)
+            try require(toolCountPlan.contains { $0.contains("idx_usage_events_tool_counts") }, "tool-count lookup must use partial index; plan=\(toolCountPlan)")
         }
     }
 

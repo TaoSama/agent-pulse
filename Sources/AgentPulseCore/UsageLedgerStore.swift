@@ -272,11 +272,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try transaction {
                 let frozen = try frozenBeforeMsUnlocked(hostname)
                 let keptEvents = frozen > 0 ? events.filter { millis($0.timestamp) >= frozen } : events
-                // 网络来源同样走文件级归属（合成 fileID），旧行会被 upsert 覆盖：与本地扫描一样，
-                // 必须在覆盖前后各记一次脏键，否则增量 finalize 无法还原受影响的去重组与 session。
-                try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
                 try insertRawEvents(keptEvents, fileID: fileID, hostname: hostname)
-                try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
                 try writeCheckpoint(checkpoint)
                 try recomputeNetworkBucketsUnlocked(events: keptEvents, source: source, hostname: hostname)
                 if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
@@ -4337,6 +4333,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 // 正向边的 SQL 本身带着同样的谓词，等值查找照样命中。
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_dirty_lineage ON usage_events(source,event_id,lineage_fingerprint) WHERE lineage_fingerprint <> '';"
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_dirty_content ON usage_events(source,event_id,codex_dedup_key) WHERE codex_dedup_key <> '';"
+                // Full finalize only needs the small subset of rows carrying tool counters for
+                // skill/MCP aggregation. Without this partial index, that step scans the entire
+                // 25GB token-event table even though most rows have empty JSON counters.
+                + "CREATE INDEX IF NOT EXISTS idx_usage_events_tool_counts ON usage_events(hostname,timestamp_ms,source,event_id) WHERE skill_counts_json <> '{}' OR mcp_counts_json <> '{}';"
                 // 其余增量边不带 lineage / content 谓词，需要一个通用的 (source, event_id) 入口。
                 // 谓词 hostname <> '' 在真实数据上恒真（record 总是写入采集机名），所以覆盖面
                 // 与普通索引一致；但计划器无法静态证明这一点，全量 GROUP BY 依旧走顺序扫描。
