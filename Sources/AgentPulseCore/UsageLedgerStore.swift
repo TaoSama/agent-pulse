@@ -80,6 +80,35 @@ public struct UsageFinalizeResult: Sendable, Equatable {
     }
 }
 
+public struct UsageDirtyKeyCount: Sendable, Equatable {
+    public let kind: String
+    public let count: Int
+
+    public init(kind: String, count: Int) {
+        self.kind = kind
+        self.count = count
+    }
+}
+
+public enum UsageCompactionStep: Int, Sendable, Equatable, CaseIterable {
+    case advanceFrozenWatermark = 1
+    case deleteFrozenRaw = 2
+    case vacuum = 3
+    case skippedVacuum = 4
+
+    public static var total: Int { 3 }
+}
+
+public struct UsageCompactionResult: Sendable, Equatable {
+    public let advancedTo: Int64
+    public let compacted: Bool
+
+    public init(advancedTo: Int64, compacted: Bool) {
+        self.advancedTo = advancedTo
+        self.compacted = compacted
+    }
+}
+
 public enum UsageIncrementalBaselineRecovery: Sendable, Equatable {
     case notNeeded
     case recovered
@@ -1301,8 +1330,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 if compactFrozen {
                     let advancedTo = try advanceFrozenWatermarkUnlocked(hostname: hostname)
                     if advancedTo > 0 {
-                        try compactFrozenRawUnlocked(hostname: hostname, frozen: advancedTo)
-                        didCompact = true
+                        didCompact = try compactFrozenRawUnlocked(hostname: hostname, frozen: advancedTo) > 0
                     }
                 }
             }
@@ -1733,6 +1761,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 增量作用域的 bucket 数上限。超过说明本轮改动面已接近全量，
     /// 逐 bucket 差异写反而比一次全表 GROUP BY 慢，直接回退。
     private static let incrementalBucketLimit = 5000
+    /// 脏键种子数量上限。超过时闭包传播本身会退化成长时间 B-Tree 随机查找，
+    /// 还没机会算出 bucket 作用域就卡住；直接全量重算更可预测，并且能正常回报 8 步进度。
+    private static let incrementalDirtyKeyLimit = 50_000
 
     /// 作用域事件数占该 hostname 全部事件的比例上限。超过就退回全量。
     ///
@@ -1912,6 +1943,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         guard try readTextUnlocked(key: Self.incrementalBaselineKey) != nil else { return false }
         guard try readTextUnlocked(key: Self.rebuildPendingKey) == nil else { return false }
         guard try frozenBeforeMsUnlocked(hostname) == 0 else { return false }
+        guard try dirtyKeyCountUnlocked(hostname: hostname) <= Self.incrementalDirtyKeyLimit else { return false }
         return try derivedHasAnyRowUnlocked(hostname: hostname)
     }
 
@@ -2821,11 +2853,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// recompute 统一归属到当前 canonical hostname（包含所有采集机的贡献）。冻结边界是全局时间概念，
     /// 若只删 canonical hostname 的行，旧机器名（改名前/多机同步）的历史原始行会成为永不可回收的死数据。
     /// 必须在 finalizeDerived 事务内、frozen 推进之后同事务调用；VACUUM 由调用方在事务外执行。
-    func compactFrozenRawUnlocked(hostname: String, frozen: Int64) throws {
-        guard frozen > 0 else { return }
+    func compactFrozenRawUnlocked(hostname: String, frozen: Int64) throws -> Int64 {
+        guard frozen > 0 else { return 0 }
         let delEvents = try prepare("DELETE FROM usage_events WHERE timestamp_ms < ?;")
         defer { sqlite3_finalize(delEvents) }
         try bind(delEvents, 1, frozen); try done(delEvents)
+        let deletedEvents = Int64(sqlite3_changes(db))
 
         // 只删完全冻结 session 的 session_events：排除任何仍有 timestamp>=frozen 事件的 (source,session_hash)。
         // 按 (source,session_hash) 复合匹配（与聚合器 session 自然键一致），且跨 hostname 判定——
@@ -2841,6 +2874,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         defer { sqlite3_finalize(delSessions) }
         try bind(delSessions, 1, frozen); try bind(delSessions, 2, frozen)
         try done(delSessions)
+        return deletedEvents + Int64(sqlite3_changes(db))
     }
 
     // MARK: - Reads
@@ -4048,10 +4082,61 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
+    public func dirtyKeyCounts(hostname: String) throws -> [UsageDirtyKeyCount] {
+        try queue.sync {
+            guard try tableExistsUnlocked("usage_dirty_keys") else { return [] }
+            let statement = try prepare("SELECT kind,COUNT(*) FROM usage_dirty_keys WHERE hostname=? GROUP BY kind ORDER BY COUNT(*) DESC, kind ASC;")
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            var result: [UsageDirtyKeyCount] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                result.append(UsageDirtyKeyCount(
+                    kind: text(statement, 0),
+                    count: Int(sqlite3_column_int64(statement, 1))
+                ))
+            }
+            return result
+        }
+    }
+
+    @discardableResult
+    public func compactFrozenRaw(
+        hostname: String,
+        progress: (@Sendable (_ step: UsageCompactionStep, _ done: Int, _ total: Int) -> Void)? = nil
+    ) throws -> UsageCompactionResult {
+        try queue.sync {
+            try ensurePerformanceIndexesUnlocked()
+            var advancedTo: Int64 = 0
+            var didCompact = false
+            progress?(.advanceFrozenWatermark, 0, UsageCompactionStep.total)
+            try transaction {
+                advancedTo = try advanceFrozenWatermarkUnlocked(hostname: hostname)
+                progress?(.advanceFrozenWatermark, UsageCompactionStep.advanceFrozenWatermark.rawValue, UsageCompactionStep.total)
+                if advancedTo > 0 {
+                    didCompact = try compactFrozenRawUnlocked(hostname: hostname, frozen: advancedTo) > 0
+                }
+                progress?(.deleteFrozenRaw, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
+            }
+            if didCompact {
+                progress?(.vacuum, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
+                try exec("VACUUM;")
+            } else {
+                progress?(.skippedVacuum, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
+            }
+            progress?(didCompact ? .vacuum : .skippedVacuum, UsageCompactionStep.total, UsageCompactionStep.total)
+            return UsageCompactionResult(advancedTo: advancedTo, compacted: didCompact)
+        }
+    }
+
     private func countUnlocked(_ sql: String, _ hostname: String) throws -> Int {
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private func dirtyKeyCountUnlocked(hostname: String) throws -> Int {
+        guard try tableExistsUnlocked("usage_dirty_keys") else { return 0 }
+        return try countUnlocked("SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname=?;", hostname)
     }
 
 

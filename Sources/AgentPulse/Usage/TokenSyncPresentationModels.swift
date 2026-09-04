@@ -126,6 +126,8 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
     case scanning
     /// finalizeDerived 派生重算（全局去重 + 聚合 + 门禁）。
     case finalizing
+    /// 可选冻结压实（推进 frozen 水位 + 删除已固化 raw + VACUUM）。
+    case compacting
     /// summaries / pendingCounts 组装。
     case summarizing
     /// 可选普通上报（仅上报已启用且串接时）。
@@ -136,8 +138,9 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
     var weight: Double {
         switch self {
         case .cliproxy: return 0.05
-        case .scanning: return 0.60
-        case .finalizing: return 0.25
+        case .scanning: return 0.57
+        case .finalizing: return 0.23
+        case .compacting: return 0.05
         case .summarizing: return 0.05
         case .reporting: return 0.05
         }
@@ -158,6 +161,7 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
         case .cliproxy: return "采集 CPA"
         case .scanning: return "扫描文件"
         case .finalizing: return "整理统计"
+        case .compacting: return "冻结压实"
         case .summarizing: return "聚合窗口"
         case .reporting: return "上报用量"
         }
@@ -169,6 +173,7 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
         case .cliproxy: return "事件"
         case .scanning: return "文件"
         case .finalizing: return "步"
+        case .compacting: return "步"
         case .summarizing: return "窗口"
         case .reporting: return "行"
         }
@@ -285,6 +290,8 @@ struct TokenSyncStatus: Sendable, Equatable {
     var scanTotal: Int = 0
     /// 整体进度 0~1（跨全部阶段带权重累加）；未在扫描时为 nil。
     var scanProgress: Double? = nil
+    /// 当前扫描阶段的聚合补充说明；沿用现有进度行展示，不改变布局。
+    var scanDetailText: String? = nil
 
     /// 自动上报间隔（本机行为，不进上报身份）。默认 30 分钟。
     var autoReportInterval: TokenReportInterval = .default
@@ -469,9 +476,15 @@ enum TokenUsageFormatting {
         let percentText = percent(percentOverride ?? status.scanProgress)
         guard let phase = status.scanPhase else { return "刷新进度：\(percentText)" }
         if status.scanTotal > 0 {
-            return "刷新进度：\(percentText) · \(phase.displayLabel) · \(status.scanDone)/\(status.scanTotal) \(phase.unit)"
+            let base = "刷新进度：\(percentText) · \(phase.displayLabel) · \(status.scanDone)/\(status.scanTotal) \(phase.unit)"
+            return appendScanDetail(status.scanDetailText, to: base)
         }
-        return "刷新进度：\(percentText) · \(phase.displayLabel)"
+        return appendScanDetail(status.scanDetailText, to: "刷新进度：\(percentText) · \(phase.displayLabel)")
+    }
+
+    private static func appendScanDetail(_ detail: String?, to base: String) -> String {
+        guard let detail, !detail.isEmpty else { return base }
+        return "\(base) · \(detail)"
     }
 
     static func tps(_ value: Double?) -> String {

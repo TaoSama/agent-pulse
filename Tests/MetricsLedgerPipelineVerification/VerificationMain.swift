@@ -43,6 +43,7 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyMissingFilesRecordDirtyKeysInBulk()
         try verifier.verifyRawFileDirtyQueriesUseHostFileIndexes()
         try verifier.verifyFrozenCompactionPreservesTotalsAndDropsRaw()
+        try verifier.verifyStandaloneFrozenCompactionRunsWithoutRecompute()
         try verifier.verifyFrozenLateEventsAreDropped()
         try verifier.verifyFrozenWatermarkIsMonotonicAndBucketAligned()
         try verifier.verifyDegradedFileVetoesFrozenAdvance()
@@ -855,6 +856,42 @@ private struct MetricsLedgerPipelineVerifier {
         try require(total2 == 140, "compact 后再次 finalize，派生总数必须仍为 140，实际 \(total2)")
     }
 
+    /// 扫描关键路径会先 finalize 派生，再按设置单独跑冻结压实维护；这个入口不得重算派生，
+    /// 只推进 frozen、删除已固化 raw 并回报三步进度。
+    func verifyStandaloneFrozenCompactionRunsWithoutRecompute() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let host = "host-a"; let source = "codex"
+        let frozenTs = agedTimestamp(daysAgo: 60)
+        let activeTs = agedTimestamp(daysAgo: 1)
+
+        try ledger.record(events: [tokenEvent(id: "old", source: source, session: "s-old", file: "f-old", ts: frozenTs, input: 100)],
+                          sessionEvents: [], editEntries: [], checkpoint: completeCheckpoint("f-old", source: source, ts: frozenTs), hostname: host)
+        try ledger.record(events: [tokenEvent(id: "new", source: source, session: "s-new", file: "f-new", ts: activeTs, input: 40)],
+                          sessionEvents: [], editEntries: [], checkpoint: completeCheckpoint("f-new", source: source, ts: activeTs), hostname: host)
+        _ = try ledger.finalizeDerived(hostname: host, compactFrozen: false)
+
+        let progress = CompactionProgressRecorder()
+        let result = try ledger.compactFrozenRaw(hostname: host) { step, done, total in
+            progress.append(step: step, done: done, total: total)
+        }
+        try require(result.compacted, "独立冻结压实必须在存在冻结区 raw 时执行删除")
+        try require(result.advancedTo > 0, "独立冻结压实必须推进 frozen 水位")
+        let events = progress.events
+        try require(events.contains { $0.0 == .advanceFrozenWatermark && $0.1 == 1 && $0.2 == UsageCompactionStep.total }, "独立压实必须回报推进 frozen 水位进度")
+        try require(events.contains { $0.0 == .deleteFrozenRaw && $0.1 == 2 && $0.2 == UsageCompactionStep.total }, "独立压实必须回报删除 frozen raw 进度")
+        try require(events.contains { $0.0 == .vacuum && $0.1 == UsageCompactionStep.total && $0.2 == UsageCompactionStep.total }, "独立压实必须回报 VACUUM 完成进度")
+
+        let buckets = try ledger.buckets(hostname: host)
+        let total = buckets.reduce(Int64(0)) { $0 + $1.counts.input }
+        try require(total == 140, "独立压实后派生 token 总数必须保留，实际 \(total)")
+        try withDatabase(database) { db in
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='old';") == 0, "独立压实必须删除冻结区原始行")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='new';") == 1, "独立压实必须保留活跃原始行")
+        }
+    }
+
     /// 用例 3：frozen 之后到达的 timestamp<frozen 迟到事件被直接丢弃、不入库、不改总数、frozen 不回退。
     func verifyFrozenLateEventsAreDropped() throws {
         let database = try temporaryDatabaseURL()
@@ -1062,5 +1099,22 @@ private struct MetricsLedgerPipelineVerifier {
         guard sqlite3_bind_int64(statement, index, value) == SQLITE_OK else {
             throw VerificationFailure.sqlite(String(cString: sqlite3_errmsg(db)))
         }
+    }
+}
+
+private final class CompactionProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [(UsageCompactionStep, Int, Int)] = []
+
+    func append(step: UsageCompactionStep, done: Int, total: Int) {
+        lock.lock()
+        storage.append((step, done, total))
+        lock.unlock()
+    }
+
+    var events: [(UsageCompactionStep, Int, Int)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
     }
 }

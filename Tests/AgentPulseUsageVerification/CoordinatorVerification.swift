@@ -60,7 +60,7 @@ enum CoordinatorVerification {
     /// - 进入扫描时置位阶段/百分比，结束时统一 clearScanProgress 归零；
     /// - scanning 阶段先预扫全部来源 root 的 jsonl 总数（setPhaseTotal）再逐文件 advanceItem；
     /// - 进度回调只在当前 generation 且仍在扫描时写（applyScanProgress 门禁），避免旧扫描覆盖新扫描；
-    /// - 各阶段边界都通过 ScanProgressReporter 报点（cliproxy / scanning / finalizing / summarizing）。
+    /// - 各阶段边界都通过 ScanProgressReporter 报点（cliproxy / scanning / finalizing / compacting / summarizing）。
     private static func verifyScanProgressReporting(_ source: String) throws {
         let scanBody = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
         // 置位进度：scanningInProgress 与阶段/百分比一并写入。
@@ -92,11 +92,20 @@ enum CoordinatorVerification {
         for marker in [
             "progressReporter.completePhase(.cliproxy)",
             "progressReporter.completePhase(.scanning)",
-            "progressReporter.enterPhase(.finalizing)",
+            "progressReporter.enterPhase(.finalizing",
+            "progressReporter.enterPhase(.compacting",
             "progressReporter.enterPhase(.summarizing",
         ] {
             try require(scanBody.contains(marker), "scanNow 缺少阶段进度报点：\(marker)")
         }
+        try require(
+            source.contains("let detail: String?")
+                && source.contains("status.scanDetailText = update.detail")
+                && source.contains("status.scanDetailText = nil")
+                && source.contains("dirtyProgressDetail(from: ledger, hostname: hostname)")
+                && source.contains("compactionProgressDetail"),
+            "扫描进度未携带 dirty/finalize/冻结压实的补充详情，UI 会让长阶段看起来卡住"
+        )
 
         // scan 逐文件推进进度。
         let scanFn = try functionBody(matching: "nonisolated private static func scan(", in: source)
@@ -126,7 +135,8 @@ enum CoordinatorVerification {
         try require(
             clear.contains("status.scanningInProgress = false")
                 && clear.contains("status.scanPhase = nil")
-                && clear.contains("status.scanProgress = nil"),
+                && clear.contains("status.scanProgress = nil")
+                && clear.contains("status.scanDetailText = nil"),
             "clearScanProgress 未把扫描进度字段全部归零"
         )
     }
@@ -469,12 +479,22 @@ enum CoordinatorVerification {
             "scanNow 的扫描/上报关键路径不应执行冻结压实；压实应拆成独立维护任务"
         )
         try require(
+            scanNowBody.contains("ledger.compactFrozenRaw(hostname: hostname)")
+                && scanNowBody.contains("progressReporter.enterPhase(.compacting"),
+            "冻结压实未作为独立维护阶段接入扫描完成后的进度链路"
+        )
+        try require(
             !scanNowBody.contains("baselineRecovery == .deferred ? (buckets: 0, sessions: 0) : try ledger.pendingCounts"),
             "scanNow deferred 分支不应伪造 pendingCounts；full finalize 后应读取真实 pending"
         )
         try require(
             scanNowBody.contains("ledger.reportingEligible(hostname:"),
             "scanNow 跳过分支未从 reportingEligible 读回上报资格（会伪造 eligible）"
+        )
+        try require(
+            try ledgerSource().contains("incrementalDirtyKeyLimit")
+                && ledgerSource().contains("dirtyKeyCountUnlocked(hostname: hostname) <= Self.incrementalDirtyKeyLimit"),
+            "增量派生缺少 dirty-key 数量门禁，大量脏键会在闭包传播阶段长时间无进度"
         )
     }
 
@@ -632,6 +652,20 @@ enum CoordinatorVerification {
             return try String(contentsOf: sourceURL, encoding: .utf8)
         } catch {
             throw CoordinatorVerificationError.failed("无法读取 Coordinator 源码：\(sourceURL.path)")
+        }
+    }
+
+    private static func ledgerSource() throws -> String {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = repositoryRoot
+            .appending(path: "Sources/AgentPulseCore/UsageLedgerStore.swift")
+        do {
+            return try String(contentsOf: sourceURL, encoding: .utf8)
+        } catch {
+            throw CoordinatorVerificationError.failed("无法读取 UsageLedgerStore 源码：\(sourceURL.path)")
         }
     }
 

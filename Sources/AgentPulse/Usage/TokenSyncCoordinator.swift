@@ -13,7 +13,7 @@ private enum TokenSyncScanError: Error {
 }
 
 /// off-main worker 向主线程回报的一次进度快照（Sendable）。
-/// 只含聚合数（阶段、已完成/总数计数、整体百分比），不含路径或正文。
+/// 只含聚合数（阶段、已完成/总数计数、整体百分比、补充说明），不含路径或正文。
 private struct ScanProgressUpdate: Sendable {
     let phase: TokenScanPhase
     /// 当前阶段的已完成 / 总数（量纲随阶段：文件 / 事件 / 步 / 窗口 / 行）。
@@ -21,6 +21,8 @@ private struct ScanProgressUpdate: Sendable {
     let total: Int
     /// 整体进度 0~1（跨阶段带权重累加）。
     let overall: Double
+    /// 展示层可选补充说明，只允许聚合计数和阶段名。
+    let detail: String?
 }
 
 /// 维护本地长期采集、普通上报开关和状态展示，并串起完整生产链：
@@ -423,6 +425,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 self?.applyScanProgress(update, generation: generation)
             }
         }
+        let compactionEnabled = statusSubject.value.compactionEnabled
         scanTask = Task { [weak self] in
             // cliproxy 主动拉取（异步 HTTP）在进入阻塞式文件扫描之前完成；失败仅记状态、
             // 返回空事件，绝不影响本地文件采集与既有链路。
@@ -564,7 +567,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
                 // 无变化轮（raw 派生 dirty 位未置 且 无 rebuild 待完成）跳过 O(全库) 重算：
                 // 派生已是最新，仅从持久标志读回上报资格，避免每轮全表读+排序（9.4G 库约 90s）。
-                progressReporter.enterPhase(.finalizing)
+                progressReporter.enterPhase(.finalizing, detail: "准备整理 dirty 状态")
                 let baselineRecovery = try ledger.recoverIncrementalBaselineIfSafe(
                     hostname: hostname,
                     currentParserVersion: currentParserVersion
@@ -572,22 +575,45 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 let needsDerivation = try ledger.requiresDerivationCompletion()
                 let needsRebuild = try ledger.requiresRebuildCompletion()
                 let needsFinalize = baselineRecovery != .deferred && (needsDerivation || needsRebuild)
+                let dirtyDetail = try Self.dirtyProgressDetail(from: ledger, hostname: hostname)
                 let finalize: UsageFinalizeResult
                 if baselineRecovery == .deferred {
                     // 大库无法廉价恢复增量基线时，必须显式跑一次全量 finalize 来建立基线并
                     // 清除 raw_derivation_pending。否则每轮都会继续 deferred，导致上报永久被门禁。
                     // 这一步的目标是尽快恢复上报资格；冻结压实会删除大范围原始行，在 10GB+ 账本上可能
                     // 把恢复事务拖到很久。压实留给后续普通扫描轮次处理，避免 UI 长时间停在 deferred。
+                    progressReporter.advance(
+                        .finalizing,
+                        done: 0,
+                        total: Self.finalizeProgressStepCount,
+                        detail: Self.finalizeProgressDetail(done: 0, dirtyDetail: dirtyDetail)
+                    )
                     finalize = try ledger.finalizeDerived(hostname: hostname, compactFrozen: false, strategy: .fullRecompute) { done, total in
-                        progressReporter.advance(.finalizing, done: done, total: total)
+                        progressReporter.advance(
+                            .finalizing,
+                            done: done,
+                            total: total,
+                            detail: Self.finalizeProgressDetail(done: done, dirtyDetail: dirtyDetail)
+                        )
                     }
                 } else if needsFinalize {
                     // 扫描/上报的关键路径只负责把派生账本推进到可上报状态。冻结压实会对大表做
                     // 不可逆删除和 VACUUM，不能绑进同一个“正在扫描”事务，否则 25GB 级账本会让
                     // UI 长时间卡在扫描中。磁盘回收应由独立维护任务处理。
+                    progressReporter.advance(
+                        .finalizing,
+                        done: 0,
+                        total: Self.finalizeProgressStepCount,
+                        detail: Self.finalizeProgressDetail(done: 0, dirtyDetail: dirtyDetail)
+                    )
                     finalize = try ledger.finalizeDerived(hostname: hostname, compactFrozen: false) { done, total in
                         // 重算内部子阶段回调：映射到 .finalizing 段的 done/total（8 步），显示「3/8 步」。
-                        progressReporter.advance(.finalizing, done: done, total: total)
+                        progressReporter.advance(
+                            .finalizing,
+                            done: done,
+                            total: total,
+                            detail: Self.finalizeProgressDetail(done: done, dirtyDetail: dirtyDetail)
+                        )
                     }
                 } else {
                     // 跳过重算：collapsed 计数本轮为 0（无新折叠工作），eligible 读持久标志，
@@ -600,12 +626,25 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                         collapsedContentDuplicates: 0
                     )
                 }
-                progressReporter.completePhase(.finalizing)
+                let postFinalizeDetail = try Self.pendingProgressDetail(from: ledger, hostname: hostname)
+                progressReporter.completePhase(.finalizing, detail: postFinalizeDetail)
                 // 只有在所有来源都完整扫描（无致命失败：任一来源枚举失败 / 单文件 I/O 失败都会
                 // 在上面抛出并终止本次扫描，不会到达此处）后，才显式清除 rebuild pending。
                 // record/finalize 不会推断重扫已完成，清除是此处唯一入口。
                 if try ledger.requiresRebuildCompletion() {
                     try ledger.markRebuildCompleted()
+                }
+                if compactionEnabled {
+                    progressReporter.enterPhase(.compacting, total: UsageCompactionStep.total, detail: "准备冻结压实")
+                    _ = try ledger.compactFrozenRaw(hostname: hostname) { step, done, total in
+                        progressReporter.advance(
+                            .compacting,
+                            done: done,
+                            total: total,
+                            detail: Self.compactionProgressDetail(step)
+                        )
+                    }
+                    progressReporter.completePhase(.compacting, detail: "冻结压实已检查")
                 }
                 // summarizing 聚合日/周/月/全部四个窗口：登记总数为窗口数，显示「n/4 窗口」。
                 progressReporter.enterPhase(.summarizing, total: TokenUsageWindow.allCases.count)
@@ -680,6 +719,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             status.scanDone = update.done
             status.scanTotal = update.total
             status.scanProgress = update.overall
+            status.scanDetailText = update.detail
         }
     }
 
@@ -747,6 +787,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         status.scanDone = 0
         status.scanTotal = 0
         status.scanProgress = nil
+        status.scanDetailText = nil
     }
 
     // MARK: - Report
@@ -782,7 +823,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let hostname = authority.hostname
         // 上报阶段进度：展示待上报行数（buckets+sessions）作为 .reporting 阶段计数「n/m 行」。
         // reporter.report 为不透明网络 I/O，不逐行回报，故仅在起止两端登记总数与完成。
-        let pendingRows = (try? ledger.pendingCounts(hostname: hostname)).map { $0.buckets + $0.sessions } ?? 0
+        let pending = try? ledger.pendingCounts(hostname: hostname)
+        let pendingRows = pending.map { $0.buckets + $0.sessions } ?? 0
+        let pendingDetail = pending.map { "buckets \($0.buckets) / sessions \($0.sessions)" }
         updateStatus { status in
             status.reportingInProgress = true
             status.reportingError = nil
@@ -790,6 +833,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             status.scanDone = 0
             status.scanTotal = pendingRows
             status.scanProgress = TokenScanPhase.reporting.baseProgress
+            status.scanDetailText = pendingDetail
         }
         let configurationURL = self.configurationURL
         let reporter = self.reporter
@@ -1146,48 +1190,49 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
         /// 进入某阶段：清零本阶段计数并按已完成阶段权重报出阶段起点（阶跃）。
         /// `total` 已知时同时登记，未知（0）则本阶段先不显示计数、待后续 setPhaseTotal 补登。
-        func enterPhase(_ phase: TokenScanPhase, total: Int = 0) {
+        func enterPhase(_ phase: TokenScanPhase, total: Int = 0, detail: String? = nil) {
             self.total = max(0, total)
             self.done = 0
-            send(phase: phase, fraction: 0)
+            send(phase: phase, fraction: 0, detail: detail)
         }
 
         /// 完成某阶段：报出阶段终点（满权重），并把已完成计数对齐到总数。
-        func completePhase(_ phase: TokenScanPhase) {
+        func completePhase(_ phase: TokenScanPhase, detail: String? = nil) {
             if total > 0 { done = total }
-            send(phase: phase, fraction: 1)
+            send(phase: phase, fraction: 1, detail: detail)
         }
 
         /// 登记当前阶段的总数（如 scanning 多来源枚举后一次性得到文件总数）。
         func setPhaseTotal(_ phase: TokenScanPhase, total: Int) {
             self.total = max(0, total)
             self.done = 0
-            send(phase: phase, fraction: 0)
+            send(phase: phase, fraction: 0, detail: nil)
         }
 
         /// 当前阶段完成一项：自增并按 done/total 回报（含计数）。
         func advanceItem(_ phase: TokenScanPhase) {
             done += 1
             let fraction = total > 0 ? Double(done) / Double(total) : 1
-            send(phase: phase, fraction: fraction)
+            send(phase: phase, fraction: fraction, detail: nil)
         }
 
         /// 按外部给定的 done/total 推进当前阶段（如 finalize 的 8 子阶段）。
-        func advance(_ phase: TokenScanPhase, done: Int, total: Int) {
+        func advance(_ phase: TokenScanPhase, done: Int, total: Int, detail: String? = nil) {
             self.total = max(0, total)
             self.done = max(0, min(done, self.total))
             let fraction = total > 0 ? Double(done) / Double(total) : 1
-            send(phase: phase, fraction: fraction)
+            send(phase: phase, fraction: fraction, detail: detail)
         }
 
-        private func send(phase: TokenScanPhase, fraction: Double) {
+        private func send(phase: TokenScanPhase, fraction: Double, detail: String?) {
             let clamped = min(max(fraction, 0), 1)
             let overall = min(phase.baseProgress + clamped * phase.weight, 1)
             emit(ScanProgressUpdate(
                 phase: phase,
                 done: done,
                 total: total,
-                overall: overall
+                overall: overall,
+                detail: detail
             ))
         }
     }
@@ -1285,6 +1330,66 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         var current = statusSubject.value
         mutate(&current)
         statusSubject.send(current)
+    }
+
+    nonisolated private static func dirtyProgressDetail(from ledger: UsageLedgerStore, hostname: String) throws -> String? {
+        let counts = try ledger.dirtyKeyCounts(hostname: hostname)
+        guard !counts.isEmpty else { return nil }
+        let total = counts.reduce(0) { $0 + $1.count }
+        let top = counts.prefix(3).map { "\($0.kind) \(compactCount($0.count))" }.joined(separator: " / ")
+        return "dirty \(compactCount(total))（\(top)）"
+    }
+
+    nonisolated private static func pendingProgressDetail(from ledger: UsageLedgerStore, hostname: String) throws -> String? {
+        guard let pending = try? ledger.pendingCounts(hostname: hostname) else { return nil }
+        return "buckets \(pending.buckets) / sessions \(pending.sessions)"
+    }
+
+    nonisolated private static func finalizeProgressDetail(done: Int, dirtyDetail: String?) -> String? {
+        let stage = finalizeStageLabel(done: done)
+        switch (stage, dirtyDetail) {
+        case let (.some(stage), .some(dirtyDetail)): return "\(stage) · \(dirtyDetail)"
+        case let (.some(stage), .none): return stage
+        case let (.none, .some(dirtyDetail)): return dirtyDetail
+        case (.none, .none): return nil
+        }
+    }
+
+    nonisolated private static let finalizeProgressStepCount = 8
+
+    nonisolated private static func finalizeStageLabel(done: Int) -> String? {
+        switch done {
+        case 0: return "准备重算"
+        case 1: return "去重"
+        case 2: return "bucket 聚合"
+        case 3: return "tool/edit 合并"
+        case 4: return "session 聚合"
+        case 5: return "写入 bucket"
+        case 6: return "写入 session"
+        case 7: return "门禁检查"
+        case 8: return "清理 dirty"
+        default: return nil
+        }
+    }
+
+    nonisolated private static func compactionProgressDetail(_ step: UsageCompactionStep) -> String {
+        switch step {
+        case .advanceFrozenWatermark: return "推进冻结水位"
+        case .deleteFrozenRaw: return "删除冻结原始行"
+        case .vacuum: return "VACUUM 回收空间"
+        case .skippedVacuum: return "无需 VACUUM"
+        }
+    }
+
+    nonisolated private static func compactCount(_ value: Int) -> String {
+        switch value {
+        case 1_000_000...:
+            return String(format: "%.1fM", Double(value) / 1_000_000)
+        case 1_000...:
+            return String(format: "%.1fK", Double(value) / 1_000)
+        default:
+            return String(value)
+        }
     }
 
     private func publish(_ summary: TokenUsageSummary) {
