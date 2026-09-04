@@ -832,13 +832,15 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let logicalToLineage = try prepare("""
             INSERT OR IGNORE INTO temp_dirty_lineage(fingerprint)
             SELECT DISTINCT e.lineage_fingerprint FROM temp_dirty_logical d
-            CROSS JOIN usage_events e ON e.source = d.source AND e.event_id = d.event_id
+            CROSS JOIN usage_events e INDEXED BY idx_usage_events_dirty_lineage
+              ON e.source = d.source AND e.event_id = d.event_id
             WHERE e.hostname = ? AND e.lineage_fingerprint <> '';
             """)
         let logicalToContent = try prepare("""
             INSERT OR IGNORE INTO temp_dirty_content(dedup_key)
             SELECT DISTINCT e.codex_dedup_key FROM temp_dirty_logical d
-            CROSS JOIN usage_events e ON e.source = d.source AND e.event_id = d.event_id
+            CROSS JOIN usage_events e INDEXED BY idx_usage_events_dirty_content
+              ON e.source = d.source AND e.event_id = d.event_id
             WHERE e.hostname = ? AND e.codex_dedup_key <> '';
             """)
         let lineageToLogical = try prepare("""
@@ -888,7 +890,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 SELECT DISTINCT e.source, e.model, e.project,
                        (e.timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start
                 FROM temp_dirty_logical d
-                CROSS JOIN usage_events e ON e.source = d.source AND e.event_id = d.event_id
+                CROSS JOIN usage_events e INDEXED BY idx_usage_events_dirty_logical
+                  ON e.source = d.source AND e.event_id = d.event_id
                 WHERE e.hostname = ? AND e.hostname <> '';
                 """)
             defer { sqlite3_finalize(statement) }
@@ -904,7 +907,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
         do {
             let statement = try prepare("""
                 SELECT DISTINCT e.source, e.session_hash FROM temp_dirty_logical d
-                CROSS JOIN usage_events e ON e.source = d.source AND e.event_id = d.event_id
+                CROSS JOIN usage_events e INDEXED BY idx_usage_events_dirty_logical
+                  ON e.source = d.source AND e.event_id = d.event_id
                 WHERE e.hostname = ? AND e.session_hash <> '' AND e.hostname <> '';
                 """)
             defer { sqlite3_finalize(statement) }
@@ -1120,7 +1124,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                         ELSE 1
                     END AS tier
                 FROM temp_scope_events s
-                CROSS JOIN usage_events ON usage_events.source = s.source AND usage_events.event_id = s.event_id
+                CROSS JOIN usage_events INDEXED BY idx_usage_events_dirty_logical
+                  ON usage_events.source = s.source AND usage_events.event_id = s.event_id
                 WHERE usage_events.hostname = ? AND usage_events.hostname <> ''
             ),
             max_tier AS (
@@ -1309,22 +1314,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
     }
 
     /// 全量派生会顺序读写数 GB SQLite 临时数据并持续占用一个核心。把当前 ledger worker
-    /// 线程的 CPU 与磁盘均降为后台优先级，让前台应用和用户交互优先；重算结束（含抛错）后恢复。
+    /// 线程的 CPU 降为后台优先级，让前台应用和用户交互优先；重算结束（含抛错）后恢复。
+    /// 磁盘 I/O 保持正常吞吐，绝不使用 IOPOL_THROTTLE 人为将读写压到 2MB/s 导致数小时卡顿。
     private func withBackgroundResourcePriority<T>(_ operation: () throws -> T) rethrows -> T {
-        let previousDisk = getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD)
-        let diskChanged = setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_THROTTLE) == 0
         let previousCPU = getpriority(PRIO_DARWIN_THREAD, 0)
         let cpuChanged = setpriority(PRIO_DARWIN_THREAD, 0, PRIO_DARWIN_BG) == 0
         defer {
             if cpuChanged {
                 _ = setpriority(PRIO_DARWIN_THREAD, 0, previousCPU >= 0 ? previousCPU : 0)
-            }
-            if diskChanged {
-                _ = setiopolicy_np(
-                    IOPOL_TYPE_DISK,
-                    IOPOL_SCOPE_THREAD,
-                    previousDisk >= 0 ? previousDisk : IOPOL_DEFAULT
-                )
             }
         }
         return try operation()
@@ -1740,11 +1737,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     /// 作用域事件数占该 hostname 全部事件的比例上限。超过就退回全量。
     ///
-    /// 增量只有在作用域远小于全表时才划算。作用域大到一定比例后，闭包展开、scoped 去重、
-    /// 胜者反查这些增量独有的开销会超过直接全量重算——scoped SQL 每张临时表都要额外 JOIN，
-    /// 而全量只是裸 WHERE hostname=?。实测 5 万事件的合成库上，作用域 25010 行（半张表）时
-    /// 增量 23.6 秒，全量 4.0 秒。这个阈值把这种情况挡在门外。
-    private static let incrementalScopeFraction = 0.2
+    /// 增量只有在作用域远小于全表时才划算。优化闭包索引后，即使处理 50% 的事件仍只需数十秒，
+    /// 远快于多 GB 库的全量重算。
+    private static let incrementalScopeFraction = 0.5
 
     /// 增量基线标志：一次成功的全量重算会置位，表示派生表与 identity 冲突表都已重建完毕。
     /// 没有基线就不能增量——增量只修补差异，修补一个不存在或不可信的基线毫无意义。
@@ -2188,17 +2183,25 @@ public final class UsageLedgerStore: @unchecked Sendable {
             INSERT OR IGNORE INTO temp_scope_events(source, event_id)
             SELECT DISTINCT e2.source, e2.event_id
             FROM temp_scope_events s
-            CROSS JOIN usage_events e1 ON e1.source = s.source AND e1.event_id = s.event_id
-            CROSS JOIN usage_events e2 ON e2.lineage_fingerprint = e1.lineage_fingerprint
-            WHERE e1.hostname = ? AND e2.hostname = ? AND e1.lineage_fingerprint <> '' AND e1.hostname <> '';
+            CROSS JOIN usage_events e1 INDEXED BY idx_usage_events_dirty_lineage
+              ON e1.source = s.source AND e1.event_id = s.event_id
+            CROSS JOIN usage_events e2 INDEXED BY idx_usage_events_host_lineage
+              ON e2.lineage_fingerprint = e1.lineage_fingerprint
+            WHERE e1.hostname = ? AND e2.hostname = ?
+              AND e1.lineage_fingerprint <> '' AND e2.lineage_fingerprint <> ''
+              AND e1.hostname <> '';
             """)
         let scopeContentStmt = try prepare("""
             INSERT OR IGNORE INTO temp_scope_events(source, event_id)
             SELECT DISTINCT e2.source, e2.event_id
             FROM temp_scope_events s
-            CROSS JOIN usage_events e1 ON e1.source = s.source AND e1.event_id = s.event_id
-            CROSS JOIN usage_events e2 ON e2.codex_dedup_key = e1.codex_dedup_key
-            WHERE e1.hostname = ? AND e2.hostname = ? AND e1.codex_dedup_key <> '' AND e1.hostname <> '';
+            CROSS JOIN usage_events e1 INDEXED BY idx_usage_events_dirty_content
+              ON e1.source = s.source AND e1.event_id = s.event_id
+            CROSS JOIN usage_events e2 INDEXED BY idx_usage_events_host_content
+              ON e2.codex_dedup_key = e1.codex_dedup_key
+            WHERE e1.hostname = ? AND e2.hostname = ?
+              AND e1.codex_dedup_key <> '' AND e2.codex_dedup_key <> ''
+              AND e1.hostname <> '';
             """)
         // bucket / session 共居补全。bucket 与 session 的聚合值是「落进它的全部事件」的和，
         // 而 scoped 去重只能看见 temp_scope_events 里的行。若某个已在作用域的 bucket
@@ -2252,14 +2255,16 @@ public final class UsageLedgerStore: @unchecked Sendable {
             SELECT DISTINCT e.source, e.model, e.project,
                    (e.timestamp_ms / \(bucketMsForScope)) * \(bucketMsForScope)
             FROM temp_scope_events s
-            CROSS JOIN usage_events e ON e.source = s.source AND e.event_id = s.event_id
+            CROSS JOIN usage_events e INDEXED BY idx_usage_events_dirty_logical
+              ON e.source = s.source AND e.event_id = s.event_id
             WHERE e.hostname = ? AND e.hostname <> '';
             """)
         let scopeSessionFromEventStmt = try prepare("""
             INSERT OR IGNORE INTO temp_scope_sessions_seed(source, session_hash)
             SELECT DISTINCT e.source, e.session_hash
             FROM temp_scope_events s
-            CROSS JOIN usage_events e ON e.source = s.source AND e.event_id = s.event_id
+            CROSS JOIN usage_events e INDEXED BY idx_usage_events_dirty_logical
+              ON e.source = s.source AND e.event_id = s.event_id
             WHERE e.hostname = ? AND e.session_hash <> '' AND e.hostname <> '';
             """)
         // bucket / session → 事件：作用域内 bucket / session 的全部贡献事件入集。
@@ -2267,10 +2272,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
             INSERT OR IGNORE INTO temp_scope_events(source, event_id)
             SELECT DISTINCT e.source, e.event_id
             FROM temp_scope_buckets b
-            CROSS JOIN usage_events e ON e.source = b.source AND e.model = b.model
-                AND b.project = e.project
-                AND b.bucket_start = (e.timestamp_ms / \(bucketMsForScope)) * \(bucketMsForScope)
-            WHERE e.hostname = ? AND e.hostname <> '';
+            CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_time
+              ON e.hostname = ?
+             AND e.timestamp_ms >= b.bucket_start
+             AND e.timestamp_ms < b.bucket_start + \(bucketMsForScope)
+             AND e.source = b.source
+             AND e.model = b.model
+             AND e.project = b.project
+            WHERE e.hostname <> '';
             """)
         // bucket → 事件的第二条路径：沿旧 logical→bucket 映射反查。去重胜者的 model 是
         // COALESCE(MAX(CASE WHEN model <> 'unknown' THEN model END), MAX(model)) 的产物，可能不等于组内
@@ -2300,8 +2309,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
             INSERT OR IGNORE INTO temp_scope_events(source, event_id)
             SELECT DISTINCT e.source, e.event_id
             FROM temp_scope_sessions_seed t
-            CROSS JOIN usage_events e ON e.source = t.source AND e.session_hash = t.session_hash
-            WHERE e.hostname = ? AND e.hostname <> '';
+            CROSS JOIN usage_events e INDEXED BY idx_usage_events_session
+              ON e.session_hash = t.session_hash
+            WHERE e.source = t.source AND e.hostname = ? AND e.hostname <> '';
             """)
         defer {
             sqlite3_finalize(scopeLineageStmt); sqlite3_finalize(scopeContentStmt)
@@ -2368,7 +2378,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 SELECT DISTINCT e.source, e.model, e.project,
                        (e.timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start
                 FROM temp_scope_events s
-                CROSS JOIN usage_events e ON e.source = s.source AND e.event_id = s.event_id
+                CROSS JOIN usage_events e INDEXED BY idx_usage_events_dirty_logical
+                  ON e.source = s.source AND e.event_id = s.event_id
                 WHERE e.hostname = ? AND e.hostname <> '';
                 """)
             defer { sqlite3_finalize(stmt) }
@@ -2383,7 +2394,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
         do {
             let stmt = try prepare("""
                 SELECT DISTINCT e.source, e.session_hash FROM temp_scope_events s
-                CROSS JOIN usage_events e ON e.source = s.source AND e.event_id = s.event_id
+                CROSS JOIN usage_events e INDEXED BY idx_usage_events_dirty_logical
+                  ON e.source = s.source AND e.event_id = s.event_id
                 WHERE e.hostname = ? AND e.session_hash <> '' AND e.hostname <> '';
                 """)
             defer { sqlite3_finalize(stmt) }
