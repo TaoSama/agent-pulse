@@ -449,6 +449,139 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
+    /// 批量捕获一组转为 missing 的文件当前在册原始行对应的脏键。
+    ///
+    /// `markFilesMissing(source:presentFileIDs:)` 可能一次性让成千上万个历史 checkpoint 从
+    /// active 转为 missing；逐文件调用 `recordDirtyKeysForFileUnlocked` 会对三张 raw 表重复做
+    /// indexed lookup。这里先把 transitioned fileID 放进临时表，再用少数几条 set-based SQL
+    /// 一次性登记相同的 logical / session / edit / bucket 键。
+    ///
+    /// 注意这里故意不直接登记 lineage/content 键：mark missing 只改变文件 tier，raw 行仍在，
+    /// logical 键足以在闭包传播阶段重新推导出这些行所属的 lineage/content 组。把每一行的
+    /// lineage/content 也提前塞进 dirty 表，会在大规模历史文件转 missing 时制造数十万冗余种子，
+    /// 让增量 finalize 在闭包传播前就退化成长时间全表级索引遍历。
+    private func recordMissingFileDirtyKeysUnlocked(fileIDs: [String], hostname: String) throws {
+        guard !fileIDs.isEmpty else { return }
+        try exec("CREATE TEMP TABLE IF NOT EXISTS temp_usage_dirty_files(file_id TEXT PRIMARY KEY) WITHOUT ROWID;")
+        try exec("DELETE FROM temp_usage_dirty_files;")
+        let insertFile = try prepare("INSERT OR IGNORE INTO temp_usage_dirty_files(file_id) VALUES(?);")
+        defer { sqlite3_finalize(insertFile) }
+        for fileID in fileIDs where !fileID.isEmpty {
+            sqlite3_reset(insertFile); sqlite3_clear_bindings(insertFile)
+            try bind(insertFile, 1, fileID)
+            try done(insertFile)
+        }
+
+        let nowMs = millis(Date())
+        let separator = "\u{1}"
+        let bucketMs = Self.bucketMilliseconds
+
+        if try tableExistsUnlocked("usage_events") {
+            let logical = try prepare("""
+                INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms)
+                SELECT DISTINCT ?, ?, e.source || ? || e.event_id, ?
+                FROM temp_usage_dirty_files f
+                CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_file
+                  ON e.hostname=? AND e.source_file_hash = f.file_id;
+                """)
+            defer { sqlite3_finalize(logical) }
+            try bind(logical, 1, hostname)
+            try bind(logical, 2, DirtyKeyKind.logical.rawValue)
+            try bind(logical, 3, separator)
+            try bind(logical, 4, nowMs)
+            try bind(logical, 5, hostname)
+            try done(logical)
+
+            let eventSessions = try prepare("""
+                INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms)
+                SELECT DISTINCT ?, ?, e.source || ? || e.session_hash, ?
+                FROM temp_usage_dirty_files f
+                CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_file
+                  ON e.hostname=? AND e.source_file_hash = f.file_id;
+                """)
+            defer { sqlite3_finalize(eventSessions) }
+            try bind(eventSessions, 1, hostname)
+            try bind(eventSessions, 2, DirtyKeyKind.session.rawValue)
+            try bind(eventSessions, 3, separator)
+            try bind(eventSessions, 4, nowMs)
+            try bind(eventSessions, 5, hostname)
+            try done(eventSessions)
+
+            let eventBuckets = try prepare("""
+                INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms)
+                SELECT DISTINCT ?, ?, e.source || ? || e.model || ? || e.project || ? || CAST((e.timestamp_ms / ?) * ? AS TEXT), ?
+                FROM temp_usage_dirty_files f
+                CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_file
+                  ON e.hostname=? AND e.source_file_hash = f.file_id;
+                """)
+            defer { sqlite3_finalize(eventBuckets) }
+            try bind(eventBuckets, 1, hostname)
+            try bind(eventBuckets, 2, DirtyKeyKind.bucket.rawValue)
+            try bind(eventBuckets, 3, separator)
+            try bind(eventBuckets, 4, separator)
+            try bind(eventBuckets, 5, separator)
+            try bind(eventBuckets, 6, bucketMs)
+            try bind(eventBuckets, 7, bucketMs)
+            try bind(eventBuckets, 8, nowMs)
+            try bind(eventBuckets, 9, hostname)
+            try done(eventBuckets)
+        }
+
+        if try tableExistsUnlocked("usage_session_events") {
+            let sessions = try prepare("""
+                INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms)
+                SELECT DISTINCT ?, ?, s.source || ? || s.session_hash, ?
+                FROM usage_session_events s
+                JOIN temp_usage_dirty_files f ON f.file_id = s.source_file_hash
+                WHERE s.hostname=?;
+                """)
+            defer { sqlite3_finalize(sessions) }
+            try bind(sessions, 1, hostname)
+            try bind(sessions, 2, DirtyKeyKind.session.rawValue)
+            try bind(sessions, 3, separator)
+            try bind(sessions, 4, nowMs)
+            try bind(sessions, 5, hostname)
+            try done(sessions)
+        }
+
+        if try tableExistsUnlocked("usage_edit_entries") {
+            let editTools = try prepare("""
+                INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms)
+                SELECT DISTINCT ?, ?, e.tool_use_id, ?
+                FROM usage_edit_entries e
+                JOIN temp_usage_dirty_files f ON f.file_id = e.source_file_hash
+                WHERE e.hostname=? AND e.tool_use_id <> '';
+                """)
+            defer { sqlite3_finalize(editTools) }
+            try bind(editTools, 1, hostname)
+            try bind(editTools, 2, DirtyKeyKind.editTool.rawValue)
+            try bind(editTools, 3, nowMs)
+            try bind(editTools, 4, hostname)
+            try done(editTools)
+
+            let editBuckets = try prepare("""
+                INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms)
+                SELECT DISTINCT ?, ?, e.source || ? || e.model || ? || e.project || ? || CAST((e.timestamp_ms / ?) * ? AS TEXT), ?
+                FROM usage_edit_entries e
+                JOIN temp_usage_dirty_files f ON f.file_id = e.source_file_hash
+                WHERE e.hostname=?;
+                """)
+            defer { sqlite3_finalize(editBuckets) }
+            try bind(editBuckets, 1, hostname)
+            try bind(editBuckets, 2, DirtyKeyKind.bucket.rawValue)
+            try bind(editBuckets, 3, separator)
+            try bind(editBuckets, 4, separator)
+            try bind(editBuckets, 5, separator)
+            try bind(editBuckets, 6, bucketMs)
+            try bind(editBuckets, 7, bucketMs)
+            try bind(editBuckets, 8, nowMs)
+            try bind(editBuckets, 9, hostname)
+            try done(editBuckets)
+        }
+
+        try exec("DELETE FROM temp_usage_dirty_files;")
+    }
+
     /// 把某 fileID 当前在册的原始行的去重键与 session 键全部登记为脏。
     ///
     /// 必须在 deleteRawForFileUnlocked 之前调用一次（捕获即将消失的旧行），插入新行之后再调用一次
@@ -1142,11 +1275,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
         progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
     ) throws -> UsageFinalizeResult {
         try queue.sync {
+            try ensurePerformanceIndexesUnlocked()
             var result = UsageFinalizeResult(reportingEligible: true, blockedReasons: [], collapsedInheritedEvents: 0)
             var didCompact = false
             try transaction {
                 try claimLegacyRawRowsIfUnambiguousUnlocked(hostname: hostname)
                 try discardLegacyNetworkDirtyKeysUnlocked(hostname: hostname)
+                try discardNoOpMissingFileDirtyKeysUnlocked(hostname: hostname)
+                try discardRedundantGroupDirtyKeysUnlocked(hostname: hostname)
                 result = try withBackgroundResourcePriority {
                     try recomputeDispatchUnlocked(hostname: hostname, strategy: strategy, progress: progress)
                 }
@@ -1602,11 +1738,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 逐 bucket 差异写反而比一次全表 GROUP BY 慢，直接回退。
     private static let incrementalBucketLimit = 5000
 
-    /// 增量 dirty key 数上限。闭包传播必须先把所有 dirty logical/lineage/content 键展开；
-    /// 当文件重扫一次性产生大量脏键时，传播自身就会比全量重算更慢，甚至长时间占住扫描事务。
-    /// 超过该值直接走全量，保持扫描/上报关键路径可预期。
-    private static let incrementalDirtyKeyLimit = 50_000
-
     /// 作用域事件数占该 hostname 全部事件的比例上限。超过就退回全量。
     ///
     /// 增量只有在作用域远小于全表时才划算。作用域大到一定比例后，闭包展开、scoped 去重、
@@ -1711,18 +1842,142 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try done(statement)
     }
 
-    private func dirtyKeyCountExceedsUnlocked(hostname: String, limit: Int) throws -> Bool {
-        guard try tableExistsUnlocked("usage_dirty_keys") else { return false }
-        let statement = try prepare("""
-            SELECT COUNT(*) FROM (
-              SELECT 1 FROM usage_dirty_keys WHERE hostname=? LIMIT ?
-            );
+    /// Missing checkpoints do not remove raw rows; they only lower file attribution tier from
+    /// active to history. For a logical event that appears in exactly one raw file, that tier
+    /// change cannot alter the logical winner or any downstream aggregate. Older builds marked
+    /// every row in every missing file dirty, creating huge no-op dirty sets on long-lived
+    /// ledgers. Trim only those provably singleton missing logical keys before propagation.
+    private func discardNoOpMissingFileDirtyKeysUnlocked(hostname: String) throws {
+        guard try tableExistsUnlocked("usage_dirty_keys"),
+              try tableExistsUnlocked("usage_events"),
+              try tableExistsUnlocked("usage_files")
+        else { return }
+
+        try exec("DROP TABLE IF EXISTS temp_noop_missing_logical;")
+        try exec("""
+            CREATE TEMP TABLE temp_noop_missing_logical(
+                source TEXT NOT NULL, event_id TEXT NOT NULL, lineage TEXT NOT NULL, content TEXT NOT NULL,
+                PRIMARY KEY(source,event_id)
+            ) WITHOUT ROWID;
             """)
-        defer { sqlite3_finalize(statement) }
-        try bind(statement, 1, hostname)
-        try bind(statement, 2, Int64(limit + 1))
-        guard sqlite3_step(statement) == SQLITE_ROW else { throw error() }
-        return sqlite3_column_int64(statement, 0) > Int64(limit)
+        defer { try? exec("DROP TABLE IF EXISTS temp_noop_missing_logical;") }
+
+        let insert = try prepare("""
+            INSERT OR IGNORE INTO temp_noop_missing_logical(source,event_id,lineage,content)
+            SELECT e.source, e.event_id, e.lineage_fingerprint, e.codex_dedup_key
+            FROM usage_dirty_keys d
+            CROSS JOIN usage_events e ON e.source = substr(d.key, 1, instr(d.key, char(1)) - 1)
+                AND e.event_id = substr(d.key, instr(d.key, char(1)) + 1)
+            JOIN usage_files f ON f.file_id = e.source_file_hash AND f.scan_status = 'missing'
+            WHERE d.hostname = ? AND d.kind = 'logical' AND instr(d.key, char(1)) > 1
+              AND e.hostname = ? AND e.hostname <> ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM usage_events e2 INDEXED BY idx_usage_events_dirty_logical
+                  WHERE e2.hostname = e.hostname AND e2.source = e.source AND e2.event_id = e.event_id
+                    AND e2.hostname <> ''
+                    AND e2.source_file_hash <> e.source_file_hash
+              );
+            """)
+        defer { sqlite3_finalize(insert) }
+        try bind(insert, 1, hostname)
+        try bind(insert, 2, hostname)
+        try done(insert)
+
+        let deleteLogical = try prepare("""
+            DELETE FROM usage_dirty_keys
+            WHERE hostname = ? AND kind = 'logical'
+              AND EXISTS (
+                  SELECT 1 FROM temp_noop_missing_logical n
+                  WHERE usage_dirty_keys.key = n.source || char(1) || n.event_id
+              );
+            """)
+        defer { sqlite3_finalize(deleteLogical) }
+        try bind(deleteLogical, 1, hostname)
+        try done(deleteLogical)
+
+        let deleteLineage = try prepare("""
+            DELETE FROM usage_dirty_keys
+            WHERE hostname = ? AND kind = 'lineage' AND key <> ''
+              AND EXISTS (SELECT 1 FROM temp_noop_missing_logical n WHERE n.lineage = usage_dirty_keys.key)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM usage_events e INDEXED BY idx_usage_events_host_lineage
+                  JOIN usage_dirty_keys d ON d.hostname = usage_dirty_keys.hostname
+                    AND d.kind = 'logical'
+                    AND d.key = e.source || char(1) || e.event_id
+                  WHERE e.hostname = usage_dirty_keys.hostname
+                    AND e.lineage_fingerprint = usage_dirty_keys.key
+                    AND e.lineage_fingerprint <> ''
+              );
+            """)
+        defer { sqlite3_finalize(deleteLineage) }
+        try bind(deleteLineage, 1, hostname)
+        try done(deleteLineage)
+
+        let deleteContent = try prepare("""
+            DELETE FROM usage_dirty_keys
+            WHERE hostname = ? AND kind = 'content' AND key <> ''
+              AND EXISTS (SELECT 1 FROM temp_noop_missing_logical n WHERE n.content = usage_dirty_keys.key)
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM usage_events e INDEXED BY idx_usage_events_host_content
+                  JOIN usage_dirty_keys d ON d.hostname = usage_dirty_keys.hostname
+                    AND d.kind = 'logical'
+                    AND d.key = e.source || char(1) || e.event_id
+                  WHERE e.hostname = usage_dirty_keys.hostname
+                    AND e.codex_dedup_key = usage_dirty_keys.key
+                    AND e.codex_dedup_key <> ''
+              );
+            """)
+        defer { sqlite3_finalize(deleteContent) }
+        try bind(deleteContent, 1, hostname)
+        try done(deleteContent)
+    }
+
+    /// Older builds eagerly stored lineage/content dirty keys for every row in files that merely
+    /// transitioned to missing. Those group keys are redundant whenever a logical dirty key for
+    /// the same raw row is also present: dirty propagation recomputes lineage/content from the
+    /// logical seed using the raw row that is still retained for missing files. Removing only the
+    /// provably-covered group seeds preserves orphan lineage/content keys that may be the sole
+    /// evidence after a file-level raw delete, while avoiding hundreds of thousands of redundant
+    /// propagation seeds on large ledgers.
+    private func discardRedundantGroupDirtyKeysUnlocked(hostname: String) throws {
+        guard try tableExistsUnlocked("usage_dirty_keys"), try tableExistsUnlocked("usage_events") else { return }
+        let deleteLineage = try prepare("""
+            DELETE FROM usage_dirty_keys
+            WHERE hostname = ? AND kind = 'lineage'
+              AND EXISTS (
+                  SELECT 1
+                  FROM usage_events e INDEXED BY idx_usage_events_host_lineage
+                  JOIN usage_dirty_keys d ON d.hostname = usage_dirty_keys.hostname
+                    AND d.kind = 'logical'
+                    AND d.key = e.source || char(1) || e.event_id
+                  WHERE e.hostname = usage_dirty_keys.hostname
+                    AND e.lineage_fingerprint = usage_dirty_keys.key
+                    AND e.lineage_fingerprint <> ''
+              );
+            """)
+        defer { sqlite3_finalize(deleteLineage) }
+        try bind(deleteLineage, 1, hostname)
+        try done(deleteLineage)
+
+        let deleteContent = try prepare("""
+            DELETE FROM usage_dirty_keys
+            WHERE hostname = ? AND kind = 'content'
+              AND EXISTS (
+                  SELECT 1
+                  FROM usage_events e INDEXED BY idx_usage_events_host_content
+                  JOIN usage_dirty_keys d ON d.hostname = usage_dirty_keys.hostname
+                    AND d.kind = 'logical'
+                    AND d.key = e.source || char(1) || e.event_id
+                  WHERE e.hostname = usage_dirty_keys.hostname
+                    AND e.codex_dedup_key = usage_dirty_keys.key
+                    AND e.codex_dedup_key <> ''
+              );
+            """)
+        defer { sqlite3_finalize(deleteContent) }
+        try bind(deleteContent, 1, hostname)
+        try done(deleteContent)
     }
 
     private func derivedHasAnyRowUnlocked(hostname: String) throws -> Bool {
@@ -1744,6 +1999,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// - 派生层无行：没有可修补的基线。
     /// - 冻结水位非 0：冻结区原始行可能已被 compact 物理删除，去重组在原始层已不完整，
     ///   闭包展开会漏掉被删成员；且全量对冻结区 bucket 跳过差异写，复现这套语义不划算。
+    ///
+    /// 不再用 dirty-key 数量做前置早退：missing 文件和文件级 replace 会一次性登记大量
+    /// lineage/content/logical 键，但真实受影响的 bucket / session 可能很小。增量路径内部
+    /// 会在闭包展开过程中按事件作用域比例和 bucket 数上限回退，全量重算只应由真实作用域决定。
     private func canRecomputeIncrementallyUnlocked(hostname: String) throws -> Bool {
         guard try tableExistsUnlocked("usage_dirty_keys") else { return false }
         guard try tableExistsUnlocked("usage_identity_conflicts") else { return false }
@@ -1751,7 +2010,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
         guard try readTextUnlocked(key: Self.incrementalBaselineKey) != nil else { return false }
         guard try readTextUnlocked(key: Self.rebuildPendingKey) == nil else { return false }
         guard try frozenBeforeMsUnlocked(hostname) == 0 else { return false }
-        guard try !dirtyKeyCountExceedsUnlocked(hostname: hostname, limit: Self.incrementalDirtyKeyLimit) else { return false }
         return try derivedHasAnyRowUnlocked(hostname: hostname)
     }
 
@@ -4004,12 +4262,18 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
+    /// 准备后台扫描所需的大表性能索引。调用方应在后台队列执行，避免阻塞 App 初始化。
+    public func prepareForUsageScan() throws {
+        try queue.sync { try ensurePerformanceIndexesUnlocked() }
+    }
+
     /// 标记一批磁盘上已消失的文件为 checkpoint missing，但绝不删除其原始行或派生历史。
     /// 删除源文件不应由 record 自动删历史；本 API 仅把这些 fileID 的 scan_status 置 "missing"，
     /// 保留 raw 以维持历史与去重口径。未登记的 fileID 忽略。
     public func markFilesMissing(fileIDs: [String], hostname: String) throws {
         guard !fileIDs.isEmpty else { return }
         try queue.sync {
+            try ensurePerformanceIndexesUnlocked()
             try transaction {
                 // 只更新真正还不是 missing 的行：未登记的 fileID 与已经 missing 的行都不存在 tier 变化，
                 // 若也置脏位就会让下一轮扫描白跑一次全库重算。
@@ -4027,10 +4291,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 // 从 ownedActive 降为 ownedHistory，可能改变 logical dedup 选中的行。
                 // 不置脏位则派生表会一直沿用旧 tier 的结果。
                 guard !transitioned.isEmpty else { return }
-                // raw 行仍在（本方法只改 checkpoint 状态），所以此刻还能读出它们的去重键。
-                for fileID in transitioned {
-                    try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
-                }
+                // raw 行仍在（本方法只改 checkpoint 状态），所以此刻还能批量读出它们的去重键。
+                try recordMissingFileDirtyKeysUnlocked(fileIDs: transitioned, hostname: hostname)
                 try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
             }
         }
@@ -4043,6 +4305,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         guard !normalizedSource.isEmpty else { throw UsageLedgerError.invalidCheckpoint }
         let present = Set(presentFileIDs)
         try queue.sync {
+            try ensurePerformanceIndexesUnlocked()
             try transaction {
                 let read = try prepare("SELECT file_id FROM usage_files WHERE source=? AND scan_status<>'missing';")
                 defer { sqlite3_finalize(read) }
@@ -4064,11 +4327,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     try bind(update, 1, nowMs); try bind(update, 2, normalizedSource); try bind(update, 3, fileID)
                     try done(update)
                 }
-                // raw 行仍在（本方法只改 checkpoint 状态），此刻还能读出这些文件的去重键，
+                // raw 行仍在（本方法只改 checkpoint 状态），此刻还能批量读出这些文件的去重键，
                 // 供增量 finalize 还原受 tier 变化影响的 bucket/session。
-                for fileID in missing {
-                    try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
-                }
+                try recordMissingFileDirtyKeysUnlocked(fileIDs: missing, hostname: hostname)
                 // 只有真的有文件转 missing 时才置脏位（上面已 guard 空集提前返回），
                 // 否则每轮扫描都会退化成全库重算。
                 try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
@@ -4224,9 +4485,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 try exec("PRAGMA user_version=10;")
             }
         }
-        // 版本无关的性能索引与增量脏键表:每次 open 幂等补建(v10 库不再走 v8 rebuild 建索引路径)。
+        // 版本无关的轻量元数据表/索引:每次 open 幂等补建。raw 大表性能索引只在后台派生前创建，
+        // 避免存量大库升级时在 App 主线程初始化阶段同步 CREATE INDEX。
         try transaction {
-            try ensurePerformanceIndexesUnlocked()
+            try ensureEssentialMetadataUnlocked()
         }
     }
 
@@ -4444,10 +4706,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    /// 幂等地补建性能索引与增量 finalize 的脏键表。`migrate()` 末尾无条件调用:v10 库的 `migrate()`
-    /// 不再走 v8 rebuild 的建索引路径,存量库要靠这里补上新索引。仅当目标表存在时建索引(兼容极简
-    /// fixture)。9.4G 库首次建索引一次性发生在此(WAL + temp_store=FILE),之后每轮省去全表排序。
-    private func ensurePerformanceIndexesUnlocked() throws {
+    /// 幂等地补建启动路径必需的轻量元数据。不得在这里触碰 usage_events 等 raw 大表索引：
+    /// UsageLedgerStore.init 可能在 App 主线程运行，存量大库上同步 CREATE INDEX 会造成冷启动假死。
+    private func ensureEssentialMetadataUnlocked() throws {
         if try tableExistsUnlocked("usage_files") {
             try exec("""
                 CREATE INDEX IF NOT EXISTS idx_usage_files_source_status
@@ -4461,11 +4722,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 CREATE INDEX IF NOT EXISTS idx_usage_buckets_host_window
                 ON usage_buckets(hostname,bucket_start_ms,model);
                 """)
-        }
-        for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
-            guard try tableExistsUnlocked(table) else { continue }
-            let sql = Self.performanceIndexSQL(for: table)
-            if !sql.isEmpty { try exec(sql) }
         }
         // 增量 finalize 的脏键表:record 事务内记录本轮受影响的去重/自然键,供 finalizeDerivedIncremental
         // 只重算受影响 bucket/session。自然键含 hostname,与派生单机口径一致。
@@ -4499,6 +4755,15 @@ public final class UsageLedgerStore: @unchecked Sendable {
             CREATE INDEX IF NOT EXISTS idx_logical_bucket_map_bucket
             ON usage_logical_bucket_map(hostname,bucket_model,bucket_project,bucket_start,source);
             """)
+    }
+
+    /// 幂等地补建 raw 大表性能索引。只在后台 scan/finalize 路径调用，避免阻塞 App 初始化。
+    private func ensurePerformanceIndexesUnlocked() throws {
+        for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
+            guard try tableExistsUnlocked(table) else { continue }
+            let sql = Self.performanceIndexSQL(for: table)
+            if !sql.isEmpty { try exec(sql) }
+        }
     }
 
     private func tableExistsUnlocked(_ table: String) throws -> Bool {

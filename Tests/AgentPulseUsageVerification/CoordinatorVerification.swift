@@ -107,6 +107,12 @@ enum CoordinatorVerification {
                 && source.contains("maximumParserBackfillBytesPerSourceScan"),
             "scan 未对首次历史采集和 parser-only 回填设置字节/时间预算"
         )
+        let prepareUsageScanOffset = try offset(of: "try ledger.prepareForUsageScan()", in: scanBody)
+        let scanRootsOffset = try offset(of: "var scanRoots:", in: scanBody)
+        try require(
+            prepareUsageScanOffset < scanRootsOffset,
+            "scanNow 必须在后台扫描路径、文件枚举前补齐 raw 性能索引，避免 App 初始化阻塞"
+        )
 
         // applyScanProgress：generation + scanningInProgress 双重门禁。
         let apply = try functionBody(named: "applyScanProgress", in: source)

@@ -486,6 +486,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     try ledger.beginParserRebuild(targetParserVersion: currentParserVersion)
                 }
                 try gate.throwIfCancelled()
+                try ledger.prepareForUsageScan()
+                try gate.throwIfCancelled()
                 // 进入 scanning 阶段：先枚举全部来源 root 的 jsonl 总数作为进度分母，
                 // 再逐文件处理并回报（已处理/总数）。totalFiles 为 0 时进度按阶段权重阶跃。
                 let localSources = Self.loadLocalCollectionSources(url: localSourcesURL)

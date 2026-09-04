@@ -40,6 +40,7 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyRecordNetworkEventsDoesNotDirtyHistoricalEvents()
         try verifier.verifyLegacyNetworkDirtyKeysAreDiscarded()
         try verifier.verifyLargeDirtyKeySetFallsBackToFullRecompute()
+        try verifier.verifyMissingFilesRecordDirtyKeysInBulk()
         try verifier.verifyRawFileDirtyQueriesUseHostFileIndexes()
         try verifier.verifyFrozenCompactionPreservesTotalsAndDropsRaw()
         try verifier.verifyFrozenLateEventsAreDropped()
@@ -71,10 +72,8 @@ private struct MetricsLedgerPipelineVerifier {
             try execute(db, "PRAGMA user_version=6;")
         }
 
-        do {
-            let ledger = try UsageLedgerStore(path: database.path)
-            try require(try ledger.eventCount() == 1, "migrated ledger must retain the legacy event")
-        }
+        let ledger = try UsageLedgerStore(path: database.path)
+        try require(try ledger.eventCount() == 1, "migrated ledger must retain the legacy event")
 
         try withDatabase(database) { db in
             try require(try scalarInt(db, "PRAGMA user_version;") == Int64(UsageLedgerStore.schemaVersion), "legacy v6 database must migrate to the current schema version")
@@ -85,6 +84,27 @@ private struct MetricsLedgerPipelineVerifier {
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='usage_edit_entries';") == 1, "raw edit table must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM pragma_table_info('usage_session_events') WHERE name='source_file_hash';") == 1, "session event file-attribution column must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_session_events WHERE event_id='legacy-se';") == 1, "v8 rebuild must retain legacy session events")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_files_source_status';") == 1, "startup migration must create lightweight usage file source/status index")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='usage_dirty_keys';") == 1, "startup migration must create dirty key metadata table")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='usage_logical_bucket_map';") == 1, "startup migration must create logical bucket metadata table")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_time';") == 0, "startup migration must defer raw usage event indexes off the app initialization path")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_tool_counts';") == 0, "startup migration must defer raw tool-count index off the app initialization path")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_lineage';") == 0, "startup migration must defer raw host/lineage index off the app initialization path")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_content';") == 0, "startup migration must defer raw host/content index off the app initialization path")
+        }
+
+        let finalizeDatabase = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: finalizeDatabase) }
+        let finalizeLedger = try UsageLedgerStore(path: finalizeDatabase.path)
+        let ts = try date("2026-08-14T01:05:00Z")
+        try finalizeLedger.record(
+            events: [tokenEvent(id: "finalize-index", source: "codex", session: "session-a", file: "file-a", ts: ts, input: 1)],
+            checkpoint: completeCheckpoint("file-a", source: "codex", ts: ts),
+            hostname: "host-a"
+        )
+        _ = try finalizeLedger.finalizeDerived(hostname: "host-a")
+
+        try withDatabase(finalizeDatabase) { db in
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_time';") == 1, "stable hostname/time index must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_tool_counts';") == 1, "tool-count partial index must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_files_source_status';") == 1, "usage file source/status index must exist")
@@ -619,10 +639,79 @@ private struct MetricsLedgerPipelineVerifier {
         }
     }
 
+    func verifyMissingFilesRecordDirtyKeysInBulk() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let host = "host-a"
+        let source = "codex"
+        let ts = try date("2026-08-14T01:05:00Z")
+        let sessionEvent = UsageSessionEvent(
+            id: "session-event-a",
+            source: source,
+            sessionHash: "session-a",
+            sourceFileHash: "file-a",
+            role: .assistant,
+            timestamp: ts
+        )
+        let editEntry = UsageEditEntry(
+            source: source,
+            model: "model-a",
+            project: "project-a",
+            sourceFileHash: "file-a",
+            timestamp: ts,
+            added: 3,
+            deleted: 1,
+            toolUseID: "tool-a"
+        )
+        let event = UsageEvent(
+            id: "event-a",
+            source: source,
+            model: "model-a",
+            project: "project-a",
+            timestamp: ts,
+            counts: UsageTokenCounts(input: 10, reportedTotal: 10),
+            sessionHash: "session-a",
+            sourceFileHash: "file-a",
+            hasTotalSnapshot: true,
+            lineageFingerprint: "lineage-a",
+            codexDedupKey: "content-a"
+        )
+        try ledger.record(
+            events: [event],
+            sessionEvents: [sessionEvent],
+            editEntries: [editEntry],
+            checkpoint: completeCheckpoint("file-a", source: source, ts: ts),
+            hostname: host
+        )
+        _ = try ledger.finalizeDerived(hostname: host)
+
+        try ledger.markFilesMissing(source: source, presentFileIDs: [], hostname: host)
+        let logicalKey = "codex\u{1}event-a"
+        let sessionKey = "codex\u{1}session-a"
+        let bucketPrefix = "codex\u{1}model-a\u{1}project-a\u{1}"
+        try withDatabase(database) { db in
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname='host-a' AND kind='logical' AND key='\(logicalKey)';") == 1, "bulk missing must dirty token logical key")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname='host-a' AND kind='lineage' AND key='lineage-a';") == 0, "bulk missing must not store redundant lineage seeds")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname='host-a' AND kind='content' AND key='content-a';") == 0, "bulk missing must not store redundant content seeds")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname='host-a' AND kind='session' AND key='\(sessionKey)';") == 1, "bulk missing must dirty session key")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname='host-a' AND kind='editTool' AND key='tool-a';") == 1, "bulk missing must dirty edit tool key")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname='host-a' AND kind='bucket' AND key LIKE '\(bucketPrefix)%';") == 1, "bulk missing must dirty affected bucket key")
+            try require(try scalarInt(db, "SELECT scan_status='missing' FROM usage_files WHERE file_id='file-a';") == 1, "bulk missing must still mark checkpoint missing")
+        }
+    }
+
     func verifyRawFileDirtyQueriesUseHostFileIndexes() throws {
         let database = try temporaryDatabaseURL()
         defer { cleanupDatabase(at: database) }
-        _ = try UsageLedgerStore(path: database.path)
+        let ledger = try UsageLedgerStore(path: database.path)
+        let ts = try date("2026-08-14T01:05:00Z")
+        try ledger.record(
+            events: [tokenEvent(id: "plan-event", source: "codex", session: "session-a", file: "file-a", ts: ts, input: 1)],
+            checkpoint: completeCheckpoint("file-a", source: "codex", ts: ts),
+            hostname: "host-a"
+        )
+        _ = try ledger.finalizeDerived(hostname: "host-a")
 
         try withDatabase(database) { db in
             let eventPlan = try queryPlanDetails(db, """
@@ -651,6 +740,27 @@ private struct MetricsLedgerPipelineVerifier {
                 FROM usage_edit_entries WHERE hostname='host-a' AND source_file_hash='file-a';
                 """)
             try require(editPlan.contains { $0.contains("idx_usage_edit_entries_host_file_dirty") }, "edit dirty lookup must use the host/file index; plan=\(editPlan)")
+
+            try execute(db, "CREATE TEMP TABLE temp_usage_dirty_files(file_id TEXT PRIMARY KEY) WITHOUT ROWID;")
+            try execute(db, "INSERT INTO temp_usage_dirty_files(file_id) VALUES('file-a');")
+
+            let bulkLogicalPlan = try queryPlanDetails(db, """
+                EXPLAIN QUERY PLAN
+                SELECT DISTINCT e.source, e.event_id
+                FROM temp_usage_dirty_files f
+                CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_file
+                  ON e.hostname='host-a' AND e.source_file_hash = f.file_id;
+                """)
+            try require(bulkLogicalPlan.contains { $0.contains("idx_usage_events_host_file") }, "bulk missing logical capture must force host/file index; plan=\(bulkLogicalPlan)")
+
+            let bulkBucketPlan = try queryPlanDetails(db, """
+                EXPLAIN QUERY PLAN
+                SELECT DISTINCT e.source, e.model, e.project, e.timestamp_ms
+                FROM temp_usage_dirty_files f
+                CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_file
+                  ON e.hostname='host-a' AND e.source_file_hash = f.file_id;
+                """)
+            try require(bulkBucketPlan.contains { $0.contains("idx_usage_events_host_file") }, "bulk missing bucket capture must force host/file index; plan=\(bulkBucketPlan)")
 
             let toolCountPlan = try queryPlanDetails(db, """
                 EXPLAIN QUERY PLAN
