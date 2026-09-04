@@ -42,7 +42,6 @@ public struct ModelTPSHistory: Sendable, Equatable, Identifiable {
 /// 每秒刷新时由样本历史派生的曲线集合。全部为纯计算结果，可在后台线程算好后
 /// 一次性回主线程赋值，避免每秒在主线程重跑总曲线 + 每模型曲线 ×2 套口径。
 private struct DerivedSeries: Sendable {
-    var sparkline: Sparkline
     var modelTPSHistory: [ModelTPSHistory]
     var dashboardSparklinePoints: [SparklinePoint]
     var dashboardModelTPSHistory: [ModelTPSHistory]
@@ -181,23 +180,19 @@ public final class MetricsStore: ObservableObject {
         }
         do {
             let result = try await collector.scan(at: Date())
-            totalTasks = metric(result.totalTasks, partial: result.activeCountsArePartial)
-            activeTasks = metric(result.activeTasks, partial: result.activeCountsArePartial)
-            taskBreakdown = result.taskBreakdown
-            desktopActive = metric(result.desktopActive, partial: result.activeCountsArePartial)
-            terminalActive = metric(result.terminalActive, partial: result.activeCountsArePartial)
+            publish(metric(result.totalTasks, partial: result.activeCountsArePartial), to: \.totalTasks)
+            publish(metric(result.activeTasks, partial: result.activeCountsArePartial), to: \.activeTasks)
+            publish(result.taskBreakdown, to: \.taskBreakdown)
+            publish(metric(result.desktopActive, partial: result.activeCountsArePartial), to: \.desktopActive)
+            publish(metric(result.terminalActive, partial: result.activeCountsArePartial), to: \.terminalActive)
             if let completed = result.completed.value {
-                completedTotal = .partial(completed)
+                publish(.partial(completed), to: \.completedTotal)
             } else {
-                completedTotal = .unavailable(reason: "本地 rollout 不可读")
+                publish(.unavailable(reason: "本地 rollout 不可读"), to: \.completedTotal)
             }
-            completedScope = result.completed.scope
-            completedIsLowerBound = result.completed.isLowerBound
-            let immediateSparkline = SparklineAnalysis.makeSparkline(
-                from: result.history,
-                end: result.sampledAt
-            )
-            publish(immediateSparkline, to: \.sparkline)
+            publish(result.completed.scope, to: \.completedScope)
+            publish(result.completed.isLowerBound, to: \.completedIsLowerBound)
+            // 数字无需等待任何曲线计算；有效变化在当前调用栈同步交给 UI。
             publish(result.liveRate.state, to: \.tpsState)
             publish(metric(from: result.liveRate), to: \.tps)
             tpsHistory = result.history.compactMap { sample in
@@ -207,8 +202,15 @@ public final class MetricsStore: ObservableObject {
             // 看板不重叠桶：缓存较长历史（最多 3600s）供跨度切换即时重算。
             dashboardSampleCache = result.dashboardHistory
             dashboardSampleEnd = result.sampledAt
-            // 总曲线 + 每模型曲线 ×2 套口径都是无 UI 依赖的纯计算。放到后台线程算好，
-            // 主线程只做一次批量赋值，避免每秒在 MainActor 上重跑整批 sparkline 管线。
+            lastRefresh = result.sampledAt
+            publish(false, to: \.isShowingCachedSnapshot)
+            publish(result.unreadableFiles > 0
+                ? "有 \(result.unreadableFiles) 个 rollout 文件不可读，计数为下界"
+                : nil, to: \.collectionWarning)
+            // 总曲线在后台只算一次，优先发布，不等待分模型与看板派生。
+            let primary = await Self.derivePrimarySeries(history: result.history, end: result.sampledAt)
+            guard !Task.isCancelled else { return }
+            publish(primary, to: \.sparkline)
             let span = dashboardSpan
             let derived = await Self.deriveSeries(
                 history: result.history,
@@ -218,14 +220,13 @@ public final class MetricsStore: ObservableObject {
                 model: makeModelTPSHistory,
                 dashboardModel: makeDashboardModelTPSHistory
             )
-            modelTPSHistory = derived.modelTPSHistory
-            dashboardSparklinePoints = derived.dashboardSparklinePoints
-            dashboardModelTPSHistory = derived.dashboardModelTPSHistory
-            lastRefresh = result.sampledAt
-            isShowingCachedSnapshot = false
-            collectionWarning = result.unreadableFiles > 0
-                ? "有 \(result.unreadableFiles) 个 rollout 文件不可读，计数为下界"
-                : nil
+            guard !Task.isCancelled else { return }
+            publish(derived.modelTPSHistory, to: \.modelTPSHistory)
+            // 派生期间用户可能切换跨度，不能覆盖已经显示的新跨度。
+            if span == dashboardSpan {
+                publish(derived.dashboardSparklinePoints, to: \.dashboardSparklinePoints)
+                publish(derived.dashboardModelTPSHistory, to: \.dashboardModelTPSHistory)
+            }
         } catch {
             applyUnavailable(reason: "采集或持久化失败：\(Self.safeErrorDescription(error))")
         }
@@ -262,20 +263,20 @@ public final class MetricsStore: ObservableObject {
     }
 
     private func applyUnavailable(reason: String) {
-        totalTasks = .unavailable(reason: reason)
-        activeTasks = .unavailable(reason: reason)
-        taskBreakdown = .unavailable
-        desktopActive = .unavailable(reason: reason)
-        completedTotal = .unavailable(reason: reason)
-        completedScope = .allLocal
-        completedIsLowerBound = false
-        terminalActive = .unavailable(reason: reason)
+        publish(.unavailable(reason: reason), to: \.totalTasks)
+        publish(.unavailable(reason: reason), to: \.activeTasks)
+        publish(.unavailable, to: \.taskBreakdown)
+        publish(.unavailable(reason: reason), to: \.desktopActive)
+        publish(.unavailable(reason: reason), to: \.completedTotal)
+        publish(.allLocal, to: \.completedScope)
+        publish(false, to: \.completedIsLowerBound)
+        publish(.unavailable(reason: reason), to: \.terminalActive)
         publish(.unavailable(reason: reason), to: \.tps)
         publish(.unavailable, to: \.tpsState)
-        modelTPSHistory = []
-        dashboardSparklinePoints = []
-        dashboardModelTPSHistory = []
-        collectionWarning = reason
+        publish([], to: \.modelTPSHistory)
+        publish([], to: \.dashboardSparklinePoints)
+        publish([], to: \.dashboardModelTPSHistory)
+        publish(reason, to: \.collectionWarning)
         lastRefresh = Date()
     }
 
@@ -294,13 +295,11 @@ public final class MetricsStore: ObservableObject {
         }
         completedScope = snapshot.completed.scope
         completedIsLowerBound = snapshot.completed.isLowerBound
-        let sparkline = SparklineAnalysis.makeSparkline(
-            from: restored.history,
-            end: snapshot.timestamp
-        )
-        publish(sparkline, to: \.sparkline)
         publish(snapshot.liveRate.state, to: \.tpsState)
         publish(metric(from: snapshot.liveRate), to: \.tps)
+        let sparkline = await Self.derivePrimarySeries(history: restored.history, end: snapshot.timestamp)
+        guard !Task.isCancelled else { return }
+        publish(sparkline, to: \.sparkline)
         tpsHistory = restored.history.compactMap { sample in
             guard let value = sample.tps else { return nil }
             return TPSPoint(timestamp: sample.timestamp, tokensPerSecond: value, state: sample.state)
@@ -314,7 +313,14 @@ public final class MetricsStore: ObservableObject {
         isShowingCachedSnapshot = true
     }
 
-    /// 在后台线程一次算好每秒刷新所需的全部派生曲线（总 + 分模型 ×2 套口径）。
+    /// 优先完成总曲线，让交互主线程只负责提交结果。
+    nonisolated static func derivePrimarySeries(history: [LiveRateSample], end: Date) async -> Sparkline {
+        await Task.detached(priority: .userInitiated) {
+            SparklineAnalysis.makeSparkline(from: history, end: end)
+        }.value
+    }
+
+    /// 在后台线程计算分模型与看板曲线。
     /// 纯计算，无 MainActor 状态依赖：`span` 与两个计算函数由调用方传入。
     private nonisolated static func deriveSeries(
         history: [LiveRateSample],
@@ -325,7 +331,6 @@ public final class MetricsStore: ObservableObject {
         dashboardModel: @Sendable @escaping ([LiveRateSample], Date, DashboardTPSSpan) -> [ModelTPSHistory]
     ) async -> DerivedSeries {
         await Task.detached(priority: .userInitiated) {
-            let sparkline = SparklineAnalysis.makeSparkline(from: history, end: end)
             let modelHistory = model(history, end)
             let dashboardPoints: [SparklinePoint]
             let dashboardModelHistory: [ModelTPSHistory]
@@ -340,7 +345,6 @@ public final class MetricsStore: ObservableObject {
                 dashboardModelHistory = []
             }
             return DerivedSeries(
-                sparkline: sparkline,
                 modelTPSHistory: modelHistory,
                 dashboardSparklinePoints: dashboardPoints,
                 dashboardModelTPSHistory: dashboardModelHistory

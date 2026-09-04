@@ -10,36 +10,36 @@ final class TPSWindowTests: XCTestCase {
         XCTAssertEqual(window.tokensInWindow(), 0)
     }
 
-    func testInstantEventUsesFixed180SecondDenominator() {
-        let window = TPSWindow()
+    func testInstantEventUsesFixed180SecondDenominator() throws {
+        let window = TPSWindow(now: { date(100) })
         XCTAssertTrue(window.record(tokenCount: 180, durationSeconds: 0, source: .cli, timestamp: date(100)))
-        XCTAssertEqual(window.currentTPS(referenceDate: date(100))!, 1, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(window.currentTPS(referenceDate: date(100))), 1, accuracy: 1e-9)
         XCTAssertEqual(window.windowSeconds, 180)
     }
 
-    func testIntervalIsAllocatedByWindowOverlap() {
-        let window = TPSWindow()
+    func testIntervalIsAllocatedByWindowOverlap() throws {
+        let window = TPSWindow(now: { date(1_000) })
         window.record(tokenCount: 6_000, durationSeconds: 600, source: .cli, timestamp: date(1_000))
         XCTAssertEqual(window.tokensInWindow(referenceDate: date(1_000)), 1_800, accuracy: 1e-9)
-        XCTAssertEqual(window.currentTPS(referenceDate: date(1_000))!, 10, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(window.currentTPS(referenceDate: date(1_000))), 10, accuracy: 1e-9)
     }
 
-    func testInstantBoundaryIsIncludedThenExpires() {
-        let window = TPSWindow()
+    func testInstantBoundaryIsIncludedThenExpires() throws {
+        let window = TPSWindow(now: { date(100) })
         window.record(tokenCount: 180, durationSeconds: 0, source: .cli, timestamp: date(100))
-        XCTAssertEqual(window.currentTPS(referenceDate: date(280))!, 1, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(window.currentTPS(referenceDate: date(280))), 1, accuracy: 1e-9)
         XCTAssertNil(window.currentTPS(referenceDate: date(280.001)))
     }
 
-    func testOutOfOrderArrival() {
-        let window = TPSWindow()
+    func testOutOfOrderArrival() throws {
+        let window = TPSWindow(now: { date(105) })
         window.record(tokenCount: 90, durationSeconds: 0, source: .cli, timestamp: date(105))
         window.record(tokenCount: 90, durationSeconds: 0, source: .cli, timestamp: date(101))
-        XCTAssertEqual(window.currentTPS(referenceDate: date(105))!, 1, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(window.currentTPS(referenceDate: date(105))), 1, accuracy: 1e-9)
     }
 
     func testInvalidSamplesRejected() {
-        let window = TPSWindow()
+        let window = TPSWindow(now: { date(100) })
         XCTAssertFalse(window.record(tokenCount: -1, durationSeconds: 1, source: .cli, timestamp: date(100)))
         XCTAssertFalse(window.record(tokenCount: 1, durationSeconds: -1, source: .cli, timestamp: date(100)))
         XCTAssertFalse(window.record(tokenCount: 1, durationSeconds: .infinity, source: .cli, timestamp: date(100)))
@@ -47,8 +47,9 @@ final class TPSWindowTests: XCTestCase {
     }
 
     func testFutureSamplesExcluded() {
-        let window = TPSWindow()
+        let window = TPSWindow(now: { date(110) })
         window.record(tokenCount: 180, durationSeconds: 0, source: .cli, timestamp: date(120))
+        XCTAssertEqual(window.sampleCount(referenceDate: date(120)), 1)
         XCTAssertNil(window.currentTPS(referenceDate: date(110)))
     }
 
@@ -60,14 +61,14 @@ final class TPSWindowTests: XCTestCase {
         XCTAssertNil(window.currentTPS())
     }
 
-    func testConcurrentRecordingIsThreadSafe() {
-        let window = TPSWindow()
+    func testConcurrentRecordingIsThreadSafe() throws {
+        let window = TPSWindow(now: { date(1_099) })
         let iterations = 1_000
         DispatchQueue.concurrentPerform(iterations: iterations) { index in
             window.record(tokenCount: 1, durationSeconds: 0, source: .cli, timestamp: date(1_000 + Double(index % 100)))
         }
         XCTAssertEqual(window.sampleCount(referenceDate: date(1_099)), iterations)
-        XCTAssertEqual(window.currentTPS(referenceDate: date(1_099))!, Double(iterations) / 180, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(window.currentTPS(referenceDate: date(1_099))), Double(iterations) / 180, accuracy: 1e-9)
     }
 
     func testLiveRateStateValueContract() {
@@ -155,7 +156,7 @@ final class ModelsCodableTests: XCTestCase {
         )
     }
 
-    func testUsageInputSummaryUsesInputOnlyCacheSemantics() {
+    func testUsageInputSummaryUsesInputOnlyCacheSemantics() throws {
         let counts = UsageTokenCounts(
             input: 30,
             output: 1_000,
@@ -170,7 +171,7 @@ final class ModelsCodableTests: XCTestCase {
         XCTAssertEqual(summary.cachedTokens, 60)
         // 新增仅纯输入；cache creation 既不计入新增，也不进入命中率分母。
         XCTAssertEqual(summary.newTokens, 30)
-        XCTAssertEqual(summary.cacheHitRate!, 60.0 / 90.0, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(summary.cacheHitRate), 60.0 / 90.0, accuracy: 1e-9)
     }
 
     func testUsageCostEstimatorMatchesAuthoritativePricing() {

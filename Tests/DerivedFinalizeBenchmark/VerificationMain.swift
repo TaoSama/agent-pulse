@@ -1,5 +1,6 @@
 import Foundation
 import AgentPulseCore
+import Darwin
 
 /// Benchmark for UsageLedgerStore.finalizeDerived.
 ///
@@ -7,19 +8,25 @@ import AgentPulseCore
 /// lineage fingerprints, codex dedup keys, inherited events, skill/mcp counts, sessions,
 /// edit entries) and measures the wall-clock cost of full recomputation under three scenarios:
 ///  1. First finalize after bulk ingest.
-///  2. Second finalize with no new data (still a full recompute when called directly;
-///     the coordinator-level needsFinalize gate would skip this in production).
+///  2. Repeated finalize with no new data, including resource-growth checks.
 ///  3. Finalize after appending a tiny batch of new events.
 @main
 enum DerivedFinalizeBenchmark {
     static func main() throws {
-        let targetEventCount = Int(ProcessInfo.processInfo.environment["BENCH_EVENT_COUNT"] ?? "200000") ?? 200_000
+        let options = try BenchmarkOptions()
+        let targetEventCount = options.eventCount
         let hostname = "benchmark-host"
 
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("derived-finalize-benchmark-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
+        let previousTemporaryDirectory = ProcessInfo.processInfo.environment["SQLITE_TMPDIR"]
+        try benchmarkRequire(setenv("SQLITE_TMPDIR", directory.path, 1) == 0, "unable to isolate SQLite temporary files")
+        defer {
+            let status = previousTemporaryDirectory.map { setenv("SQLITE_TMPDIR", $0, 1) } ?? unsetenv("SQLITE_TMPDIR")
+            if status != 0 { FileHandle.standardError.write(Data("unable to restore SQLITE_TMPDIR\n".utf8)) }
+        }
 
         let dbPath = directory.appendingPathComponent("usage.sqlite3").path
         let ledger = try UsageLedgerStore(path: dbPath)
@@ -173,6 +180,7 @@ enum DerivedFinalizeBenchmark {
         }
 
         let rawEventCount = try ledger.eventCount()
+        try benchmarkRequire(rawEventCount == totalRecorded, "fixture must preserve every raw event")
         let rawSessionEventCount = try ledger.sessionEventCount()
         print("Recorded \(totalRecorded) events across \(sources.count * filesPerSource) files")
         print("usage_events rows: \(rawEventCount)")
@@ -183,6 +191,7 @@ enum DerivedFinalizeBenchmark {
         let t1 = Date()
         let result1 = try ledger.finalizeDerived(hostname: hostname)
         let d1 = Date().timeIntervalSince(t1)
+        try benchmarkRequire(ledger.lastFinalizeDiagnostics.strategy == "full", "initial fixture must exercise full finalize")
         print("[1] first finalizeDerived: \(String(format: "%.3f", d1))s",
               "(collapsedInherited=\(result1.collapsedInheritedEvents),",
               "collapsedContent=\(result1.collapsedContentDuplicates))")
@@ -190,10 +199,12 @@ enum DerivedFinalizeBenchmark {
         let bucketCount1 = try ledger.buckets(hostname: hostname).count
         let sessionCount1 = try ledger.sessions(hostname: hostname).count
         print("    derived buckets: \(bucketCount1), sessions: \(sessionCount1)")
+        try benchmarkRequire(bucketCount1 > 0 && sessionCount1 > 0, "fixture must exercise both derived tables")
 
         let t2 = Date()
         let result2 = try ledger.finalizeDerived(hostname: hostname)
         let d2 = Date().timeIntervalSince(t2)
+        try verifyNoChangeResources(ledger: ledger, hostname: hostname, directory: directory)
         print("[2] second finalizeDerived (no new data): \(String(format: "%.3f", d2))s",
               "(collapsedInherited=\(result2.collapsedInheritedEvents),",
               "collapsedContent=\(result2.collapsedContentDuplicates))")
@@ -224,30 +235,36 @@ enum DerivedFinalizeBenchmark {
         let t3 = Date()
         let result3 = try ledger.finalizeDerived(hostname: hostname)
         let d3 = Date().timeIntervalSince(t3)
+        let appendWork = ledger.lastFinalizeDiagnostics
+        try benchmarkRequire(appendWork.strategy == "incremental", "10-event append must use incremental finalize, got \(appendWork.strategy)")
+        try benchmarkRequire(appendWork.scopedLogicalEvents == smallEvents.count,
+                             "independent append must scope exactly \(smallEvents.count) logical events, got \(appendWork.scopedLogicalEvents)")
         print("[3] finalizeDerived after 10 new events: \(String(format: "%.3f", d3))s",
               "(collapsedInherited=\(result3.collapsedInheritedEvents),",
               "collapsedContent=\(result3.collapsedContentDuplicates))")
 
         let rawEventCountAfter = try ledger.eventCount()
+        try benchmarkRequire(rawEventCountAfter == rawEventCount + smallEvents.count, "append must preserve existing raw history")
+        let appendedBuckets = try ledger.buckets(hostname: hostname).filter { $0.bucketStart > baseTime.addingTimeInterval(8 * 24 * 3600) }
+        try benchmarkRequire(appendedBuckets.reduce(Int64(0)) { $0 + $1.counts.output } == 500,
+                             "append must derive exactly 500 output tokens")
+        try verifyNoChangeResources(ledger: ledger, hostname: hostname, directory: directory)
         print("    usage_events rows after append: \(rawEventCountAfter)")
         print("")
         print("Summary: first=\(String(format: "%.3f", d1))s no-change=\(String(format: "%.3f", d2))s small-append=\(String(format: "%.3f", d3))s")
-        // 增量重算的全部意义就在这条断言上：追加 10 个事件的代价必须与账本规模脱钩，
-        // 而不是随它线性增长。阈值取全量耗时的三分之一 —— 留足机器抖动余量，同时任何
-        // 「悄悄退回全量」的回归（脏键漏登记、闭包爆炸、索引失效）都会把 small-append
-        // 推回全量量级从而在这里失败。绝对秒数不做断言：它随机器和账本规模变化。
+        // 实际路径和作用域已按精确工作量验证；耗时比作为规模足够时的补充，
+        // 捕获作用域虽小但仍执行昂贵全表查询的退化。
         let ratio = d3 / d1
         print("small-append / first = \(String(format: "%.2f", ratio))")
-        // 比值只有在 baseline 本身够大时才有意义。d1 太小的时候，进程启动、SQLite 打开
-        // 库、WAL 建立这些每次调用都要付的固定开销会盖过真实差异，比值退化成噪声，
-        // 断言既可能假过也可能假失败。BENCH_EVENT_COUNT 由调用方给定，小到几百个事件时
-        // 全量本来就是毫秒级 —— 那种规模下这条断言不成立，直接说明原因并跳过，而不是
-        // 拿一个无意义的比值报成功。
+        // 小规模耗时容易受调度和固定事务开销影响。要求计时门禁时不能把
+        // 未执行计时断言报告为成功；其余模式仍必须完成工作量及资源断言。
         let minimumBaseline = 0.5
         guard d1 >= minimumBaseline else {
-            print("DerivedFinalizeBenchmark: SKIP ratio assertion - full recompute took only \(String(format: "%.3f", d1))s,",
+            print("DerivedFinalizeBenchmark: timing ratio unavailable - full recompute took only \(String(format: "%.3f", d1))s,",
                   "below the \(String(format: "%.1f", minimumBaseline))s needed for the ratio to mean anything.",
-                  "Re-run with a larger BENCH_EVENT_COUNT (currently \(targetEventCount)) to exercise the gate.")
+                  "Work-scope and resource assertions ran (\(targetEventCount) requested events).")
+            if options.requireRatio { Foundation.exit(2) }
+            print("DerivedFinalizeBenchmark: PASS (work-scope and resources; timing ratio not evaluated)")
             return
         }
         guard ratio < 0.34 else {

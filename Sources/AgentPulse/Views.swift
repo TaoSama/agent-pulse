@@ -44,12 +44,16 @@ extension SparklineTrend {
 }
 
 struct MenuBarPulseLabel: View {
-    @ObservedObject var model: ApplicationModel
+    @ObservedObject private var viewModel: MenuBarLabelViewModel
+
+    init(model: ApplicationModel) {
+        viewModel = model.menuBarLabelViewModel
+    }
 
     var body: some View {
         Image(systemName: "waveform.path.ecg")
             .symbolRenderingMode(.monochrome)
-            .accessibilityLabel("Agent Pulse，\(model.compactSummary)，\(model.sparklineRegression.trend.accessibilityText)")
+            .accessibilityLabel(viewModel.accessibilityLabel)
     }
 }
 

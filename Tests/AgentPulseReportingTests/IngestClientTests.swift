@@ -154,10 +154,24 @@ final class IngestClientTests: XCTestCase {
         XCTAssertEqual(Array(UsageIngestClient.truncate(multibyte, 10).utf8).count, 9)
     }
 
-    func testCanonicalHostnameCapsScalars() {
+    func testCanonicalHostnameCapsUTF8BytesWithoutSplittingScalars() {
         XCTAssertEqual(CanonicalHostname.normalize("  host-a  "), "host-a")
-        XCTAssertEqual(CanonicalHostname.normalize(String(repeating: "h", count: 250)).unicodeScalars.count, 100)
-        XCTAssertEqual(CanonicalHostname.normalize(String(repeating: "\u{1F600}", count: 150)).unicodeScalars.count, 100)
+        let byteLimit = 255
+        XCTAssertEqual(CanonicalHostname.maximumByteCount, byteLimit)
+        let shortASCII = String(repeating: "h", count: 250)
+        XCTAssertEqual(CanonicalHostname.normalize(shortASCII), shortASCII)
+        XCTAssertEqual(
+            CanonicalHostname.normalize(String(repeating: "h", count: 300)),
+            String(repeating: "h", count: byteLimit)
+        )
+        let emoji = "\u{1F600}"
+        let normalizedEmoji = CanonicalHostname.normalize(String(repeating: emoji, count: 150))
+        XCTAssertEqual(normalizedEmoji, String(repeating: emoji, count: byteLimit / emoji.utf8.count))
+        XCTAssertLessThanOrEqual(normalizedEmoji.utf8.count, byteLimit)
+        let exactlyFits = String(repeating: "h", count: byteLimit - emoji.utf8.count) + emoji
+        XCTAssertEqual(CanonicalHostname.normalize(exactlyFits), exactlyFits)
+        let prefixBeforePartialScalar = String(repeating: "h", count: byteLimit - emoji.utf8.count + 1)
+        XCTAssertEqual(CanonicalHostname.normalize(prefixBeforePartialScalar + emoji), prefixBeforePartialScalar)
     }
 
     func testHostnameCanonicalizedIntoPayload() async throws {

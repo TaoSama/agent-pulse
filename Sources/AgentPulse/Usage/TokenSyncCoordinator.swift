@@ -9,7 +9,7 @@ import AgentPulseUsage
 /// 用于区分“无内容”（非失败）与“无法证明已完整扫描”（失败），
 /// 从而绝不把源目录枚举失败当成“全量成功”。
 private enum TokenSyncScanError: Error {
-    case sourceRootNotEnumerable(source: String)
+    case ledgerUnavailable
 }
 
 /// off-main worker 向主线程回报的一次进度快照（Sendable）。
@@ -52,7 +52,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     private let defaults: UserDefaults
-    private let ledger: UsageLedgerStore?
+    private var ledger: UsageLedgerStore?
+    private var initializationTask: Task<Void, Never>?
+    private var initializationGeneration: UInt64 = 0
+    private var summaryRevisionGate = UsageSnapshotRevisionGate()
+    private var daySeriesRevisionGate = UsageSnapshotRevisionGate()
+    private var networkTask: Task<Void, Never>?
+    private var networkGeneration: UInt64 = 0
+    private var reportAfterNetworkCollection = false
     private let configurationURL: URL
     /// 合并 env 文件（凭证 + 上报简单值 REPORT_BASE_URL / REPORT_CANONICAL_HOSTNAME 的单一来源）。
     private let mergedEnvURL: URL
@@ -63,6 +70,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 可选本地采集来源配置文件（owner-only 0600），独立于 reporting.json。
     /// 缺失/非法不影响内建来源采集。
     private let localCollectionURL: URL
+    private let injectedScanRoots: [UsageScanRoot]?
+    private let ledgerFactory: (@Sendable () throws -> UsageLedgerStore)?
+    private let autoLoopSleep: @Sendable (TimeInterval) async throws -> Void
 
     /// 扫描 / 上报任务句柄，用于防重入与 stop 取消。
     private var scanTask: Task<Void, Never>?
@@ -121,7 +131,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         configurationURL: URL = TokenSyncCoordinator.defaultConfigurationURL(),
         reporter: TokenUsageReporter? = nil,
         cliProxyService: CliProxyUsageService = CliProxyUsageService(),
-        usageSummaryCalendar: Calendar = .autoupdatingCurrent
+        usageSummaryCalendar: Calendar = .autoupdatingCurrent,
+        ledgerFactory: (@Sendable () throws -> UsageLedgerStore)? = nil,
+        scanRoots: [UsageScanRoot]? = nil,
+        autoLoopSleep: @escaping @Sendable (TimeInterval) async throws -> Void = { interval in
+            try await Task.sleep(for: .seconds(interval))
+        }
     ) {
         self.defaults = defaults
         self.configurationURL = configurationURL
@@ -135,7 +150,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         self.cliProxyService = cliProxyService
         self.usageSummaryCalendar = usageSummaryCalendar
         self.localCollectionURL = TokenSyncCoordinator.defaultLocalCollectionURL()
-        ledger = Self.openLedger()
+        self.ledgerFactory = ledgerFactory
+        self.injectedScanRoots = scanRoots
+        self.autoLoopSleep = autoLoopSleep
+        ledger = nil
 
         let localCollection = defaults.object(forKey: DefaultsKey.localCollectionEnabled) as? Bool ?? true
         // 冻结压实默认关闭：不可逆删除必须显式开启。
@@ -151,42 +169,15 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         self.autoReportInterval = reportInterval
         // base URL 权威改为合并 env 的 REPORT_BASE_URL；env 缺失时回落到旧 UserDefaults 值（平滑迁移）。
         let baseURL = Self.envBaseURL(url: self.mergedEnvURL) ?? (defaults.string(forKey: DefaultsKey.ingestBaseURL) ?? "")
-        var storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
+        let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
 
         // 配置权威：hostname 以合并 env 的 REPORT_CANONICAL_HOSTNAME 为准；配置未就绪时为空。
         let authority = Self.configurationAuthority(reporter: effectiveReporter, url: configurationURL, envURL: self.mergedEnvURL)
-        // 旧版数据库已经把 hostname 持久化在派生表，却没有写 UserDefaults。仅当配置和
-        // 用户保存值都为空、且账本能证明恰好一个非空 hostname 时，采纳并持久化该值，
-        // 让冷启动摘要立即恢复。多 hostname / 空库一律不猜；配置权威始终优先。
-        if authority.hostname.isEmpty,
-           storedHostname.isEmpty,
-           let candidate = ledger.flatMap({ try? $0.uniqueLegacyHostnameCandidate() }),
-           !candidate.isEmpty {
-            let normalizedCandidate = Self.normalize(candidate)
-            // Recovery must preserve the exact durable natural-key namespace. If normalization
-            // would alter it (for example, surrounding whitespace or an overlong legacy value),
-            // fail closed instead of selecting a hostname that has no matching derived rows.
-            if !normalizedCandidate.isEmpty, normalizedCandidate == candidate {
-                storedHostname = normalizedCandidate
-                defaults.set(storedHostname, forKey: DefaultsKey.canonicalHostname)
-            }
-        }
         // 上报所用 hostname 权威优先；否则回落到用户保存的本地 hostname（仅用于本地采集）。
         let effectiveHostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
 
         // 冷启动展示账本中所有 hostname 的派生数据。canonical hostname 仅决定后续采集与上报身份。
-        let initialSummary: TokenUsageSummary
-        if let ledger {
-            initialSummary = (try? Self.summaries(
-                from: ledger,
-                containing: Date(),
-                calendar: usageSummaryCalendar,
-                mergedEnvURL: self.mergedEnvURL
-            )) ?? .empty
-        } else {
-            initialSummary = .empty
-        }
-        summarySubject = CurrentValueSubject(initialSummary)
+        summarySubject = CurrentValueSubject(.empty)
 
         let canReport = !baseURL.isEmpty && !effectiveHostname.isEmpty && authority.status == .ready
         let reporting = canReport ? storedReporting : false
@@ -194,9 +185,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             // 配置已失效时持久化关闭，避免配置日后恢复后自动“复活”上报。
             defaults.set(false, forKey: DefaultsKey.reportingEnabled)
         }
-
-        let eligible = ledger.flatMap { (try? $0.reportingEligible(hostname: effectiveHostname)) } ?? true
-        let pending = ledger.flatMap { (try? $0.pendingCounts(hostname: effectiveHostname)) } ?? (0, 0)
 
         statusSubject = CurrentValueSubject(TokenSyncStatus(
             localCollectionEnabled: localCollection,
@@ -210,10 +198,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             scanningInProgress: false,
             reportingInProgress: false,
             reportingError: nil,
-            reportingEligible: eligible,
+            reportingEligible: false,
             reportingBlockedReasons: [],
-            pendingBuckets: pending.0,
-            pendingSessions: pending.1,
+            pendingBuckets: 0,
+            pendingSessions: 0,
             lastReportSucceeded: persistedLastReportSucceeded
         ))
         // status literal 未显式列出的字段走默认值；间隔与压实开关单独回填以回显持久化档位。
@@ -221,6 +209,61 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         initialStatus.autoReportInterval = reportInterval
         initialStatus.compactionEnabled = compaction
         statusSubject.send(initialStatus)
+        initializeLedger(storedHostname: storedHostname, authorityHostname: authority.hostname)
+    }
+
+    /// Opening/migrating SQLite and reading its initial snapshots must never wait on the UI actor.
+    private func initializeLedger(storedHostname: String, authorityHostname: String) {
+        guard initializationTask == nil else { return }
+        let calendar = usageSummaryCalendar
+        let envURL = mergedEnvURL
+        let factory = ledgerFactory
+        initializationGeneration &+= 1
+        let generation = initializationGeneration
+        initializationTask = Task { [weak self] in
+            let result = await Self.runOffMain { gate in
+                try gate.throwIfCancelled()
+                guard let ledger = try factory?() ?? Self.openLedger() else { throw TokenSyncScanError.ledgerUnavailable }
+                try gate.throwIfCancelled()
+                var hostname = authorityHostname.isEmpty ? storedHostname : authorityHostname
+                if hostname.isEmpty, let candidate = try ledger.uniqueLegacyHostnameCandidate(),
+                   !candidate.isEmpty, CanonicalHostname.normalize(candidate) == candidate {
+                    hostname = candidate
+                }
+                let recoveryPending = try Self.isRebuildCompletionPending(ledger: ledger)
+                return LedgerInitialization(
+                    ledger: ledger, hostname: hostname,
+                    summary: try Self.summaries(from: ledger, containing: Date(), calendar: calendar, mergedEnvURL: envURL),
+                    eligible: try ledger.reportingEligible(hostname: hostname),
+                    pending: recoveryPending ? (0, 0) : try ledger.pendingCounts(hostname: hostname),
+                    recoveryPending: recoveryPending
+                )
+            }
+            guard let self, generation == self.initializationGeneration, !Task.isCancelled else { return }
+            self.initializationTask = nil
+            switch result {
+            case let .success(initial):
+                self.ledger = initial.ledger
+                self.summaryRevisionGate = UsageSnapshotRevisionGate()
+                self.daySeriesRevisionGate = UsageSnapshotRevisionGate()
+                if authorityHostname.isEmpty, storedHostname.isEmpty, !initial.hostname.isEmpty {
+                    self.defaults.set(initial.hostname, forKey: DefaultsKey.canonicalHostname)
+                }
+                self.rebuildRecoveryPending = initial.recoveryPending
+                self.publish(initial.summary)
+                self.refreshConfigurationAuthority()
+                self.updateStatus {
+                    $0.scanError = nil
+                    $0.reportingEligible = initial.eligible
+                    $0.pendingBuckets = initial.pending.buckets
+                    $0.pendingSessions = initial.pending.sessions
+                }
+                if self.isRunning { self.beginStartup() }
+            case .failure:
+                self.updateStatus { $0.scanError = "本地账本读取失败" }
+                self.startAutoLoopIfNeeded()
+            }
+        }
     }
 
     // MARK: - Settings
@@ -230,6 +273,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         updateStatus { $0.localCollectionEnabled = enabled }
         if enabled {
             // 开启采集：按间隔周期性扫描（不依赖上报开关）。已在跑则 startAutoLoopIfNeeded 幂等不重启。
+            if isRunning { triggerScanThenReport() }
             startAutoLoopIfNeeded()
         } else if !statusSubject.value.reportingEnabled {
             // 采集与上报都关：循环无事可做，停掉。
@@ -330,8 +374,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             }
         }
         if stopAutoLoop {
-            autoLoopTask?.cancel()
-            autoLoopTask = nil
+            reconcileAutoLoop()
         }
     }
 
@@ -355,8 +398,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             }
         }
         if stopAutoLoop {
-            autoLoopTask?.cancel()
-            autoLoopTask = nil
+            reconcileAutoLoop()
         }
     }
 
@@ -366,12 +408,21 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         scanNow(chainedReport: false)
     }
 
+    private func retryLedgerInitializationIfNeeded() {
+        guard ledger == nil, initializationTask == nil else { return }
+        initializeLedger(
+            storedHostname: Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? ""),
+            authorityHostname: Self.envCanonicalHostname(url: mergedEnvURL)
+        )
+    }
+
     /// 触发扫描；chainedReport=true 则扫描成功后串接一次上报（无论开关变化，
     /// 在 finishScan 里再校验 reportingEnabled）。
     private func scanNow(chainedReport: Bool) {
         // 防重入；且不在上报进行时启动扫描，避免 rebuild 与在途上传竞争。
         guard scanTask == nil, reportTask == nil,
-              statusSubject.value.localCollectionEnabled, let ledger else { return }
+              statusSubject.value.localCollectionEnabled else { return }
+        guard let ledger else { retryLedgerInitializationIfNeeded(); return }
         refreshConfigurationAuthority()
 
         // 解析有效 hostname：配置权威优先，否则用户保存的本地 hostname。绝不 fallback Host.current。
@@ -390,20 +441,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         // 弹确认框征询用户，不再静默自动改名；unset 时首次落库即对齐。
         // 触发只依赖 effectiveHostname，不挂 configReady——否则没配 reporting.json、只改本地
         // 设备标识的用户（权威缺失）永远进不到弹窗分支。
-        if case let .mismatch(stored) = (try? ledger.hostnameState(current: hostname)) ?? .unset {
-            // 已有弹窗等待决策时不重复弹，避免每轮扫描重复打扰；本轮不扫描，待用户决策后再触发。
-            guard !pendingHostnamePrompt else {
-                updateStatus { $0.scanningInProgress = false }
-                return
-            }
-            presentHostnameMismatch(old: stored, new: hostname)
-            updateStatus { $0.scanningInProgress = false }
-            return
-        }
+        guard !pendingHostnamePrompt else { return }
         // 置位扫描进度：起点为 cliproxy 阶段 0%。文件计数在 scanning 阶段登记。
         updateStatus { status in
             status.scanningInProgress = true
-            status.scanPhase = .cliproxy
+            status.scanError = nil
+            status.scanPhase = .scanning
             status.scanDone = 0
             status.scanTotal = 0
             status.scanProgress = 0
@@ -412,12 +455,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let currentParserVersion = UsageJSONLParser.parserVersion
         // 在启动后台 Task 前捕获为局部常量：闭包内 self 为弱引用，不能直接访问实例存储属性。
         let localSourcesURL = localCollectionURL
+        let injectedScanRoots = self.injectedScanRoots
         let summaryCalendar = usageSummaryCalendar
         let summaryEnvURL = self.mergedEnvURL
         scanGeneration &+= 1
         let generation = scanGeneration
-        let cliProxyService = self.cliProxyService
-        let cliProxyConfigPath = Self.cliProxyConfigPath(defaults: defaults)
         // 进度回调：worker 各阶段 / 逐文件回报聚合快照，跨线程回到主 actor 更新 status；
         // 仅当仍是当前 generation 时才写，避免旧扫描回调覆盖新扫描。
         let progressReporter = ScanProgressReporter { [weak self] update in
@@ -427,54 +469,26 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
         let compactionEnabled = statusSubject.value.compactionEnabled
         scanTask = Task { [weak self] in
-            // cliproxy 主动拉取（异步 HTTP）在进入阻塞式文件扫描之前完成；失败仅记状态、
-            // 返回空事件，绝不影响本地文件采集与既有链路。
-            var cliProxyEvents: [UsageEvent] = []
-            var cliProxyError: String?
-            let cliProxySourceCount = CliProxyUsageService.configuredSourceCount(atPath: cliProxyConfigPath)
-            let cliProxyConfigured = cliProxySourceCount > 0
-            progressReporter.enterPhase(.cliproxy)
-            if cliProxyConfigured {
-                do {
-                    var watermarks: [String: Int64] = [:]
-                    for identity in CliProxyUsageService.configuredSourceIdentities(atPath: cliProxyConfigPath) {
-                        if let latest = try ledger.latestNetworkEventTimestampMS(
-                            project: identity,
-                            source: CliProxyUsageParser.source,
-                            hostname: hostname
-                        ) {
-                            watermarks[identity] = latest
-                        }
-                    }
-                    let result = try await cliProxyService.fetchUsage(
-                        atPath: cliProxyConfigPath,
-                        latestTimestampMSByIdentity: watermarks
-                    )
-                    cliProxyEvents = result.events
-                    if result.failedSourceCount > 0 {
-                        cliProxyError = "部分 CPA 来源采集失败（\(result.failedSourceCount)/\(result.sourceCount)）"
-                    }
-                } catch is CancellationError {
-                    // 取消：走后续 cancelled 分支统一处理。
-                } catch {
-                    cliProxyError = (error as? LocalizedError)?.errorDescription ?? "cliproxyapi 采集失败"
-                }
+            let preflight = await Self.runOffMain { gate in
+                try gate.throwIfCancelled()
+                return try ledger.hostnameState(current: hostname)
             }
-            // 登记本阶段计数：拉取到的事件数（未配置或失败时为 0，则该阶段不显示计数）。
-            progressReporter.setPhaseTotal(.cliproxy, total: cliProxyEvents.count)
-            progressReporter.completePhase(.cliproxy)
-            self?.updateCliProxyStatus(
-                configured: cliProxyConfigured,
-                sourceCount: cliProxySourceCount,
-                error: cliProxyError,
-                generation: generation
-            )
-
-            // 绑定为不可变值再进入 @Sendable worker，满足 Swift 6 并发捕获约束。
-            let networkEvents = cliProxyEvents
+            guard let self, generation == self.scanGeneration, !Task.isCancelled else { return }
+            switch preflight {
+            case let .success(.mismatch(stored)):
+                self.scanTask = nil
+                self.updateStatus { Self.clearScanProgress(&$0) }
+                self.presentHostnameMismatch(old: stored, new: hostname)
+                return
+            case .success:
+                self.startNetworkCollection(hostname: hostname)
+            case let .failure(error):
+                self.finishScan(generation: generation, cancelled: false, chainedReport: chainedReport, result: .failure(error))
+                return
+            }
             // 无变化轮跳过全库重算时，上报资格布尔从账本持久标志读回，blocked 原因（未持久化）
             // 沿用上轮：raw 未变则派生不变，原因列表必与上次 finalize 一致。
-            let priorBlockedReasons = self?.status.reportingBlockedReasons ?? []
+            let priorBlockedReasons = self.status.reportingBlockedReasons
             // 阻塞式 SQLite/文件扫描在后台队列执行（不阻塞主线程），不使用 detached 分叉。
             let result = await Self.runOffMain { gate in
                 try gate.throwIfCancelled()
@@ -496,77 +510,45 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 try gate.throwIfCancelled()
                 // 进入 scanning 阶段：先枚举全部来源 root 的 jsonl 总数作为进度分母，
                 // 再逐文件处理并回报（已处理/总数）。totalFiles 为 0 时进度按阶段权重阶跃。
-                let localSources = Self.loadLocalCollectionSources(url: localSourcesURL)
-                var scanRoots: [URL] = [Self.codexSessionsRoot, Self.codexArchivedSessionsRoot, Self.claudeProjectsRoot]
-                scanRoots += localSources.map(\.root)
-                let totalFiles = scanRoots.reduce(0) { $0 + Self.countJSONLFiles(root: $1) }
-                progressReporter.setPhaseTotal(.scanning, total: totalFiles)
-                // 逐来源扫描并收集磁盘 present fileID；record 只处理变化文件（status!=complete 或
-                // size/mtime/parserVersion 不匹配），不触发派生重算。
-                // Codex sessions 与 archived_sessions 同为 source="codex"：必须合并两 root 的
-                // present 集合后，对 "codex" 只调用一次 markFilesMissing，否则会互相误标 missing。
-                var codexPresentFileIDs: [String] = []
-                codexPresentFileIDs += try Self.scan(
-                    root: Self.codexSessionsRoot,
-                    source: "codex",
-                    budget: .activeSessions,
-                    ledger: ledger,
-                    hostname: hostname,
-                    cancellation: gate,
-                    progress: progressReporter
-                )
-                try gate.throwIfCancelled()
-                // 归档会话不属于运行中 task 口径，但其已产生的 token 仍属于累计用量。
-                codexPresentFileIDs += try Self.scan(
-                    root: Self.codexArchivedSessionsRoot,
-                    source: "codex",
-                    budget: .backgroundHistory,
-                    ledger: ledger,
-                    hostname: hostname,
-                    cancellation: gate,
-                    progress: progressReporter
-                )
-                try gate.throwIfCancelled()
-                try ledger.markFilesMissing(source: "codex", presentFileIDs: codexPresentFileIDs, hostname: hostname)
-                try gate.throwIfCancelled()
-                let claudePresentFileIDs = try Self.scan(
-                    root: Self.claudeProjectsRoot,
-                    source: "claude-code",
-                    includeSubagents: true,
-                    budget: .backgroundHistory,
-                    ledger: ledger,
-                    hostname: hostname,
-                    cancellation: gate,
-                    progress: progressReporter
-                )
-                try gate.throwIfCancelled()
-                try ledger.markFilesMissing(source: "claude-code", presentFileIDs: claudePresentFileIDs, hostname: hostname)
-                try gate.throwIfCancelled()
-                // 可选的用户声明本地来源（Claude-compatible transcript）。配置缺失/非法不影响内建来源。
-                // 每个自定义 source 独立聚合 present 集合，再各自按 source 标 missing。
-                var localPresentBySource: [String: [String]] = [:]
-                for local in localSources {
-                    let present = try Self.scan(
-                        root: local.root,
-                        source: local.source,
-                        includeSubagents: local.includeSubagents,
-                        budget: .backgroundHistory,
-                        ledger: ledger,
-                        hostname: hostname,
-                        cancellation: gate,
-                        progress: progressReporter
-                    )
-                    localPresentBySource[local.source, default: []] += present
-                    try gate.throwIfCancelled()
+                let localSources = injectedScanRoots == nil ? Self.loadLocalCollectionSources(url: localSourcesURL) : []
+                let scanRoots = injectedScanRoots ?? [
+                    UsageScanRoot(root: Self.codexSessionsRoot, source: "codex"),
+                    UsageScanRoot(root: Self.codexArchivedSessionsRoot, source: "codex"),
+                    UsageScanRoot(root: Self.claudeProjectsRoot, source: "claude-code", includeSubagents: true)
+                ] + localSources.map {
+                    UsageScanRoot(root: $0.root, source: $0.source, includeSubagents: $0.includeSubagents)
                 }
-                for (source, present) in localPresentBySource {
-                    try ledger.markFilesMissing(source: source, presentFileIDs: present, hostname: hostname)
+                let manifests = try scanRoots.map {
+                    try UsageScanManifest.discover(source: $0, checkCancellation: gate.throwIfCancelled)
+                }
+                let totalFiles = manifests.reduce(0) { $0 + $1.files.count }
+                progressReporter.setPhaseTotal(.scanning, total: totalFiles)
+                var checkpointsBySource: [String: [String: UsageFileCheckpoint]] = [:]
+                var presentBySource: [String: [String]] = [:]
+                for manifest in manifests {
                     try gate.throwIfCancelled()
+                    let source = manifest.source.source
+                    if checkpointsBySource[source] == nil {
+                        checkpointsBySource[source] = try ledger.checkpoints(source: source)
+                    }
+                    var checkpoints = checkpointsBySource[source] ?? [:]
+                    let present = try UsageFileScanner.scan(
+                        manifest: manifest, ledger: ledger, hostname: hostname,
+                        checkpoints: &checkpoints,
+                        legacyCodexRoots: scanRoots.filter { $0.source == "codex" }.map(\.root),
+                        onFile: { progressReporter.advanceItem(.scanning) },
+                        checkCancellation: gate.throwIfCancelled
+                    )
+                    checkpointsBySource[source] = checkpoints
+                    presentBySource[source, default: []] += present
+                }
+                // A source can span several roots. Only complete discovery and ingestion of
+                // all of them proves that an absent checkpoint really became historical.
+                for (source, present) in presentBySource {
+                    try gate.throwIfCancelled()
+                    try ledger.markFilesMissing(source: source, presentFileIDs: present, hostname: hostname)
                 }
                 progressReporter.completePhase(.scanning)
-                // cliproxy 主动拉取事件：只写原始层，不写文件 checkpoint（网络来源无偏移语义）。
-                try ledger.recordNetworkEvents(networkEvents, source: CliProxyUsageParser.source, hostname: hostname)
-                try gate.throwIfCancelled()
                 // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
                 // 无变化轮（raw 派生 dirty 位未置 且 无 rebuild 待完成）跳过 O(全库) 重算：
                 // 派生已是最新，仅从持久标志读回上报资格，避免每轮全表读+排序（9.4G 库约 90s）。
@@ -659,10 +641,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 )
                 let pending = try ledger.pendingCounts(hostname: hostname)
                 progressReporter.completePhase(.summarizing)
-                return ScanOutcome(summary: summary, finalize: finalize, pending: pending)
+                return ScanOutcome(summary: summary, finalize: finalize, pending: pending,
+                                   recoveryPending: try Self.isRebuildCompletionPending(ledger: ledger))
             }
             let cancelled = Task.isCancelled
-            self?.finishScan(generation: generation, cancelled: cancelled, chainedReport: chainedReport, result: result)
+            self.finishScan(generation: generation, cancelled: cancelled, chainedReport: chainedReport, result: result)
         }
     }
 
@@ -688,29 +671,121 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 两者都会把 canonical_hostname 更新为新名，因此之后比对为 .match，不再重复弹窗；
     /// 落地后重新触发一次扫描，让新名承接后续采集。
     private func resolveHostnameMismatch(old: String, new: String, rename: Bool) {
-        pendingHostnamePrompt = false
         guard let ledger else { return }
-        do {
-            if rename {
-                try ledger.rebuildForHostname(new)
-            } else {
-                try ledger.adoptHostname(new)
+        let priorNetworkTask = networkTask
+        priorNetworkTask?.cancel()
+        networkTask = nil
+        networkGeneration &+= 1
+        reportAfterNetworkCollection = false
+        scanGeneration &+= 1
+        let generation = scanGeneration
+        scanTask = Task { [weak self] in
+            await priorNetworkTask?.value
+            let result = await Self.runOffMain { gate in
+                try gate.throwIfCancelled()
+                if rename {
+                    try ledger.rebuildForHostname(new)
+                } else {
+                    try ledger.adoptHostname(new)
+                }
             }
-        } catch {
-            updateStatus { $0.configurationError = "设备标识改名失败" }
-            return
+            guard let self, generation == self.scanGeneration else { return }
+            self.scanTask = nil
+            self.pendingHostnamePrompt = false
+            if case .failure = result {
+                self.updateStatus { $0.configurationError = "设备标识改名失败" }
+            } else if self.isRunning, self.statusSubject.value.localCollectionEnabled {
+                self.scanNow(chainedReport: false)
+            }
         }
-        // 新名已生效，重新触发扫描；此时 hostnameState 为 .match，不会再弹窗。
-        if isRunning, statusSubject.value.localCollectionEnabled { scanNow(chainedReport: false) }
     }
 
-    /// 把 cliproxy 采集配置状态与错误刷新到 UI（只在当前 generation 有效时）。
-    private func updateCliProxyStatus(configured: Bool, sourceCount: Int, error: String?, generation: UInt64) {
-        guard generation == scanGeneration else { return }
-        updateStatus { status in
-            status.cliProxyConfigured = configured
-            status.cliProxySourceCount = sourceCount
-            status.cliProxyError = error
+    /// Network collection has its own lifetime: local discovery, parsing and publication can
+    /// finish while a CPA is slow. Reporting waits for both operations when explicitly chained.
+    private func startNetworkCollection(hostname: String) {
+        guard networkTask == nil, let ledger else { return }
+        let service = cliProxyService
+        let configPath = Self.cliProxyConfigPath(defaults: defaults)
+        let calendar = usageSummaryCalendar
+        let envURL = mergedEnvURL
+        networkGeneration &+= 1
+        let generation = networkGeneration
+        networkTask = Task { [weak self] in
+            do {
+                let prepared = await Self.runOffMain(queue: Self.networkWorkerQueue) { gate in
+                    try gate.throwIfCancelled()
+                    let identities = CliProxyUsageService.configuredSourceIdentities(atPath: configPath)
+                    return try ledger.cliProxyCollectionStates(identities: identities, hostname: hostname)
+                }
+                let states = try prepared.get()
+                try Task.checkCancellation()
+                if states.isEmpty {
+                    guard let self, generation == self.networkGeneration else { return }
+                    self.updateStatus {
+                        $0.cliProxyConfigured = false
+                        $0.cliProxySourceCount = 0
+                        $0.cliProxyError = nil
+                    }
+                    self.finishNetworkCollection(generation: generation)
+                    return
+                }
+                let collected = try await service.collectUsage(atPath: configPath, statesByIdentity: states)
+                let committed = await Self.runOffMain(queue: Self.networkWorkerQueue) { gate in
+                    var committedStates = states
+                    for collection in collected.collections {
+                        try gate.throwIfCancelled()
+                        committedStates[collection.identity] = try ledger.commitCliProxyCollection(
+                            collection, hostname: hostname, checkCancellation: gate.throwIfCancelled
+                        )
+                        try collection.removeStaging()
+                    }
+                    try gate.throwIfCancelled()
+                    let finalStates = Array(committedStates.values)
+                    guard collected.collections.contains(where: { $0.eventCount > 0 }),
+                          try !Self.isRebuildCompletionPending(ledger: ledger) else {
+                        return NetworkCollectionOutcome(states: finalStates, snapshot: nil)
+                    }
+                    let snapshot = NetworkSnapshot(
+                        summary: try Self.summaries(from: ledger, containing: Date(), calendar: calendar, mergedEnvURL: envURL),
+                        pending: try ledger.pendingCounts(hostname: hostname)
+                    )
+                    return NetworkCollectionOutcome(states: finalStates, snapshot: snapshot)
+                }
+                let outcome = try committed.get()
+                guard let self, generation == self.networkGeneration, !Task.isCancelled else { return }
+                self.updateStatus {
+                    $0.cliProxyConfigured = collected.sourceCount > 0
+                    $0.cliProxySourceCount = collected.sourceCount
+                    $0.cliProxyError = CliProxyCollectionPresentation.diagnostic(
+                        states: outcome.states, failedSourceCount: collected.failedSourceCount,
+                        sourceCount: collected.sourceCount
+                    )
+                }
+                if let snapshot = outcome.snapshot, self.publish(snapshot.summary) {
+                    self.updateStatus {
+                        $0.pendingBuckets = snapshot.pending.buckets
+                        $0.pendingSessions = snapshot.pending.sessions
+                    }
+                    if self.dashboardDayActive { self.refreshDashboardDaySeries(active: true) }
+                }
+            } catch is CancellationError {
+                // Cancellation only ends this collection; existing durable usage is retained.
+            } catch {
+                guard let self, generation == self.networkGeneration else { return }
+                self.updateStatus { $0.cliProxyError = "CPA 采集失败，下轮自动重试" }
+            }
+            self?.finishNetworkCollection(generation: generation)
+        }
+    }
+
+    private func finishNetworkCollection(generation: UInt64) {
+        guard generation == networkGeneration else { return }
+        networkTask = nil
+        let shouldReport = reportAfterNetworkCollection
+        reportAfterNetworkCollection = false
+        if shouldReport, status.reportingEnabled {
+            if scanTask != nil { reportAfterCurrentScan = true }
+            else { reportNow() }
         }
     }
 
@@ -740,24 +815,26 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         case let .success(outcome):
             let completedAt = Date()
             defaults.set(completedAt, forKey: DefaultsKey.lastScanAt)
-            publish(outcome.summary)
+            let acceptedSnapshot = publish(outcome.summary)
             // 看板停在 1 天视图时，随本轮扫描顺带刷新账本曲线（30min 粒度，实时性要求低）。
             if dashboardDayActive { refreshDashboardDaySeries(active: true) }
             updateStatus { status in
                 status.lastScanAt = completedAt
                 Self.clearScanProgress(&status)
-                status.configurationError = nil
+                status.scanError = nil
                 status.reportingEligible = outcome.finalize.reportingEligible
                 status.reportingBlockedReasons = outcome.finalize.blockedReasons
-                status.pendingBuckets = outcome.pending.buckets
-                status.pendingSessions = outcome.pending.sessions
+                if acceptedSnapshot {
+                    status.pendingBuckets = outcome.pending.buckets
+                    status.pendingSessions = outcome.pending.sessions
+                }
             }
             // rebuild pending 恢复路径：本次扫描已完整跑完全部来源（无致命失败），
             // 且 off-main 已在 finalize 后清除 pending。此处确认已清除后再恢复正常启动链路
             // （恢复上报）。若因某种原因仍未清除，则保持 pending、绝不发网络请求。
             if rebuildRecoveryPending {
                 reportAfterCurrentScan = false
-                if isRebuildCompletionPending() {
+                if outcome.recoveryPending {
                     // 未清除（例如刚被并发再次 reset）：保持恢复态，等待下一轮重扫，不做任何网络动作。
                     return
                 }
@@ -778,9 +855,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             // 绝不清除、绝不发网络请求。恢复标记保留，待下次扫描重试。
             updateStatus { status in
                 Self.clearScanProgress(&status)
-                status.configurationError = "本地扫描失败"
+                status.scanError = "本地扫描失败，可重试"
             }
         }
+        startAutoLoopIfNeeded()
     }
 
     /// 复位扫描进度展示字段：结束扫描时把百分比 / 文件计数 / 阶段清零。
@@ -799,16 +877,14 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         // 防重入；且不在扫描进行时上报，避免与 rebuild 竞争。
         guard reportTask == nil, scanTask == nil else { return }
         // rebuild pending 期间绝不发网络请求：必须先完整重扫全部来源并清除 pending。
-        if isRebuildCompletionPending() {
-            updateStatus { $0.reportingError = "本地重建未完成，请先完成完整扫描后再上报" }
-            return
-        }
+        if networkTask != nil { reportAfterNetworkCollection = true; return }
         refreshConfigurationAuthority()
         let current = statusSubject.value
-        guard current.reportingEnabled, let ledger else {
+        guard current.reportingEnabled else {
             updateStatus { $0.reportingError = "上报未启用" }
             return
         }
+        guard let ledger else { retryLedgerInitializationIfNeeded(); return }
         guard current.configurationStatus == .ready else {
             updateStatus { $0.reportingError = "配置未就绪，无法上报" }
             return
@@ -826,9 +902,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let hostname = authority.hostname
         // 上报阶段进度：展示待上报行数（buckets+sessions）作为 .reporting 阶段计数「n/m 行」。
         // reporter.report 为不透明网络 I/O，不逐行回报，故仅在起止两端登记总数与完成。
-        let pending = try? ledger.pendingCounts(hostname: hostname)
-        let pendingRows = pending.map { $0.buckets + $0.sessions } ?? 0
-        let pendingDetail = pending.map { "buckets \($0.buckets) / sessions \($0.sessions)" }
+        let pendingRows = current.pendingBuckets + current.pendingSessions
+        let pendingDetail = "buckets \(current.pendingBuckets) / sessions \(current.pendingSessions)"
         updateStatus { status in
             status.reportingInProgress = true
             status.reportingError = nil
@@ -846,6 +921,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             // reporter.report 是异步 I/O（含单事务 ack）；直接在持有的任务里 await，不再 detached 分叉。
             let result: Result<TokenUsageReport, Error>
             do {
+                let pending = await Self.runOffMain { gate in
+                    try gate.throwIfCancelled()
+                    return try Self.isRebuildCompletionPending(ledger: ledger)
+                }
+                if try pending.get() { throw UsageLedgerError.localDerivationPending }
+                try Task.checkCancellation()
                 let report = try await reporter.report(
                     ledger: ledger,
                     hostname: hostname,
@@ -909,18 +990,22 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     func start() {
         guard !isRunning else { return }
         isRunning = true
+        startAutoLoopIfNeeded()
+        guard initializationTask == nil else { return }
+        beginStartup()
+    }
+
+    private func beginStartup() {
         // 启动即刷新配置权威，使 UI 一开始就反映真实能力。
         refreshConfigurationAuthority()
         // 崩溃安全恢复的最高优先级：存在 rebuild pending（上次已 reset 清库但未确认全部来源
         // 重扫成功）时，绝不发任何网络请求（普通 report）。必须先完整重扫全部 configured roots；
         // 仅当所有来源无致命失败、pending 被显式清除后，finishScan 才恢复正常启动链路（上报）。
-        if isRebuildCompletionPending() {
-            rebuildRecoveryPending = true
+        if rebuildRecoveryPending {
             if statusSubject.value.localCollectionEnabled {
                 scanNow(chainedReport: false)
             }
-            // 采集关闭时无法自动重扫：保持 pending，等待用户开启本地采集或手动扫描，
-            // 期间仍禁止一切网络动作。不启动自动上报循环。
+            startAutoLoopIfNeeded()
             return
         }
         if statusSubject.value.localCollectionEnabled {
@@ -932,12 +1017,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     /// 是否存在未确认完成的 rebuild（只读；账本不可用时视作无）。
-    private func isRebuildCompletionPending() -> Bool {
-        guard let ledger else { return false }
+    nonisolated private static func isRebuildCompletionPending(ledger: UsageLedgerStore) throws -> Bool {
         // 网络门禁：只要存在「parser 显式重建未确认完成」或「文件已 replace 但派生尚未成功
         // 重算（raw derivation dirty）」任一挂起，都必须 fail-closed，绝不发任何网络请求。
-        let rebuildPending = (try? ledger.requiresRebuildCompletion()) ?? false
-        let derivationPending = (try? ledger.requiresDerivationCompletion()) ?? false
+        let rebuildPending = try ledger.requiresRebuildCompletion()
+        let derivationPending = try ledger.requiresDerivationCompletion()
         return rebuildPending || derivationPending
     }
 
@@ -956,9 +1040,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 使得任何旧的完成回调都被判定为过期，避免覆盖 stop 之后启动的新任务。
     func stop() {
         isRunning = false
+        initializationTask?.cancel()
+        initializationTask = nil
+        initializationGeneration &+= 1
         autoLoopTask?.cancel()
         autoLoopTask = nil
         reportAfterCurrentScan = false
+        networkTask?.cancel()
+        networkTask = nil
+        networkGeneration &+= 1
+        reportAfterNetworkCollection = false
         // 清除 rebuild 恢复标记：下次 start() 会重新读取账本 pending 状态并重新分流。
         rebuildRecoveryPending = false
         scanTask?.cancel()
@@ -995,13 +1086,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         // 采集开启即可周期性扫描（不依赖上报开关）；上报另需其自身就绪，由循环体内分支决定。
         let status = statusSubject.value
         guard autoLoopTask == nil, isRunning,
-              status.localCollectionEnabled || status.reportingEnabled,
-              !isRebuildCompletionPending() else { return }
+              status.localCollectionEnabled || status.reportingEnabled else { return }
+        let sleep = autoLoopSleep
         autoLoopTask = Task { [weak self] in
             let interval = self?.autoReportInterval.seconds ?? TokenReportInterval.default.seconds
             while !Task.isCancelled {
                 do {
-                    try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                    try await sleep(interval)
                 } catch { return }
                 guard let self, self.isRunning else { return }
                 let current = self.statusSubject.value
@@ -1026,9 +1117,34 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     private struct ScanOutcome {
-        let summary: TokenUsageSummary
+        let summary: TokenUsageSummarySnapshot
         let finalize: UsageFinalizeResult
         let pending: (buckets: Int, sessions: Int)
+        let recoveryPending: Bool
+    }
+
+    private struct LedgerInitialization: Sendable {
+        let ledger: UsageLedgerStore
+        let hostname: String
+        let summary: TokenUsageSummarySnapshot
+        let eligible: Bool
+        let pending: (buckets: Int, sessions: Int)
+        let recoveryPending: Bool
+    }
+
+    private struct NetworkSnapshot: Sendable {
+        let summary: TokenUsageSummarySnapshot
+        let pending: (buckets: Int, sessions: Int)
+    }
+
+    private struct NetworkCollectionOutcome: Sendable {
+        let states: [CliProxyCollectionState]
+        let snapshot: NetworkSnapshot?
+    }
+
+    private struct DaySeriesSnapshot: Sendable {
+        let revision: Int64
+        let series: DashboardDaySeries
     }
 
     /// 读取上报权威：hostname 来自合并 env 的 REPORT_CANONICAL_HOSTNAME；配置就绪状态走注入了
@@ -1091,6 +1207,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             }
         }
         if stopAutoLoop {
+            reconcileAutoLoop()
+        }
+    }
+
+    private func reconcileAutoLoop() {
+        reportAfterCurrentScan = false
+        reportAfterNetworkCollection = false
+        if statusSubject.value.localCollectionEnabled {
+            startAutoLoopIfNeeded()
+        } else {
             autoLoopTask?.cancel()
             autoLoopTask = nil
         }
@@ -1154,6 +1280,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     // 扫描会解析大型 JSONL 并批量更新账本，属于可延后的缓存维护工作。
     // 使用 background QoS，避免应用冷启动时与菜单栏交互及其它前台进程争抢 CPU。
     nonisolated private static let workerQueue = DispatchQueue(label: "com.agentpulse.token-sync.worker", qos: .background)
+    nonisolated private static let networkWorkerQueue = DispatchQueue(label: "com.agentpulse.token-sync.network", qos: .utility)
 
     /// 线程安全的取消闸门：由 Task 取消回调置位，GCD worker 在每个文件边界检查。
     private final class CancellationGate: @unchecked Sendable {
@@ -1254,12 +1381,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     nonisolated private static func runOffMain<T: Sendable>(
+        queue: DispatchQueue = workerQueue,
         _ work: @escaping @Sendable (CancellationGate) throws -> T
     ) async -> Result<T, Error> {
         let gate = CancellationGate()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                workerQueue.async {
+                queue.async {
                     continuation.resume(returning: Result { try work(gate) })
                 }
             }
@@ -1408,8 +1536,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
     }
 
-    private func publish(_ summary: TokenUsageSummary) {
-        summarySubject.send(summary)
+    @discardableResult
+    private func publish(_ snapshot: TokenUsageSummarySnapshot) -> Bool {
+        guard summaryRevisionGate.accept(snapshot.revision) else { return false }
+        summarySubject.send(snapshot.summary)
+        return true
     }
 
     /// 刷新看板 1 天曲线：off-main 读取所有 hostname 的 30min bucket → 换算平均 TPS →
@@ -1429,8 +1560,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             }
             await MainActor.run {
                 guard let self else { return }
-                if case let .success(series) = result {
-                    self.daySeriesSubject.send(series)
+                if case let .success(snapshot) = result,
+                   self.daySeriesRevisionGate.accept(snapshot.revision) {
+                    self.daySeriesSubject.send(snapshot.series)
                 }
                 // 失败保持上次值（不覆盖为空，避免闪烁）。
             }
@@ -1452,16 +1584,18 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     nonisolated private static func buildDaySeries(
         from ledger: UsageLedgerStore,
         now: Date
-    ) throws -> DashboardDaySeries {
+    ) throws -> DaySeriesSnapshot {
         let span = DashboardTPSSpan.oneDay
         let start = now.addingTimeInterval(-span.totalSeconds)
-        let totalBuckets = try ledger.outputTokenBuckets(start: start, end: now)
-        let modelBuckets = try ledger.outputTokenBucketsByModel(start: start, end: now)
-        let total = SparklineAnalysis.makeUsageLedgerTPSPoints(buckets: totalBuckets, end: now)
+        let snapshot = try ledger.summarySnapshot(
+            containing: now, includeWindowSummaries: false,
+            outputRange: DateInterval(start: start, end: now)
+        )
+        let total = SparklineAnalysis.makeUsageLedgerTPSPoints(buckets: snapshot.outputBuckets, end: now)
 
         var byModel: [String: [(bucketStart: Date, outputTokens: Int64)]] = [:]
         var modelOutputSum: [String: Int64] = [:]
-        for row in modelBuckets {
+        for row in snapshot.outputBucketsByModel {
             // 归一后 `<synthetic>` 等占位并入 unknown，同名跨 bucket 累加，不再单独成行。
             let model = displayModelName(row.model)
             byModel[model, default: []].append((row.bucketStart, row.outputTokens))
@@ -1476,12 +1610,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         for (model, sum) in modelOutputSum where sum > 0 {
             modelLatestTPS[model] = Double(sum) / span.totalSeconds
         }
-        return DashboardDaySeries(
+        return DaySeriesSnapshot(revision: snapshot.revision, series: DashboardDaySeries(
             total: total,
             perModel: perModel,
             modelLatestTPS: modelLatestTPS,
             computedAt: now
-        )
+        ))
     }
 
     /// 四个窗口共享同一参考时刻与时区，并从所有 hostname 的 derived bucket 查询。
@@ -1491,39 +1625,33 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         containing date: Date,
         calendar: Calendar,
         mergedEnvURL: URL
-    ) throws -> TokenUsageSummary {
-        // 四窗口真实按模型 token（原始名）：日为纯真实明细；周/月/全部作为叠加到虚拟基线上的真实增量。
-        let realModels: [TokenUsageWindow: [UsageModelTokenSummary]] = [
-            .day: try ledger.modelSummary(window: .day, containing: date, calendar: calendar),
-            .week: try ledger.modelSummary(window: .week, containing: date, calendar: calendar),
-            .month: try ledger.modelSummary(window: .month, containing: date, calendar: calendar),
-            .all: try ledger.modelSummary(window: nil, containing: date, calendar: calendar),
-        ]
-        return TokenWindowVirtualBuckets.apply(
-            to: TokenUsageSummary(
-                day: try ledger.summary(
-                    window: .day,
-                    containing: date,
-                    calendar: calendar
-                ).map(windowSummary(from:)),
-                week: try ledger.summary(
-                    window: .week,
-                    containing: date,
-                    calendar: calendar
-                ).map(windowSummary(from:)),
-                month: try ledger.summary(
-                    window: .month,
-                    containing: date,
-                    calendar: calendar
-                ).map(windowSummary(from:)),
-                all: try ledger.summary(
-                    window: nil,
-                    containing: date,
-                    calendar: calendar
-                ).map(windowSummary(from:))
-            ),
-            realModels: realModels,
-            enabled: isVirtualBaselineUser(mergedEnvURL: mergedEnvURL)
+    ) throws -> TokenUsageSummarySnapshot {
+        let snapshot = try ledger.summarySnapshot(containing: date, calendar: calendar)
+        var realModels: [TokenUsageWindow: [UsageModelTokenSummary]] = [:]
+        var summary = TokenUsageSummary.empty
+        for item in snapshot.windows {
+            let value = item.summary.map(windowSummary(from:))
+            switch item.window {
+            case .day:
+                summary.day = value
+                realModels[.day] = item.models
+            case .week:
+                summary.week = value
+                realModels[.week] = item.models
+            case .month:
+                summary.month = value
+                realModels[.month] = item.models
+            case nil:
+                summary.all = value
+                realModels[.all] = item.models
+            }
+        }
+        return TokenUsageSummarySnapshot(
+            revision: snapshot.revision,
+            summary: TokenWindowVirtualBuckets.apply(
+                to: summary, realModels: realModels,
+                enabled: isVirtualBaselineUser(mergedEnvURL: mergedEnvURL)
+            )
         )
     }
 
@@ -1548,7 +1676,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         )
     }
 
-    private static func openLedger() -> UsageLedgerStore? {
+    nonisolated private static func openLedger() -> UsageLedgerStore? {
         do {
             let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appending(path: "AgentPulse", directoryHint: .isDirectory)
             let ownerOnlyDirectoryPermissions = NSNumber(value: Int16(0o700))
@@ -1568,203 +1696,4 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         } catch { return nil }
     }
 
-    /// 扫描单一来源根目录：逐 jsonl 文件按 checkpoint 跳过未变更文件，
-    /// 变更文件解析后同时写入 token 事件与 session 事件。不触发派生重算。
-    /// 扫描单个来源根目录。includeSubagents 控制是否把 subagents/agent-*.jsonl 视为子代理转录
-    /// （计入 token、不产 session 事件）。内建 codex 传 false，claude-compatible 来源可开启。
-    /// 返回本次在磁盘上实际枚举到的该来源文件 fileID 列表（present set）。调用方据此在扫描
-    /// 全部 root 后按 source 聚合，交给 Ledger 标记「磁盘已消失」文件为 missing（保留 raw 历史）。
-    @discardableResult
-    nonisolated private static func scan(
-        root: URL,
-        source: String,
-        includeSubagents: Bool = false,
-        budget: SourceScanBudget,
-        ledger: UsageLedgerStore,
-        hostname: String,
-        cancellation: CancellationGate,
-        progress: ScanProgressReporter
-    ) throws -> [String] {
-        // 不存在的来源根目录：无需扫描，视作该来源“无内容”（非失败）。
-        // 但根目录存在却无法枚举，属致命失败：绝不能当作扫描成功静默吞掉，
-        // 否则会在数据缺失的情况下清除 rebuild pending / 误判“全量成功”。
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory) else { return [] }
-        guard isDirectory.boolValue else {
-            throw TokenSyncScanError.sourceRootNotEnumerable(source: source)
-        }
-        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey], options: [.skipsHiddenFiles]) else {
-            throw TokenSyncScanError.sourceRootNotEnumerable(source: source)
-        }
-        var presentFileIDs: [String] = []
-        var parserBackfillsRemaining = maximumParserBackfillsPerSourceScan
-        var parserBackfillBytesRemaining = maximumParserBackfillBytesPerSourceScan
-        var firstTimeBytesRemaining = budget.firstTimeBytes
-        let startedAt = Date()
-        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
-            try cancellation.throwIfCancelled()
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
-            guard values.isRegularFile == true else { continue }
-            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            let fileSize = (attributes[.size] as? NSNumber)?.int64Value ?? 0
-            let modifiedAt = values.contentModificationDate ?? Date.distantPast
-            let fileIdentity = Self.fileIdentity(for: url, source: source)
-            let fileID = UsageJSONLParser.fileID(for: fileIdentity)
-            presentFileIDs.append(fileID)
-            // 每个枚举到的 jsonl 文件（无论跳过还是解析）都推进一格进度，与预扫总数对齐。
-            progress.advanceItem(.scanning)
-            let exhaustedTimeBudget = Date().timeIntervalSince(startedAt) >= budget.maxDurationSeconds
-            let deferLargeActiveFile = shouldDeferLargeActiveFile(size: fileSize, modifiedAt: modifiedAt)
-            let matchingCheckpoint = try ledger.checkpoint(fileID: fileID)
-                ?? migrateLegacyCheckpointIfPossible(
-                    for: url,
-                    source: source,
-                    fileID: fileID,
-                    fileSize: fileSize,
-                    modifiedAt: modifiedAt,
-                    ledger: ledger
-                )
-            if let checkpoint = matchingCheckpoint,
-               checkpoint.status == "complete",
-               checkpoint.size == fileSize,
-               abs(checkpoint.modifiedAt.timeIntervalSince(modifiedAt)) < 0.001 {
-                if checkpoint.parserVersion == UsageJSONLParser.parserVersion {
-                    continue
-                }
-                if parserBackfillsRemaining <= 0
-                    || fileSize > maximumParserBackfillFileBytes
-                    || fileSize > parserBackfillBytesRemaining
-                    || exhaustedTimeBudget {
-                    continue
-                }
-                parserBackfillsRemaining -= 1
-                parserBackfillBytesRemaining -= fileSize
-            } else if deferLargeActiveFile {
-                continue
-            } else if fileSize > firstTimeBytesRemaining || exhaustedTimeBudget {
-                continue
-            } else {
-                firstTimeBytesRemaining -= fileSize
-            }
-            let data = try Data(contentsOf: url, options: .mappedIfSafe)
-            let parsed = UsageJSONLParser.parse(
-                data: data,
-                source: source,
-                fileIdentity: fileIdentity,
-                modifiedAt: modifiedAt,
-                isSubagent: includeSubagents && isClaudeSubagentTranscript(url)
-            )
-            try ledger.record(
-                events: parsed.events,
-                sessionEvents: parsed.sessionEvents,
-                editEntries: parsed.editEntries,
-                editMetricsSupported: true,
-                checkpoint: parsed.checkpoint,
-                hostname: hostname
-            )
-        }
-        return presentFileIDs
-    }
-
-    nonisolated private static func shouldDeferLargeActiveFile(size: Int64, modifiedAt: Date, now: Date = Date()) -> Bool {
-        size > maximumImmediateUsageParseBytes
-            && now.timeIntervalSince(modifiedAt) < largeActiveFileDeferralInterval
-    }
-
-    nonisolated private static let maximumImmediateUsageParseBytes: Int64 = 96 * 1024 * 1024
-    nonisolated private static let largeActiveFileDeferralInterval: TimeInterval = 30 * 60
-    nonisolated private static let maximumParserBackfillsPerSourceScan = 64
-    nonisolated private static let maximumParserBackfillFileBytes: Int64 = 16 * 1024 * 1024
-    nonisolated private static let maximumParserBackfillBytesPerSourceScan: Int64 = 32 * 1024 * 1024
-
-    /// Codex moves completed rollouts from sessions/YYYY/MM/DD into archived_sessions. The
-    /// rollout filename is stable across that move, while the absolute path is not. Other sources
-    /// keep path-based identity because their filenames are not guaranteed globally unique.
-    nonisolated private static func fileIdentity(for url: URL, source: String) -> String {
-        if source == UsageJSONLParser.codexSource,
-           url.lastPathComponent.hasPrefix("rollout-"),
-           url.pathExtension == "jsonl" {
-            return url.lastPathComponent
-        }
-        return url.path
-    }
-
-    nonisolated private static func migrateLegacyCheckpointIfPossible(
-        for url: URL,
-        source: String,
-        fileID: String,
-        fileSize: Int64,
-        modifiedAt: Date,
-        ledger: UsageLedgerStore
-    ) throws -> UsageFileCheckpoint? {
-        guard source == UsageJSONLParser.codexSource,
-              url.deletingLastPathComponent().standardizedFileURL.path == codexArchivedSessionsRoot.standardizedFileURL.path
-        else { return nil }
-
-        for legacyIdentity in legacyCodexSessionIdentities(forArchivedRollout: url) {
-            let oldFileID = UsageJSONLParser.fileID(for: legacyIdentity)
-            if let migrated = try ledger.migrateFileIdentityIfCheckpointMatches(
-                from: oldFileID,
-                to: fileID,
-                expectedSource: source,
-                expectedSize: fileSize,
-                expectedModifiedAt: modifiedAt,
-                expectedParserVersion: UsageJSONLParser.parserVersion
-            ) {
-                return migrated
-            }
-        }
-        return nil
-    }
-
-    nonisolated private static func legacyCodexSessionIdentities(forArchivedRollout url: URL) -> [String] {
-        let name = url.lastPathComponent
-        let prefix = "rollout-"
-        guard name.hasPrefix(prefix), name.hasSuffix(".jsonl"), name.count >= prefix.count + 10 else {
-            return []
-        }
-        let dateStart = name.index(name.startIndex, offsetBy: prefix.count)
-        let dateEnd = name.index(dateStart, offsetBy: 10)
-        let parts = name[dateStart..<dateEnd].split(separator: "-")
-        guard parts.count == 3 else { return [] }
-        let relative = [String(parts[0]), String(parts[1]), String(parts[2]), name]
-            .joined(separator: "/")
-        let symlinkPath = codexSessionsRoot.appending(path: relative).path
-        let resolvedPath = codexSessionsRoot.resolvingSymlinksInPath().appending(path: relative).path
-        if symlinkPath == resolvedPath { return [symlinkPath] }
-        return [symlinkPath, resolvedPath]
-    }
-
-    private struct SourceScanBudget: Sendable {
-        let firstTimeBytes: Int64
-        let maxDurationSeconds: TimeInterval
-
-        static let activeSessions = SourceScanBudget(firstTimeBytes: 32 * 1024 * 1024, maxDurationSeconds: 10)
-        static let backgroundHistory = SourceScanBudget(firstTimeBytes: 4 * 1024 * 1024, maxDurationSeconds: 5)
-    }
-
-    /// Claude Task 子代理转录的稳定磁盘布局：`subagents/agent-*.jsonl`。
-    /// 子代理用量计入总量，但不会生成独立 session 聚合。
-    nonisolated private static func isClaudeSubagentTranscript(_ url: URL) -> Bool {
-        url.deletingPathExtension().lastPathComponent.hasPrefix("agent-")
-            && url.deletingLastPathComponent().lastPathComponent == "subagents"
-    }
-
-    /// 预扫某来源根目录的 jsonl 文件数，作为 scanning 阶段进度分母（best-effort）。
-    /// 目录不存在 / 无法枚举时返回 0；真实 scan 仍会在无法枚举时抛致命错误。
-    nonisolated private static func countJSONLFiles(root: URL) -> Int {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory),
-              isDirectory.boolValue,
-              let enumerator = FileManager.default.enumerator(
-                at: root,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-              ) else { return 0 }
-        var count = 0
-        for case let url as URL in enumerator where url.pathExtension == "jsonl" {
-            count += 1
-        }
-        return count
-    }
 }

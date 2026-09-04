@@ -1,0 +1,29 @@
+name: Offline checks
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: macOS arm64 offline verification
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: '6.3'
+      - name: Verify runtime and fixture gates
+        run: python3 scripts/verify.py
+      - name: Verify distributable app
+        run: python3 scripts/package_app.py --archive --version 1.0.0

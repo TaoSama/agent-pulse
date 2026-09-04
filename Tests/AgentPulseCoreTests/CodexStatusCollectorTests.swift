@@ -53,14 +53,13 @@ final class CodexStatusCollectorTests: XCTestCase {
 
     func testParseSessionMeta() throws {
         let contents = try Self.fixture("cli_user_two_complete.jsonl")
-        let firstLine = String(contents.split(whereSeparator: { $0.isNewline }).first!)
-        let meta = CodexSessionParser.parseSessionMeta(line: firstLine)
-        XCTAssertNotNil(meta)
-        XCTAssertEqual(meta?.sessionID, "11111111-1111-7111-8111-111111111111")
-        XCTAssertEqual(meta?.threadSource, "user")
-        XCTAssertEqual(meta?.originator, "codex_exec")
-        XCTAssertTrue(meta!.isTopLevel)
-        XCTAssertEqual(CodexSessionParser.source(forOriginator: meta?.originator), .cli)
+        let firstLine = String(try XCTUnwrap(contents.split(whereSeparator: { $0.isNewline }).first))
+        let meta = try XCTUnwrap(CodexSessionParser.parseSessionMeta(line: firstLine))
+        XCTAssertEqual(meta.sessionID, "11111111-1111-7111-8111-111111111111")
+        XCTAssertEqual(meta.threadSource, "user")
+        XCTAssertEqual(meta.originator, "codex_exec")
+        XCTAssertTrue(meta.isTopLevel)
+        XCTAssertEqual(CodexSessionParser.source(forOriginator: meta.originator), .cli)
     }
 
     func testParseSessionMetaRejectsNonMeta() {
@@ -141,19 +140,36 @@ final class CodexStatusCollectorTests: XCTestCase {
         func now() -> Date { date }
     }
 
-    func makeCollector(processes: Result<[RunningProcess], ProcessScanError>) -> CodexStatusCollector {
-        CodexStatusCollector(
+    func makeCollector(processes: Result<[RunningProcess], ProcessScanError>) throws -> CodexStatusCollector {
+        let manager = FileManager.default
+        let directory = manager.temporaryDirectory.appendingPathComponent("codex-status-fixture-\(UUID().uuidString)", isDirectory: true)
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try FileManager.default.removeItem(at: directory) }
+        let referenceDate = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-08-10T00:05:00Z"))
+        // Discovery accepts rollout-*.jsonl. Keep pure-parser fixtures named for
+        // their scenarios, and construct the on-disk layout the collector reads.
+        let fixtureNames = [
+            "cli_user_two_complete.jsonl", "cli_user_duplicate_turn.jsonl",
+            "cli_user_missing_turn.jsonl", "cli_user_active.jsonl", "aborted_last.jsonl",
+            "desktop_user_one_complete.jsonl", "subagent_excluded.jsonl", "automation_excluded.jsonl",
+        ]
+        for name in fixtureNames {
+            let destination = directory.appendingPathComponent("rollout-\(name)")
+            try manager.copyItem(at: Self.fixturesDirectory.appendingPathComponent(name), to: destination)
+            try manager.setAttributes([.modificationDate: referenceDate], ofItemAtPath: destination.path)
+        }
+        return CodexStatusCollector(
             processScanner: FakeScanner(result: processes),
-            sessionsDirectories: [Self.fixturesDirectory],
+            sessionsDirectories: [directory],
             automationRoots: [],
-            clock: FixedClock(date: Date(timeIntervalSince1970: 1_786_298_400))
+            clock: FixedClock(date: referenceDate)
         )
     }
 
-    func testCollectGeneratingWhenLiveProcessAndActiveCandidate() {
+    func testCollectGeneratingWhenLiveProcessAndActiveCandidate() throws {
         // fixtures 含 CLI 活跃候选（cli_user_active）。提供一个匹配的 live CLI 进程。
         let cli = RunningProcess(pid: 42, executablePath: "/x/@openai/codex/bin/codex", residentMemoryBytes: 2048, cpuUsagePercent: 7.0)
-        let snapshot = makeCollector(processes: .success([cli])).collect(source: .cli)
+        let snapshot = try makeCollector(processes: .success([cli])).collect(source: .cli)
         XCTAssertEqual(snapshot.status, .generating)
         XCTAssertEqual(snapshot.process?.pid, 42)
         XCTAssertEqual(snapshot.process?.residentMemoryBytes, 2048)
@@ -164,23 +180,23 @@ final class CodexStatusCollectorTests: XCTestCase {
         XCTAssertEqual(snapshot.completedTaskCount, 4)
     }
 
-    func testCollectDegradedWhenCandidateButNoLiveProcess() {
-        let snapshot = makeCollector(processes: .success([])).collect(source: .cli)
+    func testCollectDegradedWhenCandidateButNoLiveProcess() throws {
+        let snapshot = try makeCollector(processes: .success([])).collect(source: .cli)
         XCTAssertEqual(snapshot.status, .degraded)
         XCTAssertNotNil(snapshot.degradedReason)
         if case .other = snapshot.degradedReason {} else { XCTFail("expected .other") }
     }
 
-    func testCollectDesktopCountsOnlyDesktopOriginator() {
+    func testCollectDesktopCountsOnlyDesktopOriginator() throws {
         let desktop = RunningProcess(pid: 7, executablePath: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")
-        let snapshot = makeCollector(processes: .success([desktop])).collect(source: .desktop)
+        let snapshot = try makeCollector(processes: .success([desktop])).collect(source: .desktop)
         // desktop_user_one_complete 提供 1 个；无 desktop 活跃候选 => idle。
         XCTAssertEqual(snapshot.completedTaskCount, 1)
         XCTAssertEqual(snapshot.status, .idle)
     }
 
-    func testCollectProcessScanFailureIsDegradedWithExplicitError() {
-        let snapshot = makeCollector(processes: .failure(.launchFailed("boom"))).collect(source: .cli)
+    func testCollectProcessScanFailureIsDegradedWithExplicitError() throws {
+        let snapshot = try makeCollector(processes: .failure(.launchFailed("boom"))).collect(source: .cli)
         XCTAssertEqual(snapshot.status, .degraded)
         XCTAssertNotNil(snapshot.degradedReason)
         XCTAssertNil(snapshot.completedTaskCount)

@@ -106,6 +106,12 @@ public struct CodexRuntimeMetrics: Sendable, Equatable {
 
 /// 只包含聚合计数的实时速率对账数据；不暴露路径、会话 ID、正文或凭证。
 public struct CodexRuntimeMetricsDiagnostics: Sendable, Equatable {
+    public let claudeDesktopBytesRead: Int
+    public let runtimeJSONRecordsDecoded: Int
+    public let modelSearchRecordsDecoded: Int
+    public let retainedTokenEvents: Int
+    public let discoveryFullScans: Int
+    public let discoveryMetadataReads: Int
     public let configuredRoots: Int
     public let canonicalRoots: Int
     public let discoveredJSONLFiles: Int
@@ -248,6 +254,15 @@ public actor CodexRuntimeMetricsCollector {
         let sessionKey: String
     }
 
+    private struct TokenWindowTotals {
+        var tokens = 0.0
+        var models: [String: Double] = [:]
+        var shortTokens = 0.0
+        var shortModels: [String: Double] = [:]
+        var secondTokens = 0.0
+        var secondModels: [String: Double] = [:]
+    }
+
     private struct MessageUsage {
         let output: Int
         let lastSeen: Date
@@ -334,7 +349,7 @@ public actor CodexRuntimeMetricsCollector {
         let desktopTask: SessionTaskState?
         let codexCLITask: SessionTaskState?
         let latestOutputSignal: Date?
-        let tokenEvents: [TrackedTokenEvent]
+        var tokenEvents: [TrackedTokenEvent]
     }
 
     private struct SessionTaskState {
@@ -343,9 +358,15 @@ public actor CodexRuntimeMetricsCollector {
         let activityAt: Date?
     }
 
+    private struct AggregateFileSummary {
+        let completedIdentities: Set<String>
+        let desktopTask: SessionTaskState?
+        let codexCLITask: SessionTaskState?
+    }
+
     private struct FileCacheEntry {
         let signature: FileSignature
-        let summary: FileSummary
+        var summary: FileSummary
         let lastSeen: Date
         let readOffset: UInt64
         let meta: CodexSessionMeta?
@@ -376,6 +397,7 @@ public actor CodexRuntimeMetricsCollector {
         var latestOutputSignal: Date?
         var filesScanned = 0
         var unreadableFiles = 0
+        var unavailablePaths = Set<String>()
         var tokenEvents: [TrackedTokenEvent] = []
         var filesReusedFromCache = 0
         var filesReadIncrementally = 0
@@ -416,27 +438,43 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     private struct ClaudeDesktopFileCacheEntry {
-        let modifiedAt: Date?
-        let fileSize: Int?
-        let summary: ClaudeDesktopSessionSummary
-    }
+        var signature: FileSignature
+        var readOffset: UInt64 = 0
+        var tailGuard = Data()
+        var sessionID: String?
+        var isDesktopSession = false
+        var latestActivity: Date?
+        var lastMessageRole: String?
+        var lastAssistantEndTurn = false
 
-    private struct ProcessSnapshot {
-        let sampledAt: Date
-        let processes: [RunningProcess]
+        var summary: ClaudeDesktopSessionSummary {
+            guard isDesktopSession, let sessionID else { return .notDesktopSession }
+            let unfinished = lastMessageRole == "user"
+                || (lastMessageRole == "assistant" && !lastAssistantEndTurn)
+            return .session(sessionID: sessionID, activityAt: latestActivity, unfinished: unfinished)
+        }
     }
 
     private let configuration: CodexRuntimeMetricsConfiguration
     private let processScanner: any ProcessScanning
     private let canonicalSessionDirectories: [URL]
     private let canonicalClaudeProjectsDirectory: URL
+    private let discoveryIndex: RuntimeFileDiscoveryIndex
     private let store: SQLiteSnapshotStore
     private var memoryHistory: [Date: LiveRateSample]
     private var restoredDisplaySnapshot: CachedRuntimeMetricsSnapshot?
     private var fileCache: [String: FileCacheEntry] = [:]
+    private var aggregateDirtyPaths = Set<String>()
+    private var aggregateUnavailablePaths = Set<String>()
+    private var aggregateFiles: [String: AggregateFileSummary] = [:]
+    private var aggregateCompletedReferences: [String: Int] = [:]
+    private var aggregateCompletedIdentities = Set<String>()
+    private var aggregateDesktopTasks: [String: SessionTaskState] = [:]
+    private var aggregateCLITasks: [String: SessionTaskState] = [:]
+    private var desktopTaskFiles: [String: [String: SessionTaskState]] = [:]
+    private var cliTaskFiles: [String: [String: SessionTaskState]] = [:]
     private var lastFullSignatureCheck: Date?
     private var cachedFiles: [URL] = []
-    private var lastDiscoveryAt: Date?
     private var lastScanAt: Date?
     private var liveTrackedPaths = Set<String>()
     private var tokenFileProviders: [String: TokenFileProvider] = [:]
@@ -445,17 +483,19 @@ public actor CodexRuntimeMetricsCollector {
     private var cachedTokenDirectoryReadable = false
     private var cachedCodexEnumerationFailed = false
     private var cachedTokenEnumerationFailed = false
-    private var cachedClaudeDesktopMetric: RuntimeTaskCategoryMetric?
-    private var lastClaudeDesktopMetricAt: Date?
+    private var claudeDesktopFiles: [URL] = []
     private var claudeDesktopFileCache: [String: ClaudeDesktopFileCacheEntry] = [:]
-    private var cachedProcessSnapshot: ProcessSnapshot?
+    private var claudeDesktopBytesRead = 0
+    private var runtimeJSONRecordsDecoded = 0
+    private var modelSearchRecordsDecoded = 0
     private var lastSnapshotMaintenanceAt: Date?
     private let fractionalISO8601: ISO8601DateFormatter
     private let basicISO8601: ISO8601DateFormatter
 
     public init(
         configuration: CodexRuntimeMetricsConfiguration,
-        processScanner: any ProcessScanning = SystemProcessScanner()
+        processScanner: any ProcessScanning = SystemProcessScanner(),
+        fileChangeMonitor: (any RuntimeFileChangeMonitoring)? = nil
     ) throws {
         self.configuration = configuration
         self.processScanner = processScanner
@@ -469,6 +509,9 @@ public actor CodexRuntimeMetricsCollector {
         canonicalClaudeProjectsDirectory = configuration.claudeProjectsDirectory
             .resolvingSymlinksInPath()
             .standardizedFileURL
+        discoveryIndex = try RuntimeFileDiscoveryIndex(
+            roots: canonicalSessionDirectories + [canonicalClaudeProjectsDirectory], monitor: fileChangeMonitor
+        )
         let parent = configuration.databaseURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         store = try SQLiteSnapshotStore(path: configuration.databaseURL.path)
@@ -489,8 +532,10 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     public func scan(at requestedDate: Date = Date()) throws -> CodexRuntimeMetrics {
+        claudeDesktopBytesRead = 0
+        runtimeJSONRecordsDecoded = 0
+        modelSearchRecordsDecoded = 0
         let sampledAt = Date(timeIntervalSince1970: floor(requestedDate.timeIntervalSince1970))
-        let window = TPSWindow(now: { sampledAt })
         var accumulator = ScanAccumulator()
         var codexDirectoryReadable = false
         var tokenDirectoryReadable = false
@@ -499,9 +544,11 @@ public actor CodexRuntimeMetricsCollector {
         let forceFullSignatureCheck = lastFullSignatureCheck.map {
             sampledAt.timeIntervalSince($0) >= Self.fullReconcileInterval
         } ?? true
-        let discoveryDue = lastDiscoveryAt.map {
-            sampledAt.timeIntervalSince($0) >= Self.discoveryInterval
-        } ?? true
+        let indexChanged = discoveryIndex.refresh(ignoringUpdatesFor: liveTrackedPaths)
+        let trackingExpired = liveTrackedPaths.contains {
+            fileCache[$0].map { sampledAt.timeIntervalSince($0.lastSeen) > Self.trackedFileRetention } ?? false
+        }
+        let discoveryDue = indexChanged || trackingExpired
         let observationGap = lastScanAt.map {
             sampledAt.timeIntervalSince($0) > TPSWindow.windowSeconds
         } ?? false
@@ -518,8 +565,8 @@ public actor CodexRuntimeMetricsCollector {
             cachedTokenDirectoryReadable = tokenDirectoryReadable
             cachedCodexEnumerationFailed = codexEnumerationFailed
             cachedTokenEnumerationFailed = tokenEnumerationFailed
-            lastDiscoveryAt = sampledAt
             let retainedPaths = Set(cachedFiles.map(\.path))
+            aggregateDirtyPaths.formUnion(fileCache.keys.filter { !retainedPaths.contains($0) })
             fileCache = fileCache.filter { retainedPaths.contains($0.key) }
             files = cachedFiles
         } else {
@@ -538,7 +585,7 @@ public actor CodexRuntimeMetricsCollector {
                 accumulator: &accumulator
             )
         }
-        _ = window.record(contentsOf: accumulator.tokenEvents.map(\.sample), referenceDate: sampledAt)
+        refreshAggregate(into: &accumulator)
         if forceFullSignatureCheck { lastFullSignatureCheck = sampledAt }
 
         let desktopMetric: RuntimeTaskCategoryMetric
@@ -630,28 +677,21 @@ public actor CodexRuntimeMetricsCollector {
         ])
 
         let sourceAvailable = tokenDirectoryReadable && !tokenEnumerationFailed
-        let overlapTokens = window.tokensInWindow(referenceDate: sampledAt)
-        let modelTokens = window.tokensInWindowByModel(referenceDate: sampledAt)
-        // 看板 5s 滑窗曲线：额外取该时刻前 5 秒的真实 output（总 + 分模型），存入样本供曲线逐点绘制。
-        let shortWindow = Double(LiveRateSample.shortWindowSeconds)
-        let shortTokens = window.tokensInShortWindow(referenceDate: sampledAt, windowSeconds: shortWindow)
-        let shortModelTokens = window.tokensInShortWindowByModel(referenceDate: sampledAt, windowSeconds: shortWindow)
-        // 看板不重叠桶曲线：额外取该 1 秒的逐秒净增量（总 + 分模型），严格 (t-1, t] 窗口、
-        // 右边界不含未来容差，相邻秒不重叠，可按桶求和不重复计。与 5s 重叠口径分开存。
-        let lastSecondTokens = window.tokensInLastSecond(referenceDate: sampledAt)
-        let lastSecondModelTokens = window.tokensInLastSecondByModel(referenceDate: sampledAt)
+        let windows = tokenWindowTotals(accumulator.tokenEvents, at: sampledAt)
         let liveRate = makeLiveRateSample(
             at: sampledAt,
             sourceAvailable: sourceAvailable,
             latestSignalAt: accumulator.latestOutputSignal,
-            tokensInWindow: overlapTokens,
-            modelTokensInWindow: modelTokens,
-            tokensInShortWindow: shortTokens,
-            modelTokensInShortWindow: shortModelTokens,
-            tokensInLastSecond: lastSecondTokens,
-            modelTokensInLastSecond: lastSecondModelTokens
+            tokensInWindow: windows.tokens,
+            modelTokensInWindow: windows.models,
+            tokensInShortWindow: windows.shortTokens,
+            modelTokensInShortWindow: windows.shortModels,
+            tokensInLastSecond: windows.secondTokens,
+            modelTokensInLastSecond: windows.secondModels
         )
         try persistLiveRate(liveRate)
+        let dashboard = dashboardHistory(at: sampledAt)
+        let historyCutoff = sampledAt.addingTimeInterval(-Double(CodexRuntimeMetricsConfiguration.historyPointLimit - 1))
         let metrics = CodexRuntimeMetrics(
             sampledAt: sampledAt,
             totalTasks: totalTasks,
@@ -667,8 +707,8 @@ public actor CodexRuntimeMetricsCollector {
                 available: codexDirectoryReadable
             ),
             liveRate: liveRate,
-            history: recentHistory(at: sampledAt),
-            dashboardHistory: dashboardHistory(at: sampledAt),
+            history: dashboard.filter { $0.timestamp >= historyCutoff },
+            dashboardHistory: dashboard,
             filesScanned: accumulator.filesScanned,
             unreadableFiles: accumulator.unreadableFiles,
             filesReusedFromCache: accumulator.filesReusedFromCache,
@@ -676,7 +716,7 @@ public actor CodexRuntimeMetricsCollector {
             filesFullyParsed: accumulator.filesFullyParsed,
             diagnostics: makeDiagnostics(
                 accumulator: accumulator,
-                overlapTokens: overlapTokens,
+                overlapTokens: windows.tokens,
                 referenceDate: sampledAt
             )
         )
@@ -779,14 +819,7 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     private func processSnapshot(at now: Date) throws -> [RunningProcess] {
-        if let cachedProcessSnapshot,
-           now.timeIntervalSince(cachedProcessSnapshot.sampledAt) >= 0,
-           now.timeIntervalSince(cachedProcessSnapshot.sampledAt) < Self.processSnapshotInterval {
-            return cachedProcessSnapshot.processes
-        }
-        let processes = try processScanner.scan()
-        cachedProcessSnapshot = ProcessSnapshot(sampledAt: now, processes: processes)
-        return processes
+        try processScanner.scan()
     }
 
     /// Claude 桌面版为每个对话在 ~/.claude/projects/<slug>/<sessionId>.jsonl 追加事件流。
@@ -806,20 +839,9 @@ public actor CodexRuntimeMetricsCollector {
                 present: false,
                 quality: .complete
             )
-            cachedClaudeDesktopMetric = closed
-            lastClaudeDesktopMetricAt = now
             return closed
         }
-        if let cachedClaudeDesktopMetric,
-           let lastClaudeDesktopMetricAt,
-           now.timeIntervalSince(lastClaudeDesktopMetricAt) >= 0,
-           now.timeIntervalSince(lastClaudeDesktopMetricAt) < Self.discoveryInterval {
-            return cachedClaudeDesktopMetric
-        }
-        let metric = computeClaudeDesktopSessions(now: now)
-        cachedClaudeDesktopMetric = metric
-        lastClaudeDesktopMetricAt = now
-        return metric
+        return computeClaudeDesktopSessions(now: now)
     }
 
     private func computeClaudeDesktopSessions(now: Date) -> RuntimeTaskCategoryMetric {
@@ -836,43 +858,13 @@ public actor CodexRuntimeMetricsCollector {
                 quality: .unavailable
             )
         }
-        guard let enumerator = fileManager.enumerator(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return RuntimeTaskCategoryMetric(
-                totalTasks: nil,
-                activeTasks: nil,
-                present: true,
-                quality: .unavailable
-            )
-        }
-
         var sessionIDs = Set<String>()
         var activeSessionIDs = Set<String>()
         var seenPaths = Set<String>()
         var degraded = false
-        for case let fileURL as URL in enumerator {
-            guard fileURL.pathExtension.lowercased() == "jsonl" else { continue }
-            // 只统计顶层会话文件，排除 subagents/workflows 派生轨迹。
-            let standardized = fileURL.resolvingSymlinksInPath().standardizedFileURL
-            guard !standardized.pathComponents.contains("subagents") else { continue }
-            seenPaths.insert(standardized.path)
-            let values = try? standardized.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
-            let summary: ClaudeDesktopSessionSummary
-            if let cached = claudeDesktopFileCache[standardized.path],
-               cached.modifiedAt == values?.contentModificationDate,
-               cached.fileSize == values?.fileSize {
-                summary = cached.summary
-            } else {
-                summary = summarizeClaudeDesktopSession(at: standardized, now: now)
-                claudeDesktopFileCache[standardized.path] = ClaudeDesktopFileCacheEntry(
-                    modifiedAt: values?.contentModificationDate,
-                    fileSize: values?.fileSize,
-                    summary: summary
-                )
-            }
+        for fileURL in claudeDesktopFiles {
+            seenPaths.insert(fileURL.path)
+            let summary = summarizeClaudeDesktopSession(at: fileURL)
             switch summary {
             case .unreadable:
                 degraded = true
@@ -898,49 +890,67 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     /// 单条会话文件的最小解析：判定是否为 claude-desktop-3p 顶层会话，并推断当前是否活跃。
-    private func summarizeClaudeDesktopSession(at url: URL, now: Date) -> ClaudeDesktopSessionSummary {
-        let contents: String
+    private func summarizeClaudeDesktopSession(at url: URL) -> ClaudeDesktopSessionSummary {
+        if !liveTrackedPaths.contains(url.path), !discoveryIndex.requiresSignatureCheck(url.path),
+           let cached = claudeDesktopFileCache[url.path] { return cached.summary }
+        guard let status = Self.fileStatus(atPath: url.path), let size = status.size else {
+            return .unreadable
+        }
+        let signature = FileSignature(
+            modifiedAt: status.modifiedAt, createdAt: status.createdAt,
+            size: size, resourceIdentifier: status.resourceIdentifier
+        )
+        let cached = claudeDesktopFileCache[url.path]
+        if let cached, cached.signature == signature { return cached.summary }
+        var entry = ClaudeDesktopFileCacheEntry(signature: signature)
+        let data: Data
         do {
-            contents = try String(contentsOf: url, encoding: .utf8)
+            let handle = try FileHandle(forReadingFrom: url)
+            do {
+                if let cached,
+                   cached.signature.resourceIdentifier == signature.resourceIdentifier,
+                   cached.signature.createdAt == signature.createdAt,
+                   size > (cached.signature.size ?? 0),
+                   cached.readOffset >= UInt64(cached.tailGuard.count) {
+                    try handle.seek(toOffset: cached.readOffset - UInt64(cached.tailGuard.count))
+                    let guarded = try handle.read(upToCount: cached.tailGuard.count) ?? Data()
+                    if guarded == cached.tailGuard { entry = cached }
+                }
+                try handle.seek(toOffset: entry.readOffset)
+                data = try handle.readToEnd() ?? Data()
+                try handle.close()
+            } catch {
+                try handle.close()
+                throw error
+            }
         } catch {
             return .unreadable
         }
+        let completeLength = completeLineLength(in: data)
+        claudeDesktopBytesRead += data.count
         let decoder = JSONDecoder()
-        var sessionID: String?
-        var isDesktopSession = false
-        var latestActivity: Date?
-        // 尾部会话状态：最后一条“消息”是 user（无后续 assistant）视为进行中；
-        // 最后一条 assistant 的 stop_reason == end_turn 视为已结束，否则视为进行中。
-        var lastMessageRole: String?
-        var lastAssistantEndTurn = false
-        for rawLine in contents.split(separator: "\n", omittingEmptySubsequences: true) {
-            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8) else { continue }
-            guard let record = try? decoder.decode(ClaudeDesktopRecord.self, from: data) else { continue }
-            if let id = record.sessionId, sessionID == nil { sessionID = id }
-            if record.entrypoint == "claude-desktop-3p" { isDesktopSession = true }
+        // Only complete records advance the cursor. A partial JSON/UTF-8 line is
+        // retried together with its next append, including after a metadata-only change.
+        for rawLine in data.prefix(completeLength).split(separator: 0x0A) {
+            guard let record = try? decoder.decode(ClaudeDesktopRecord.self, from: Data(rawLine)) else { continue }
+            if let id = record.sessionId, entry.sessionID == nil { entry.sessionID = id }
+            if record.entrypoint == "claude-desktop-3p" { entry.isDesktopSession = true }
             guard let type = record.type, type == "user" || type == "assistant" else { continue }
             if let ts = record.timestamp, let parsed = parseTimestamp(ts) {
-                if latestActivity.map({ parsed > $0 }) ?? true { latestActivity = parsed }
+                if entry.latestActivity.map({ parsed > $0 }) ?? true { entry.latestActivity = parsed }
             }
-            lastMessageRole = record.message?.role ?? type
+            entry.lastMessageRole = record.message?.role ?? type
             if type == "assistant" {
-                lastAssistantEndTurn = record.message?.stopReason == "end_turn"
+                entry.lastAssistantEndTurn = record.message?.stopReason == "end_turn"
             }
         }
-        guard isDesktopSession, let resolvedID = sessionID else {
-            return .notDesktopSession
-        }
-        // 尾部“仍在进行”：最后一条是 user（模型尚未回复），或最后一条 assistant 未以 end_turn 收尾。
-        let unfinishedTail: Bool
-        if lastMessageRole == "user" {
-            unfinishedTail = true
-        } else if lastMessageRole == "assistant" {
-            unfinishedTail = !lastAssistantEndTurn
-        } else {
-            unfinishedTail = false
-        }
-        return .session(sessionID: resolvedID, activityAt: latestActivity, unfinished: unfinishedTail)
+        var guardData = entry.tailGuard
+        guardData.append(data.prefix(completeLength))
+        entry.tailGuard = tailGuard(for: guardData)
+        entry.readOffset += UInt64(completeLength)
+        entry.signature = signature
+        claudeDesktopFileCache[url.path] = entry
+        return entry.summary
     }
 
     private func discoverFiles(at now: Date) -> DiscoveryResult {
@@ -961,6 +971,7 @@ public actor CodexRuntimeMetricsCollector {
         var seenPaths = Set<String>()
         var completedMetricFiles: [String: URL] = [:]
         var candidates: [Candidate] = []
+        var discoveredClaudeFiles: [URL] = []
         let fileManager = FileManager.default
 
         func enumerate(
@@ -968,38 +979,28 @@ public actor CodexRuntimeMetricsCollector {
             provider: TokenFileProvider,
             includesCodexCompleted: Bool
         ) -> (readable: Bool, failed: Bool) {
-            var isDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory),
-                  isDirectory.boolValue,
-                  fileManager.isReadableFile(atPath: directory.path) else {
+            guard discoveryIndex.isReadable(directory) else {
                 return (false, false)
             }
-            guard let enumerator = fileManager.enumerator(
-                at: directory,
-                includingPropertiesForKeys: nil,
-                options: []
-            ) else {
-                return (true, true)
-            }
-            for case let discoveredURL as URL in enumerator {
-                guard discoveredURL.pathExtension.lowercased() == "jsonl" else { continue }
+            for entry in discoveryIndex.entries(in: directory) {
                 diagnostics.discoveredJSONLFiles += 1
-                let canonicalURL = discoveredURL.resolvingSymlinksInPath().standardizedFileURL
+                let canonicalURL = entry.url
                 guard seenPaths.insert(canonicalURL.path).inserted else {
                     diagnostics.duplicateFiles += 1
                     continue
                 }
                 tokenFileProviders[canonicalURL.path] = provider
+                if case .claude = provider,
+                   !canonicalURL.pathComponents.contains("subagents") {
+                    discoveredClaudeFiles.append(canonicalURL)
+                }
                 guard shouldTrackLiveJSONL(canonicalURL) else {
                     diagnostics.excludedAggregateFiles += 1
                     continue
                 }
                 guard !liveTrackedPaths.contains(canonicalURL.path) else { continue }
-                guard let values = try? canonicalURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
-                      let size = values.fileSize,
-                      let modifiedAt = values.contentModificationDate else {
-                    continue
-                }
+                let size = entry.size
+                let modifiedAt = entry.modifiedAt
                 guard size > 0 else {
                     diagnostics.excludedEmptyFiles += 1
                     continue
@@ -1015,7 +1016,7 @@ public actor CodexRuntimeMetricsCollector {
                 }
                 candidates.append(Candidate(url: canonicalURL, modifiedAt: modifiedAt))
             }
-            return (true, false)
+            return (true, discoveryIndex.enumerationFailed(directory))
         }
 
         for directory in canonicalSessionDirectories {
@@ -1034,9 +1035,11 @@ public actor CodexRuntimeMetricsCollector {
         )
         claudeDirectoryReadable = claudeResult.readable
         claudeEnumerationFailed = claudeResult.failed
+        claudeDesktopFiles = discoveredClaudeFiles
 
         let expiredTrackedPaths = liveTrackedPaths.filter { path in
-            guard fileManager.fileExists(atPath: path), let cached = fileCache[path] else { return true }
+            guard discoveryIndex.containsFile(path), fileManager.fileExists(atPath: path),
+                  let cached = fileCache[path] else { return true }
             return now.timeIntervalSince(cached.lastSeen) > Self.trackedFileRetention
         }
         liveTrackedPaths.subtract(expiredTrackedPaths)
@@ -1073,9 +1076,16 @@ public actor CodexRuntimeMetricsCollector {
         allowIncrementalRead: Bool,
         accumulator: inout ScanAccumulator
     ) {
+        // Expire retained event arrays even when a file stops changing. Otherwise
+        // an idle file keeps copying its final busy window into every new sample.
+        if var cached = fileCache[file.path], !cached.summary.tokenEvents.isEmpty {
+            cached.summary.tokenEvents.removeAll { !eventCanOverlapWindow($0.sample, referenceDate: now) }
+            fileCache[file.path] = cached
+        }
         if let cached = fileCache[file.path],
            !liveTrackedPaths.contains(file.path),
            !forceSignatureCheck,
+           !discoveryIndex.requiresSignatureCheck(file.path),
            cached.summary.desktopTask?.lifecycleStarted != true,
            cached.summary.codexCLITask?.lifecycleStarted != true,
            cached.signature.modifiedAt.map({ now.timeIntervalSince($0) > Self.recentFileInterval }) == true {
@@ -1092,6 +1102,7 @@ public actor CodexRuntimeMetricsCollector {
         // stale signature and be wrongly served from cache.
         guard let status = Self.fileStatus(atPath: file.path) else {
             accumulator.unreadableFiles += 1
+            accumulator.unavailablePaths.insert(file.path)
             return
         }
         let signature = FileSignature(
@@ -1111,6 +1122,7 @@ public actor CodexRuntimeMetricsCollector {
            let updated = updateIncrementally(file: file, cached: cached, signature: signature, now: now) {
             accumulator.filesReadIncrementally += 1
             fileCache[file.path] = updated
+            aggregateDirtyPaths.insert(file.path)
             apply(updated.summary, now: now, accumulator: &accumulator)
             return
         }
@@ -1127,12 +1139,14 @@ public actor CodexRuntimeMetricsCollector {
             }
         } catch {
             accumulator.unreadableFiles += 1
+            accumulator.unavailablePaths.insert(file.path)
             return
         }
         accumulator.filesFullyParsed += 1
         let completeLength = completeLineLength(in: fileData)
         guard let contents = String(data: fileData.prefix(completeLength), encoding: .utf8) else {
             accumulator.unreadableFiles += 1
+            accumulator.unavailablePaths.insert(file.path)
             return
         }
         let isCodexFile: Bool = switch tokenFileProviders[file.path] {
@@ -1188,7 +1202,9 @@ public actor CodexRuntimeMetricsCollector {
         if liveTrackedPaths.contains(file.path) {
             let baseline = baselineData(from: fileData)
             for (lineIndex, line) in completeLines(in: baseline.data, skippingLeadingPartialLine: baseline.skipsLeadingPartialLine).enumerated() {
-                if let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] {
+                runtimeJSONRecordsDecoded += 1
+                let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
+                if let object {
                     if let model = turnContextModel(object) {
                         currentModel = model
                         hasSeenTurnContext = true
@@ -1221,7 +1237,7 @@ public actor CodexRuntimeMetricsCollector {
                         }
                     }
                 }
-                guard let parsed = parseTokenLine(line, now: now) else { continue }
+                guard let object, let parsed = parseTokenLine(line, object: object, now: now) else { continue }
                 tokenDiagnostics.parsedOutputObservations += 1
                 tokenDiagnostics.baselineObservations += 1
                 // 子 agent 继承前缀跟踪：一旦某条 token 时间戳越过 meta 时间簇，标记已越过。
@@ -1296,7 +1312,7 @@ public actor CodexRuntimeMetricsCollector {
             signature: signature,
             summary: summary,
             lastSeen: now,
-            readOffset: UInt64(signature.size ?? fileData.count),
+            readOffset: UInt64((signature.size ?? fileData.count) - (fileData.count - completeLength)),
             meta: meta,
             previousTotalOutput: previousTotal,
             previousOutputTimestamp: previousTimestamp,
@@ -1308,8 +1324,9 @@ public actor CodexRuntimeMetricsCollector {
             messageUsage: messageUsage,
             messageSequence: messageSequence,
             tokenDiagnostics: tokenDiagnostics,
-            tailGuard: tailGuard(for: fileData)
+            tailGuard: tailGuard(for: fileData.prefix(completeLength))
         )
+        aggregateDirtyPaths.insert(file.path)
         apply(summary, now: now, accumulator: &accumulator)
     }
 
@@ -1444,9 +1461,10 @@ public actor CodexRuntimeMetricsCollector {
         } ?? false
 
         for (lineIndex, rawLine) in text.split(whereSeparator: { $0.isNewline }).enumerated() {
-            let line = String(rawLine)
-            if let data = line.data(using: .utf8),
-               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            let data = Data(rawLine.utf8)
+            runtimeJSONRecordsDecoded += 1
+            guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+            do {
                 // 权威 turn 模型只从 turn_context 事件取；仅当从未见过 turn_context
                 // 时才回退到宽松的 knownModelName，避免被非权威 model 字段污染。
                 if let model = turnContextModel(object) {
@@ -1456,9 +1474,7 @@ public actor CodexRuntimeMetricsCollector {
                     currentModel = model
                 }
             }
-            if let data = line.data(using: .utf8),
-               let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-               (object["type"] as? String) == "event_msg",
+            if (object["type"] as? String) == "event_msg",
                let payload = object["payload"] as? [String: Any],
                let eventType = payload["type"] as? String,
                let meta = cached.meta {
@@ -1485,7 +1501,7 @@ public actor CodexRuntimeMetricsCollector {
             }
 
             guard liveTrackedPaths.contains(file.path),
-                  let parsed = parseTokenLine(Data(line.utf8), now: now) else { continue }
+                  let parsed = parseTokenLine(data, object: object, now: now) else { continue }
             tokenDiagnostics.parsedOutputObservations += 1
             // 子 agent 继承前缀：时间戳仍在 meta 时间簇内的 token 属于父线程副本，不产出 TPS 事件。
             // 但仍推进 previousTotal/previousTimestamp 基线，使越过前缀后的第一条真实产出从继承末值
@@ -1671,10 +1687,9 @@ public actor CodexRuntimeMetricsCollector {
         return readable.split(whereSeparator: { $0 == 0x0A }).map { Data($0) }
     }
 
-    private func parseTokenLine(_ line: Data, now: Date) -> ParsedTokenLine? {
+    private func parseTokenLine(_ line: Data, object: [String: Any], now: Date) -> ParsedTokenLine? {
         guard line.containsASCIIKeyword(Self.tokenKeyword)
-                || line.containsASCIIKeyword(Self.usageKeyword),
-              let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
+                || line.containsASCIIKeyword(Self.usageKeyword) else {
             return nil
         }
         let timestamp = parsedTimestamp(from: object, fallback: now)
@@ -1735,11 +1750,12 @@ public actor CodexRuntimeMetricsCollector {
             let lineStart = data[data.startIndex..<match.lowerBound].lastIndex(of: 0x0A)
                 .map { data.index(after: $0) } ?? data.startIndex
             let lineEnd = data[match.upperBound..<data.endIndex].firstIndex(of: 0x0A) ?? data.endIndex
+            modelSearchRecordsDecoded += 1
             if let object = (try? JSONSerialization.jsonObject(with: data[lineStart..<lineEnd])) as? [String: Any],
                let model = knownModelName(object) {
                 return model
             }
-            searchEnd = match.lowerBound
+            searchEnd = lineStart
         }
         return nil
     }
@@ -1752,11 +1768,12 @@ public actor CodexRuntimeMetricsCollector {
             let lineStart = data[data.startIndex..<match.lowerBound].lastIndex(of: 0x0A)
                 .map { data.index(after: $0) } ?? data.startIndex
             let lineEnd = data[match.upperBound..<data.endIndex].firstIndex(of: 0x0A) ?? data.endIndex
+            modelSearchRecordsDecoded += 1
             if let object = (try? JSONSerialization.jsonObject(with: data[lineStart..<lineEnd])) as? [String: Any],
                let model = turnContextModel(object) {
                 return model
             }
-            searchEnd = match.lowerBound
+            searchEnd = lineStart
         }
         return nil
     }
@@ -1911,6 +1928,26 @@ public actor CodexRuntimeMetricsCollector {
             && start <= referenceDate.addingTimeInterval(Self.futureTimestampTolerance)
     }
 
+    private func tokenWindowTotals(_ events: [TrackedTokenEvent], at now: Date) -> TokenWindowTotals {
+        var totals = TokenWindowTotals()
+        for event in events {
+            let sample = event.sample
+            guard sample.isValid, eventCanOverlapWindow(sample, referenceDate: now) else { continue }
+            let model = sample.model ?? "unknown"
+            let tokens = TPSWindow.includedTokens(for: sample, referenceDate: now)
+            let short = TPSWindow.includedTokens(for: sample, referenceDate: now,
+                                                 windowSeconds: Double(LiveRateSample.shortWindowSeconds))
+            let second = TPSWindow.strictSecondTokens(for: sample, referenceDate: now)
+            totals.tokens += tokens
+            totals.shortTokens += short
+            totals.secondTokens += second
+            if tokens > 0 { totals.models[model, default: 0] += tokens }
+            if short > 0 { totals.shortModels[model, default: 0] += short }
+            if second > 0 { totals.secondModels[model, default: 0] += second }
+        }
+        return totals
+    }
+
     private func pruneMessageUsage(_ usage: inout [String: MessageUsage], now: Date) {
         usage = usage.filter { now.timeIntervalSince($0.value.lastSeen) <= Self.messageRetention }
         guard usage.count > Self.maximumMessageIdentities else { return }
@@ -1933,8 +1970,7 @@ public actor CodexRuntimeMetricsCollector {
         // 重新落盘，跨文件无法按 message 身份折叠，会把同一次真实 output 重复计入实时 TPS
         // （实测把速率放大到约 3 倍）。与任务计数扫描（discoverFiles 中排除 subagents）口径对齐，
         // 只统计顶层会话文件。
-        guard !url.resolvingSymlinksInPath().standardizedFileURL
-            .pathComponents.contains("subagents") else { return false }
+        guard !url.pathComponents.contains("subagents") else { return false }
         return !["summary", "aggregate", "snapshot", "live-rate", "live_rate"].contains {
             name.contains($0)
         }
@@ -1951,13 +1987,60 @@ public actor CodexRuntimeMetricsCollector {
         accumulator: inout ScanAccumulator
     ) {
         accumulator.filesScanned += 1
-        accumulator.completedIdentities.formUnion(summary.completedIdentities)
-        merge(summary.desktopTask, into: &accumulator.desktopTasks)
-        merge(summary.codexCLITask, into: &accumulator.codexCLITasks)
         if let signal = summary.latestOutputSignal {
             accumulator.latestOutputSignal = max(accumulator.latestOutputSignal ?? signal, signal)
         }
         accumulator.tokenEvents.append(contentsOf: summary.tokenEvents)
+    }
+
+    private func refreshAggregate(into accumulator: inout ScanAccumulator) {
+        aggregateDirtyPaths.formUnion(aggregateUnavailablePaths.symmetricDifference(accumulator.unavailablePaths))
+        for path in aggregateDirtyPaths {
+            let old = aggregateFiles.removeValue(forKey: path)
+            let new = accumulator.unavailablePaths.contains(path) ? nil : fileCache[path].map {
+                AggregateFileSummary(completedIdentities: $0.summary.completedIdentities,
+                                     desktopTask: $0.summary.desktopTask, codexCLITask: $0.summary.codexCLITask)
+            }
+            for identity in (old?.completedIdentities ?? []).subtracting(new?.completedIdentities ?? []) {
+                let count = (aggregateCompletedReferences[identity] ?? 1) - 1
+                if count == 0 {
+                    aggregateCompletedReferences.removeValue(forKey: identity)
+                    aggregateCompletedIdentities.remove(identity)
+                } else {
+                    aggregateCompletedReferences[identity] = count
+                }
+            }
+            for identity in (new?.completedIdentities ?? []).subtracting(old?.completedIdentities ?? []) {
+                aggregateCompletedReferences[identity, default: 0] += 1
+                aggregateCompletedIdentities.insert(identity)
+            }
+            updateTaskAggregate(path: path, old: old?.desktopTask, new: new?.desktopTask,
+                                files: &desktopTaskFiles, tasks: &aggregateDesktopTasks)
+            updateTaskAggregate(path: path, old: old?.codexCLITask, new: new?.codexCLITask,
+                                files: &cliTaskFiles, tasks: &aggregateCLITasks)
+            aggregateFiles[path] = new
+        }
+        aggregateUnavailablePaths = accumulator.unavailablePaths
+        aggregateDirtyPaths.removeAll(keepingCapacity: true)
+        accumulator.completedIdentities = aggregateCompletedIdentities
+        accumulator.desktopTasks = aggregateDesktopTasks
+        accumulator.codexCLITasks = aggregateCLITasks
+    }
+
+    private func updateTaskAggregate(
+        path: String, old: SessionTaskState?, new: SessionTaskState?,
+        files: inout [String: [String: SessionTaskState]], tasks: inout [String: SessionTaskState]
+    ) {
+        if let old { files[old.sessionID]?[path] = nil }
+        if let new { files[new.sessionID, default: [:]][path] = new }
+        for sessionID in Set([old?.sessionID, new?.sessionID].compactMap { $0 }) {
+            tasks[sessionID] = nil
+            if let candidates = files[sessionID], !candidates.isEmpty {
+                for candidate in candidates.values { merge(candidate, into: &tasks) }
+            } else {
+                files[sessionID] = nil
+            }
+        }
     }
 
     private func merge(
@@ -2038,6 +2121,12 @@ public actor CodexRuntimeMetricsCollector {
                 : nil
         }).count
         return CodexRuntimeMetricsDiagnostics(
+            claudeDesktopBytesRead: claudeDesktopBytesRead,
+            runtimeJSONRecordsDecoded: runtimeJSONRecordsDecoded,
+            modelSearchRecordsDecoded: modelSearchRecordsDecoded,
+            retainedTokenEvents: accumulator.tokenEvents.count,
+            discoveryFullScans: discoveryIndex.fullScanCount,
+            discoveryMetadataReads: discoveryIndex.metadataReads,
             configuredRoots: discoveryDiagnostics.configuredRoots,
             canonicalRoots: discoveryDiagnostics.canonicalRoots,
             discoveredJSONLFiles: discoveryDiagnostics.discoveredJSONLFiles,
@@ -2182,8 +2271,6 @@ public actor CodexRuntimeMetricsCollector {
     private static let staleAfter = CodexRuntimeMetricsConfiguration.staleAfterSeconds
     private static let activeTaskTimeout = CodexRuntimeMetricsConfiguration.activeTaskTimeoutSeconds
     private static let recentFileInterval: TimeInterval = 15 * 60
-    private static let discoveryInterval: TimeInterval = 10
-    private static let processSnapshotInterval: TimeInterval = 5
     private static let snapshotMaintenanceInterval: TimeInterval = 5 * 60
     private static let fullReconcileInterval: TimeInterval = 5 * 60
     private static let trackedFileRetention: TimeInterval = 30 * 60

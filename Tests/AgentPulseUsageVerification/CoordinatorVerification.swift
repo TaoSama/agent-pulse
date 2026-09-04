@@ -12,7 +12,7 @@ enum CoordinatorVerification {
 
         let source = try coordinatorSource()
         try verifyLegacyHostnameRecoveryPrecedence(source)
-        try verifyUsageSummaryCalendarInjection(source)
+        try verifyUsageSummaryCalendarInjection()
         try verifyOperationsAreMutuallyExclusive(source)
         try verifyStopCancelsEveryOperation(source)
         try verifyRebuildPendingBlocksNetworkUntilFullScan(source)
@@ -25,6 +25,56 @@ enum CoordinatorVerification {
         try verifyOperationTimestampsPersistAcrossLaunches(source)
         try verifyNoChangeRoundSkipsFinalize(source)
         print("TokenSyncCoordinator verification passed")
+    }
+
+    private static func verifyFileScannerProgress() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "usage-scanner-verification-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appending(path: "large.jsonl")
+        let first = #"{"type":"assistant","timestamp":"2026-09-01T00:00:01Z","sessionId":"fixture-session","cwd":"/fixture","message":{"id":"first","model":"fixture-model","content":[],"usage":{"output_tokens":5}}}"# + "\n"
+        // This file exceeded the previous history admission budget and could never advance.
+        let oldHistoryBudget = 4 * 1024 * 1024
+        var data = Data(repeating: 0x0A, count: oldHistoryBudget + 1)
+        data.append(Data(first.utf8))
+        try data.write(to: file)
+        let ledger = try UsageLedgerStore(path: ":memory:")
+        let source = UsageScanRoot(root: directory, source: "fixture")
+        let hostname = "scanner-verification"
+        let manifest = try UsageScanManifest.discover(source: source)
+        try require(manifest.files.count == 1 && manifest.files[0].size > oldHistoryBudget,
+                    "discovery must retain oversized history files")
+        var checkpoints = try ledger.checkpoints(source: source.source)
+        let present = try UsageFileScanner.scan(manifest: manifest, ledger: ledger, hostname: hostname,
+                                               checkpoints: &checkpoints)
+        guard let fileID = present.first else { throw CoordinatorVerificationError.failed("scanner omitted history file") }
+        try require(try ledger.checkpoint(fileID: fileID)?.offset == Int64(data.count),
+                    "large history file did not reach its durable end")
+        _ = try ledger.finalizeDerived(hostname: hostname)
+        try require(try ledger.summary()?.counts.total == 5,
+                    "large history file usage was not collected")
+        _ = try UsageFileScanner.scan(manifest: manifest, ledger: ledger, hostname: hostname,
+                                      checkpoints: &checkpoints)
+        try require(try !ledger.requiresDerivationCompletion(), "unchanged file unnecessarily dirtied derived data")
+
+        let second = #"{"type":"assistant","timestamp":"2026-09-01T00:00:02Z","sessionId":"fixture-session","cwd":"/fixture","message":{"id":"second","model":"fixture-model","content":[],"usage":{"output_tokens":6}}}"# + "\n"
+        let handle = try FileHandle(forWritingTo: file)
+        _ = try handle.seekToEnd()
+        try handle.write(contentsOf: Data(second.utf8))
+        try handle.close()
+        _ = try UsageFileScanner.scan(manifest: UsageScanManifest.discover(source: source), ledger: ledger,
+                                      hostname: hostname, checkpoints: &checkpoints)
+        _ = try ledger.finalizeDerived(hostname: hostname)
+        try require(try ledger.summary()?.counts.total == 11,
+                    "appended usage failed to update the oversized file")
+
+        do {
+            _ = try UsageScanManifest.discover(source: UsageScanRoot(root: file, source: "fixture"))
+            throw CoordinatorVerificationError.failed("regular file must not count as an empty source directory")
+        } catch UsageFileScanError.rootNotEnumerable {
+            // An incomplete discovery must not become a successful missing-file update.
+        }
     }
 
     /// 设置页展示的最近扫描/上报状态必须跨进程恢复，同时保持既有语义：
@@ -62,121 +112,28 @@ enum CoordinatorVerification {
     /// - 进度回调只在当前 generation 且仍在扫描时写（applyScanProgress 门禁），避免旧扫描覆盖新扫描；
     /// - 各阶段边界都通过 ScanProgressReporter 报点（cliproxy / scanning / finalizing / compacting / summarizing）。
     private static func verifyScanProgressReporting(_ source: String) throws {
-        let scanBody = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
-        // 置位进度：scanningInProgress 与阶段/百分比一并写入。
-        try require(
-            scanBody.contains("status.scanPhase = .cliproxy")
-                && scanBody.contains("status.scanProgress = 0"),
-            "scanNow 未在启动时置位扫描进度阶段/百分比"
-        )
-        // 进度回调经 generation 门禁跨线程回主 actor。
-        try require(
-            scanBody.contains("ScanProgressReporter { [weak self] update in")
-                && scanBody.contains("self?.applyScanProgress(update, generation: generation)"),
-            "scanNow 未建立带 generation 门禁的进度回调"
-        )
-        // scanning 阶段：预扫总数在逐文件 scan 之前。
-        let totalOffset = try offset(of: "progressReporter.setPhaseTotal(.scanning, total: totalFiles)", in: scanBody)
-        let firstScanOffset = try offset(of: "root: Self.codexSessionsRoot", in: scanBody)
-        try require(totalOffset < firstScanOffset, "预扫文件总数必须在逐文件扫描之前登记")
-        try require(
-            scanBody.contains("Self.countJSONLFiles(root: $1)"),
-            "scanning 阶段未预扫来源 root 的 jsonl 总数作为进度分母"
-        )
-        try require(
-            scanBody.contains("budget: .activeSessions")
-                && scanBody.contains("budget: .backgroundHistory"),
-            "内建活跃来源与历史来源未使用分级扫描预算"
-        )
-        // 各阶段边界均报点。
-        for marker in [
-            "progressReporter.completePhase(.cliproxy)",
-            "progressReporter.completePhase(.scanning)",
-            "progressReporter.enterPhase(.finalizing",
-            "progressReporter.enterPhase(.compacting",
-            "progressReporter.enterPhase(.summarizing",
-        ] {
-            try require(scanBody.contains(marker), "scanNow 缺少阶段进度报点：\(marker)")
-        }
-        try require(
-            source.contains("let detail: String?")
-                && source.contains("status.scanDetailText = update.detail")
-                && source.contains("status.scanDetailText = nil")
-                && source.contains("dirtyProgressDetail(from: ledger, hostname: hostname)")
-                && source.contains("compactionProgressDetail"),
-            "扫描进度未携带 dirty/finalize/冻结压实的补充详情，UI 会让长阶段看起来卡住"
-        )
-
-        // scan 逐文件推进进度。
-        let scanFn = try functionBody(matching: "nonisolated private static func scan(", in: source)
-        try require(scanFn.contains("progress.advanceItem(.scanning)"), "scan 未逐文件推进进度")
-        try require(
-            scanFn.contains("firstTimeBytesRemaining")
-                && scanFn.contains("maxDurationSeconds")
-                && source.contains("maximumParserBackfillBytesPerSourceScan"),
-            "scan 未对首次历史采集和 parser-only 回填设置字节/时间预算"
-        )
-        let prepareUsageScanOffset = try offset(of: "try ledger.prepareForUsageScan {", in: scanBody)
-        let scanRootsOffset = try offset(of: "var scanRoots:", in: scanBody)
-        try require(
-            prepareUsageScanOffset < scanRootsOffset,
-            "scanNow 必须在后台扫描路径、文件枚举前补齐 raw 性能索引，避免 App 初始化阻塞"
-        )
-        try require(
-            scanBody.contains("progressReporter.enterPhase(.scanning, detail: \"准备扫描索引\")")
-                && scanBody.contains("progressReporter.advance(.scanning, done: 0, total: 0, detail: \"准备扫描索引\")"),
-            "扫描索引准备阶段缺少可见进度心跳"
-        )
-
-        // applyScanProgress：generation + scanningInProgress 双重门禁。
+        let scan = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
+        try require(scan.contains("status.scanPhase = .scanning"), "local scan must publish progress immediately")
+        try require(scan.contains("UsageScanManifest.discover") && scan.contains("UsageFileScanner.scan"),
+                    "progress and ingestion must share discovery")
+        try require(scan.contains("progressReporter.advanceItem(.scanning)"), "missing file progress")
         let apply = try functionBody(named: "applyScanProgress", in: source)
-        try require(
-            apply.contains("generation == scanGeneration, statusSubject.value.scanningInProgress"),
-            "applyScanProgress 未同时用 generation 与 scanningInProgress 做门禁"
-        )
-
-        // finishScan 各分支统一 clearScanProgress 归零。
-        let clear = try functionBody(matching: "private static func clearScanProgress(", in: source)
-        try require(
-            clear.contains("status.scanningInProgress = false")
-                && clear.contains("status.scanPhase = nil")
-                && clear.contains("status.scanProgress = nil")
-                && clear.contains("status.scanDetailText = nil"),
-            "clearScanProgress 未把扫描进度字段全部归零"
-        )
+        try require(apply.contains("generation == scanGeneration, statusSubject.value.scanningInProgress"),
+                    "stale progress must not replace current activity")
+        try verifyFileScannerProgress()
     }
 
     private static func verifyCodexArchivedRolloutIdentityIsStable(_ source: String) throws {
-        let scanFn = try functionBody(matching: "nonisolated private static func scan(", in: source)
-        try require(
-            scanFn.contains("let fileIdentity = Self.fileIdentity(for: url, source: source)")
-                && scanFn.contains("UsageJSONLParser.fileID(for: fileIdentity)")
-                && scanFn.contains("migrateLegacyCheckpointIfPossible")
-                && scanFn.contains("fileIdentity: fileIdentity"),
-            "scan 必须用来源相关的稳定 file identity，避免 Codex 归档移动后 checkpoint 失效"
-        )
-
-        let identityFn = try functionBody(matching: "nonisolated private static func fileIdentity(for url:", in: source)
-        try require(
-            identityFn.contains("source == UsageJSONLParser.codexSource")
-                && identityFn.contains("url.lastPathComponent.hasPrefix(\"rollout-\")")
-                && identityFn.contains("return url.lastPathComponent")
-                && identityFn.contains("return url.path"),
-            "Codex rollout 文件应按稳定文件名识别，非 Codex 来源继续按路径识别"
-        )
-
-        let migrationFn = try functionBody(matching: "nonisolated private static func migrateLegacyCheckpointIfPossible(", in: source)
-        try require(
-            migrationFn.contains("legacyCodexSessionIdentities(forArchivedRollout: url)")
-                && migrationFn.contains("ledger.migrateFileIdentityIfCheckpointMatches"),
-            "archived rollout 必须尝试迁移旧 path-hash checkpoint，避免存量库重新解析历史归档"
-        )
+        let name = "rollout-2026-09-01T10-00-00-session.jsonl"
+        let active = URL(fileURLWithPath: "/fixture/sessions/2026/09/01/" + name)
+        let archived = URL(fileURLWithPath: "/fixture/archived/" + name)
+        try require(UsageFileScanner.fileIdentity(for: active, source: "codex")
+                    == UsageFileScanner.fileIdentity(for: archived, source: "codex"),
+                    "archiving must preserve Codex file identity")
+        try require(UsageFileScanner.fileIdentity(for: active, source: "claude-code") !=
+                    UsageFileScanner.fileIdentity(for: archived, source: "claude-code"),
+                    "other sources must retain path identity")
     }
-
-    /// 上报间隔可配置契约（E2）：
-    /// - 间隔为实例属性、从 defaults 读取（缺省档），不再是硬编码静态常量；
-    /// - setAutoReportInterval 写 defaults + 重启自动循环使新值生效；
-    /// - 自动循环读取实例间隔（而非静态常量）。
     private static func verifyAutoReportIntervalIsConfigurable(_ source: String) throws {
         try require(
             source.contains("private var autoReportInterval: TokenReportInterval"),
@@ -268,7 +225,7 @@ enum CoordinatorVerification {
     private static func verifyHostnameMismatchPromptNotGatedByAuthority(_ source: String) throws {
         let scanBody = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
         // mismatch 判定与弹窗触发必须存在。
-        let mismatchOffset = try offset(of: "case let .mismatch(stored) = (try? ledger.hostnameState(current: hostname))", in: scanBody)
+        let mismatchOffset = try offset(of: "case let .success(.mismatch(stored)):", in: scanBody)
         try require(scanBody.contains("presentHostnameMismatch(old: stored, new: hostname)"), "scanNow 未在 mismatch 时触发确认弹窗")
         // configReady 不得再作为 mismatch 弹窗的门禁（若仍存在 configReady，必须不在弹窗触发之前把它作为条件）。
         try require(
@@ -281,51 +238,53 @@ enum CoordinatorVerification {
     }
 
     private static func verifyLegacyHostnameRecoveryPrecedence(_ source: String) throws {
-        let initializer = try functionBody(matching: "init(", in: source)
-        let authority = try offset(of: "configurationAuthority(reporter: effectiveReporter, url: configurationURL, envURL: self.mergedEnvURL)", in: initializer)
-        let candidate = try offset(of: "uniqueLegacyHostnameCandidate()", in: initializer)
-        let effective = try offset(of: "let effectiveHostname = authority.hostname.isEmpty ? storedHostname : authority.hostname", in: initializer)
-        try require(authority < candidate && candidate < effective, "legacy hostname recovery precedence is not config > defaults > unique ledger candidate")
-        try require(
-            initializer.contains("authority.hostname.isEmpty")
-                && initializer.contains("storedHostname.isEmpty")
-                && initializer.contains("normalizedCandidate == candidate")
-                && initializer.contains("defaults.set(storedHostname, forKey: DefaultsKey.canonicalHostname)"),
-            "legacy hostname candidate is not gated or persisted"
-        )
+        let initialization = try functionBody(matching: "private func initializeLedger(", in: source)
+        try require(initialization.contains("authorityHostname.isEmpty ? storedHostname : authorityHostname")
+                    && initialization.contains("if hostname.isEmpty, let candidate")
+                    && initialization.contains("CanonicalHostname.normalize(candidate) == candidate"),
+                    "legacy hostname recovery must preserve config/defaults precedence and exact durable identity")
+        try require(initialization.contains("Self.runOffMain") && initialization.contains("uniqueLegacyHostnameCandidate()"),
+                    "legacy recovery must run outside the UI actor")
     }
 
-    private static func verifyUsageSummaryCalendarInjection(_ source: String) throws {
-        guard let initializerStart = source.range(
-            of: "    init(\n        defaults: UserDefaults = .standard,"
-        )?.lowerBound else {
-            throw CoordinatorVerificationError.failed("TokenSyncCoordinator initializer missing")
+    private static func verifyUsageSummaryCalendarInjection() throws {
+        guard let newYork = TimeZone(identifier: "America/New_York"),
+              let utc = TimeZone(secondsFromGMT: 0) else {
+            throw CoordinatorVerificationError.failed("missing calendar fixture time zones")
         }
-        let initializer = try functionBody(
-            matching: "init(",
-            in: String(source[initializerStart...])
-        )
-        try require(
-            source.contains("usageSummaryCalendar: Calendar = .autoupdatingCurrent")
-                && initializer.contains("self.usageSummaryCalendar = usageSummaryCalendar"),
-            "usage summary calendar must default to the system calendar and remain injectable"
-        )
-        try require(!source.contains("Asia/Shanghai"), "usage summary calendar still hard-codes Asia/Shanghai")
-
-        let summaries = try functionBody(matching: "nonisolated private static func summaries(", in: source)
-        try require(
-            source.contains("containing date: Date,\n        calendar: Calendar")
-                && summaries.components(separatedBy: "calendar: calendar").count - 1 == 8,
-            "day/week/month/all token + per-model summaries must share the injected calendar"
-        )
-
-        let scan = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
-        try require(
-            initializer.contains("calendar: usageSummaryCalendar")
-                && scan.contains("let summaryCalendar = usageSummaryCalendar")
-                && scan.contains("calendar: summaryCalendar"),
-            "startup and post-scan summaries must both use the injected calendar"
-        )
+        var localCalendar = Calendar(identifier: .gregorian)
+        localCalendar.timeZone = newYork
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = utc
+        let reference = try localDate(2024, 3, 10, 12, 0, calendar: localCalendar)
+        let events = [
+            ("prior-local-day", try localDate(2024, 3, 9, 23, 30, calendar: localCalendar), Int64(2)),
+            ("current-local-day", try localDate(2024, 3, 10, 0, 30, calendar: localCalendar), Int64(4))
+        ].map { id, timestamp, tokens in
+            UsageEvent(id: id, source: "fixture", model: "fixture-model", project: "fixture",
+                       timestamp: timestamp, counts: UsageTokenCounts(output: tokens),
+                       sessionHash: "fixture-session", sourceFileHash: "timezone-file")
+        }
+        let ledger = try UsageLedgerStore(path: ":memory:")
+        try ledger.record(events: events, checkpoint: UsageFileCheckpoint(
+            fileID: "timezone-file", source: "fixture", pathHash: "timezone-file",
+            offset: 1, size: 1, modifiedAt: reference, parserVersion: UsageJSONLParser.parserVersion,
+            status: "complete"
+        ), hostname: "timezone-fixture")
+        _ = try ledger.finalizeDerived(hostname: "timezone-fixture")
+        let local = try ledger.summarySnapshot(containing: reference, calendar: localCalendar)
+        let universal = try ledger.summarySnapshot(containing: reference, calendar: utcCalendar)
+        for (snapshot, expectedDay) in [(local, Int64(4)), (universal, Int64(6))] {
+            try require(snapshot.windows.count == 4, "snapshot omitted a calendar window")
+            for item in snapshot.windows {
+                let expected = item.window == .day ? expectedDay : Int64(6)
+                try require(item.summary?.counts.total == expected,
+                            "injected calendar did not control snapshot window totals")
+                try require(item.models.reduce(Int64(0)) { $0 + $1.counts.total } == expected,
+                            "per-model totals and summary used different calendar boundaries")
+            }
+        }
+        try require(universal.revision > local.revision, "calendar snapshots must preserve publication ordering")
     }
 
     private static func verifyCalendarWindowBoundaries() throws {
@@ -496,25 +455,6 @@ enum CoordinatorVerification {
             scanNowBody.contains("ledger.reportingEligible(hostname:"),
             "scanNow 跳过分支未从 reportingEligible 读回上报资格（会伪造 eligible）"
         )
-        try require(
-            try ledgerSource().contains("incrementalDirtyKeyLimit")
-                && ledgerSource().contains("dirtyKeyCountUnlocked(hostname: hostname) <= Self.incrementalDirtyKeyLimit"),
-            "增量派生缺少 dirty-key 数量门禁，大量脏键会在闭包传播阶段长时间无进度"
-        )
-        try require(
-            try ledgerSource().contains("incrementalDedupKeyLimit")
-                && ledgerSource().contains("dirtyKeyCountUnlocked(hostname: hostname, kinds: [.lineage, .content]) <= Self.incrementalDedupKeyLimit")
-                && ledgerSource().contains("guard try dirtyKeysAllowIncrementalRecomputeUnlocked(hostname: hostname) else { return nil }"),
-            "增量派生缺少 lineage/content 去重组门禁，大去重脏集必须回退全量并显示分阶段进度"
-        )
-        let dirtyGateOffset = try offset(of: "let allowIncrementalDirtyKeys = try dirtyKeysAllowIncrementalRecomputeUnlocked", in: ledgerSource())
-        let redundantDiscardOffset = try offset(of: "try discardRedundantGroupDirtyKeysUnlocked(hostname: hostname)", in: ledgerSource())
-        try require(
-            dirtyGateOffset < redundantDiscardOffset
-                && ledgerSource().contains("allowIncrementalDirtyKeys: allowIncrementalDirtyKeys")
-                && ledgerSource().contains("if strategy == .automatic, allowIncrementalDirtyKeys, try canRecomputeIncrementallyUnlocked"),
-            "lineage/content 门禁必须在冗余脏键清理前计算，否则清理会掩盖大去重脏集并误入增量闭包"
-        )
     }
 
     private static func localDate(
@@ -576,88 +516,24 @@ enum CoordinatorVerification {
     /// rebuild pending（已 reset 未确认重扫完成）期间，绝不能发起任何网络请求：
     /// start() 必须先于上报检查 pending 并只做扫描；report / startAutoLoop 都必须在 pending 时短路。
     private static func verifyRebuildPendingBlocksNetworkUntilFullScan(_ source: String) throws {
-        // start(): rebuild pending 分支必须早于上报副作用。
-        let startBody = try functionBody(named: "start", in: source)
-        let pendingGate = try offset(of: "isRebuildCompletionPending()", in: startBody)
-        try require(
-            pendingGate < offset(of: "triggerScanThenReport()", in: startBody),
-            "启动时 rebuild pending 门禁未先于上报"
-        )
-        try require(
-            startBody.contains("rebuildRecoveryPending = true")
-                && startBody.contains("scanNow(chainedReport: false)"),
-            "rebuild pending 启动分支未先触发完整扫描"
-        )
-        // rebuild pending 分支内不得直接触发上报（先扫描）。
-        let pendingBranch: String
-        if let branchRange = startBody.range(of: "if isRebuildCompletionPending() {"),
-           let branchEnd = startBody.range(of: "return", range: branchRange.upperBound..<startBody.endIndex) {
-            pendingBranch = String(startBody[branchRange.lowerBound..<branchEnd.upperBound])
-        } else {
-            throw CoordinatorVerificationError.failed("找不到 start() 的 rebuild pending 分支")
-        }
-        try require(
-            !pendingBranch.contains("reportNow()")
-                && !pendingBranch.contains("triggerScanThenReport()"),
-            "rebuild pending 启动分支仍触发了网络动作（上报）"
-        )
-
-        // reportNow(): pending 时短路且不进入配置刷新 / 网络路径。
-        let reportBody = try functionBody(named: "reportNow", in: source)
-        try require(
-            offset(of: "isRebuildCompletionPending()", in: reportBody)
-                < offset(of: "reportTask = Task", in: reportBody),
-            "reportNow 未在发起上报任务前检查 rebuild pending"
-        )
-
-        // startAutoLoopIfNeeded(): pending 时不启动自动上报循环。
-        let autoLoopBody = try functionBody(named: "startAutoLoopIfNeeded", in: source)
-        try require(
-            autoLoopBody.contains("!isRebuildCompletionPending()"),
-            "自动上报循环在 rebuild pending 时仍会启动"
-        )
+        let report = try functionBody(named: "reportNow", in: source)
+        try require(try offset(of: "Self.isRebuildCompletionPending(ledger: ledger)", in: report)
+                    < offset(of: "reporter.report(", in: report),
+                    "reporting must inspect durable recovery state before network side effects")
+        let loop = try functionBody(named: "startAutoLoopIfNeeded", in: source)
+        try require(!loop.contains("isRebuildCompletionPending"),
+                    "pending recovery must retain automatic local retries without synchronous ledger reads")
     }
-
-    /// “全量成功”证据：只有所有来源无致命失败地完整扫描后，才显式清除 rebuild pending。
-    /// - scan 对存在却无法枚举的来源根抛错（不静默 return），degraded 单文件错误经 record 抛出传播；
-    /// - markRebuildCompleted() 只在 scan 闭包内、finalizeDerived 之后调用（此前任一 throw 都到不了）；
-    /// - finishScan 失败分支保持 pending、不发网络请求。
     private static func verifyFullScanEvidenceGatesRebuildCompletion(_ source: String) throws {
-        // scan(): 源根存在却无法枚举必须抛错，不能当作扫描成功。
-        let scanBody = try functionBody(matching: "nonisolated private static func scan(", in: source)
-        try require(
-            scanBody.contains("TokenSyncScanError.sourceRootNotEnumerable"),
-            "scan 未把来源根不可枚举视作致命失败"
-        )
-        // 不存在的根允许安静跳过；但可枚举失败必须抛错，二者都必须显式区分。
-        try require(
-            scanBody.contains("fileExists(atPath: root.path")
-                && scanBody.contains("isDirectory.boolValue"),
-            "scan 未区分“来源根缺失（跳过）”与“存在却不可枚举（失败）”"
-        )
-
-        // scanNow() 的 off-main 闭包：markRebuildCompleted 必须在 finalizeDerived 之后。
-        // 用前缀匹配以对 finalizeDerived 的可选参数（如 compactFrozen）鲁棒，仅校验调用顺序不变。
-        let scanNowBody = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
-        let finalizeOffset = try offset(of: "ledger.finalizeDerived(hostname: hostname", in: scanNowBody)
-        let markOffset = try offset(of: "ledger.markRebuildCompleted()", in: scanNowBody)
-        try require(finalizeOffset < markOffset, "markRebuildCompleted 未在 finalizeDerived 之后调用")
-        try require(
-            scanNowBody.contains("ledger.requiresRebuildCompletion()"),
-            "scanNow 未在清除前确认存在 rebuild pending"
-        )
-
-        // finishScan 失败分支：保持 pending（不 mark）、不触发上报。
-        let finishScanBody = try functionBody(named: "finishScan", in: source)
-        try require(
-            !finishScanBody.contains("markRebuildCompleted()"),
-            "finishScan 不应在主线程清除 rebuild pending（清除只在扫描成功的 off-main 闭包内）"
-        )
-        try require(
-            finishScanBody.contains("rebuildRecoveryPending")
-                && finishScanBody.contains("isRebuildCompletionPending()"),
-            "finishScan 未在恢复前确认 pending 已清除"
-        )
+        let scan = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
+        try require(try offset(of: "ledger.finalizeDerived(hostname: hostname", in: scan)
+                    < offset(of: "ledger.markRebuildCompleted()", in: scan),
+                    "rebuild completion must follow successful discovery, ingestion and derivation")
+        let finish = try functionBody(named: "finishScan", in: source)
+        try require(finish.contains("outcome.recoveryPending")
+                    && finish.contains("status.scanError =")
+                    && !finish.contains("markRebuildCompleted()"),
+                    "failed scans must stay retryable without clearing persistent recovery")
     }
 
     private static func coordinatorSource() throws -> String {
@@ -694,8 +570,21 @@ enum CoordinatorVerification {
 
     private static func functionBody(matching marker: String, in source: String) throws -> String {
         guard let markerRange = source.range(of: marker),
-              let openingBrace = source[markerRange.lowerBound...].firstIndex(of: "{") else {
+              let parametersStart = source[markerRange.lowerBound...].firstIndex(of: "(") else {
             throw CoordinatorVerificationError.failed("找不到函数：\(marker)")
+        }
+
+        // Default closure arguments may contain braces before the actual function body.
+        var parameterDepth = 0
+        var parameterCursor = parametersStart
+        repeat {
+            if source[parameterCursor] == "(" { parameterDepth += 1 }
+            if source[parameterCursor] == ")" { parameterDepth -= 1 }
+            parameterCursor = source.index(after: parameterCursor)
+        } while parameterDepth > 0 && parameterCursor < source.endIndex
+        guard parameterDepth == 0,
+              let openingBrace = source[parameterCursor...].firstIndex(of: "{") else {
+            throw CoordinatorVerificationError.failed("函数参数不完整：\(marker)")
         }
 
         var depth = 0

@@ -41,7 +41,7 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyLegacyNetworkDirtyKeysAreDiscarded()
         try verifier.verifyLargeDirtyKeySetFallsBackToFullRecompute()
         try verifier.verifyMissingFilesRecordDirtyKeysInBulk()
-        try verifier.verifyRawFileDirtyQueriesUseHostFileIndexes()
+        try verifier.verifyIncrementalWorkStaysScoped()
         try verifier.verifyFrozenCompactionPreservesTotalsAndDropsRaw()
         try verifier.verifyStandaloneFrozenCompactionRunsWithoutRecompute()
         try verifier.verifyFrozenLateEventsAreDropped()
@@ -112,7 +112,8 @@ private struct MetricsLedgerPipelineVerifier {
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_lineage';") == 1, "host/lineage partial index must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_content';") == 1, "host/content partial index must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_usage_events_host','idx_usage_events_host_logical');") == 0, "legacy usage host indexes must be removed after one-time migration")
-            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_session_events_host_group';") == 1, "hostname-prefixed session streaming index must exist")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_session_events_host_group_covering';") == 1, "covering session streaming index must exist")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_session_events_host_group';") == 0, "redundant narrow session index must be removed")
         }
     }
 
@@ -702,96 +703,48 @@ private struct MetricsLedgerPipelineVerifier {
         }
     }
 
-    func verifyRawFileDirtyQueriesUseHostFileIndexes() throws {
+    func verifyIncrementalWorkStaysScoped() throws {
         let database = try temporaryDatabaseURL()
         defer { cleanupDatabase(at: database) }
         let ledger = try UsageLedgerStore(path: database.path)
         let ts = try date("2026-08-14T01:05:00Z")
+        let backgroundCount = 1_200
+        let background = (0..<backgroundCount).map { index in
+            tokenEvent(id: "background-\(index)", source: "codex", session: "background-session-\(index)",
+                       file: "background", ts: ts, input: 1)
+        }
         try ledger.record(
-            events: [tokenEvent(id: "plan-event", source: "codex", session: "session-a", file: "file-a", ts: ts, input: 1)],
-            checkpoint: completeCheckpoint("file-a", source: "codex", ts: ts),
+            events: background,
+            checkpoint: completeCheckpoint("background", source: "codex", ts: ts),
             hostname: "host-a"
         )
         _ = try ledger.finalizeDerived(hostname: "host-a")
-
-        try withDatabase(database) { db in
-            let eventPlan = try queryPlanDetails(db, """
-                EXPLAIN QUERY PLAN
-                SELECT source,event_id,lineage_fingerprint,codex_dedup_key,session_hash,model,project,timestamp_ms
-                FROM usage_events WHERE hostname='host-a' AND source_file_hash='file-a';
-                """)
-            try require(eventPlan.contains { $0.contains("idx_usage_events_host_file") }, "usage event dirty lookup must use the host/file index; plan=\(eventPlan)")
-
-            let filePlan = try queryPlanDetails(db, """
-                EXPLAIN QUERY PLAN
-                SELECT file_id FROM usage_files WHERE source='codex' AND scan_status<>'missing';
-                """)
-            try require(filePlan.contains { $0.contains("idx_usage_files_source_status") }, "missing-file scan must use the source/status index; plan=\(filePlan)")
-
-            let sessionPlan = try queryPlanDetails(db, """
-                EXPLAIN QUERY PLAN
-                SELECT DISTINCT source,session_hash
-                FROM usage_session_events WHERE hostname='host-a' AND source_file_hash='file-a';
-                """)
-            try require(sessionPlan.contains { $0.contains("idx_session_events_host_file_dirty") }, "session dirty lookup must use the host/file index; plan=\(sessionPlan)")
-
-            let editPlan = try queryPlanDetails(db, """
-                EXPLAIN QUERY PLAN
-                SELECT DISTINCT source,model,project,timestamp_ms,tool_use_id
-                FROM usage_edit_entries WHERE hostname='host-a' AND source_file_hash='file-a';
-                """)
-            try require(editPlan.contains { $0.contains("idx_usage_edit_entries_host_file_dirty") }, "edit dirty lookup must use the host/file index; plan=\(editPlan)")
-
-            try execute(db, "CREATE TEMP TABLE temp_usage_dirty_files(file_id TEXT PRIMARY KEY) WITHOUT ROWID;")
-            try execute(db, "INSERT INTO temp_usage_dirty_files(file_id) VALUES('file-a');")
-
-            let bulkLogicalPlan = try queryPlanDetails(db, """
-                EXPLAIN QUERY PLAN
-                SELECT DISTINCT e.source, e.event_id
-                FROM temp_usage_dirty_files f
-                CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_file
-                  ON e.hostname='host-a' AND e.source_file_hash = f.file_id;
-                """)
-            try require(bulkLogicalPlan.contains { $0.contains("idx_usage_events_host_file") }, "bulk missing logical capture must force host/file index; plan=\(bulkLogicalPlan)")
-
-            let bulkBucketPlan = try queryPlanDetails(db, """
-                EXPLAIN QUERY PLAN
-                SELECT DISTINCT e.source, e.model, e.project, e.timestamp_ms
-                FROM temp_usage_dirty_files f
-                CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_file
-                  ON e.hostname='host-a' AND e.source_file_hash = f.file_id;
-                """)
-            try require(bulkBucketPlan.contains { $0.contains("idx_usage_events_host_file") }, "bulk missing bucket capture must force host/file index; plan=\(bulkBucketPlan)")
-
-            let toolCountPlan = try queryPlanDetails(db, """
-                EXPLAIN QUERY PLAN
-                SELECT source,event_id,skill_counts_json,mcp_counts_json
-                FROM usage_events
-                WHERE hostname='host-a' AND (skill_counts_json <> '{}' OR mcp_counts_json <> '{}');
-                """)
-            try require(toolCountPlan.contains { $0.contains("idx_usage_events_tool_counts") }, "tool-count lookup must use partial index; plan=\(toolCountPlan)")
-
-            try execute(db, "CREATE TEMP TABLE temp_dirty_lineage(fingerprint TEXT PRIMARY KEY);")
-            try execute(db, "CREATE TEMP TABLE temp_dirty_content(dedup_key TEXT PRIMARY KEY);")
-
-            let lineagePlan = try queryPlanDetails(db, """
-                EXPLAIN QUERY PLAN
-                SELECT DISTINCT e.source, e.event_id
-                FROM temp_dirty_lineage d
-                CROSS JOIN usage_events e ON e.lineage_fingerprint = d.fingerprint
-                WHERE e.hostname = 'host-a' AND e.hostname <> '' AND e.lineage_fingerprint <> '';
-                """)
-            try require(lineagePlan.contains { $0.contains("idx_usage_events_host_lineage") }, "lineage dirty expansion must use the host/lineage index; plan=\(lineagePlan)")
-
-            let contentPlan = try queryPlanDetails(db, """
-                EXPLAIN QUERY PLAN
-                SELECT DISTINCT e.source, e.event_id
-                FROM temp_dirty_content d
-                CROSS JOIN usage_events e ON e.codex_dedup_key = d.dedup_key
-                WHERE e.hostname = 'host-a' AND e.hostname <> '' AND e.codex_dedup_key <> '';
-                """)
-            try require(contentPlan.contains { $0.contains("idx_usage_events_host_content") }, "content dirty expansion must use the host/content index; plan=\(contentPlan)")
+        let initialBuckets = try ledger.buckets(hostname: "host-a")
+        let appendTime = ts.addingTimeInterval(TimeInterval(UsageLedgerStore.bucketMilliseconds) / 1_000)
+        for (file, input, calls) in [("copy-a", Int64(3), 1), ("copy-b", Int64(7), 2)] {
+            let event = UsageEvent(
+                id: file, source: "codex", model: "append-model", project: "append-project",
+                timestamp: appendTime, counts: UsageTokenCounts(input: input),
+                sessionHash: "append-\(file)", sourceFileHash: file,
+                codexDedupKey: "shared-content", skillCounts: ["build": calls]
+            )
+            try ledger.record(events: [event], checkpoint: completeCheckpoint(file, source: "codex", ts: appendTime), hostname: "host-a")
         }
+        _ = try ledger.finalizeDerived(hostname: "host-a")
+        let work = ledger.lastFinalizeDiagnostics
+        try require(work.strategy == "incremental", "small append must execute incremental path, got \(work.strategy)")
+        try require(work.scopedLogicalEvents == 2, "cross-file content group must scope two events, got \(work.scopedLogicalEvents)")
+        let buckets = try ledger.buckets(hostname: "host-a")
+        let appended = buckets.filter { $0.model == "append-model" }
+        try require(appended.count == 1 && appended[0].counts.input == 7, "content duplicates must derive one 7-token winner")
+        try require(appended[0].skillCounts == ["build": 2], "content duplicate skill counts must merge by max")
+        try require(buckets.filter { $0.model != "append-model" } == initialBuckets, "append must preserve unrelated historical buckets")
+        try require(try ledger.eventCount() == backgroundCount + 2, "scoped finalize must preserve raw history")
+        _ = try ledger.finalizeDerived(hostname: "host-a")
+        let unchanged = ledger.lastFinalizeDiagnostics
+        try require(unchanged.strategy == "noChange" && unchanged.scopedLogicalEvents == 0,
+                    "unchanged finalize must avoid rebuilding temporary event tables")
+        try require(unchanged.sqliteChangedRows == 0, "unchanged finalize must write no SQLite rows")
     }
 
     // MARK: - Frozen watermark (v3) 场景
@@ -1043,20 +996,6 @@ private struct MetricsLedgerPipelineVerifier {
         defer { sqlite3_finalize(statement) }
         guard sqlite3_step(statement) == SQLITE_ROW else { throw VerificationFailure.sqlite(String(cString: sqlite3_errmsg(db))) }
         return sqlite3_column_int64(statement, 0)
-    }
-
-    private func queryPlanDetails(_ db: OpaquePointer, _ sql: String) throws -> [String] {
-        var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw VerificationFailure.sqlite(String(cString: sqlite3_errmsg(db)))
-        }
-        defer { sqlite3_finalize(statement) }
-        var details: [String] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
-            guard let value = sqlite3_column_text(statement, 3) else { continue }
-            details.append(String(cString: value))
-        }
-        return details
     }
 
     private func insertBucket(_ url: URL, hostname: String, model: String, at date: Date, counts: UsageTokenCounts) throws {

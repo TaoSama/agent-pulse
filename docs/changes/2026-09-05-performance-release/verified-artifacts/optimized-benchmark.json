@@ -1,0 +1,21 @@
+{
+  "revision": "uncommitted codex/performance-release based on 494f251",
+  "configuration": "release",
+  "command": "BENCH_EVENT_COUNT=200000 BENCH_REQUIRE_RATIO=1 /usr/bin/time -l .build/release/DerivedFinalizeBenchmark",
+  "exitCode": 0,
+  "events": 200000,
+  "firstFinalizeSeconds": 2.444,
+  "noChangeSecondsRoundedToMilliseconds": 0.000,
+  "smallAppendSeconds": 0.020,
+  "appendedEvents": 10,
+  "wallSeconds": 5.10,
+  "userSeconds": 3.85,
+  "systemSeconds": 0.65,
+  "maxResidentBytes": 315326464,
+  "peakFootprintBytes": 309117720,
+  "unchangedRoundsPerPhase": 8,
+  "unchangedSQLiteChangedRows": 0,
+  "unchangedDBWALAndNamedTemporaryFilesStable": true,
+  "unchangedResidentGrowthBytes": [131072, 16384],
+  "scope": "Same 200000-event synthetic workload as baseline.json. Process resource peaks include fixture ingestion. Does not measure unlinked temporary files, production steady state, or 48-hour stability. Zero rounded duration is not literally zero execution time."
+}

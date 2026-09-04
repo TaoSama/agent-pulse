@@ -7,6 +7,31 @@ public protocol TokenSupplying: Sendable {
     func token(forceRefresh: Bool) async throws -> SecretToken
 }
 
+/// Created once per report, so successive batches reuse a credential only in
+/// memory. Refreshes are fenced before replacing the cached credential.
+public actor ReportTokenSupplier: TokenSupplying {
+    private let supplier: TokenSupplying
+    private let identity: TokenAccountIdentity
+    private var cached: SecretToken?
+
+    public init(supplier: TokenSupplying, identity: TokenAccountIdentity = TokenAccountIdentity()) {
+        self.supplier = supplier
+        self.identity = identity
+    }
+
+    public func token(forceRefresh: Bool) async throws -> SecretToken {
+        try Task.checkCancellation()
+        if !forceRefresh, let cached { return cached }
+        let token = try await supplier.token(forceRefresh: forceRefresh)
+        try Task.checkCancellation()
+        if let cached, !identity.sameStableAccount(cached.reveal(), token.reveal()) {
+            throw IngestClientError.authIdentityChanged
+        }
+        cached = token
+        return token
+    }
+}
+
 /// Adapts the synchronous command token provider to the async TokenSupplying
 /// surface the client consumes.
 public struct CommandTokenSupplier: TokenSupplying {

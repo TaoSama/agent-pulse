@@ -214,6 +214,22 @@ private func verifyRebuildChain() throws {
             + "got \(linesAdded)/\(linesDeleted)"
     )
 
+    try require(try ledger.requiresRebuildCompletion(),
+                "finalize must leave rebuild completion pending until every source is confirmed")
+    try ledger.markRebuildCompleted()
+    try require(!(try ledger.requiresRebuildCompletion()),
+                "explicit completion after the successful fixture scan must clear rebuild pending")
+
+    // Keep the connection open: a redundant finalize must not advance revisions
+    // or rewrite derived rows and cannot rely on shutdown to clean up its WAL.
+    let beforeNoChange = try readSnapshot(databaseURL)
+    _ = try ledger.finalizeDerived(hostname: Expected.host)
+    let noChangeWork = ledger.lastFinalizeDiagnostics
+    try require(noChangeWork.strategy == "noChange", "rebuilt ledger must recognize an unchanged finalize")
+    try require(noChangeWork.sqliteChangedRows == 0, "unchanged rebuilt ledger must not write rows")
+    try require(try readSnapshot(databaseURL) == beforeNoChange,
+                "unchanged finalize must preserve raw counts, derived counts and revision watermark")
+
     handle = nil
     try checkpointWriteAheadLog(databaseURL)
     try verifyStructuralInvariants(databaseURL, expectedHostname: Expected.host)
@@ -594,7 +610,7 @@ private func saturatedAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
     return overflow ? Int64.max : sum
 }
 
-private struct DatabaseSnapshot {
+private struct DatabaseSnapshot: Equatable {
     let schemaVersion: Int64
     let events: Int64
     let buckets: Int64

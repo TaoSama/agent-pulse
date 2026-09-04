@@ -1,0 +1,17 @@
+{
+  "revision": "494f2510e794bfb7f237bd029bf4b99cd70a0f20",
+  "configuration": "release",
+  "command": "BENCH_EVENT_COUNT=200000 /usr/bin/time -l .build/release/DerivedFinalizeBenchmark",
+  "exitCode": 0,
+  "events": 200000,
+  "firstFinalizeSeconds": 10.338,
+  "noChangeSeconds": 0.373,
+  "smallAppendSeconds": 0.430,
+  "appendedEvents": 10,
+  "wallSeconds": 19.98,
+  "userSeconds": 14.51,
+  "systemSeconds": 2.45,
+  "maxResidentBytes": 355434496,
+  "peakFootprintBytes": 331219784,
+  "scope": "Synthetic fixture only; includes ingestion and process lifetime resource peaks. Not a steady-state production measurement."
+}

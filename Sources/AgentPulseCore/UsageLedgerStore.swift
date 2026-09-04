@@ -137,8 +137,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
     public static let defaultMaxSessionsPerBatch = 1_000
     public static let defaultMaxEventsForBaselineRecovery: Int64 = 200_000
 
-    private var db: OpaquePointer?
-    private let queue = DispatchQueue(label: "com.agentpulse.usage-ledger")
+    var db: OpaquePointer?
+    let queue = DispatchQueue(label: "com.agentpulse.usage-ledger", qos: .utility)
+    private var finalizeDiagnostics = UsageFinalizeDiagnostics()
+    private var isFinalizing = false
+    private var summarySnapshotRevision: Int64 = 0
+    public var lastFinalizeDiagnostics: UsageFinalizeDiagnostics { queue.sync { finalizeDiagnostics } }
     /// 数据库主文件路径；用于对 db 及其 WAL/SHM 边车文件收紧 POSIX 权限（0600）。
     private let path: String
     /// 用量库仅当前用户可读写：库中含项目路径、hostname 等可识别信息，禁止同机其它用户读取。
@@ -156,13 +160,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try exec("PRAGMA journal_mode=WAL;")
             try exec("PRAGMA busy_timeout=5000;")
             try exec("PRAGMA foreign_keys=ON;")
-            // 批量写入 / 全表重读调优：WAL 下 synchronous=NORMAL 崩溃至多丢最后一个未 checkpoint
-            // 事务（本账本可重扫恢复，可接受）；32MiB 页缓存吃下全库 raw 重读；派生重算的
+            // WAL + NORMAL 在进程崩溃时保持一致性；系统掉电可能丢失最近一次同步以来的事务。
+            // 32MiB 页缓存限制 raw 重读的常驻内存；派生重算的
             // 临时表/排序走磁盘：大库（4.4M+ 事件）下 MEMORY 会把 temp_deduped_events 全放内存触发 jetsam。
             try exec("PRAGMA synchronous=NORMAL;")
             try exec("PRAGMA cache_size=-32768;")
             try exec("PRAGMA temp_store=FILE;")
             try migrate()
+            try initializeParserPersistenceUnlocked()
             // WAL 模式与迁移都会创建/触碰 db、-wal、-shm；统一在此收紧到 0600，
             // 不放宽已更严格的权限（best-effort：文件不存在则跳过）。
             tightenFilePermissions()
@@ -253,6 +258,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 // 否则一旦某个被删的行原本是某个去重组的胜者，我们就再也无法知道该组还有谁需要重算。
                 try recordDirtyKeysForFileUnlocked(fileID: fileID, hostname: hostname)
                 try deleteRawForFileUnlocked(fileID: fileID)
+                try deleteParserStateUnlocked(fileID: fileID)
                 try insertRawEvents(keptEvents, fileID: fileID, hostname: hostname)
                 try insertRawSessionEvents(keptSessionEvents, fileID: fileID, hostname: hostname)
                 try insertRawEditEntries(editEntries, fileID: fileID, hostname: hostname)
@@ -301,9 +307,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try transaction {
                 let frozen = try frozenBeforeMsUnlocked(hostname)
                 let keptEvents = frozen > 0 ? events.filter { millis($0.timestamp) >= frozen } : events
+                let previousBuckets = try networkPreviousBucketEventsUnlocked(keptEvents, source: source, hostname: hostname)
                 try insertRawEvents(keptEvents, fileID: fileID, hostname: hostname)
                 try writeCheckpoint(checkpoint)
-                try recomputeNetworkBucketsUnlocked(events: keptEvents, source: source, hostname: hostname)
+                try recomputeNetworkBucketsUnlocked(events: keptEvents + previousBuckets, source: source, hostname: hostname)
                 if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
                     try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
                 }
@@ -311,10 +318,33 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
+    func networkPreviousBucketEventsUnlocked(_ events: [UsageEvent], source: String, hostname: String) throws -> [UsageEvent] {
+        let statement = try prepare("SELECT model,project,timestamp_ms FROM usage_events WHERE source_file_hash=? AND event_id=? AND hostname=?;")
+        defer { sqlite3_finalize(statement) }
+        var previous: [String: UsageEvent] = [:]
+        for event in events {
+            sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+            try bind(statement, 1, "network\u{1}\(source)")
+            try bind(statement, 2, event.id); try bind(statement, 3, hostname)
+            guard try step(statement) == SQLITE_ROW else { continue }
+            let model = text(statement, 0), project = text(statement, 1)
+            let timestamp = sqlite3_column_int64(statement, 2)
+            let oldStart = timestamp / Self.bucketMilliseconds * Self.bucketMilliseconds
+            let newStart = millis(event.timestamp) / Self.bucketMilliseconds * Self.bucketMilliseconds
+            guard model != event.model || project != event.project || oldStart != newStart else { continue }
+            previous[compositeKey(source, model, project, String(oldStart))] = UsageEvent(
+                id: event.id, source: source, model: model, project: project,
+                timestamp: date(timestamp), counts: UsageTokenCounts(),
+                sessionHash: "", sourceFileHash: ""
+            )
+        }
+        return Array(previous.values)
+    }
+
     /// Network events have no lineage/content replay semantics and all share one authoritative
     /// synthetic file attribution. Re-aggregate only their affected natural keys; comparing the
     /// complete bucket value keeps retries idempotent and preserves the revision/ACK contract.
-    private func recomputeNetworkBucketsUnlocked(events: [UsageEvent], source: String, hostname: String) throws {
+    func recomputeNetworkBucketsUnlocked(events: [UsageEvent], source: String, hostname: String) throws {
         struct BucketMeta {
             let source: String
             let model: String
@@ -330,8 +360,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
         guard !affected.isEmpty else { return }
 
-        let existing = try readBucketRowsUnlocked(hostname: hostname)
+        let existing = try readBucketRowsUnlocked(hostname: hostname, keys: Set(affected.keys))
         var changed: [UsageBucket] = []
+        var removed: [String] = []
         for (key, meta) in affected {
             let statement = try prepare("""
                 SELECT input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,
@@ -351,7 +382,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
             var counts = UsageTokenCounts()
             var skillCounts: [String: Int] = [:]
             var mcpCounts: [String: Int] = [:]
-            while sqlite3_step(statement) == SQLITE_ROW {
+            var hasRows = false
+            while try step(statement) == SQLITE_ROW {
+                hasRows = true
                 let row = UsageTokenCounts(
                     input: sqlite3_column_int64(statement, 0),
                     output: sqlite3_column_int64(statement, 1),
@@ -372,6 +405,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 mcpCounts = UsageToolMetrics.mergeCounts(mcpCounts, decodeStringIntMap(text(statement, 7)))
             }
 
+            if !hasRows {
+                if existing[key] != nil { removed.append(key) }
+                continue
+            }
             let bucket = UsageBucket(
                 hostname: hostname,
                 source: meta.source,
@@ -385,9 +422,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
             if existing[key]?.bucket != bucket { changed.append(bucket) }
         }
 
-        guard !changed.isEmpty else { return }
+        guard !changed.isEmpty || !removed.isEmpty else { return }
         let revision = try nextRevisionUnlocked(hostname: hostname)
         for bucket in changed { try upsertBucketUnlocked(bucket, revision: revision) }
+        for key in removed { try deleteBucketUnlocked(hostname: hostname, key: key) }
     }
 
     /// 返回指定网络来源身份已入库事件的最新毫秒时间戳。先从小型派生表定位
@@ -399,7 +437,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try bind(bucket, 1, hostname)
             try bind(bucket, 2, source)
             try bind(bucket, 3, project)
-            guard sqlite3_step(bucket) == SQLITE_ROW, sqlite3_column_type(bucket, 0) != SQLITE_NULL else { return nil }
+            guard try step(bucket) == SQLITE_ROW, sqlite3_column_type(bucket, 0) != SQLITE_NULL else { return nil }
             let bucketStart = sqlite3_column_int64(bucket, 0)
 
             let statement = try prepare("SELECT MAX(timestamp_ms) FROM usage_events WHERE hostname=? AND timestamp_ms>=? AND source=? AND project=?;")
@@ -408,18 +446,18 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try bind(statement, 2, bucketStart)
             try bind(statement, 3, source)
             try bind(statement, 4, project)
-            guard sqlite3_step(statement) == SQLITE_ROW, sqlite3_column_type(statement, 0) != SQLITE_NULL else { return nil }
+            guard try step(statement) == SQLITE_ROW, sqlite3_column_type(statement, 0) != SQLITE_NULL else { return nil }
             return sqlite3_column_int64(statement, 0)
         }
     }
 
     /// 网络来源 checkpoint 的 parser 版本基线：取一个足够大的稳定值，保证不小于任何本地
     /// JSONL 解析器版本，从而永不触发 parser 升级重建。
-    private static let networkParserVersion: Int32 = 1_000_000
+    static let networkParserVersion: Int32 = 1_000_000
 
     /// 校验本批所有行的 sourceFileHash 与 checkpoint.fileID 相符（空值视为归属该 fileID，合法）。
     /// 非空且不等 -> invalidCheckpoint：绝不把外部错误归属写入本文件的替换事务。
-    private func validateAttribution(events: [UsageEvent], sessionEvents: [UsageSessionEvent], editEntries: [UsageEditEntry], fileID: String) throws {
+    func validateAttribution(events: [UsageEvent], sessionEvents: [UsageSessionEvent], editEntries: [UsageEditEntry], fileID: String) throws {
         for event in events where !event.sourceFileHash.isEmpty && event.sourceFileHash != fileID {
             throw UsageLedgerError.invalidCheckpoint
         }
@@ -616,76 +654,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 必须在 deleteRawForFileUnlocked 之前调用一次（捕获即将消失的旧行），插入新行之后再调用一次
     /// （捕获本批带来的新键）。只登记「这些行参与了哪些去重组」，组内其余成员由 finalize 时的闭包
     /// 展开负责补齐——这里不做展开，因为 record 在扫描热路径上，每个文件都要跑。
-    private func recordDirtyKeysForFileUnlocked(fileID: String, hostname: String) throws {
-        guard try tableExistsUnlocked("usage_events") else { return }
-        var logical: Set<String> = []
-        var lineage: Set<String> = []
-        var content: Set<String> = []
-        var sessions: Set<String> = []
-        var buckets: Set<String> = []
-        let bucketMs = Self.bucketMilliseconds
-        do {
-            let statement = try prepare("""
-                SELECT source, event_id, lineage_fingerprint, codex_dedup_key, session_hash,
-                       model, project, timestamp_ms
-                FROM usage_events WHERE hostname=? AND source_file_hash=?;
-                """)
-            defer { sqlite3_finalize(statement) }
-            try bind(statement, 1, hostname); try bind(statement, 2, fileID)
-            while sqlite3_step(statement) == SQLITE_ROW {
-                let source = text(statement, 0)
-                logical.insert(compositeKey(source, text(statement, 1)))
-                lineage.insert(text(statement, 2))
-                content.insert(text(statement, 3))
-                sessions.insert(compositeKey(source, text(statement, 4)))
-                // 行当前所在的 bucket：删行后就再也算不出来了，必须此刻记下。
-                let start = (sqlite3_column_int64(statement, 7) / bucketMs) * bucketMs
-                buckets.insert(compositeKey(source, text(statement, 5), text(statement, 6), String(start)))
-            }
-        }
-        // session 活动事件独立于 token 事件：同一文件可能只贡献 session 行。
-        if try tableExistsUnlocked("usage_session_events") {
-            let statement = try prepare(
-                "SELECT DISTINCT source, session_hash FROM usage_session_events WHERE hostname=? AND source_file_hash=?;"
-            )
-            defer { sqlite3_finalize(statement) }
-            try bind(statement, 1, hostname); try bind(statement, 2, fileID)
-            while sqlite3_step(statement) == SQLITE_ROW {
-                sessions.insert(compositeKey(text(statement, 0), text(statement, 1)))
-            }
-        }
-        // edit 条目可能是该文件的唯一产物（纯 edit 文件没有任何 token 事件），此时上面两个
-        // 循环一个键都收集不到，所以这里独立收集。
-        //
-        // 记录 edit 条目当前所在的 bucket 自然键：若这些行随文件替换被删，之后就再也查不到
-        // 它们曾落在哪个 bucket，那个 bucket 既不会被重算也不会被删，陈旧值永久残留。
-        // 与 token 侧的 DirtyKeyKind.bucket 同理。
-        //
-        // 同时记录 tool_use_id：edit 按它跨文件去重，胜者易主会把行数归属挪到另一个文件的
-        // bucket，那个 bucket 无法从本文件的行还原，只能靠 tool_use_id 反查。登记 tool_use_id
-        // 而不是整个 source —— 后者会把该来源的每一个 edit bucket 都拖进闭包（实测追加
-        // 10 个事件就拉进 80 个 bucket，再经 session / bucket_map 两条边雪崩到两万多行）。
-        var editTools: Set<String> = []
-        if try tableExistsUnlocked("usage_edit_entries") {
-            let statement = try prepare("""
-                SELECT DISTINCT source, model, project, timestamp_ms, tool_use_id
-                FROM usage_edit_entries WHERE hostname=? AND source_file_hash=?;
-                """)
-            defer { sqlite3_finalize(statement) }
-            try bind(statement, 1, hostname); try bind(statement, 2, fileID)
-            while sqlite3_step(statement) == SQLITE_ROW {
-                let source = text(statement, 0)
-                editTools.insert(text(statement, 4))
-                let start = (sqlite3_column_int64(statement, 3) / bucketMs) * bucketMs
-                buckets.insert(compositeKey(source, text(statement, 1), text(statement, 2), String(start)))
-            }
-        }
-        try insertDirtyKeysUnlocked(logical, kind: .logical, hostname: hostname)
-        try insertDirtyKeysUnlocked(lineage, kind: .lineage, hostname: hostname)
-        try insertDirtyKeysUnlocked(content, kind: .content, hostname: hostname)
-        try insertDirtyKeysUnlocked(sessions, kind: .session, hostname: hostname)
-        try insertDirtyKeysUnlocked(editTools, kind: .editTool, hostname: hostname)
-        try insertDirtyKeysUnlocked(buckets, kind: .bucket, hostname: hostname)
+    func recordDirtyKeysForFileUnlocked(fileID: String, hostname: String) throws {
+        try markParserRowsDirtyUnlocked(fileID: fileID, allRows: true, hostname: hostname)
     }
 
     /// 复合键分隔符统一用 U+0001，与派生表的 bucket/session key 口径一致。
@@ -695,7 +665,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     /// 删除某 fileID 归属的全部原始行（token/session/edit）。文件级替换的第一步。
     /// 仅删该 fileID：跨文件相同 event/tool ID 的其它文件行不受影响。
-    private func deleteRawForFileUnlocked(fileID: String) throws {
+    func deleteRawForFileUnlocked(fileID: String) throws {
         for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
             guard try tableExistsUnlocked(table) else { continue }
             let statement = try prepare("DELETE FROM \(table) WHERE source_file_hash=?;")
@@ -704,7 +674,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    private func insertRawEvents(_ events: [UsageEvent], fileID: String, hostname: String) throws {
+    func insertRawEvents(_ events: [UsageEvent], fileID: String, hostname: String) throws {
         // 合并策略随事件持久化（merge_strategy），不再按来源名硬编码：
         // - cumulativeMax（Claude-compatible）：同 msg.id 流式累计增长，逐列取最大保证不丢更新，
         //   且 model=unknown 时保留既有 model（流式早行不冲掉已知 model）。
@@ -749,7 +719,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             if event.mergeStrategy == .cumulativeMax {
                 sqlite3_reset(existingCounts); sqlite3_clear_bindings(existingCounts)
                 try bind(existingCounts, 1, fileID); try bind(existingCounts, 2, event.id)
-                if sqlite3_step(existingCounts) == SQLITE_ROW {
+                if try step(existingCounts) == SQLITE_ROW {
                     skillCounts = maximumCounts(decodeStringIntMap(text(existingCounts, 0)), skillCounts)
                     mcpCounts = maximumCounts(decodeStringIntMap(text(existingCounts, 1)), mcpCounts)
                 }
@@ -773,7 +743,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    private func insertRawSessionEvents(_ events: [UsageSessionEvent], fileID: String, hostname: String) throws {
+    func insertRawSessionEvents(_ events: [UsageSessionEvent], fileID: String, hostname: String) throws {
         let sql = """
             INSERT OR IGNORE INTO usage_session_events
             (event_id,source,session_hash,role,timestamp_ms,source_file_hash,hostname,created_at_ms)
@@ -790,7 +760,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    private func insertRawEditEntries(_ entries: [UsageEditEntry], fileID: String, hostname: String) throws {
+    func insertRawEditEntries(_ entries: [UsageEditEntry], fileID: String, hostname: String) throws {
         let sql = """
             INSERT OR IGNORE INTO usage_edit_entries
             (tool_use_id,source,model,project,timestamp_ms,lines_added,lines_deleted,source_file_hash,hostname,created_at_ms)
@@ -808,7 +778,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    private func markEditMetricSourceUnlocked(_ source: String, hostname: String) throws {
+    func markEditMetricSourceUnlocked(_ source: String, hostname: String) throws {
         let normalized = source.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return }
         let statement = try prepare("INSERT OR IGNORE INTO usage_edit_metric_sources(source,created_at_ms) VALUES(?,?);")
@@ -844,19 +814,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
     ///
     /// 传播只做这三个键的等值查找，走 idx_usage_events_host_time / _lineage / _dedup 索引，
     /// 代价与受影响的组规模成正比，与账本总行数无关。
-    private func expandDirtyScopeUnlocked(hostname: String) throws -> DirtyScope {
-        try dropDirtyClosureTablesUnlocked()
-        try exec("CREATE TEMP TABLE temp_dirty_logical(source TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(source,event_id));")
-        try exec("CREATE TEMP TABLE temp_dirty_lineage(fingerprint TEXT PRIMARY KEY);")
-        try exec("CREATE TEMP TABLE temp_dirty_content(dedup_key TEXT PRIMARY KEY);")
-        defer { try? dropDirtyClosureTablesUnlocked() }
-        try seedDirtyKeysUnlocked(hostname: hostname)
-        try propagateDirtyClosureUnlocked(hostname: hostname)
-        return try collectDirtyScopeUnlocked(hostname: hostname)
-    }
 
     /// 不动点传播：三级去重键互相传播直到不再产生新键。要求 temp_dirty_* 三张表已建好并灌过种子。
-    private func propagateDirtyClosureUnlocked(hostname: String) throws {
+    private func propagateDirtyClosureUnlocked(hostname: String) throws -> Bool {
         // 四条传播语句都加 hostname 过滤，避免多机场景下把其它 hostname 的事件拉进作用域。
         let logicalToLineage = try prepare("""
             INSERT OR IGNORE INTO temp_dirty_lineage(fingerprint)
@@ -904,8 +864,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
             sqlite3_reset(contentToLogical); sqlite3_clear_bindings(contentToLogical)
             try bind(contentToLogical, 1, hostname); try done(contentToLogical)
             added += sqlite3_changes(db)
-            if added == 0 { break }
+            if added == 0 { return true }
+            if try scalar("SELECT COUNT(*) FROM temp_dirty_logical;") > Self.incrementalDirtyKeyLimit { return false }
         }
+        return false
     }
 
     /// 收集闭包覆盖的 bucket / session 自然键。要求传播已完成。
@@ -925,7 +887,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 """)
             defer { sqlite3_finalize(statement) }
             try bind(statement, 1, hostname)
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 scope.buckets.insert(compositeKey(
                     text(statement, 0), text(statement, 1), text(statement, 2),
                     String(sqlite3_column_int64(statement, 3))
@@ -942,7 +904,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 """)
             defer { sqlite3_finalize(statement) }
             try bind(statement, 1, hostname)
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 scope.sessions.insert(compositeKey(text(statement, 0), text(statement, 1)))
             }
         }
@@ -1001,7 +963,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, hostname); try bind(statement, 2, kind.rawValue)
         var keys: [String] = []
-        while sqlite3_step(statement) == SQLITE_ROW { keys.append(text(statement, 0)) }
+        while try step(statement) == SQLITE_ROW { keys.append(text(statement, 0)) }
         return keys
     }
 
@@ -1032,7 +994,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             for toolUseID in tools {
                 sqlite3_reset(statement); sqlite3_clear_bindings(statement)
                 try bind(statement, 1, hostname); try bind(statement, 2, toolUseID)
-                while sqlite3_step(statement) == SQLITE_ROW {
+                while try step(statement) == SQLITE_ROW {
                     keys.append(compositeKey(
                         text(statement, 0), text(statement, 1), text(statement, 2),
                         String(sqlite3_column_int64(statement, 3))
@@ -1051,7 +1013,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             for source in sources {
                 sqlite3_reset(statement); sqlite3_clear_bindings(statement)
                 try bind(statement, 1, hostname); try bind(statement, 2, source)
-                while sqlite3_step(statement) == SQLITE_ROW {
+                while try step(statement) == SQLITE_ROW {
                     keys.append(compositeKey(
                         text(statement, 0), text(statement, 1), text(statement, 2),
                         String(sqlite3_column_int64(statement, 3))
@@ -1084,8 +1046,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     event_id, source, model, project, timestamp_ms,
                     input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
                     reasoning_output_tokens, total_tokens, session_hash,
-                    inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                    skill_counts_json, mcp_counts_json, merge_strategy,
+                    inherited, lineage_fingerprint, codex_dedup_key,
+                    merge_strategy,
                     CASE
                         WHEN source_file_hash = '' THEN 0
                         WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
@@ -1116,12 +1078,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     MAX(total_tokens) AS total_tokens,
                     MAX(session_hash) AS session_hash,
                     MIN(inherited) AS inherited,
-                    MAX(has_total_snapshot) AS has_total_snapshot,
                     MAX(lineage_fingerprint) AS lineage_fingerprint,
                     MAX(codex_dedup_key) AS codex_dedup_key,
-                    COALESCE(MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 'cumulativeMax' END), MAX(merge_strategy)) AS merge_strategy,
-                    MAX(skill_counts_json) AS skill_counts_json,
-                    MAX(mcp_counts_json) AS mcp_counts_json,
                     CASE
                         WHEN MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 1 ELSE 0 END) = 1 THEN 0
                         WHEN COUNT(DISTINCT session_hash) > 1 THEN 1
@@ -1145,8 +1103,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     usage_events.event_id, usage_events.source, usage_events.model, usage_events.project, usage_events.timestamp_ms,
                     usage_events.input_tokens, usage_events.output_tokens, usage_events.cached_input_tokens, usage_events.cache_creation_input_tokens,
                     usage_events.reasoning_output_tokens, usage_events.total_tokens, usage_events.session_hash,
-                    usage_events.inherited, usage_events.has_total_snapshot, usage_events.lineage_fingerprint, usage_events.codex_dedup_key,
-                    usage_events.skill_counts_json, usage_events.mcp_counts_json, usage_events.merge_strategy,
+                    usage_events.inherited, usage_events.lineage_fingerprint, usage_events.codex_dedup_key,
+                    usage_events.merge_strategy,
                     CASE
                         WHEN usage_events.source_file_hash = '' THEN 0
                         WHEN usage_events.source_file_hash IN (SELECT file_id FROM active_files) THEN 2
@@ -1179,12 +1137,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     MAX(total_tokens) AS total_tokens,
                     MAX(session_hash) AS session_hash,
                     MIN(inherited) AS inherited,
-                    MAX(has_total_snapshot) AS has_total_snapshot,
                     MAX(lineage_fingerprint) AS lineage_fingerprint,
                     MAX(codex_dedup_key) AS codex_dedup_key,
-                    COALESCE(MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 'cumulativeMax' END), MAX(merge_strategy)) AS merge_strategy,
-                    MAX(skill_counts_json) AS skill_counts_json,
-                    MAX(mcp_counts_json) AS mcp_counts_json,
                     CASE
                         WHEN MAX(CASE WHEN merge_strategy = 'cumulativeMax' THEN 1 ELSE 0 END) = 1 THEN 0
                         WHEN COUNT(DISTINCT session_hash) > 1 THEN 1
@@ -1209,16 +1163,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
             )
                 SELECT source, event_id, model, project, timestamp_ms,
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                       reasoning_output_tokens, total_tokens, session_hash,
-                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
+                       reasoning_output_tokens, total_tokens, lineage_fingerprint, codex_dedup_key
                 FROM lineage_ranked WHERE rn = 1
                 UNION ALL
                 SELECT source, event_id, model, project, timestamp_ms,
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                       reasoning_output_tokens, total_tokens, session_hash,
-                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
+                       reasoning_output_tokens, total_tokens, lineage_fingerprint, codex_dedup_key
                 FROM temp_logical_events WHERE lineage_fingerprint = '';
         """
 
@@ -1238,16 +1188,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
             content_dedup AS (
                 SELECT source, event_id, model, project, timestamp_ms,
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                       reasoning_output_tokens, total_tokens, session_hash,
-                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
+                       reasoning_output_tokens, total_tokens, codex_dedup_key
                 FROM content_ranked WHERE rn = 1
                 UNION ALL
                 SELECT source, event_id, model, project, timestamp_ms,
                        input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                       reasoning_output_tokens, total_tokens, session_hash,
-                       inherited, has_total_snapshot, lineage_fingerprint, codex_dedup_key,
-                       skill_counts_json, mcp_counts_json, merge_strategy
+                       reasoning_output_tokens, total_tokens, codex_dedup_key
                 FROM temp_lineage_events WHERE codex_dedup_key = ''
             )
             SELECT * FROM content_dedup;
@@ -1266,17 +1212,17 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private static func skillAttributionSQL(bucketMs: Int64) -> String {
         """
             CREATE TEMP TABLE temp_skill_attribution AS
-            WITH target_logical AS (
+            WITH target_logical AS MATERIALIZED (
                 SELECT l.source, l.event_id, l.lineage_fingerprint, l.codex_dedup_key
-                FROM temp_skill_members m
-                JOIN temp_logical_events l ON l.source = m.source AND l.event_id = m.event_id
+                FROM temp_logical_events l
+                CROSS JOIN temp_skill_members m ON l.source = m.source AND l.event_id = m.event_id
             ),
-            lineage_winner AS (
+            lineage_winner AS MATERIALIZED (
                 SELECT t.source AS member_source, t.event_id AS member_event_id,
                        w.source AS win_source, w.event_id AS win_event_id,
                        w.codex_dedup_key
-                FROM target_logical t
-                JOIN temp_lineage_events w ON w.lineage_fingerprint = t.lineage_fingerprint
+                FROM temp_lineage_events w
+                CROSS JOIN target_logical t ON w.lineage_fingerprint = t.lineage_fingerprint
                 WHERE t.lineage_fingerprint <> ''
                 UNION ALL
                 SELECT t.source, t.event_id, t.source, t.event_id,
@@ -1289,16 +1235,16 @@ public final class UsageLedgerStore: @unchecked Sendable {
                        d.source AS winner_source, d.event_id AS winner_event_id,
                        d.model AS winner_model, d.project AS winner_project,
                        (d.timestamp_ms / \(bucketMs)) * \(bucketMs) AS winner_bucket_start
-                FROM lineage_winner lw
-                JOIN temp_deduped_events d ON d.codex_dedup_key = lw.codex_dedup_key
+                FROM temp_deduped_events d
+                CROSS JOIN lineage_winner lw ON d.codex_dedup_key = lw.codex_dedup_key
                 WHERE lw.codex_dedup_key <> ''
                 UNION ALL
                 SELECT lw.member_source, lw.member_event_id,
                        d.source AS winner_source, d.event_id AS winner_event_id,
                        d.model AS winner_model, d.project AS winner_project,
                        (d.timestamp_ms / \(bucketMs)) * \(bucketMs) AS winner_bucket_start
-                FROM lineage_winner lw
-                JOIN temp_deduped_events d ON d.source = lw.win_source AND d.event_id = lw.win_event_id
+                FROM temp_deduped_events d
+                CROSS JOIN lineage_winner lw ON d.source = lw.win_source AND d.event_id = lw.win_event_id
                 WHERE lw.codex_dedup_key = ''
             )
             SELECT member_source AS source, member_event_id AS event_id,
@@ -1316,7 +1262,24 @@ public final class UsageLedgerStore: @unchecked Sendable {
         progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil
     ) throws -> UsageFinalizeResult {
         try queue.sync {
+            finalizeDiagnostics = UsageFinalizeDiagnostics()
+            let previousChanges = sqlite3_total_changes64(db)
+            isFinalizing = true
+            defer {
+                finalizeDiagnostics.sqliteChangedRows = sqlite3_total_changes64(db) - previousChanges
+                isFinalizing = false
+            }
             try ensurePerformanceIndexesUnlocked()
+            if strategy == .automatic, !compactFrozen,
+               try readTextUnlocked(key: Self.incrementalBaselineKey) != nil,
+               try !hasLocalDerivationPendingUnlocked(),
+               try dirtyKeyCountUnlocked(hostname: hostname) == 0 {
+                finalizeDiagnostics.strategy = "noChange"
+                return UsageFinalizeResult(
+                    reportingEligible: try readTextUnlocked(key: reportingEligibleKey(hostname)) != "0",
+                    blockedReasons: [], collapsedInheritedEvents: 0
+                )
+            }
             var result = UsageFinalizeResult(reportingEligible: true, blockedReasons: [], collapsedInheritedEvents: 0)
             var didCompact = false
             try transaction {
@@ -1357,17 +1320,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    /// 全量派生会顺序读写数 GB SQLite 临时数据并持续占用一个核心。把当前 ledger worker
-    /// 线程的 CPU 降为后台优先级，让前台应用和用户交互优先；重算结束（含抛错）后恢复。
-    /// 磁盘 I/O 保持正常吞吐，绝不使用 IOPOL_THROTTLE 人为将读写压到 2MB/s 导致数小时卡顿。
+    /// 队列使用 utility QoS。PRIO_DARWIN_BG 同时节流磁盘，不能用来只降低 CPU 优先级；
+    /// 不修改共享 worker 线程的后台状态，确保派生中的临时文件 I/O 持续推进。
     private func withBackgroundResourcePriority<T>(_ operation: () throws -> T) rethrows -> T {
-        let previousCPU = getpriority(PRIO_DARWIN_THREAD, 0)
-        let cpuChanged = setpriority(PRIO_DARWIN_THREAD, 0, PRIO_DARWIN_BG) == 0
-        defer {
-            if cpuChanged {
-                _ = setpriority(PRIO_DARWIN_THREAD, 0, previousCPU >= 0 ? previousCPU : 0)
-            }
-        }
         return try operation()
     }
 
@@ -1433,7 +1388,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let statement = try prepare("SELECT file_id FROM usage_files WHERE scan_status<>'missing';")
         defer { sqlite3_finalize(statement) }
         var result = Set<String>()
-        while sqlite3_step(statement) == SQLITE_ROW { result.insert(text(statement, 0)) }
+        while try step(statement) == SQLITE_ROW { result.insert(text(statement, 0)) }
         return result
     }
 
@@ -1500,7 +1455,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         do {
             let collapseStmt = try prepare(collapseCountSQL)
             defer { sqlite3_finalize(collapseStmt) }
-            if sqlite3_step(collapseStmt) == SQLITE_ROW {
+            if try step(collapseStmt) == SQLITE_ROW {
                 collapsedInheritedEvents = Int(sqlite3_column_int64(collapseStmt, 0))
                 collapsedContentDuplicates = Int(sqlite3_column_int64(collapseStmt, 1))
                 unprovableInherited = Int(sqlite3_column_int64(collapseStmt, 2))
@@ -1540,7 +1495,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         var buckets: [String: BucketAgg] = [:]
         var bucketMeta: [String: (source: String, model: String, project: String, start: Int64)] = [:]
 
-        while sqlite3_step(bucketStmt) == SQLITE_ROW {
+        while try step(bucketStmt) == SQLITE_ROW {
             let source = text(bucketStmt, 0)
             let model = text(bucketStmt, 1)
             let project = text(bucketStmt, 2)
@@ -1560,8 +1515,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
         advanceStage() // 4) bucket token 聚合完成
 
-        // skill/mcp 计数合并：SQL MAX(JSON) 无法按 key 取 max，因此加载所有非空计数事件
-        // （约 1.5 万行），在 Swift 端复现 tier→logical ID→lineage→content 四级去重的计数合并。
+        // skill/mcp 归属胜者由共享 SQL 决定；非空 JSON 计数在 Swift 中按 key 合并。
         let skillEventSQL = """
             SELECT e.source, e.event_id, e.model, e.project, e.session_hash, e.timestamp_ms,
                    e.inherited,
@@ -1581,7 +1535,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         defer { sqlite3_finalize(skillEventStmt) }
         try bind(skillEventStmt, 1, hostname)
         var skillEvents: [SkillMergeEvent] = []
-        while sqlite3_step(skillEventStmt) == SQLITE_ROW {
+        while try step(skillEventStmt) == SQLITE_ROW {
             skillEvents.append(SkillMergeEvent(
                 source: text(skillEventStmt, 0),
                 eventID: text(skillEventStmt, 1),
@@ -1660,7 +1614,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         do {
             let sessionProjStmt = try prepare(sessionProjSQL)
             defer { sqlite3_finalize(sessionProjStmt) }
-            while sqlite3_step(sessionProjStmt) == SQLITE_ROW {
+            while try step(sessionProjStmt) == SQLITE_ROW {
                 let source = text(sessionProjStmt, 0)
                 let sessionHash = text(sessionProjStmt, 1)
                 let project = text(sessionProjStmt, 2)
@@ -1792,7 +1746,6 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 脏键种子数量上限。超过时闭包传播本身会退化成长时间 B-Tree 随机查找，
     /// 还没机会算出 bucket 作用域就卡住；直接全量重算更可预测，并且能正常回报 8 步进度。
     private static let incrementalDirtyKeyLimit = 50_000
-    private static let incrementalDedupKeyLimit = 0
 
     /// 作用域事件数占该 hostname 全部事件的比例上限。超过就退回全量。
     ///
@@ -1825,7 +1778,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let statement = try prepare("SELECT COUNT(*) FROM usage_identity_conflicts WHERE hostname=?;")
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, hostname)
-        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        guard try step(statement) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(statement, 0))
     }
 
@@ -1851,10 +1804,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         do {
             let statement = try prepare("""
                 DELETE FROM usage_identity_conflicts
-                WHERE hostname = ?
-                  AND EXISTS (SELECT 1 FROM temp_scope_events s
-                              WHERE s.source = usage_identity_conflicts.source
-                                AND s.event_id = usage_identity_conflicts.event_id);
+                WHERE (hostname,source,event_id) IN (SELECT ?,source,event_id FROM temp_scope_events);
                 """)
             defer { sqlite3_finalize(statement) }
             try bind(statement, 1, hostname); try done(statement)
@@ -1948,7 +1898,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             let statement = try prepare("SELECT 1 FROM \(table) WHERE hostname=? LIMIT 1;")
             defer { sqlite3_finalize(statement) }
             try bind(statement, 1, hostname)
-            if sqlite3_step(statement) == SQLITE_ROW { return true }
+            if try step(statement) == SQLITE_ROW { return true }
         }
         return false
     }
@@ -1967,7 +1917,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private func dirtyKeysAllowIncrementalRecomputeUnlocked(hostname: String) throws -> Bool {
         guard try tableExistsUnlocked("usage_dirty_keys") else { return false }
         guard try dirtyKeyCountUnlocked(hostname: hostname) <= Self.incrementalDirtyKeyLimit else { return false }
-        return try dirtyKeyCountUnlocked(hostname: hostname, kinds: [.lineage, .content]) <= Self.incrementalDedupKeyLimit
+        return true
     }
 
     private func canRecomputeIncrementallyUnlocked(hostname: String) throws -> Bool {
@@ -2027,7 +1977,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             guard try tableExistsUnlocked(table) else { continue }
             let statement = try prepare("SELECT 1 FROM \(table) WHERE hostname='' LIMIT 1;")
             defer { sqlite3_finalize(statement) }
-            if sqlite3_step(statement) == SQLITE_ROW { return true }
+            if try step(statement) == SQLITE_ROW { return true }
         }
         return false
     }
@@ -2036,7 +1986,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let statement = try prepare("SELECT 1 FROM usage_files WHERE scan_status<>'missing' AND parser_version<? LIMIT 1;")
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, Int64(parserVersion))
-        return sqlite3_step(statement) == SQLITE_ROW
+        return try step(statement) == SQLITE_ROW
     }
 
     private func ensureLogicalBucketMapUnlocked() throws {
@@ -2141,9 +2091,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
         defer { try? exec("DROP TABLE IF EXISTS temp_scope_events;") }
 
         try seedDirtyKeysUnlocked(hostname: hostname)
-        try withSQLiteProgressHeartbeat(heartbeat) {
+        let dirtyConverged = try withSQLiteProgressHeartbeat(heartbeat) {
             try propagateDirtyClosureUnlocked(hostname: hostname)
         }
+        guard dirtyConverged else { return nil }
         var scope = try withSQLiteProgressHeartbeat(heartbeat) {
             try collectDirtyScopeUnlocked(hostname: hostname)
         }
@@ -2299,14 +2250,23 @@ public final class UsageLedgerStore: @unchecked Sendable {
             sqlite3_finalize(scopeEventFromBucketStmt); sqlite3_finalize(scopeEventFromSessionStmt)
             sqlite3_finalize(scopeEventFromBucketMapStmt); sqlite3_finalize(scopeBucketFromMapStmt)
         }
-        // 作用域上限先算出来，循环里每轮检查。不能等循环结束再判：雪崩式增长的代价正是在
-        // 循环内花掉的，实测跑满 16 轮要 54 秒，而这轮本来就注定退回全量（全量只要 4 秒）。
-        let hostEventTotal = try hostEventCountUnlocked(hostname: hostname)
-        let scopeEventCeiling = hostEventTotal > 0
-            ? Int(Double(hostEventTotal) * Self.incrementalScopeFraction)
-            : Int.max
-        var scopeOverflowed = false
-        try withSQLiteProgressHeartbeat(heartbeat) {
+        // 比例只需证明 host 至少有 ceil(scope / fraction) 行；小作用域无需 COUNT 全历史。
+        var verifiedScopeCount = 0
+        func scopeWithinLimits() throws -> Bool {
+            guard try scalar("SELECT COUNT(*) FROM temp_scope_buckets;") <= Self.incrementalBucketLimit else { return false }
+            let count = Int(try scalar("SELECT COUNT(*) FROM temp_scope_events;"))
+            guard count > verifiedScopeCount else { return true }
+            let minimumHostRows = Int64(ceil(Double(count) / Self.incrementalScopeFraction))
+            let statement = try prepare("SELECT 1 FROM usage_events WHERE hostname=? LIMIT 1 OFFSET ?;")
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, hostname)
+            try bind(statement, 2, minimumHostRows - 1)
+            guard try step(statement) == SQLITE_ROW else { return false }
+            verifiedScopeCount = count
+            return true
+        }
+        func completeScope() throws -> Bool {
+            guard try scopeWithinLimits() else { return false }
             for _ in 0 ..< Self.dirtyClosureIterationLimit {
             var added: Int32 = 0
             sqlite3_reset(scopeLineageStmt); sqlite3_clear_bindings(scopeLineageStmt)
@@ -2341,15 +2301,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try bind(scopeBucketFromMapStmt, 1, hostname)
             try done(scopeBucketFromMapStmt)
             added += sqlite3_changes(db)
-            if added == 0 { break }
-            if try Int(scalar("SELECT COUNT(*) FROM temp_scope_events;")) > scopeEventCeiling {
-                scopeOverflowed = true
-                break
+
+                guard try scopeWithinLimits() else { return false }
+                if added == 0 { return true }
             }
-            }
+            return false
         }
-        // 作用域太大就退回全量：增量的开销随作用域线性增长，而全量是固定成本。
-        if scopeOverflowed { return nil }
+        guard try withSQLiteProgressHeartbeat(heartbeat, { try completeScope() }) else { return nil }
         advanceStage() // 1) 闭包展开 + 组补全完成
 
         // 组补全后，scope.buckets / scope.sessions 需要按补全后的 temp_scope_events 重新收集，
@@ -2366,7 +2324,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 """)
             defer { sqlite3_finalize(stmt) }
             try bind(stmt, 1, hostname)
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            while try step(stmt) == SQLITE_ROW {
                 scope.buckets.insert(compositeKey(
                     text(stmt, 0), text(stmt, 1), text(stmt, 2),
                     String(sqlite3_column_int64(stmt, 3))
@@ -2382,7 +2340,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 """)
             defer { sqlite3_finalize(stmt) }
             try bind(stmt, 1, hostname)
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            while try step(stmt) == SQLITE_ROW {
                 scope.sessions.insert(compositeKey(text(stmt, 0), text(stmt, 1)))
             }
         }
@@ -2398,7 +2356,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 """)
             defer { sqlite3_finalize(stmt) }
             try bind(stmt, 1, hostname)
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            while try step(stmt) == SQLITE_ROW {
                 scope.buckets.insert(compositeKey(
                     text(stmt, 0), text(stmt, 1), text(stmt, 2),
                     String(sqlite3_column_int64(stmt, 3))
@@ -2427,7 +2385,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // 跑完 scoped 去重拿到新胜者 bucket 后，再拿这些 bucket 反查映射表，把同样贡献到
         // 它们的其它 logical 组拉进作用域，然后重跑去重。新拉进的组又可能带出新 bucket，
         // 所以要循环到不动点。temp_scope_events 只增不减且上界是全表，循环必终止。
-        try withSQLiteProgressHeartbeat(heartbeat) {
+        let winnersConverged = try withSQLiteProgressHeartbeat(heartbeat) { () throws -> Bool in
             for _ in 0 ..< Self.dirtyClosureIterationLimit {
             // 每轮从头重建三张去重临时表（上一轮的作用域可能已变大）。
             // 循环退出时表一定存在，后续聚合阶段直接用。
@@ -2453,6 +2411,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
                        (timestamp_ms / \(bucketMs)) * \(bucketMs) AS bucket_start
                 FROM temp_deduped_events;
                 """)
+            try exec("INSERT OR IGNORE INTO temp_scope_buckets SELECT source,model,project,bucket_start FROM temp_winner_buckets;")
+            guard try scopeWithinLimits() else {
+                try exec("DROP TABLE temp_winner_buckets;")
+                return false
+            }
             let winnerBucketStmt = try prepare("""
                 INSERT OR IGNORE INTO temp_scope_events(source, event_id)
                 SELECT DISTINCT m.source, m.event_id
@@ -2467,9 +2430,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
             let grew = sqlite3_changes(db)
             sqlite3_finalize(winnerBucketStmt)
             try exec("DROP TABLE IF EXISTS temp_winner_buckets;")
-            if grew == 0 { break }
+            if grew == 0 { return true }
+            guard try completeScope() else { return false }
             }
+            return false
         }
+        guard winnersConverged else { return nil }
         advanceStage() // 2-3) 三级去重完成
 
         // 去重胜者的 model 可能是 COALESCE(MAX(CASE WHEN model <> 'unknown' THEN model END), MAX(model))
@@ -2483,7 +2449,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 FROM temp_deduped_events;
                 """)
             defer { sqlite3_finalize(statement) }
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 scope.buckets.insert(compositeKey(
                     text(statement, 0), text(statement, 1), text(statement, 2),
                     String(sqlite3_column_int64(statement, 3))
@@ -2501,7 +2467,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 """)
             defer { sqlite3_finalize(statement) }
             try bind(statement, 1, hostname)
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 scope.sessions.insert(compositeKey(text(statement, 0), text(statement, 1)))
             }
         }
@@ -2516,7 +2482,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 """)
             defer { sqlite3_finalize(statement) }
             try bind(statement, 1, hostname)
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 scope.buckets.insert(compositeKey(
                     text(statement, 0), text(statement, 1), text(statement, 2),
                     String(sqlite3_column_int64(statement, 3))
@@ -2533,7 +2499,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 "SELECT COUNT(*) FROM temp_logical_events WHERE inherited = 1 AND lineage_fingerprint = '';"
             )
             defer { sqlite3_finalize(statement) }
-            if sqlite3_step(statement) == SQLITE_ROW {
+            if try step(statement) == SQLITE_ROW {
                 unprovableInherited = Int(sqlite3_column_int64(statement, 0))
             }
         }
@@ -2558,7 +2524,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                         - (SELECT COUNT(DISTINCT codex_dedup_key) FROM temp_lineage_events WHERE codex_dedup_key <> '');
                 """)
             defer { sqlite3_finalize(statement) }
-            if sqlite3_step(statement) == SQLITE_ROW {
+            if try step(statement) == SQLITE_ROW {
                 collapsedInheritedEvents = Int(sqlite3_column_int64(statement, 0))
                 collapsedContentDuplicates = Int(sqlite3_column_int64(statement, 1))
             }
@@ -2584,7 +2550,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 GROUP BY source, model, project, bucket_start;
                 """)
             defer { sqlite3_finalize(statement) }
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 let source = text(statement, 0)
                 let model = text(statement, 1)
                 let project = text(statement, 2)
@@ -2607,8 +2573,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
         advanceStage() // 4) bucket token 聚合完成
 
-        // 6) skill/mcp 四级去重合并：SQL 的 MAX(JSON) 无法按 key 取 max，必须在 Swift 端重做
-        //    tier -> logical -> lineage -> content 四级。只取作用域内的事件。
+        // 6) 共享 SQL 决定作用域内 skill/mcp 的归属胜者，Swift 仅按 key 合并 JSON 计数。
         let scopedSkillEvents = try readScopedSkillMergeEventsUnlocked(hostname: hostname)
         for ev in try mergeSkillCountsByBucketUnlocked(scopedSkillEvents, bucketMs: bucketMs) {
             guard var agg = buckets[ev.key] else { continue }
@@ -2618,14 +2583,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
         advanceStage() // 4.5) skill/mcp 合并完成
 
-        // 7) edit 聚合：edit 表按 tool_use_id 全局去重，胜者可能在作用域外的文件里，
-        //    所以读全量 edit 条目（该表行数远小于 usage_events），只把落在作用域内的 bucket 计入。
+        // 7) 找到作用域触及的 edit ID，再在全部文件候选里选赢家。
         let editMetricSources = try readEditMetricSourcesUnlocked()
         for key in bucketMeta.keys {
             guard let meta = bucketMeta[key], editMetricSources.contains(meta.source) else { continue }
             buckets[key]?.codeMetricVersion = UsageEditLines.codeMetricVersion
         }
-        for edit in try readAllRawEditEntries(hostname: hostname) {
+        for edit in try readAllRawEditEntries(hostname: hostname, bucketKeys: scope.buckets) {
             let start = (edit.timestampMs / bucketMs) * bucketMs
             let key = compositeKey(edit.source, edit.model, edit.project, String(start))
             guard scope.buckets.contains(key) else { continue }
@@ -2652,7 +2616,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 FROM temp_logical_events WHERE project <> '';
                 """)
             defer { sqlite3_finalize(statement) }
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 let key = compositeKey(text(statement, 0), text(statement, 1))
                 let timestampMs = sqlite3_column_int64(statement, 3)
                 if let current = sessionProject[key], current.timestampMs >= timestampMs { continue }
@@ -2671,7 +2635,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let newRevision = try nextRevisionUnlocked(hostname: hostname)
         var changed = false
 
-        let existingBuckets = try readBucketRowsUnlocked(hostname: hostname)
+        let existingBuckets = try readBucketRowsUnlocked(hostname: hostname, keys: scope.buckets)
         for key in scope.buckets {
             guard let meta = bucketMeta[key], let aggregate = buckets[key] else {
                 // 作用域内但本轮聚合无结果：该 bucket 的全部贡献都没了（源文件被删/行被替换/
@@ -2711,7 +2675,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             }
         }
 
-        let existingSessions = try readSessionRowsUnlocked(hostname: hostname)
+        let existingSessions = try readSessionRowsUnlocked(hostname: hostname, keys: scope.sessions)
         advanceStage() // 7) bucket 差异写完成
         var producedSessionKeys: Set<String> = []
         for session in sessions {
@@ -2740,13 +2704,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
         // 更新作用域内 logical 组的 bucket 映射：先删旧映射，再从 temp_deduped_events 写入新的。
         // 必须在 defer DROP temp_deduped_events 之前执行。
+        finalizeDiagnostics.scopedLogicalEvents = Int(try scalar("SELECT COUNT(*) FROM temp_scope_events;"))
         let bms = Self.bucketMilliseconds
         try exec("""
             DELETE FROM usage_logical_bucket_map
-            WHERE hostname='\(hostname)' AND EXISTS (
-                SELECT 1 FROM temp_scope_events s
-                WHERE s.source = usage_logical_bucket_map.source
-                  AND s.event_id = usage_logical_bucket_map.event_id
+            WHERE (hostname,source,event_id) IN (
+                SELECT '\(hostname)',source,event_id FROM temp_scope_events
             );
             """)
         try exec("""
@@ -2787,7 +2750,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, hostname)
         var events: [SkillMergeEvent] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             events.append(SkillMergeEvent(
                 source: text(statement, 0), eventID: text(statement, 1),
                 model: text(statement, 2), project: text(statement, 3),
@@ -2849,10 +2812,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try ensureIdentityConflictTableUnlocked()
         if strategy == .automatic, allowIncrementalDirtyKeys, try canRecomputeIncrementallyUnlocked(hostname: hostname) {
             if let result = try recomputeDerivedIncrementalUnlocked(hostname: hostname, progress: progress) {
+                finalizeDiagnostics.strategy = "incremental"
                 try clearDirtyKeysUnlocked(hostname: hostname)
                 return result
             }
         }
+        finalizeDiagnostics.strategy = "full"
         let result = try recomputeDerivedUnlocked(hostname: hostname, progress: progress)
         // 全量重算刚刚重建了完整基线（含 identity 冲突表），下一轮起可以走增量。
         try setTextUnlocked(key: Self.incrementalBaselineKey, value: "1")
@@ -2941,11 +2906,25 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     // MARK: - Reads
 
+    public func checkpoints(source: String) throws -> [String: UsageFileCheckpoint] {
+        try queue.sync {
+            let statement = try prepare("SELECT file_id,path_hash,read_offset,file_size,mtime_ms,parser_version,scan_status FROM usage_files WHERE source=?;")
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, source)
+            var result: [String: UsageFileCheckpoint] = [:]
+            while try step(statement) == SQLITE_ROW {
+                let fileID = text(statement, 0)
+                result[fileID] = UsageFileCheckpoint(fileID: fileID, source: source, pathHash: text(statement, 1), offset: sqlite3_column_int64(statement, 2), size: sqlite3_column_int64(statement, 3), modifiedAt: date(sqlite3_column_int64(statement, 4)), parserVersion: Int(sqlite3_column_int64(statement, 5)), status: text(statement, 6))
+            }
+            return result
+        }
+    }
+
     public func checkpoint(fileID: String) throws -> UsageFileCheckpoint? {
         try queue.sync {
             let statement = try prepare("SELECT source,path_hash,read_offset,file_size,mtime_ms,parser_version,scan_status FROM usage_files WHERE file_id=?;")
             defer { sqlite3_finalize(statement) }; try bind(statement, 1, fileID)
-            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            guard try step(statement) == SQLITE_ROW else { return nil }
             return UsageFileCheckpoint(fileID: fileID, source: text(statement, 0), pathHash: text(statement, 1), offset: sqlite3_column_int64(statement, 2), size: sqlite3_column_int64(statement, 3), modifiedAt: date(sqlite3_column_int64(statement, 4)), parserVersion: Int(sqlite3_column_int64(statement, 5)), status: text(statement, 6))
         }
     }
@@ -2981,6 +2960,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     try bind(statement, 2, oldFileID)
                     try done(statement)
                 }
+                try migrateParserFileIdentityUnlocked(from: oldFileID, to: newFileID)
                 try deleteCheckpointUnlocked(fileID: oldFileID)
                 try writeCheckpoint(UsageFileCheckpoint(
                     fileID: newFileID,
@@ -3001,7 +2981,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let statement = try prepare("SELECT source,path_hash,read_offset,file_size,mtime_ms,parser_version,scan_status FROM usage_files WHERE file_id=?;")
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, fileID)
-        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        guard try step(statement) == SQLITE_ROW else { return nil }
         return UsageFileCheckpoint(fileID: fileID, source: text(statement, 0), pathHash: text(statement, 1), offset: sqlite3_column_int64(statement, 2), size: sqlite3_column_int64(statement, 3), modifiedAt: date(sqlite3_column_int64(statement, 4)), parserVersion: Int(sqlite3_column_int64(statement, 5)), status: text(statement, 6))
     }
 
@@ -3029,7 +3009,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             let checkpoint = try prepare("SELECT 1 FROM usage_files WHERE scan_status<>'missing' AND parser_version<? LIMIT 1;")
             defer { sqlite3_finalize(checkpoint) }
             try bind(checkpoint, 1, Int64(currentParserVersion))
-            if sqlite3_step(checkpoint) == SQLITE_ROW { return true }
+            if try step(checkpoint) == SQLITE_ROW { return true }
 
             let missingCheckpoint = try prepare("""
                 SELECT 1
@@ -3042,7 +3022,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                   );
                 """)
            defer { sqlite3_finalize(missingCheckpoint) }
-           if sqlite3_step(missingCheckpoint) == SQLITE_ROW { return true }
+           if try step(missingCheckpoint) == SQLITE_ROW { return true }
 
             // 安全网：活跃（非 missing）文件的原始事件携带 epoch 前非法时间戳（含 v1 distantPast 错值）
             // 必须触发 rebuild。已标 missing 的已删文件历史不再触发，避免无限 rebuild；
@@ -3060,7 +3040,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 """
             let invalidTimestamp = try prepare(invalidTimestampSQL)
             defer { sqlite3_finalize(invalidTimestamp) }
-            return sqlite3_step(invalidTimestamp) == SQLITE_ROW
+            return try step(invalidTimestamp) == SQLITE_ROW
         }
     }
 
@@ -3091,10 +3071,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
             """)
         defer { sqlite3_finalize(statement) }
         var hostnames: [String] = []
-        var result = sqlite3_step(statement)
+        var result = try step(statement)
         while result == SQLITE_ROW {
             hostnames.append(text(statement, 0))
-            result = sqlite3_step(statement)
+            result = try step(statement)
         }
         guard result == SQLITE_DONE else { throw error() }
         guard hostnames.count == 1 else { return nil }
@@ -3131,7 +3111,37 @@ public final class UsageLedgerStore: @unchecked Sendable {
             ) LIMIT 1;
             """)
         defer { sqlite3_finalize(statement) }
-        return sqlite3_step(statement) == SQLITE_ROW
+        return try step(statement) == SQLITE_ROW
+    }
+
+    /// All windows and optional series share one SQLite read snapshot. The revision orders
+    /// completed reads within this ledger instance so concurrent UI consumers can reject stale publication.
+    /// Set includeWindowSummaries to false for series-only reads without the four window queries.
+    public func summarySnapshot(
+        containing date: Date, hostname: String? = nil, calendar: Calendar = .current,
+        prices: [UsageModelPrice] = [], includeWindowSummaries: Bool = true,
+        outputRange: DateInterval? = nil
+    ) throws -> UsageLedgerSummarySnapshot {
+        try queue.sync {
+            try exec("BEGIN DEFERRED;")
+            do {
+                let windows: [UsageLedgerSummaryWindowSnapshot]
+                if includeWindowSummaries {
+                    windows = try [UsageSummaryWindow.day, .week, .month].map { window in
+                        try summaryWindowUnlocked(window: window, containing: date, hostname: hostname, calendar: calendar, prices: prices)
+                    } + [try summaryWindowUnlocked(window: nil, containing: date, hostname: hostname, calendar: calendar, prices: prices)]
+                } else {
+                    windows = []
+                }
+                let output = try outputRange.map { try outputTokenBucketsUnlocked(hostname: hostname, start: $0.start, end: $0.end) } ?? []
+                let outputByModel = try outputRange.map { try outputTokenBucketsByModelUnlocked(hostname: hostname, start: $0.start, end: $0.end) } ?? []
+                try exec("COMMIT;")
+                summarySnapshotRevision += 1
+                return UsageLedgerSummarySnapshot(revision: summarySnapshotRevision, windows: windows, outputBuckets: output, outputBucketsByModel: outputByModel)
+            } catch {
+                try rollbackAfterFailureUnlocked(error)
+            }
+        }
     }
 
     /// 兼容入口：汇总 usage_buckets 中所有 hostname 的全时段派生数据。
@@ -3148,9 +3158,28 @@ public final class UsageLedgerStore: @unchecked Sendable {
         calendar: Calendar = .current,
         prices: [UsageModelPrice] = []
     ) throws -> UsageSummary? {
-        try queue.sync { () throws -> UsageSummary? in
+        try queue.sync {
+            try summaryWindowUnlocked(window: window, containing: date, hostname: hostname, calendar: calendar, prices: prices).summary
+        }
+    }
+
+    public func modelSummary(
+        window: UsageSummaryWindow?,
+        containing date: Date,
+        hostname: String? = nil,
+        calendar: Calendar = .current
+    ) throws -> [UsageModelTokenSummary] {
+        try queue.sync {
+            try summaryWindowUnlocked(window: window, containing: date, hostname: hostname, calendar: calendar, prices: []).models
+        }
+    }
+
+    private func summaryWindowUnlocked(
+        window: UsageSummaryWindow?, containing date: Date, hostname: String?,
+        calendar: Calendar, prices: [UsageModelPrice]
+    ) throws -> UsageLedgerSummaryWindowSnapshot {
             guard let filter = bucketSummaryFilter(window: window, containing: date, hostname: hostname, calendar: calendar) else {
-                return nil
+                return UsageLedgerSummaryWindowSnapshot(window: window, summary: nil, models: [])
             }
             let sql = """
                 SELECT model,
@@ -3169,66 +3198,38 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try bindBucketSummaryFilter(filter, to: statement)
             var total = UsageTokenCounts(); var cost = 0.0; var newest: Int64?
             var found = false
-            while sqlite3_step(statement) == SQLITE_ROW {
+            var models: [UsageModelTokenSummary] = []
+            while try step(statement) == SQLITE_ROW {
                 found = true
                 let counts = bucketSummaryCounts(statement)
+                models.append(UsageModelTokenSummary(model: text(statement, 0), counts: counts))
                 total = sumCounts(total, counts)
                 cost += UsageCostEstimator.cost(model: text(statement, 0), counts: counts, prices: prices)
                 newest = max(newest ?? 0, sqlite3_column_int64(statement, 7))
             }
             if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
-            return found ? UsageSummary(updatedAt: newest.map { self.date($0) }, counts: total, estimatedCostUSD: cost) : nil
-        }
-    }
-
-    /// 按模型 token 汇总。hostname=nil 时跨所有设备；window=nil 表示全时段；
-    /// 非 nil 使用调用方 calendar 的窗口区间，边界为 [start,end)。
-    /// 仅聚合 token 计数（不含费用），按 total 降序返回；无数据返回空数组。
-    public func modelSummary(
-        window: UsageSummaryWindow?,
-        containing date: Date,
-        hostname: String? = nil,
-        calendar: Calendar = .current
-    ) throws -> [UsageModelTokenSummary] {
-        try queue.sync { () throws -> [UsageModelTokenSummary] in
-            guard let filter = bucketSummaryFilter(window: window, containing: date, hostname: hostname, calendar: calendar) else {
-                return []
-            }
-            let sql = """
-                SELECT model,
-                       SUM(input_tokens),
-                       SUM(output_tokens),
-                       SUM(cached_input_tokens),
-                       SUM(cache_creation_input_tokens),
-                       SUM(reasoning_output_tokens),
-                       SUM(MAX(total_tokens, input_tokens + output_tokens + cached_input_tokens + cache_creation_input_tokens + reasoning_output_tokens))
-                FROM usage_buckets
-                \(filter.whereClause)
-                GROUP BY model;
-                """
-            let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
-            try bindBucketSummaryFilter(filter, to: statement)
-            var rows: [UsageModelTokenSummary] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                rows.append(UsageModelTokenSummary(model: text(statement, 0), counts: bucketSummaryCounts(statement)))
-            }
-            if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
-            return rows.sorted {
+            let summary = found ? UsageSummary(updatedAt: newest.map { self.date($0) }, counts: total, estimatedCostUSD: cost) : nil
+            models.sort {
                 if $0.counts.total == $1.counts.total { return $0.model < $1.model }
                 return $0.counts.total > $1.counts.total
             }
-        }
+            return UsageLedgerSummaryWindowSnapshot(window: window, summary: summary, models: models)
     }
 
     /// 指定 hostname 在 [start,end) 内、按 30min bucket_start 聚合的 output_tokens 时间序列。
     /// 用于看板 1 天 TPS 曲线（每个 30min bucket 的 output 之和 → /1800 = 平均 TPS）。
     /// 按 bucketStart 升序返回；无数据返回空数组。queue.sync 阻塞，勿在主线程调用。
     public func outputTokenBuckets(
+        hostname: String? = nil, start: Date, end: Date
+    ) throws -> [(bucketStart: Date, outputTokens: Int64)] {
+        try queue.sync { try outputTokenBucketsUnlocked(hostname: hostname, start: start, end: end) }
+    }
+
+    private func outputTokenBucketsUnlocked(
         hostname: String? = nil,
         start: Date,
         end: Date
     ) throws -> [(bucketStart: Date, outputTokens: Int64)] {
-        try queue.sync {
             var sql = "SELECT bucket_start_ms,SUM(output_tokens) FROM usage_buckets WHERE "
             if hostname != nil { sql += "hostname=? AND " }
             sql += "bucket_start_ms>=? AND bucket_start_ms<? "
@@ -3239,21 +3240,25 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try bind(statement, bindIndex, millis(start))
             try bind(statement, bindIndex + 1, millis(end))
             var rows: [(bucketStart: Date, outputTokens: Int64)] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 rows.append((date(sqlite3_column_int64(statement, 0)), sqlite3_column_int64(statement, 1)))
             }
             if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
             return rows
-        }
     }
 
     /// 同上，但按 (bucket_start, model) 分组，供看板 1 天分模型曲线。
     public func outputTokenBucketsByModel(
+        hostname: String? = nil, start: Date, end: Date
+    ) throws -> [(bucketStart: Date, model: String, outputTokens: Int64)] {
+        try queue.sync { try outputTokenBucketsByModelUnlocked(hostname: hostname, start: start, end: end) }
+    }
+
+    private func outputTokenBucketsByModelUnlocked(
         hostname: String? = nil,
         start: Date,
         end: Date
     ) throws -> [(bucketStart: Date, model: String, outputTokens: Int64)] {
-        try queue.sync {
             var sql = "SELECT bucket_start_ms,model,SUM(output_tokens) FROM usage_buckets WHERE "
             if hostname != nil { sql += "hostname=? AND " }
             sql += "bucket_start_ms>=? AND bucket_start_ms<? "
@@ -3264,12 +3269,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try bind(statement, bindIndex, millis(start))
             try bind(statement, bindIndex + 1, millis(end))
             var rows: [(bucketStart: Date, model: String, outputTokens: Int64)] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 rows.append((date(sqlite3_column_int64(statement, 0)), text(statement, 1), sqlite3_column_int64(statement, 2)))
             }
             if sqlite3_errcode(db) != SQLITE_OK && sqlite3_errcode(db) != SQLITE_DONE { throw error() }
             return rows
-        }
     }
 
     private struct BucketSummaryFilter {
@@ -3339,7 +3343,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let statement = try prepare("SELECT COUNT(*) FROM usage_events WHERE hostname=?;")
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, hostname)
-        guard sqlite3_step(statement) == SQLITE_ROW else { throw error() }
+        guard try step(statement) == SQLITE_ROW else { throw error() }
         return Int(sqlite3_column_int64(statement, 0))
     }
 
@@ -3353,14 +3357,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, hostname)
         try bind(statement, 2, limit + 1)
-        guard sqlite3_step(statement) == SQLITE_ROW else { throw error() }
+        guard try step(statement) == SQLITE_ROW else { throw error() }
         return sqlite3_column_int64(statement, 0) > limit
     }
 
     public func eventCount() throws -> Int {
         try queue.sync {
             let statement = try prepare("SELECT COUNT(*) FROM usage_events;"); defer { sqlite3_finalize(statement) }
-            guard sqlite3_step(statement) == SQLITE_ROW else { throw error() }
+            guard try step(statement) == SQLITE_ROW else { throw error() }
             return Int(sqlite3_column_int64(statement, 0))
         }
     }
@@ -3368,7 +3372,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
     public func sessionEventCount() throws -> Int {
         try queue.sync {
             let statement = try prepare("SELECT COUNT(*) FROM usage_session_events;"); defer { sqlite3_finalize(statement) }
-            guard sqlite3_step(statement) == SQLITE_ROW else { throw error() }
+            guard try step(statement) == SQLITE_ROW else { throw error() }
             return Int(sqlite3_column_int64(statement, 0))
         }
     }
@@ -3380,7 +3384,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             """
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         var result: [UsageBucket] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             let counts = UsageTokenCounts(input: sqlite3_column_int64(statement, 4), output: sqlite3_column_int64(statement, 5), cachedInput: sqlite3_column_int64(statement, 6), cacheCreationInput: sqlite3_column_int64(statement, 7), reasoningOutput: sqlite3_column_int64(statement, 8), reportedTotal: sqlite3_column_int64(statement, 9))
             result.append(UsageBucket(
                 hostname: hostname, source: text(statement, 0), model: text(statement, 1), project: text(statement, 2),
@@ -3400,7 +3404,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             """
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         var result: [UsageSession] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             result.append(UsageSession(
                 hostname: hostname, source: text(statement, 0), sessionHash: text(statement, 1),
                 project: text(statement, 9), skills: decodeStringArray(text(statement, 10)),
@@ -3421,20 +3425,18 @@ public final class UsageLedgerStore: @unchecked Sendable {
         sessionSkillCounts: [String: [String: Int]],
         scopedToTempSessions: Bool = false
     ) throws -> [UsageSession] {
-        let duplicateWinners = try duplicateSessionEventWinnersUnlocked(hostname: hostname)
+        let duplicateWinners = try duplicateSessionEventWinnersUnlocked(hostname: hostname, scoped: scopedToTempSessions)
         // scoped 模式只聚合 temp_scope_sessions 里的 session。单个 session 的聚合只依赖它
-        // 自己的活动行，所以按 session 切分是无损的。scoped 分支不强制 INDEXED BY：加了
-        // EXISTS 子查询后让查询规划器自己选，避免与强制索引冲突。
+        // 自己的活动行，所以按 session 切分是无损的。由临时 scope 表驱动 covering 索引，
+        // 避免先扫描全 host 再过滤。
         let sessionScanSQL = scopedToTempSessions ? """
-            SELECT event_id,source,session_hash,role,timestamp_ms,source_file_hash
-            FROM usage_session_events
-            WHERE hostname=?
-              AND EXISTS (SELECT 1 FROM temp_scope_sessions t
-                          WHERE t.source = usage_session_events.source
-                            AND t.session_hash = usage_session_events.session_hash)
-            ORDER BY source,session_hash,timestamp_ms,
-                     CASE role WHEN 'user' THEN 0 WHEN 'synthetic_user' THEN 1 ELSE 2 END,
-                     event_id,source_file_hash;
+            SELECT e.event_id,e.source,e.session_hash,e.role,e.timestamp_ms,e.source_file_hash
+            FROM temp_scope_sessions t
+            CROSS JOIN usage_session_events e INDEXED BY idx_session_events_host_group_covering
+              ON e.hostname=? AND e.source=t.source AND e.session_hash=t.session_hash
+            ORDER BY e.source,e.session_hash,e.timestamp_ms,
+                     CASE e.role WHEN 'user' THEN 0 WHEN 'synthetic_user' THEN 1 ELSE 2 END,
+                     e.event_id,e.source_file_hash;
             """ : """
             SELECT event_id,source,session_hash,role,timestamp_ms,source_file_hash
             FROM usage_session_events INDEXED BY idx_session_events_host_group_covering
@@ -3506,7 +3508,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             segmentEndMs = nil
         }
 
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             let eventID = text(statement, 0)
             let source = text(statement, 1)
             let sessionHash = text(statement, 2)
@@ -3543,17 +3545,26 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return sessions
     }
 
-    private func duplicateSessionEventWinnersUnlocked(hostname: String) throws -> [String: String] {
-        let activeFiles = try ownedActiveFileIDsUnlocked()
+    private func duplicateSessionEventWinnersUnlocked(hostname: String, scoped: Bool = false) throws -> [String: String] {
         var winners: [String: String] = [:]
+        let scope = scoped ? """
+            AND (source,event_id) IN (
+                SELECT e.source,e.event_id FROM temp_scope_sessions t
+                CROSS JOIN usage_session_events e INDEXED BY idx_session_events_host_group_covering
+                  ON e.hostname=? AND e.source=t.source AND e.session_hash=t.session_hash)
+            """ : ""
         let statement = try prepare("""
-            SELECT source,event_id,source_file_hash
+            SELECT source,event_id,source_file_hash,
+                   CASE WHEN source_file_hash='' THEN 0
+                        WHEN EXISTS(SELECT 1 FROM usage_files f WHERE f.file_id=usage_session_events.source_file_hash AND f.scan_status<>'missing') THEN 2
+                        ELSE 1 END
             FROM usage_session_events INDEXED BY idx_session_events_host
-            WHERE hostname=?
+            WHERE hostname=? \(scope)
             ORDER BY source,event_id,source_file_hash;
             """)
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, hostname)
+        if scoped { try bind(statement, 2, hostname) }
 
         var currentSource = ""
         var currentEventID = ""
@@ -3566,11 +3577,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
             winners["\(currentSource)\u{1}\(currentEventID)"] = currentWinner
         }
 
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             let source = text(statement, 0)
             let eventID = text(statement, 1)
             let fileID = text(statement, 2)
-            let tier = attributionTier(sourceFileHash: fileID, activeFiles: activeFiles)
+            guard let tier = AttributionTier(rawValue: Int(sqlite3_column_int(statement, 3))) else { throw UsageLedgerError.invalidCheckpoint }
             if currentCount == 0 || source != currentSource || eventID != currentEventID {
                 flushCurrent()
                 currentSource = source
@@ -3596,7 +3607,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let sql = "SELECT event_id,source,model,project,timestamp_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,session_hash,inherited,has_total_snapshot,lineage_fingerprint,codex_dedup_key,skill_counts_json,mcp_counts_json,merge_strategy,source_file_hash,hostname FROM usage_events WHERE hostname=? ORDER BY timestamp_ms,event_id,source_file_hash;"
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         var result: [TieredRawEvent] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             let counts = UsageTokenCounts(input: sqlite3_column_int64(statement, 5), output: sqlite3_column_int64(statement, 6), cachedInput: sqlite3_column_int64(statement, 7), cacheCreationInput: sqlite3_column_int64(statement, 8), reasoningOutput: sqlite3_column_int64(statement, 9), reportedTotal: sqlite3_column_int64(statement, 10))
             let sourceFileHash = text(statement, 19)
             result.append(TieredRawEvent(
@@ -3728,19 +3739,49 @@ public final class UsageLedgerStore: @unchecked Sendable {
             )
     }
 
-    private func readAllRawEditEntries(hostname: String) throws -> [RawEditEntry] {
+    private func readAllRawEditEntries(hostname: String, bucketKeys: Set<String>? = nil) throws -> [RawEditEntry] {
         // 跨文件相同 tool_use_id 只保留确定性一条，避免同一编辑被两份文件重复计入行数指标。
         // v8 归属优先级：ownedActive > ownedHistory > legacy；有更高 tier 时完全忽略低 tier 旧行，
         // 仅当无任何 owned 行时保留 legacy。同 tier 内维持既有「按 timestamp,tool_use_id,source_file_hash
         // 稳定排序取首个」的确定性口径。
-        let activeFiles = try ownedActiveFileIDsUnlocked()
-        let statement = try prepare("SELECT source,model,project,timestamp_ms,lines_added,lines_deleted,tool_use_id,source_file_hash,hostname FROM usage_edit_entries WHERE hostname=? ORDER BY timestamp_ms,tool_use_id,source_file_hash;")
+        if let bucketKeys {
+            try materializeBucketKeysUnlocked(bucketKeys, table: "temp_edit_scope_buckets")
+            try exec("DROP TABLE IF EXISTS temp_edit_scope_ids;")
+            try exec("CREATE TEMP TABLE temp_edit_scope_ids(tool_use_id TEXT PRIMARY KEY) WITHOUT ROWID;")
+            let seed = try prepare("""
+                INSERT OR IGNORE INTO temp_edit_scope_ids
+                SELECT e.tool_use_id FROM temp_edit_scope_buckets b
+                CROSS JOIN usage_edit_entries e INDEXED BY idx_usage_edit_entries_host
+                  ON e.hostname=? AND e.timestamp_ms>=b.bucket_start
+                 AND e.timestamp_ms<b.bucket_start+\(Self.bucketMilliseconds)
+                 AND e.source=b.source AND e.model=b.model AND e.project=b.project;
+                """)
+            defer { sqlite3_finalize(seed) }
+            try bind(seed, 1, hostname); try done(seed)
+        }
+        defer {
+            if bucketKeys != nil {
+                try? exec("DROP TABLE temp_edit_scope_buckets;")
+                try? exec("DROP TABLE temp_edit_scope_ids;")
+            }
+        }
+        // 先按 bucket 找受影响的 ID，再取这些 ID 在全部文件中的候选；不能先裁剪胜者。
+        let scope = bucketKeys == nil ? "" : "AND e.tool_use_id IN (SELECT tool_use_id FROM temp_edit_scope_ids)"
+        let statement = try prepare("""
+            SELECT e.source,e.model,e.project,e.timestamp_ms,e.lines_added,e.lines_deleted,
+                   e.tool_use_id,e.source_file_hash,e.hostname,
+                   CASE WHEN e.source_file_hash='' THEN 0
+                        WHEN EXISTS(SELECT 1 FROM usage_files f WHERE f.file_id=e.source_file_hash AND f.scan_status<>'missing') THEN 2
+                        ELSE 1 END
+            FROM usage_edit_entries e WHERE e.hostname=? \(scope)
+            ORDER BY e.timestamp_ms,e.tool_use_id,e.source_file_hash;
+            """)
         defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         var order: [String] = []
         var byKey: [String: (entry: RawEditEntry, tier: AttributionTier)] = [:]
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             let toolUseID = text(statement, 6)
-            let tier = attributionTier(sourceFileHash: text(statement, 7), activeFiles: activeFiles)
+            guard let tier = AttributionTier(rawValue: Int(sqlite3_column_int(statement, 9))) else { throw UsageLedgerError.invalidCheckpoint }
             let entry = RawEditEntry(
                 source: text(statement, 0), model: text(statement, 1), project: text(statement, 2),
                 timestampMs: sqlite3_column_int64(statement, 3),
@@ -3761,7 +3802,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let statement = try prepare("SELECT source FROM usage_edit_metric_sources;")
         defer { sqlite3_finalize(statement) }
         var result = Set<String>()
-        while sqlite3_step(statement) == SQLITE_ROW { result.insert(text(statement, 0)) }
+        while try step(statement) == SQLITE_ROW { result.insert(text(statement, 0)) }
         return result
     }
 
@@ -3775,7 +3816,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         var order: [String] = []
         var byKey: [String: (event: UsageSessionEvent, tier: AttributionTier)] = [:]
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             guard let role = UsageSessionEvent.Role(rawValue: text(statement, 3)) else { continue }
             let key = "\(text(statement, 1))\u{1}\(text(statement, 0))"
             let tier = attributionTier(sourceFileHash: text(statement, 5), activeFiles: activeFiles)
@@ -3922,7 +3963,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             """)
         defer { sqlite3_finalize(statement) }
         var result: [String: (winnerKey: String, bucketKey: String)] = [:]
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             let memberKey = compositeKey(text(statement, 0), text(statement, 1))
             let winnerKey = compositeKey(text(statement, 2), text(statement, 3))
             let bucketKey = compositeKey(
@@ -3937,11 +3978,28 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     private struct BucketRow: Equatable { let bucket: UsageBucket; let revision: Int64; let synced: Int64 }
 
-    private func readBucketRowsUnlocked(hostname: String) throws -> [String: BucketRow] {
-        let sql = "SELECT source,model,project,bucket_start_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,skills_json,skill_counts_json,mcp_counts_json,lines_added,lines_deleted,code_metric_version,revision,synced_revision FROM usage_buckets WHERE hostname=?;"
+    private func materializeBucketKeysUnlocked(_ keys: Set<String>, table: String) throws {
+        try exec("DROP TABLE IF EXISTS \(table);")
+        try exec("CREATE TEMP TABLE \(table)(source TEXT NOT NULL,model TEXT NOT NULL,project TEXT NOT NULL,bucket_start INTEGER NOT NULL,PRIMARY KEY(source,model,project,bucket_start)) WITHOUT ROWID;")
+        let insert = try prepare("INSERT INTO \(table) VALUES(?,?,?,?);")
+        defer { sqlite3_finalize(insert) }
+        for key in keys {
+            let parts = key.components(separatedBy: "\u{1}")
+            guard parts.count == 4, let start = Int64(parts[3]) else { throw UsageLedgerError.invalidCheckpoint }
+            sqlite3_reset(insert); sqlite3_clear_bindings(insert)
+            for index in 0..<3 { try bind(insert, Int32(index + 1), parts[index]) }
+            try bind(insert, 4, start); try done(insert)
+        }
+    }
+
+    private func readBucketRowsUnlocked(hostname: String, keys: Set<String>? = nil) throws -> [String: BucketRow] {
+        if let keys { try materializeBucketKeysUnlocked(keys, table: "temp_read_bucket_keys") }
+        defer { if keys != nil { try? exec("DROP TABLE temp_read_bucket_keys;") } }
+        let predicate = keys == nil ? "hostname=?" : "(hostname,source,model,project,bucket_start_ms) IN (SELECT ?,source,model,project,bucket_start FROM temp_read_bucket_keys)"
+        let sql = "SELECT source,model,project,bucket_start_ms,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_output_tokens,total_tokens,skills_json,skill_counts_json,mcp_counts_json,lines_added,lines_deleted,code_metric_version,revision,synced_revision FROM usage_buckets WHERE \(predicate);"
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         var result: [String: BucketRow] = [:]
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             let start = sqlite3_column_int64(statement, 3)
             let key = "\(text(statement,0))\u{1}\(text(statement,1))\u{1}\(text(statement,2))\u{1}\(start)"
             let counts = UsageTokenCounts(input: sqlite3_column_int64(statement, 4), output: sqlite3_column_int64(statement, 5), cachedInput: sqlite3_column_int64(statement, 6), cacheCreationInput: sqlite3_column_int64(statement, 7), reasoningOutput: sqlite3_column_int64(statement, 8), reportedTotal: sqlite3_column_int64(statement, 9))
@@ -3994,14 +4052,27 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let synced: Int64
     }
 
-    private func readSessionRowsUnlocked(hostname: String) throws -> [String: SessionRow] {
+    private func readSessionRowsUnlocked(hostname: String, keys: Set<String>? = nil) throws -> [String: SessionRow] {
+        if let keys {
+            try exec("CREATE TEMP TABLE temp_read_session_keys(source TEXT NOT NULL,session_hash TEXT NOT NULL,PRIMARY KEY(source,session_hash)) WITHOUT ROWID;")
+            let insert = try prepare("INSERT INTO temp_read_session_keys VALUES(?,?);")
+            defer { sqlite3_finalize(insert) }
+            for key in keys {
+                let parts = key.components(separatedBy: "\u{1}")
+                guard parts.count == 2 else { throw UsageLedgerError.invalidCheckpoint }
+                sqlite3_reset(insert); sqlite3_clear_bindings(insert)
+                try bind(insert, 1, parts[0]); try bind(insert, 2, parts[1]); try done(insert)
+            }
+        }
+        defer { if keys != nil { try? exec("DROP TABLE temp_read_session_keys;") } }
+        let predicate = keys == nil ? "hostname=?" : "(hostname,source,session_hash) IN (SELECT ?,source,session_hash FROM temp_read_session_keys)"
         let sql = """
             SELECT source,session_hash,first_activity_ms,last_activity_ms,active_seconds,message_count,user_message_count,assistant_events,hour_histogram,revision,synced_revision,project,skills_json
-            FROM usage_sessions WHERE hostname=?;
+            FROM usage_sessions WHERE \(predicate);
             """
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
         var map: [String: SessionRow] = [:]
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             let session = UsageSession(
                 hostname: hostname, source: text(statement, 0), sessionHash: text(statement, 1),
                 project: text(statement, 11), skills: decodeStringArray(text(statement, 12)),
@@ -4070,7 +4141,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             let bucketStmt = try prepare(bucketSQL); defer { sqlite3_finalize(bucketStmt) }; try bind(bucketStmt, 1, hostname)
             var pendingBuckets: [UsagePendingBucket] = []
             var moreBuckets = false
-            while sqlite3_step(bucketStmt) == SQLITE_ROW {
+            while try step(bucketStmt) == SQLITE_ROW {
                 if let bucketLimit, pendingBuckets.count >= bucketLimit { moreBuckets = true; break }
                 let counts = UsageTokenCounts(input: sqlite3_column_int64(bucketStmt, 4), output: sqlite3_column_int64(bucketStmt, 5), cachedInput: sqlite3_column_int64(bucketStmt, 6), cacheCreationInput: sqlite3_column_int64(bucketStmt, 7), reasoningOutput: sqlite3_column_int64(bucketStmt, 8), reportedTotal: sqlite3_column_int64(bucketStmt, 9))
                 let bucket = UsageBucket(
@@ -4089,7 +4160,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             let sessionStmt = try prepare(sessionSQL); defer { sqlite3_finalize(sessionStmt) }; try bind(sessionStmt, 1, hostname)
             var pendingSessions: [UsagePendingSession] = []
             var moreSessions = false
-            while sqlite3_step(sessionStmt) == SQLITE_ROW {
+            while try step(sessionStmt) == SQLITE_ROW {
                 if let sessionLimit, pendingSessions.count >= sessionLimit { moreSessions = true; break }
                 let session = UsageSession(
                     hostname: hostname, source: text(sessionStmt, 0), sessionHash: text(sessionStmt, 1),
@@ -4162,7 +4233,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             defer { sqlite3_finalize(statement) }
             try bind(statement, 1, hostname)
             var result: [UsageDirtyKeyCount] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while try step(statement) == SQLITE_ROW {
                 result.append(UsageDirtyKeyCount(
                     kind: text(statement, 0),
                     count: Int(sqlite3_column_int64(statement, 1))
@@ -4224,7 +4295,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     private func countUnlocked(_ sql: String, _ hostname: String) throws -> Int {
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }; try bind(statement, 1, hostname)
-        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        guard try step(statement) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(statement, 0))
     }
 
@@ -4242,7 +4313,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         for (offset, kind) in kinds.enumerated() {
             try bind(statement, Int32(offset + 2), kind.rawValue)
         }
-        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        guard try step(statement) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int64(statement, 0))
     }
 
@@ -4426,11 +4497,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 defer { sqlite3_finalize(read) }
                 try bind(read, 1, normalizedSource)
                 var missing: [String] = []
-                var result = sqlite3_step(read)
+                var result = try step(read)
                 while result == SQLITE_ROW {
                     let fileID = text(read, 0)
                     if !present.contains(fileID) { missing.append(fileID) }
-                    result = sqlite3_step(read)
+                    result = try step(read)
                 }
                 guard result == SQLITE_DONE else { throw error() }
                 guard !missing.isEmpty else { return }
@@ -4469,6 +4540,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 try exec("DELETE FROM usage_edit_metric_sources;")
                 try exec("DELETE FROM usage_events;")
                 try exec("DELETE FROM usage_files;")
+                try resetParserPersistenceUnlocked()
                 // 清 sync_state，但保留 per-host revision 高水位（revision\u{1}*），
                 // 使 reset 后新行从高水位继续递增，旧在途 batch 因 revision 不匹配无法误 ack。
                 // 注意：frozen_before_ms\u{1}* 不在保留之列——resetForRebuild 从磁盘源文件全量重扫重建，
@@ -4657,7 +4729,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let statement = try prepare("SELECT 1 FROM pragma_table_info(?) WHERE name=? LIMIT 1;")
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, table); try bind(statement, 2, column)
-        if sqlite3_step(statement) == SQLITE_ROW { return }
+        if try step(statement) == SQLITE_ROW { return }
         try exec("ALTER TABLE \(table) ADD COLUMN \(column) \(definition);")
     }
 
@@ -4808,7 +4880,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_dirty_logical ON usage_events(source,event_id) WHERE hostname <> '';"
         case "usage_session_events":
             return "CREATE INDEX IF NOT EXISTS idx_session_events_host ON usage_session_events(hostname,source,event_id,source_file_hash);"
-                + "CREATE INDEX IF NOT EXISTS idx_session_events_host_group ON usage_session_events(hostname,source,session_hash,timestamp_ms);"
+                + "DROP INDEX IF EXISTS idx_session_events_host_group;"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_group_covering ON usage_session_events(hostname,source,session_hash,timestamp_ms,role,event_id,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_time ON usage_session_events(timestamp_ms);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_file_dirty ON usage_session_events(hostname,source_file_hash,source,session_hash);"
@@ -4887,14 +4959,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let statement = try prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;")
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, table)
-        return sqlite3_step(statement) == SQLITE_ROW
+        return try step(statement) == SQLITE_ROW
     }
 
     private func tableHasAnyRowUnlocked(_ table: String) throws -> Bool {
         guard try tableExistsUnlocked(table) else { return false }
         let statement = try prepare("SELECT 1 FROM \(table) LIMIT 1;")
         defer { sqlite3_finalize(statement) }
-        return sqlite3_step(statement) == SQLITE_ROW
+        return try step(statement) == SQLITE_ROW
     }
 
     private func tableColumnsUnlocked(_ table: String) throws -> Set<String> {
@@ -4902,7 +4974,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, table)
         var columns = Set<String>()
-        while sqlite3_step(statement) == SQLITE_ROW { columns.insert(text(statement, 0)) }
+        while try step(statement) == SQLITE_ROW { columns.insert(text(statement, 0)) }
         return columns
     }
 
@@ -4962,7 +5034,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
     }
 
     /// 因 timestamp < frozen 被 record 丢弃的迟到原始事件累计数（per-hostname，观测/验证用）。
-    private func frozenDroppedEventsKey(_ hostname: String) -> String { "frozen_dropped_events\u{1}\(hostname)" }
+    func frozenDroppedEventsKey(_ hostname: String) -> String { "frozen_dropped_events\u{1}\(hostname)" }
 
     /// 已丢弃的迟到事件累计数（供 smoke/验证断言迟到事件确被丢弃而非入库）。
     public func frozenDroppedEventCount(hostname: String) throws -> Int64 {
@@ -4970,13 +5042,13 @@ public final class UsageLedgerStore: @unchecked Sendable {
     }
    private static let rebuildPendingKey = "rebuild_pending"
    private static let rebuildCompletedParserVersionKey = "rebuild_completed_parser_version"
-    private static let canonicalHostnameKey = "canonical_hostname"
+    static let canonicalHostnameKey = "canonical_hostname"
     /// v9 -> v10 迁移无法唯一确定 legacy 原始行归属时置位；仅在后续能证明归属时扫描并认领一次。
     private static let unresolvedLegacyRawHostnameKey = "unresolved_legacy_raw_hostname"
     /// raw 派生 dirty 位：每次 raw replace（record）同事务置位；finalizeDerived 成功重算派生后同事务清除。
     /// 置位期间 reportingEligible / pendingBatch 一律 fail-closed，确保文件替换后、
     /// finalize 之前进程崩溃不会上报仍反映旧原始归属的陈旧派生。
-    private static let rawDerivationPendingKey = "raw_derivation_pending"
+    static let rawDerivationPendingKey = "raw_derivation_pending"
     /// parser rebuild pending 持久记录目标 parser 版本（resetForRebuild 写入），供协调层用
     /// requiresRebuildCompletion/markRebuildCompleted 完成；自动路径不再依赖 reset。
     private static let rebuildTargetParserVersionKey = "rebuild_target_parser_version"
@@ -4990,7 +5062,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             """)
         defer { sqlite3_finalize(statement) }
         var highWatermarks: [(hostname: String, revision: Int64)] = []
-        while sqlite3_step(statement) == SQLITE_ROW {
+        while try step(statement) == SQLITE_ROW {
             highWatermarks.append((text(statement, 0), sqlite3_column_int64(statement, 1)))
         }
         for item in highWatermarks {
@@ -5001,22 +5073,22 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
 
-    private func readIntUnlocked(key: String) throws -> Int64? { try readTextUnlocked(key: key).flatMap { Int64($0) } }
-    private func setIntUnlocked(key: String, value: Int64) throws { try setTextUnlocked(key: key, value: String(value)) }
+    func readIntUnlocked(key: String) throws -> Int64? { try readTextUnlocked(key: key).flatMap { Int64($0) } }
+    func setIntUnlocked(key: String, value: Int64) throws { try setTextUnlocked(key: key, value: String(value)) }
 
     private func deleteKeyUnlocked(_ key: String) throws {
         let statement = try prepare("DELETE FROM sync_state WHERE key=?;"); defer { sqlite3_finalize(statement) }
         try bind(statement, 1, key); try done(statement)
     }
 
-    private func readTextUnlocked(key: String) throws -> String? {
+    func readTextUnlocked(key: String) throws -> String? {
         let statement = try prepare("SELECT value FROM sync_state WHERE key=?;"); defer { sqlite3_finalize(statement) }
         try bind(statement, 1, key)
-        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        guard try step(statement) == SQLITE_ROW else { return nil }
         return text(statement, 0)
     }
 
-    private func setTextUnlocked(key: String, value: String) throws {
+    func setTextUnlocked(key: String, value: String) throws {
         let sql = "INSERT INTO sync_state(key,value,updated_at_ms) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at_ms=excluded.updated_at_ms;"
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
         try bind(statement, 1, key); try bind(statement, 2, value); try bind(statement, 3, millis(Date()))
@@ -5029,7 +5101,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             || readTextUnlocked(key: Self.rebuildPendingKey) != nil
     }
 
-    private func writeCheckpoint(_ checkpoint: UsageFileCheckpoint) throws {
+    func writeCheckpoint(_ checkpoint: UsageFileCheckpoint) throws {
         let checkpointSQL = """
             INSERT INTO usage_files(file_id,source,path_hash,read_offset,file_size,mtime_ms,parser_version,scan_status,updated_at_ms)
             VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET
@@ -5088,7 +5160,33 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     // MARK: - SQLite plumbing
 
-    private func transaction(_ body: () throws -> Void) throws { try exec("BEGIN IMMEDIATE;"); do { try body(); try exec("COMMIT;") } catch { _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil); throw error } }
+    func transaction(_ body: () throws -> Void) throws {
+        try exec("BEGIN IMMEDIATE;")
+        do {
+            try body()
+            try exec("COMMIT;")
+        } catch {
+            try rollbackAfterFailureUnlocked(error)
+        }
+    }
+
+    private struct TransactionRollbackFailure: Error, CustomStringConvertible {
+        let original: Error
+        let rollback: Error
+
+        var description: String {
+            "Transaction failed: \(original); rollback also failed: \(rollback)"
+        }
+    }
+
+    private func rollbackAfterFailureUnlocked(_ original: Error) throws -> Never {
+        do {
+            try exec("ROLLBACK;")
+        } catch {
+            throw TransactionRollbackFailure(original: original, rollback: error)
+        }
+        throw original
+    }
     private final class SQLiteProgressHeartbeat {
         private let callback: () -> Void
         private var lastEmit = DispatchTime.now().uptimeNanoseconds
@@ -5118,15 +5216,39 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return try body()
     }
 
-    private func exec(_ sql: String) throws { guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw error() } }
-    private func scalar(_ sql: String) throws -> Int32 { let s = try prepare(sql); defer { sqlite3_finalize(s) }; guard sqlite3_step(s) == SQLITE_ROW else { throw error() }; return sqlite3_column_int(s, 0) }
-    private func prepare(_ sql: String) throws -> OpaquePointer? { var s: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &s, nil) == SQLITE_OK else { throw error() }; return s }
-    private func bind(_ s: OpaquePointer?, _ index: Int32, _ value: String) throws { guard sqlite3_bind_text(s, index, value, -1, usageSQLiteTransient) == SQLITE_OK else { throw error() } }
-    private func bind(_ s: OpaquePointer?, _ index: Int32, _ value: Int64) throws { guard sqlite3_bind_int64(s, index, value) == SQLITE_OK else { throw error() } }
-    private func done(_ s: OpaquePointer?) throws { guard sqlite3_step(s) == SQLITE_DONE else { throw error() } }
-    private func text(_ s: OpaquePointer?, _ column: Int32) -> String { sqlite3_column_text(s, column).map { String(cString: $0) } ?? "" }
+    func exec(_ sql: String) throws {
+        try sql.withCString { start in
+            var cursor: UnsafePointer<CChar>? = start
+            while let current = cursor, current.pointee != 0 {
+                var statement: OpaquePointer?
+                var next: UnsafePointer<CChar>?
+                guard sqlite3_prepare_v2(db, current, -1, &statement, &next) == SQLITE_OK else { throw error() }
+                defer { sqlite3_finalize(statement) }
+                if let statement {
+                    while try step(statement) == SQLITE_ROW { }
+                }
+                guard next != current else { throw error() }
+                cursor = next
+            }
+        }
+    }
+    private func scalar(_ sql: String) throws -> Int32 { let s = try prepare(sql); defer { sqlite3_finalize(s) }; guard try step(s) == SQLITE_ROW else { throw error() }; return sqlite3_column_int(s, 0) }
+    func prepare(_ sql: String) throws -> OpaquePointer? { var s: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &s, nil) == SQLITE_OK else { throw error() }; return s }
+    func bind(_ s: OpaquePointer?, _ index: Int32, _ value: String) throws { guard sqlite3_bind_text(s, index, value, -1, usageSQLiteTransient) == SQLITE_OK else { throw error() } }
+    func bind(_ s: OpaquePointer?, _ index: Int32, _ value: Int64) throws { guard sqlite3_bind_int64(s, index, value) == SQLITE_OK else { throw error() } }
+    func step(_ statement: OpaquePointer?) throws -> Int32 {
+        let result = sqlite3_step(statement)
+        if isFinalizing {
+            finalizeDiagnostics.sqliteFullScanSteps += Int(sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_FULLSCAN_STEP, 1))
+            finalizeDiagnostics.sqliteAutoIndexRows += Int(sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_AUTOINDEX, 1))
+        }
+        guard result == SQLITE_ROW || result == SQLITE_DONE else { throw error() }
+        return result
+    }
+    func done(_ s: OpaquePointer?) throws { guard try step(s) == SQLITE_DONE else { throw error() } }
+    func text(_ s: OpaquePointer?, _ column: Int32) -> String { sqlite3_column_text(s, column).map { String(cString: $0) } ?? "" }
     private func error() -> UsageLedgerError { UsageLedgerError.sqlite(db.map { String(cString: sqlite3_errmsg($0)) } ?? "database unavailable") }
-    private func millis(_ date: Date) -> Int64 { Int64((date.timeIntervalSince1970 * 1000).rounded()) }
+    func millis(_ date: Date) -> Int64 { Int64((date.timeIntervalSince1970 * 1000).rounded()) }
     private func date(_ millis: Int64) -> Date { Date(timeIntervalSince1970: Double(millis) / 1000) }
 }
 

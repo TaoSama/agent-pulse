@@ -69,20 +69,14 @@ private final class ScriptedBatchClient: UsageBatchReporting, @unchecked Sendabl
 @main
 enum AgentPulseUsageVerification {
     static func main() async throws {
-        do {
-            try verifyConfigurationSafety()
-            try verifyGeneralizedSourceDispatch()
-            try verifyLocalCollectionConfigValidation()
-            try verifyPayloadMapping()
-            try await verifyPartialAckAndRecovery()
-            try await verifyMalformedAcknowledgementsRemainPending()
-            try await verifyCancellationKeepsBatchPending()
-            try await CoordinatorVerification.run()
-        } catch {
-            fputs("TEMP DIAG step failed: \(error)\n", stderr)
-            for symbol in Thread.callStackSymbols { fputs("  \(symbol)\n", stderr) }
-            throw error
-        }
+        try verifyConfigurationSafety()
+        try verifyGeneralizedSourceDispatch()
+        try verifyLocalCollectionConfigValidation()
+        try verifyPayloadMapping()
+        try await verifyPartialAckAndRecovery()
+        try await verifyMalformedAcknowledgementsRemainPending()
+        try await verifyCancellationKeepsBatchPending()
+        try await CoordinatorVerification.run()
         print("AgentPulseUsage verification passed")
     }
 

@@ -42,6 +42,10 @@ let package = Package(
             name: "AgentPulse",
             dependencies: ["AgentPulseCore", "AgentPulseR2", "AgentPulseReporting", "AgentPulseUI", "AgentPulseUsage"]
         ),
+        .testTarget(
+            name: "AgentPulseTests",
+            dependencies: ["AgentPulse"]
+        ),
         .executableTarget(
             name: "AgentPulseCollectorVerification",
             dependencies: ["AgentPulseCore"],
@@ -61,6 +65,7 @@ let package = Package(
                 "Fixtures",
                 "ModelsAndTPSWindowTests.swift",
                 "SQLiteSnapshotStoreTests.swift",
+                "StorageLifecycleTests.swift",
             ],
             sources: ["VerificationMain.swift"]
         ),
@@ -142,6 +147,16 @@ let package = Package(
             name: "DerivedFinalizeEquivalence",
             dependencies: ["AgentPulseCore"],
             path: "Tests/DerivedFinalizeEquivalence"
+        ),
+        .executableTarget(
+            name: "IncrementalParserVerification",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/IncrementalParserVerification"
+        ),
+        .executableTarget(
+            name: "CliProxyPipelineVerification",
+            dependencies: ["AgentPulseCore", "AgentPulseReporting"],
+            path: "Tests/CliProxyPipelineVerification"
         ),
     ],
     swiftLanguageModes: [.v6]

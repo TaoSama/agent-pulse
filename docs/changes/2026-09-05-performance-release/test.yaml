@@ -1,0 +1,22 @@
+cdn: false
+execution:
+  mode: sequential
+  plans:
+    - name: Verify installed Agent Pulse on macOS
+      platform: computer
+      repeat: 1
+      retry: 0
+cases:
+  - name: 已安装应用显示并响应交互
+    steps:
+      - do: 打开 /Applications/AgentPulse.app 并等待 6 秒
+      - aiAct: 找到 Agent Pulse 悬浮球，拖动到屏幕中部，再单击打开任务概览
+      - assert: Agent Pulse 悬浮球与任务概览可见，内容没有重叠或裁切
+      - aiAct: 双击 Agent Pulse 悬浮球打开 TPS 看板
+      - assert: TPS 看板显示曲线区域和数值图例，窗口布局正常
+      - do: 保存当前屏幕截图作为交互验证证据
+  - name: 刷新与显示保持一致
+    steps:
+      - aiAct: 从 Agent Pulse 菜单栏打开设置，找到趋势颜色设置并切换一次，然后恢复原值
+      - assert: Agent Pulse 设置界面可见且响应，悬浮球仍正常显示
+      - do: 保存当前屏幕截图并核对 AgentPulse 进程仍在运行
