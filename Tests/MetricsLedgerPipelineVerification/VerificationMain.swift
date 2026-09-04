@@ -38,6 +38,7 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyLargeBaselineRecoveryIsDeferred()
         try verifier.verifyDeferredBaselineFullRecomputeDoesNotCompactFrozenRaw()
         try verifier.verifyRecordNetworkEventsDoesNotDirtyHistoricalEvents()
+        try verifier.verifyLegacyNetworkDirtyKeysAreDiscarded()
         try verifier.verifyLargeDirtyKeySetFallsBackToFullRecompute()
         try verifier.verifyRawFileDirtyQueriesUseHostFileIndexes()
         try verifier.verifyFrozenCompactionPreservesTotalsAndDropsRaw()
@@ -545,6 +546,43 @@ private struct MetricsLedgerPipelineVerifier {
             try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname='host-a';") == 0, "network append must not dirty historical synthetic-file events")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sync_state WHERE key='raw_derivation_pending';") == 0, "network append must not set raw derivation pending")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE source='cliproxy';") == 1_002, "network events must still be stored idempotently")
+        }
+    }
+
+    func verifyLegacyNetworkDirtyKeysAreDiscarded() throws {
+        let database = try temporaryDatabaseURL()
+        defer { cleanupDatabase(at: database) }
+        let ledger = try UsageLedgerStore(path: database.path)
+        let host = "host-a"
+        let networkSource = CliProxyUsageParser.source
+        let codexSource = "codex"
+        let ts = try date("2026-08-14T02:05:00Z")
+
+        try ledger.recordNetworkEvents([
+            tokenEvent(id: "network-old", source: networkSource, session: "net", file: "ignored", ts: ts, input: 7),
+        ], source: networkSource, hostname: host)
+        try ledger.record(
+            events: [tokenEvent(id: "local-old", source: codexSource, session: "local", file: "file-a", ts: ts, input: 11)],
+            checkpoint: completeCheckpoint("file-a", source: codexSource, ts: ts),
+            hostname: host
+        )
+
+        try withDatabase(database) { db in
+            try execute(db, "DELETE FROM usage_dirty_keys WHERE hostname='host-a';")
+            try execute(db, "INSERT OR REPLACE INTO sync_state(key,value,updated_at_ms) VALUES('raw_derivation_pending','1',0);")
+            try execute(db, "INSERT INTO usage_dirty_keys(hostname,kind,key,created_at_ms) VALUES('host-a','logical','cliproxy'||char(1)||'network-old',0);")
+            try execute(db, "INSERT INTO usage_dirty_keys(hostname,kind,key,created_at_ms) VALUES('host-a','bucket','cliproxy'||char(1)||'model-a'||char(1)||'project-a'||char(1)||'0',0);")
+            try execute(db, "INSERT INTO usage_dirty_keys(hostname,kind,key,created_at_ms) VALUES('host-a','session','cliproxy'||char(1)||'net',0);")
+            try execute(db, "INSERT INTO usage_dirty_keys(hostname,kind,key,created_at_ms) VALUES('host-a','logical','codex'||char(1)||'local-old',0);")
+        }
+
+        _ = try ledger.finalizeDerived(hostname: host)
+
+        try withDatabase(database) { db in
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_dirty_keys WHERE hostname='host-a';") == 0, "finalize must consume all dirty keys")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sync_state WHERE key='raw_derivation_pending';") == 0, "finalize must clear pending after discarding legacy network dirty keys")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_buckets WHERE hostname='host-a' AND source='cliproxy';") == 1, "network bucket must remain available")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_buckets WHERE hostname='host-a' AND source='codex';") == 1, "local file bucket must still be recomputed")
         }
     }
 

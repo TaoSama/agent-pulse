@@ -1146,6 +1146,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             var didCompact = false
             try transaction {
                 try claimLegacyRawRowsIfUnambiguousUnlocked(hostname: hostname)
+                try discardLegacyNetworkDirtyKeysUnlocked(hostname: hostname)
                 result = try withBackgroundResourcePriority {
                     try recomputeDispatchUnlocked(hostname: hostname, strategy: strategy, progress: progress)
                 }
@@ -1686,6 +1687,28 @@ public final class UsageLedgerStore: @unchecked Sendable {
         let statement = try prepare("DELETE FROM usage_dirty_keys WHERE hostname=?;")
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, hostname); try done(statement)
+    }
+
+    /// Drop dirty keys left by older builds that treated append-only network sources as if they
+    /// were replace-by-file logs. Network sources maintain affected buckets inside
+    /// recordNetworkEvents, so these synthetic-file dirty keys only force a pointless full
+    /// recompute on large ledgers. Local JSONL file dirty keys are preserved.
+    private func discardLegacyNetworkDirtyKeysUnlocked(hostname: String) throws {
+        guard try tableExistsUnlocked("usage_dirty_keys"), try tableExistsUnlocked("usage_files") else { return }
+        let statement = try prepare("""
+            DELETE FROM usage_dirty_keys
+            WHERE hostname=?
+              AND kind IN ('logical','session','bucket')
+              AND instr(key, char(1)) > 1
+              AND substr(key, 1, instr(key, char(1)) - 1) IN (
+                  SELECT DISTINCT source FROM usage_files
+                  WHERE parser_version >= ? AND source <> ''
+              );
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        try bind(statement, 2, Int64(Self.networkParserVersion))
+        try done(statement)
     }
 
     private func dirtyKeyCountExceedsUnlocked(hostname: String, limit: Int) throws -> Bool {
