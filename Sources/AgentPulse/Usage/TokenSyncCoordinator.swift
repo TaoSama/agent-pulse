@@ -576,7 +576,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 if baselineRecovery == .deferred {
                     // 大库无法廉价恢复增量基线时，必须显式跑一次全量 finalize 来建立基线并
                     // 清除 raw_derivation_pending。否则每轮都会继续 deferred，导致上报永久被门禁。
-                    finalize = try ledger.finalizeDerived(hostname: hostname, compactFrozen: compactionEnabled, strategy: .fullRecompute) { done, total in
+                    // 这一步的目标是尽快恢复上报资格；冻结压实会删除大范围原始行，在 10GB+ 账本上可能
+                    // 把恢复事务拖到很久。压实留给后续普通扫描轮次处理，避免 UI 长时间停在 deferred。
+                    finalize = try ledger.finalizeDerived(hostname: hostname, compactFrozen: false, strategy: .fullRecompute) { done, total in
                         progressReporter.advance(.finalizing, done: done, total: total)
                     }
                 } else if needsFinalize {

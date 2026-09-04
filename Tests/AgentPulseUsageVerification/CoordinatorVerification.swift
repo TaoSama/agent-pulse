@@ -426,6 +426,11 @@ enum CoordinatorVerification {
             "scanNow 未在大账本 baseline recovery deferred 时转入全量 finalize 恢复基线"
         )
         try require(
+            scanNowBody.contains("baselineRecovery == .deferred")
+                && scanNowBody.contains("compactFrozen: false, strategy: .fullRecompute"),
+            "scanNow deferred baseline 恢复必须跳过冻结压实，避免大账本上报门禁长期不解除"
+        )
+        try require(
             !scanNowBody.contains("baselineRecovery == .deferred ? (buckets: 0, sessions: 0) : try ledger.pendingCounts"),
             "scanNow deferred 分支不应伪造 pendingCounts；full finalize 后应读取真实 pending"
         )
