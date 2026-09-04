@@ -4384,6 +4384,12 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// 不再走 v8 rebuild 的建索引路径,存量库要靠这里补上新索引。仅当目标表存在时建索引(兼容极简
     /// fixture)。9.4G 库首次建索引一次性发生在此(WAL + temp_store=FILE),之后每轮省去全表排序。
     private func ensurePerformanceIndexesUnlocked() throws {
+        if try tableExistsUnlocked("usage_files") {
+            try exec("""
+                CREATE INDEX IF NOT EXISTS idx_usage_files_source_status
+                ON usage_files(source,scan_status,file_id);
+                """)
+        }
         if try tableExistsUnlocked("usage_buckets") {
             try exec("""
                 CREATE INDEX IF NOT EXISTS idx_usage_buckets_window

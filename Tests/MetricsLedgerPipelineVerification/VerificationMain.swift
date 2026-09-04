@@ -87,6 +87,7 @@ private struct MetricsLedgerPipelineVerifier {
             try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_session_events WHERE event_id='legacy-se';") == 1, "v8 rebuild must retain legacy session events")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_host_time';") == 1, "stable hostname/time index must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_events_tool_counts';") == 1, "tool-count partial index must exist")
+            try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_usage_files_source_status';") == 1, "usage file source/status index must exist")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_usage_events_host','idx_usage_events_host_logical');") == 0, "legacy usage host indexes must be removed after one-time migration")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_session_events_host_group';") == 1, "hostname-prefixed session streaming index must exist")
         }
@@ -628,6 +629,12 @@ private struct MetricsLedgerPipelineVerifier {
                 FROM usage_events WHERE hostname='host-a' AND source_file_hash='file-a';
                 """)
             try require(eventPlan.contains { $0.contains("idx_usage_events_host_file") }, "usage event dirty lookup must use the host/file index; plan=\(eventPlan)")
+
+            let filePlan = try queryPlanDetails(db, """
+                EXPLAIN QUERY PLAN
+                SELECT file_id FROM usage_files WHERE source='codex' AND scan_status<>'missing';
+                """)
+            try require(filePlan.contains { $0.contains("idx_usage_files_source_status") }, "missing-file scan must use the source/status index; plan=\(filePlan)")
 
             let sessionPlan = try queryPlanDetails(db, """
                 EXPLAIN QUERY PLAN
