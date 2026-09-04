@@ -458,16 +458,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let injectedScanRoots = self.injectedScanRoots
         let summaryCalendar = usageSummaryCalendar
         let summaryEnvURL = self.mergedEnvURL
+        let compactionEnabled = statusSubject.value.compactionEnabled
         scanGeneration &+= 1
         let generation = scanGeneration
         // 进度回调：worker 各阶段 / 逐文件回报聚合快照，跨线程回到主 actor 更新 status；
         // 仅当仍是当前 generation 时才写，避免旧扫描回调覆盖新扫描。
-        let progressReporter = ScanProgressReporter { [weak self] update in
+        let progressReporter = ScanProgressReporter(activePhases: Self.activeScanPhases(compactionEnabled: compactionEnabled)) { [weak self] update in
             Task { @MainActor in
                 self?.applyScanProgress(update, generation: generation)
             }
         }
-        let compactionEnabled = statusSubject.value.compactionEnabled
         scanTask = Task { [weak self] in
             let preflight = await Self.runOffMain { gate in
                 try gate.throwIfCancelled()
@@ -621,12 +621,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 }
                 if compactionEnabled {
                     progressReporter.enterPhase(.compacting, total: UsageCompactionStep.total, detail: "准备冻结压实")
-                    _ = try ledger.compactFrozenRaw(hostname: hostname) { step, done, total in
+                    _ = try ledger.compactFrozenRaw(hostname: hostname) { update in
                         progressReporter.advance(
                             .compacting,
-                            done: done,
-                            total: total,
-                            detail: Self.compactionProgressDetail(step)
+                            done: update.done,
+                            total: update.total,
+                            detail: Self.compactionProgressDetail(update)
                         )
                     }
                     progressReporter.completePhase(.compacting, detail: "冻结压实已检查")
@@ -638,7 +638,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     containing: Date(),
                     calendar: summaryCalendar,
                     mergedEnvURL: summaryEnvURL
-                )
+                ) { done, total, detail in
+                    progressReporter.advance(.summarizing, done: done, total: total, detail: detail)
+                }
                 let pending = try ledger.pendingCounts(hostname: hostname)
                 progressReporter.completePhase(.summarizing)
                 return ScanOutcome(summary: summary, finalize: finalize, pending: pending,
@@ -801,6 +803,25 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
     }
 
+    private func applyReportProgress(
+        bucketsDone: Int,
+        sessionsDone: Int,
+        bucketsPending: Int,
+        sessionsPending: Int,
+        generation: UInt64
+    ) {
+        guard generation == reportGeneration, statusSubject.value.reportingInProgress else { return }
+        updateStatus { status in
+            let done = bucketsDone + sessionsDone
+            let pending = bucketsPending + sessionsPending
+            status.scanPhase = .reporting
+            status.scanDone = done
+            status.scanTotal = max(status.scanTotal, done + pending)
+            status.scanProgress = status.scanTotal > 0 ? min(Double(done) / Double(status.scanTotal), 1) : 1
+            status.scanDetailText = "buckets \(bucketsPending) / sessions \(sessionsPending)"
+        }
+    }
+
     private func finishScan(generation: UInt64, cancelled: Bool, chainedReport: Bool, result: Result<ScanOutcome, Error>) {
         // 只处理当前 generation 的完成回调；旧任务被取消后再回到主线程时，
         // 若新任务已启动，generation 会不同，直接忽略避免覆盖新句柄。
@@ -910,7 +931,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             status.scanPhase = .reporting
             status.scanDone = 0
             status.scanTotal = pendingRows
-            status.scanProgress = TokenScanPhase.reporting.baseProgress
+            status.scanProgress = 0
             status.scanDetailText = pendingDetail
         }
         let configurationURL = self.configurationURL
@@ -932,7 +953,17 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     hostname: hostname,
                     baseURL: baseURL,
                     configurationURL: configurationURL
-                )
+                ) { [weak self] bucketsDone, sessionsDone, bucketsPending, sessionsPending in
+                    Task { @MainActor in
+                        self?.applyReportProgress(
+                            bucketsDone: bucketsDone,
+                            sessionsDone: sessionsDone,
+                            bucketsPending: bucketsPending,
+                            sessionsPending: sessionsPending,
+                            generation: generation
+                        )
+                    }
+                }
                 result = .success(report)
             } catch {
                 result = .failure(error)
@@ -1309,6 +1340,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     /// 只搬运聚合数（阶段、文件计数、百分比），绝不携带路径 / 正文 / 凭证。
     private final class ScanProgressReporter: @unchecked Sendable {
         private let emit: @Sendable (ScanProgressUpdate) -> Void
+        private let weights: [TokenScanPhase: (base: Double, weight: Double)]
         // 通用「已完成 / 总数」计数：每个阶段各自登记自己的量纲（文件 / 事件 / 步 / 窗口 / 行），
         // 阶段切换时清零重置，供 scanDetail 统一显示「done/total 单位」。
         private var total = 0
@@ -1316,7 +1348,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         private var currentPhase: TokenScanPhase?
         private var phaseStartedAt = DispatchTime.now().uptimeNanoseconds
 
-        init(_ emit: @escaping @Sendable (ScanProgressUpdate) -> Void) {
+        init(
+            activePhases: [TokenScanPhase] = [.scanning, .finalizing, .summarizing],
+            _ emit: @escaping @Sendable (ScanProgressUpdate) -> Void
+        ) {
+            self.weights = Self.normalizedWeights(for: activePhases)
             self.emit = emit
         }
 
@@ -1344,10 +1380,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
 
         /// 当前阶段完成一项：自增并按 done/total 回报（含计数）。
-        func advanceItem(_ phase: TokenScanPhase) {
+        func advanceItem(_ phase: TokenScanPhase, detail: String? = nil) {
             done += 1
             let fraction = total > 0 ? Double(done) / Double(total) : 1
-            send(phase: phase, fraction: fraction, detail: nil)
+            send(phase: phase, fraction: fraction, detail: detail)
         }
 
         /// 按外部给定的 done/total 推进当前阶段（如 finalize 的 8 子阶段）。
@@ -1360,7 +1396,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
         private func send(phase: TokenScanPhase, fraction: Double, detail: String?) {
             let clamped = min(max(fraction, 0), 1)
-            let overall = min(phase.baseProgress + clamped * phase.weight, 1)
+            let stage = weights[phase] ?? (base: phase.baseProgress, weight: phase.weight)
+            let overall = min(stage.base + clamped * stage.weight, 1)
             emit(ScanProgressUpdate(
                 phase: phase,
                 done: done,
@@ -1378,6 +1415,24 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             let running = "执行中 \(elapsed)s"
             return "\(detail) · \(running)"
         }
+
+        private static func normalizedWeights(for phases: [TokenScanPhase]) -> [TokenScanPhase: (base: Double, weight: Double)] {
+            let active = phases.isEmpty ? TokenScanPhase.allCases : phases
+            let total = active.reduce(0) { $0 + $1.weight }
+            guard total > 0 else { return [:] }
+            var base = 0.0
+            var result: [TokenScanPhase: (base: Double, weight: Double)] = [:]
+            for phase in active {
+                let weight = phase.weight / total
+                result[phase] = (base, weight)
+                base += weight
+            }
+            return result
+        }
+    }
+
+    nonisolated private static func activeScanPhases(compactionEnabled: Bool) -> [TokenScanPhase] {
+        compactionEnabled ? [.scanning, .finalizing, .compacting, .summarizing] : [.scanning, .finalizing, .summarizing]
     }
 
     nonisolated private static func runOffMain<T: Sendable>(
@@ -1516,16 +1571,26 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
     }
 
-    nonisolated private static func compactionProgressDetail(_ step: UsageCompactionStep) -> String {
-        switch step {
+    nonisolated private static func compactionProgressDetail(_ progress: UsageCompactionProgress) -> String {
+        let label: String
+        switch progress.step {
         case .advanceFrozenWatermark: return "推进冻结水位"
-        case .deleteFrozenRaw: return "删除冻结原始行"
-        case .vacuum: return "VACUUM 回收空间"
+        case .deleteFrozenRaw: label = "删除冻结原始行"
+        case .vacuum: label = "VACUUM 回收空间"
         case .skippedVacuum: return "无需 VACUUM"
         }
+        guard progress.deletedRows > 0 else { return label }
+        if progress.step == .deleteFrozenRaw, progress.lastBatchRows > 0 {
+            return "\(label) · 已删 \(compactCount(progress.deletedRows)) · 本批 \(compactCount(progress.lastBatchRows))"
+        }
+        return "\(label) · 已删 \(compactCount(progress.deletedRows))"
     }
 
     nonisolated private static func compactCount(_ value: Int) -> String {
+        compactCount(Int64(value))
+    }
+
+    nonisolated private static func compactCount(_ value: Int64) -> String {
         switch value {
         case 1_000_000...:
             return String(format: "%.1fM", Double(value) / 1_000_000)
@@ -1624,9 +1689,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         from ledger: UsageLedgerStore,
         containing date: Date,
         calendar: Calendar,
-        mergedEnvURL: URL
+        mergedEnvURL: URL,
+        progress: ((Int, Int, String) -> Void)? = nil
     ) throws -> TokenUsageSummarySnapshot {
         let snapshot = try ledger.summarySnapshot(containing: date, calendar: calendar)
+        let totalWindows = TokenUsageWindow.allCases.count
+        var completedWindows = 0
+        func completeWindow(_ window: TokenUsageWindow) {
+            completedWindows += 1
+            progress?(completedWindows, totalWindows, windowProgressDetail(window))
+        }
         var realModels: [TokenUsageWindow: [UsageModelTokenSummary]] = [:]
         var summary = TokenUsageSummary.empty
         for item in snapshot.windows {
@@ -1635,15 +1707,19 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             case .day:
                 summary.day = value
                 realModels[.day] = item.models
+                completeWindow(.day)
             case .week:
                 summary.week = value
                 realModels[.week] = item.models
+                completeWindow(.week)
             case .month:
                 summary.month = value
                 realModels[.month] = item.models
+                completeWindow(.month)
             case nil:
                 summary.all = value
                 realModels[.all] = item.models
+                completeWindow(.all)
             }
         }
         return TokenUsageSummarySnapshot(
@@ -1653,6 +1729,15 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 enabled: isVirtualBaselineUser(mergedEnvURL: mergedEnvURL)
             )
         )
+    }
+
+    nonisolated private static func windowProgressDetail(_ window: TokenUsageWindow) -> String {
+        switch window {
+        case .day: return "日窗口"
+        case .week: return "周窗口"
+        case .month: return "月窗口"
+        case .all: return "全部窗口"
+        }
     }
 
     /// 虚拟基线身份哨兵：仅当合并 env 的 USER 等于此值时，才对 week/month/all 套展示层基线。

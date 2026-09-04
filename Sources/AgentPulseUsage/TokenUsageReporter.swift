@@ -157,7 +157,8 @@ public struct TokenUsageReporter: Sendable {
         ledger: UsageLedgerStore,
         hostname: String,
         baseURL: URL,
-        configurationURL: URL
+        configurationURL: URL,
+        progress: (@Sendable (_ bucketsDone: Int, _ sessionsDone: Int, _ bucketsPending: Int, _ sessionsPending: Int) -> Void)? = nil
     ) async throws -> TokenUsageReport {
         guard Self.isValidBaseURL(baseURL) else { throw TokenUsageReporterError.invalidBaseURL }
         let configuration = try configurationLoader(configurationURL)
@@ -221,6 +222,13 @@ public struct TokenUsageReporter: Sendable {
                 report.bucketsAcknowledged += pending.buckets.count
                 report.sessionsAcknowledged += pending.sessions.count
                 report.responses.append(ack.response)
+                let remaining = try ledger.pendingCounts(hostname: configuredHostname)
+                progress?(
+                    report.bucketsAcknowledged,
+                    report.sessionsAcknowledged,
+                    remaining.buckets,
+                    remaining.sessions
+                )
                 continue
             }
 

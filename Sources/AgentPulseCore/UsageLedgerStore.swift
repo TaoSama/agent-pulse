@@ -99,6 +99,22 @@ public enum UsageCompactionStep: Int, Sendable, Equatable, CaseIterable {
     public static var total: Int { 3 }
 }
 
+public struct UsageCompactionProgress: Sendable, Equatable {
+    public let step: UsageCompactionStep
+    public let done: Int
+    public let total: Int
+    public let deletedRows: Int64
+    public let lastBatchRows: Int64
+
+    public init(step: UsageCompactionStep, done: Int, total: Int, deletedRows: Int64, lastBatchRows: Int64) {
+        self.step = step
+        self.done = done
+        self.total = total
+        self.deletedRows = deletedRows
+        self.lastBatchRows = lastBatchRows
+    }
+}
+
 public struct UsageCompactionResult: Sendable, Equatable {
     public let advancedTo: Int64
     public let compacted: Bool
@@ -4248,19 +4264,41 @@ public final class UsageLedgerStore: @unchecked Sendable {
         hostname: String,
         progress: (@Sendable (_ step: UsageCompactionStep, _ done: Int, _ total: Int) -> Void)? = nil
     ) throws -> UsageCompactionResult {
+        try compactFrozenRaw(hostname: hostname) { update in
+            progress?(update.step, update.done, update.total)
+        }
+    }
+
+    @discardableResult
+    public func compactFrozenRaw(
+        hostname: String,
+        progressUpdate: (@Sendable (_ update: UsageCompactionProgress) -> Void)?
+    ) throws -> UsageCompactionResult {
         try queue.sync {
             try ensurePerformanceIndexesUnlocked()
             var advancedTo: Int64 = 0
             var didCompact = false
-            progress?(.advanceFrozenWatermark, 0, UsageCompactionStep.total)
+            var deletedRows: Int64 = 0
+            var lastBatchRows: Int64 = 0
+            func emit(_ step: UsageCompactionStep, _ done: Int) {
+                progressUpdate?(UsageCompactionProgress(
+                    step: step,
+                    done: done,
+                    total: UsageCompactionStep.total,
+                    deletedRows: deletedRows,
+                    lastBatchRows: lastBatchRows
+                ))
+            }
+
+            emit(.advanceFrozenWatermark, 0)
             try transaction {
                 advancedTo = try advanceFrozenWatermarkUnlocked(hostname: hostname)
             }
-            progress?(.advanceFrozenWatermark, UsageCompactionStep.advanceFrozenWatermark.rawValue, UsageCompactionStep.total)
+            emit(.advanceFrozenWatermark, UsageCompactionStep.advanceFrozenWatermark.rawValue)
             if advancedTo > 0 {
                 while true {
                     let deleted = try withSQLiteProgressHeartbeat({
-                        progress?(.deleteFrozenRaw, UsageCompactionStep.advanceFrozenWatermark.rawValue, UsageCompactionStep.total)
+                        emit(.deleteFrozenRaw, UsageCompactionStep.advanceFrozenWatermark.rawValue)
                     }) {
                         var batchDeleted: Int64 = 0
                         try transaction {
@@ -4273,22 +4311,24 @@ public final class UsageLedgerStore: @unchecked Sendable {
                         return batchDeleted
                     }
                     guard deleted > 0 else { break }
+                    lastBatchRows = deleted
+                    deletedRows += deleted
                     didCompact = true
-                    progress?(.deleteFrozenRaw, UsageCompactionStep.advanceFrozenWatermark.rawValue, UsageCompactionStep.total)
+                    emit(.deleteFrozenRaw, UsageCompactionStep.deleteFrozenRaw.rawValue)
                 }
             }
-            progress?(.deleteFrozenRaw, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
+            emit(.deleteFrozenRaw, UsageCompactionStep.deleteFrozenRaw.rawValue)
             if didCompact {
-                progress?(.vacuum, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
+                emit(.vacuum, UsageCompactionStep.deleteFrozenRaw.rawValue)
                 try withSQLiteProgressHeartbeat({
-                    progress?(.vacuum, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
+                    emit(.vacuum, UsageCompactionStep.deleteFrozenRaw.rawValue)
                 }) {
                     try exec("VACUUM;")
                 }
             } else {
-                progress?(.skippedVacuum, UsageCompactionStep.deleteFrozenRaw.rawValue, UsageCompactionStep.total)
+                emit(.skippedVacuum, UsageCompactionStep.deleteFrozenRaw.rawValue)
             }
-            progress?(didCompact ? .vacuum : .skippedVacuum, UsageCompactionStep.total, UsageCompactionStep.total)
+            emit(didCompact ? .vacuum : .skippedVacuum, UsageCompactionStep.total)
             return UsageCompactionResult(advancedTo: advancedTo, compacted: didCompact)
         }
     }

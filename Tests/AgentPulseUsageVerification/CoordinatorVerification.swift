@@ -114,9 +114,32 @@ enum CoordinatorVerification {
     private static func verifyScanProgressReporting(_ source: String) throws {
         let scan = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
         try require(scan.contains("status.scanPhase = .scanning"), "local scan must publish progress immediately")
+        try require(scan.contains("activeScanPhases(compactionEnabled: compactionEnabled)"),
+                    "scan progress must normalize active phases so skipped phases do not stall the percentage")
         try require(scan.contains("UsageScanManifest.discover") && scan.contains("UsageFileScanner.scan"),
                     "progress and ingestion must share discovery")
         try require(scan.contains("progressReporter.advanceItem(.scanning)"), "missing file progress")
+        try require(scan.contains("progressReporter.enterPhase(.finalizing")
+                    && scan.contains("finalizeProgressDetail(done: done, dirtyDetail: dirtyDetail)"),
+                    "finalize must surface step and dirty-key progress details")
+        try require(scan.contains("progressReporter.enterPhase(.compacting")
+                    && scan.contains("Self.compactionProgressDetail(update)"),
+                    "compaction must surface frozen-row progress through existing detail text")
+        try require(scan.contains("progressReporter.enterPhase(.summarizing")
+                    && scan.contains("progressReporter.advance(.summarizing, done: done, total: total, detail: detail)"),
+                    "summary window calculation must publish progress")
+        try require(source.contains("progress: ((Int, Int, String) -> Void)? = nil")
+                    && source.contains("completeWindow(.day)")
+                    && source.contains("completeWindow(.all)"),
+                    "summaries must keep snapshot semantics while reporting each existing window")
+        let reporter = try functionBody(matching: "private final class ScanProgressReporter", in: source)
+        try require(reporter.contains("normalizedWeights(for: activePhases)")
+                    && source.contains("activeScanPhases(compactionEnabled: Bool)"),
+                    "progress reporter must normalize weights for only the active scan phases")
+        let report = try functionBody(named: "reportNow", in: source)
+        try require(report.contains("applyReportProgress(")
+                    && source.contains("private func applyReportProgress("),
+                    "report ACKs must update the existing progress fields")
         let apply = try functionBody(named: "applyScanProgress", in: source)
         try require(apply.contains("generation == scanGeneration, statusSubject.value.scanningInProgress"),
                     "stale progress must not replace current activity")

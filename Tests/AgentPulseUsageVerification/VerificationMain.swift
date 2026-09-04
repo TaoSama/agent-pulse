@@ -5,6 +5,23 @@ import AgentPulseUsage
 
 private enum VerificationError: Error { case failed(String) }
 
+private final class ReportProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [(Int, Int, Int, Int)] = []
+
+    func append(_ bucketsDone: Int, _ sessionsDone: Int, _ bucketsPending: Int, _ sessionsPending: Int) {
+        lock.lock()
+        storage.append((bucketsDone, sessionsDone, bucketsPending, sessionsPending))
+        lock.unlock()
+    }
+
+    var updates: [(Int, Int, Int, Int)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
 private final class ScriptedBatchClient: UsageBatchReporting, @unchecked Sendable {
     private let lock = NSLock()
     private let failOnCall: Int?
@@ -192,17 +209,24 @@ enum AgentPulseUsageVerification {
         try require(afterFailureRevision > initialRevision, "failed revision was acknowledged")
         try require(scripted.requests.allSatisfy { !$0.request.fullSync && !$0.request.fullSyncReset }, "ordinary report triggered full sync")
 
+        let progress = ReportProgressRecorder()
         let recovered = try await reporter.report(
             ledger: ledger,
             hostname: hostname,
             baseURL: URL(string: "https://example.invalid")!,
             configurationURL: URL(fileURLWithPath: "/unused")
-        )
+        ) { bucketsDone, sessionsDone, bucketsPending, sessionsPending in
+            progress.append(bucketsDone, sessionsDone, bucketsPending, sessionsPending)
+        }
         try require(
             recovered.bucketsAcknowledged == 1
                 && recovered.bucketsPending == 0
                 && recovered.partialFailures.isEmpty,
             "failed batch did not recover"
+        )
+        try require(
+            progress.updates.last.map { $0.0 == 1 && $0.1 == 1 && $0.2 == 0 && $0.3 == 0 } == true,
+            "report progress did not publish acknowledged rows and remaining pending rows"
         )
 
         let missingHostname = makeReporter(client: ScriptedBatchClient(), hostname: "")
