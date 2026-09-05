@@ -14,13 +14,13 @@ import Foundation
 /// 单个重采样后的曲线点。
 ///
 /// `value` 为该时间步的真实 TPS（tokens/second），`nil` 表示缺口（无有效数据）。
-/// `normalized` 为绘图用的 0...1 归一化值，仅在 `value != nil` 时有意义。
+/// `normalized` 为绘图用的 0...1 值；紧凑趋势图经插值和平滑后，即使真实值缺失也可有绘图值。
 public struct SparklinePoint: Sendable, Equatable {
     /// 该时间步的中心时间（重采样栅格上的固定时刻）。
     public let time: Date
     /// 真实 TPS；缺口为 nil。
     public let value: Double?
-    /// 归一化到 0...1 的绘图值；缺口为 nil。
+    /// 绘图值独立于真实值：紧凑趋势图可补齐缺口，不能用它替代统计数据。
     public let normalized: Double?
 
     public init(time: Date, value: Double?, normalized: Double?) {

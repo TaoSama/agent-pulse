@@ -609,8 +609,8 @@ struct OrbDetailView: View {
     }
 }
 
-/// 气泡里的实时 TPS 卡：左上 TPS 数值 + 右侧小曲线（总曲线与各模型曲线叠画在同一张小图、
-/// 共享纵轴），下方配各模型图例（不含总计行；总曲线仍画在图上）。与菜单同源的 15 分钟 sparkline。
+/// 气泡里的实时 TPS 卡：左上 TPS 数值 + 右侧总趋势与模型历史叠图，下方配各模型图例。
+/// 图例不含总计行；总曲线与菜单同源，使用连续归一化的 15 分钟 sparkline。
 private struct OrbTPSCard: View {
     @ObservedObject var model: ApplicationModel
 
@@ -625,7 +625,7 @@ private struct OrbTPSCard: View {
                     .font(.system(size: 22, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                 Spacer(minLength: 8)
-                // 总曲线 + 各模型曲线叠画在同一张小图（共享纵轴，无坐标轴）。
+                // 总趋势与模型历史叠画，无坐标轴，不表示共用绝对 TPS 数值轴。
                 OrbCombinedSparkline(
                     total: model.sparklinePoints,
                     models: model.modelTPSHistory,
@@ -655,8 +655,8 @@ private struct OrbTPSCard: View {
     }
 }
 
-/// 紧凑组合曲线：总曲线（粗）+ 各模型曲线（细）叠画在一张小图，所有线共享同一纵轴上界，
-/// 遇缺口断开、不跨缺口连线。无坐标轴，仅供气泡内小图使用。
+/// 紧凑组合曲线：总曲线（粗）使用连续归一化趋势，模型曲线（细）保留原始 TPS 标尺及缺口。
+/// 两者不共用绝对 TPS 数值轴；无坐标轴，仅供气泡内小图使用。
 private struct OrbCombinedSparkline: View {
     let total: [SparklinePoint]
     let models: [ModelTPSHistory]
