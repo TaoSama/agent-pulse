@@ -154,10 +154,24 @@ final class IngestClientTests: XCTestCase {
         XCTAssertEqual(Array(UsageIngestClient.truncate(multibyte, 10).utf8).count, 9)
     }
 
-    func testCanonicalHostnameCapsScalars() {
+    func testCanonicalHostnameCapsUTF8BytesWithoutSplittingScalars() {
         XCTAssertEqual(CanonicalHostname.normalize("  host-a  "), "host-a")
-        XCTAssertEqual(CanonicalHostname.normalize(String(repeating: "h", count: 250)).unicodeScalars.count, 100)
-        XCTAssertEqual(CanonicalHostname.normalize(String(repeating: "\u{1F600}", count: 150)).unicodeScalars.count, 100)
+        let byteLimit = 255
+        XCTAssertEqual(CanonicalHostname.maximumByteCount, byteLimit)
+        let shortASCII = String(repeating: "h", count: 250)
+        XCTAssertEqual(CanonicalHostname.normalize(shortASCII), shortASCII)
+        XCTAssertEqual(
+            CanonicalHostname.normalize(String(repeating: "h", count: 300)),
+            String(repeating: "h", count: byteLimit)
+        )
+        let emoji = "\u{1F600}"
+        let normalizedEmoji = CanonicalHostname.normalize(String(repeating: emoji, count: 150))
+        XCTAssertEqual(normalizedEmoji, String(repeating: emoji, count: byteLimit / emoji.utf8.count))
+        XCTAssertLessThanOrEqual(normalizedEmoji.utf8.count, byteLimit)
+        let exactlyFits = String(repeating: "h", count: byteLimit - emoji.utf8.count) + emoji
+        XCTAssertEqual(CanonicalHostname.normalize(exactlyFits), exactlyFits)
+        let prefixBeforePartialScalar = String(repeating: "h", count: byteLimit - emoji.utf8.count + 1)
+        XCTAssertEqual(CanonicalHostname.normalize(prefixBeforePartialScalar + emoji), prefixBeforePartialScalar)
     }
 
     func testHostnameCanonicalizedIntoPayload() async throws {
@@ -244,6 +258,155 @@ final class IngestClientTests: XCTestCase {
         XCTAssertFalse(secondBody.contains("autonomy"))
     }
 
+    func testReportTokenSupplierCoalescesConcurrentFirstAcquisition() async throws {
+        let source = ControlledReportTokens()
+        let supplier = ReportTokenSupplier(supplier: source)
+        let tasks = (0..<8).map { _ in Task { try await supplier.token(forceRefresh: false) } }
+        try await waitForWaiters(supplier, count: tasks.count)
+        try await waitForCalls(source, count: 1)
+        let expected = stableJWT("first")
+        try await source.complete(0, with: .success(SecretToken(expected)))
+        for task in tasks { let token = try await task.value; XCTAssertEqual(token.reveal(), expected) }
+        let cached = try await supplier.token(forceRefresh: false)
+        XCTAssertEqual(cached.reveal(), expected)
+        let history = await source.history()
+        XCTAssertEqual(history, [false])
+    }
+
+    func testReportTokenSupplierCoalescesForceOverlappingInitialAndRefresh() async throws {
+        let source = ControlledReportTokens()
+        let supplier = ReportTokenSupplier(supplier: source)
+        let initial = Task { try await supplier.token(forceRefresh: false) }
+        try await waitForWaiters(supplier, count: 1)
+        try await waitForCalls(source, count: 1)
+        let forced = (0..<2).map { _ in Task { try await supplier.token(forceRefresh: true) } }
+        try await waitForWaiters(supplier, count: 3)
+        let first = stableJWT("first")
+        let refreshed = makeTestJWT("{\"iss\":\"issuer\",\"sub\":\"first\",\"nonce\":2}")
+        try await source.complete(0, with: .success(SecretToken(first)))
+        let original = try await initial.value
+        XCTAssertEqual(original.reveal(), first)
+        try await waitForCalls(source, count: 2)
+        let overlapping = Task { try await supplier.token(forceRefresh: true) }
+        let ordinary = Task { try await supplier.token(forceRefresh: false) }
+        try await waitForWaiters(supplier, count: 4)
+        try await source.complete(1, with: .success(SecretToken(refreshed)))
+        for task in forced + [overlapping, ordinary] {
+            let token = try await task.value
+            XCTAssertEqual(token.reveal(), refreshed)
+        }
+        let history = await source.history()
+        XCTAssertEqual(history, [false, true])
+    }
+
+    func testReportTokenSupplierHonorsQueuedForceAfterInitialFailure() async throws {
+        let source = ControlledReportTokens()
+        let supplier = ReportTokenSupplier(supplier: source)
+        let initial = Task { try await supplier.token(forceRefresh: false) }
+        try await waitForCalls(source, count: 1)
+        let forced = (0..<2).map { _ in Task { try await supplier.token(forceRefresh: true) } }
+        try await waitForWaiters(supplier, count: 3)
+        try await source.complete(0, with: .failure(URLError(.timedOut)))
+        do { _ = try await initial.value; XCTFail("expected initial acquisition failure") }
+        catch { XCTAssertEqual((error as? URLError)?.code, .timedOut) }
+        try await waitForCalls(source, count: 2)
+        let expected = stableJWT("first")
+        try await source.complete(1, with: .success(SecretToken(expected)))
+        for task in forced { let token = try await task.value; XCTAssertEqual(token.reveal(), expected) }
+        let history = await source.history()
+        XCTAssertEqual(history, [false, true])
+    }
+
+    func testReportTokenSupplierFencesSharedRefreshAndRecoversFromFailure() async throws {
+        let source = ControlledReportTokens()
+        let supplier = ReportTokenSupplier(supplier: source)
+        let first = stableJWT("first")
+        let initial = Task { try await supplier.token(forceRefresh: false) }
+        try await waitForCalls(source, count: 1)
+        try await source.complete(0, with: .success(SecretToken(first)))
+        _ = try await initial.value
+        let rejected = (0..<2).map { _ in Task { try await supplier.token(forceRefresh: true) } }
+        try await waitForWaiters(supplier, count: 2)
+        try await waitForCalls(source, count: 2)
+        try await source.complete(1, with: .success(SecretToken(stableJWT("different"))))
+        for task in rejected {
+            do { _ = try await task.value; XCTFail("expected identity fence") }
+            catch { XCTAssertEqual(error as? IngestClientError, .authIdentityChanged) }
+        }
+        let retained = try await supplier.token(forceRefresh: false)
+        XCTAssertEqual(retained.reveal(), first)
+        let failed = (0..<2).map { _ in Task { try await supplier.token(forceRefresh: true) } }
+        try await waitForWaiters(supplier, count: 2)
+        try await waitForCalls(source, count: 3)
+        try await source.complete(2, with: .failure(URLError(.timedOut)))
+        for task in failed {
+            do { _ = try await task.value; XCTFail("expected helper failure") }
+            catch { XCTAssertEqual((error as? URLError)?.code, .timedOut) }
+        }
+        let retry = Task { try await supplier.token(forceRefresh: true) }
+        try await waitForCalls(source, count: 4)
+        try await source.complete(3, with: .success(SecretToken(first)))
+        let recovered = try await retry.value
+        XCTAssertEqual(recovered.reveal(), first)
+        let history = await source.history()
+        XCTAssertEqual(history, [false, true, true, true])
+    }
+
+    func testReportTokenSupplierCancellationDoesNotCancelOtherWaiters() async throws {
+        let source = ControlledReportTokens()
+        let supplier = ReportTokenSupplier(supplier: source)
+        let cancelled = Task { try await supplier.token(forceRefresh: false) }
+        let surviving = Task { try await supplier.token(forceRefresh: false) }
+        try await waitForWaiters(supplier, count: 2)
+        try await waitForCalls(source, count: 1)
+        cancelled.cancel()
+        do { _ = try await cancelled.value; XCTFail("expected immediate cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        try await waitForWaiters(supplier, count: 1)
+        try await source.complete(0, with: .success(SecretToken(stableJWT("first"))))
+        _ = try await surviving.value
+        let cancellations = await source.cancelledCalls()
+        let history = await source.history()
+        XCTAssertTrue(cancellations.isEmpty)
+        XCTAssertEqual(history, [false])
+    }
+
+    func testReportTokenSupplierDropsLateResultAfterLastWaiterCancels() async throws {
+        let source = ControlledReportTokens()
+        let supplier = ReportTokenSupplier(supplier: source)
+        let abandoned = Task { try await supplier.token(forceRefresh: false) }
+        try await waitForCalls(source, count: 1)
+        abandoned.cancel()
+        do { _ = try await abandoned.value; XCTFail("expected cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        try await waitForWaiters(supplier, count: 0)
+        let replacement = Task { try await supplier.token(forceRefresh: false) }
+        try await waitForCalls(source, count: 2)
+        try await source.complete(0, with: .success(SecretToken(stableJWT("abandoned"))))
+        try await source.complete(1, with: .success(SecretToken(stableJWT("replacement"))))
+        let token = try await replacement.value
+        XCTAssertEqual(token.reveal(), stableJWT("replacement"))
+        let cached = try await supplier.token(forceRefresh: false)
+        XCTAssertEqual(cached.reveal(), token.reveal())
+        try await waitForCondition { await source.cancelledCalls() == [0] }
+    }
+
+    private func waitForWaiters(_ supplier: ReportTokenSupplier, count: Int) async throws {
+        try await waitForCondition { await supplier.pendingWaiterCount == count }
+    }
+
+    private func waitForCalls(_ source: ControlledReportTokens, count: Int) async throws {
+        try await waitForCondition { await source.history().count == count }
+    }
+
+    private func waitForCondition(_ condition: () async -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while !(await condition()) {
+            guard Date() < deadline else { throw ReportTokenFixtureError.timeout }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+    }
+
     func test413RebuildsGzipAndHeaders() async throws {
         // An oversized autonomy section pushes the first body past the gzip
         // threshold; the degraded body drops back below it, proving the JSON,
@@ -260,4 +423,27 @@ final class IngestClientTests: XCTestCase {
         XCTAssertFalse(secondBody.contains("autonomy"))
         XCTAssertTrue(secondBody.contains("\"bucketStart\":\"t\""))
     }
+}
+
+private enum ReportTokenFixtureError: Error { case timeout, missingCall }
+
+/// Explicitly released calls keep concurrent requests overlapping. Deliberately
+/// returns after cancellation to exercise the supplier's stale-generation fence.
+private actor ControlledReportTokens: TokenSupplying {
+    private var calls: [Bool] = []
+    private var cancelled: [Int] = []
+    private var pending: [Int: CheckedContinuation<SecretToken, Error>] = [:]
+    func token(forceRefresh: Bool) async throws -> SecretToken {
+        let index = calls.count
+        calls.append(forceRefresh)
+        let token = try await withCheckedThrowingContinuation { pending[index] = $0 }
+        if Task.isCancelled { cancelled.append(index) }
+        return token
+    }
+    func complete(_ index: Int, with result: Result<SecretToken, Error>) throws {
+        guard let continuation = pending.removeValue(forKey: index) else { throw ReportTokenFixtureError.missingCall }
+        continuation.resume(with: result)
+    }
+    func history() -> [Bool] { calls }
+    func cancelledCalls() -> [Int] { cancelled }
 }

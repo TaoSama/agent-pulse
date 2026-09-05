@@ -99,6 +99,9 @@ struct TokenSyncSettingsSection: View {
                         model.scanTokenUsageNow()
                     }
                 }
+                if let error = model.tokenSyncStatus.scanError {
+                    SettingsFootnote(error, tone: .negative)
+                }
             }
         }
     }

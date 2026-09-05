@@ -14,6 +14,7 @@ struct AgentPulseCollectorVerification {
         try await withFixture(named: "warm-rescan", verifyWarmRescanReusesCache)
         try await withFixture(named: "exclusions", verifyStaleAndEmptyFilesExcluded)
         try await withFixture(named: "unreadable", verifyUnreadableFilesDoNotFailScan)
+        try await RuntimeIncrementalVerification.run()
         print("AgentPulseCollector verification passed")
     }
 

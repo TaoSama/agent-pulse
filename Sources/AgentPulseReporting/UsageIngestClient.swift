@@ -60,7 +60,7 @@ public struct CommandTokenSupplier: TokenSupplying {
 /// be attached after a resolution has already arrived (the cancellation handler
 /// can fire before the continuation body runs), so a pending result is
 /// replayed on attach.
-private final class ContinuationLatch: @unchecked Sendable {
+final class ContinuationLatch: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<SecretToken, Error>?
     private var pendingResult: Result<SecretToken, Error>?

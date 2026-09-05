@@ -27,7 +27,7 @@ public struct CliProxyUsageService: Sendable {
 
     /// management API 用量端点路径（相对 base URL）。
     private static let usagePath = "/v0/management/usage"
-    private static let analyticsPath = "/v0/management/monitoring/analytics"
+    public static let analyticsPath = "/v0/management/monitoring/analytics"
     private static let analyticsPageSize = 5_000
     private static let maxAnalyticsPages = 1_000
 
@@ -39,7 +39,8 @@ public struct CliProxyUsageService: Sendable {
     private static let maxConfigFileBytes = EnvFile.defaultMaxBytes
 
     /// usage 响应最大字节数保护（端点无界，可达数十 MB 且持续增长）。
-    private static let maxResponseBytes = 128 * 1024 * 1024
+    public static let maxResponseBytes = 128 * 1024 * 1024
+    public static let maxAnalyticsResponseBytes = 16 * 1024 * 1024
 
     /// 请求超时（秒）。全量明细可能较大，给足时间但设硬上限。
     private static let requestTimeout: TimeInterval = 60
@@ -50,7 +51,9 @@ public struct CliProxyUsageService: Sendable {
 
     public init(
         transport: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse) = { request in
-            try await URLSession.shared.data(for: request)
+            try await CliProxyUsageService.boundedResponse(for: request,
+                maximumBytes: request.url?.path == CliProxyUsageService.analyticsPath
+                    ? CliProxyUsageService.maxAnalyticsResponseBytes : CliProxyUsageService.maxResponseBytes)
         }
     ) {
         self.transport = transport
@@ -105,7 +108,7 @@ public struct CliProxyUsageService: Sendable {
                     do {
                         return .success(try await fetch(
                             configuration,
-                            fromMS: latestTimestampMSByIdentity[configuration.identity].map { $0 + 1 }
+                            fromMS: latestTimestampMSByIdentity[configuration.identity]
                         ))
                     } catch is CancellationError {
                         throw CancellationError()
@@ -149,56 +152,20 @@ public struct CliProxyUsageService: Sendable {
     }
 
     private func fetchAnalytics(_ configuration: Configuration, fromMS: Int64?) async throws -> [UsageEvent] {
-        var beforeMS: Int64?
-        var beforeID: Int64?
-        var pageCount = 0
+        let writer = try CliProxyStageWriter()
+        let cursor = try await stageAnalytics(configuration, writer: writer, fromMS: fromMS ?? 1,
+            toMS: Int64(Date().timeIntervalSince1970 * 1_000) + 60_000,
+            beforeMS: nil, beforeID: nil, budget: Self.maxAnalyticsPages,
+            options: CliProxyCollectionOptions(pageSize: Self.analyticsPageSize))
+        guard cursor.beforeMS == nil else { throw CliProxyUsageError.responseTooLarge }
+        let staged = writer.finish(identity: configuration.identity,
+                                   state: CliProxyCollectionState(endpoint: .analytics))
         var events: [UsageEvent] = []
-        var seenCursors = Set<String>()
-        let targetHash = CliProxyUsageParser.apiKeyHash(for: configuration.targetAPIKey)
-        let toMS = Int64(Date().timeIntervalSince1970 * 1_000) + 60_000
-
-        while true {
-            try Task.checkCancellation()
-            pageCount += 1
-            guard pageCount <= Self.maxAnalyticsPages else { throw CliProxyUsageError.responseTooLarge }
-            var eventsPage: [String: Any] = ["limit": Self.analyticsPageSize]
-            if let beforeMS, let beforeID {
-                eventsPage["before_ms"] = beforeMS
-                eventsPage["before_id"] = beforeID
-            }
-            let payload: [String: Any] = [
-                "from_ms": fromMS ?? 1,
-                "to_ms": toMS,
-                "filters": ["api_key_hashes": [targetHash]],
-                "include": ["events_page": eventsPage],
-            ]
-            var request = authorizedRequest(url: configuration.analyticsURL, method: "POST", managementKey: configuration.managementKey)
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-            let (data, http) = try await perform(request)
-            if [404, 405, 501].contains(http.statusCode) { throw AnalyticsFallback.unsupported }
-            try validate(http: http, data: data)
-            let page: CliProxyUsageParser.AnalyticsPage
-            do {
-                page = try CliProxyUsageParser.parseAnalyticsPage(
-                    data: data,
-                    targetAPIKey: configuration.targetAPIKey,
-                    sourceIdentifier: configuration.sourceIdentifier
-                )
-            } catch CliProxyUsageParser.AnalyticsParseError.incompatibleSchema {
-                throw AnalyticsFallback.unsupported
-            }
-            events.append(contentsOf: page.events)
-            guard page.hasMore else { return events }
-            guard page.nextBeforeMS > 0, page.nextBeforeID > 0 else { throw CliProxyUsageError.network }
-            let cursor = "\(page.nextBeforeMS):\(page.nextBeforeID)"
-            guard seenCursors.insert(cursor).inserted else { throw CliProxyUsageError.network }
-            beforeMS = page.nextBeforeMS
-            beforeID = page.nextBeforeID
-        }
+        try staged.forEachPage { events.append(contentsOf: $0) }
+        return events
     }
 
-    private func fetchLegacyUsage(_ configuration: Configuration) async throws -> [UsageEvent] {
+    func fetchLegacyUsage(_ configuration: Configuration) async throws -> [UsageEvent] {
         let request = authorizedRequest(url: configuration.usageURL, method: "GET", managementKey: configuration.managementKey)
         let (data, http) = try await perform(request)
         try validate(http: http, data: data)
@@ -209,7 +176,7 @@ public struct CliProxyUsageService: Sendable {
         )
     }
 
-    private func authorizedRequest(url: URL, method: String, managementKey: String) -> URLRequest {
+    func authorizedRequest(url: URL, method: String, managementKey: String) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = Self.requestTimeout
@@ -220,12 +187,14 @@ public struct CliProxyUsageService: Sendable {
         return request
     }
 
-    private func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+    func perform(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         do {
             let (data, response) = try await transport(request)
             guard let http = response as? HTTPURLResponse else { throw CliProxyUsageError.network }
             return (data, http)
         } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled || Task.isCancelled {
             throw CancellationError()
         } catch let error as CliProxyUsageError {
             throw error
@@ -234,7 +203,7 @@ public struct CliProxyUsageService: Sendable {
         }
     }
 
-    private func validate(http: HTTPURLResponse, data: Data) throws {
+    func validate(http: HTTPURLResponse, data: Data) throws {
         guard (200...299).contains(http.statusCode) else {
             switch http.statusCode {
             case 401, 403: throw CliProxyUsageError.unauthorized
@@ -247,7 +216,7 @@ public struct CliProxyUsageService: Sendable {
     // MARK: - 配置解析
 
     /// 内存态配置：base URL、management key、目标 apikey。绝不落盘 / 日志。
-    struct Configuration {
+    struct Configuration: Sendable {
         /// nil 为历史默认来源；非 nil 为具名来源标识。
         let sourceIdentifier: String?
         let usageURL: URL
@@ -273,7 +242,7 @@ public struct CliProxyUsageService: Sendable {
         case failure(CliProxyUsageError)
     }
 
-    private struct ConfigurationSet {
+    struct ConfigurationSet {
         let configurations: [Configuration]
         let invalidSourceCount: Int
     }
@@ -284,7 +253,7 @@ public struct CliProxyUsageService: Sendable {
         try loadConfigurationSet(atPath: path).configurations
     }
 
-    private static func loadConfigurationSet(atPath path: String) throws -> ConfigurationSet {
+    static func loadConfigurationSet(atPath path: String) throws -> ConfigurationSet {
         let environment: [String: String]
         do {
             environment = try EnvFile.load(path: path, maxBytes: maxConfigFileBytes)
@@ -419,9 +388,11 @@ public enum CliProxyUsageError: Error, Sendable, Equatable {
     case httpFailure(Int)
     case responseTooLarge
     case network
+    case staging
+    case protocolIdentityUnresolved
 }
 
-private extension CliProxyUsageError {
+extension CliProxyUsageError {
     var reportingPriority: Int {
         switch self {
         case .unauthorized: return 4
@@ -429,6 +400,7 @@ private extension CliProxyUsageError {
         case .httpFailure: return 2
         case .network: return 1
         case .invalidConfiguration: return 5
+        case .staging, .protocolIdentityUnresolved: return 5
         case .configFileMissing, .configFileUnreadable, .insecurePermissions: return 0
         }
     }
@@ -445,10 +417,12 @@ extension CliProxyUsageError: LocalizedError {
         case let .httpFailure(code): return "cliproxyapi 用量拉取失败（HTTP \(code)）。"
         case .responseTooLarge: return "cliproxyapi 用量响应过大，已跳过本轮采集。"
         case .network: return "cliproxyapi 网络异常，采集未完成，请检查网络连接。"
+        case .staging: return "CPA 采集暂存失败，已保留原进度。"
+        case .protocolIdentityUnresolved: return "CPA 历史接口身份尚未确认或存在混用，已保留旧统计并暂停该来源追加。"
         }
     }
 }
 
-private enum AnalyticsFallback: Error {
+enum AnalyticsFallback: Error {
     case unsupported
 }

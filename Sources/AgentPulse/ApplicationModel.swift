@@ -28,6 +28,26 @@ struct OrbSnapshot: Equatable {
     let trendColorMode: TrendColorMode
     let dayTotalTokens: Int64?
     let isExpanded: Bool
+
+    /// 悬浮球没有时间轴，只比较真正参与绘制的值。
+    var renderedSparklineValues: [Double?] {
+        let values = sparklinePoints.map { point in
+            point.normalized.flatMap { $0.isFinite ? $0 : nil }
+        }
+        if values.contains(where: { $0 != nil }) { return values }
+        if let tps, tps.isFinite, tps >= 0 { return [0.5, 0.5] }
+        return []
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.tps.map { String(format: "%.1f", $0) } == rhs.tps.map { String(format: "%.1f", $0) }
+            && lhs.renderedSparklineValues == rhs.renderedSparklineValues
+            && lhs.trend == rhs.trend
+            && lhs.trendColorMode == rhs.trendColorMode
+            && TokenUsageFormatting.compactTokens(lhs.dayTotalTokens)
+                == TokenUsageFormatting.compactTokens(rhs.dayTotalTokens)
+            && lhs.isExpanded == rhs.isExpanded
+    }
 }
 
 /// 悬浮球专用的可观察对象。ApplicationModel 每秒刷新的 20+ 个 @Published 字段
@@ -44,6 +64,42 @@ final class OrbViewModel: ObservableObject {
     func update(_ newSnapshot: OrbSnapshot) {
         guard newSnapshot != snapshot else { return }
         snapshot = newSnapshot
+    }
+
+    /// 使用 publisher 的新值构造完整快照，不能在 @Published 的 willSet 中回读属性。
+    func bind(
+        tps: AnyPublisher<Double?, Never>,
+        sparkline: AnyPublisher<Sparkline, Never>,
+        dayTotalTokens: AnyPublisher<Int64?, Never>,
+        colorMode: AnyPublisher<TrendColorMode, Never>
+    ) -> AnyCancellable {
+        Publishers.CombineLatest4(tps, sparkline, dayTotalTokens, colorMode)
+            .sink { [weak self] tps, sparkline, tokens, mode in
+                guard let self else { return }
+                update(OrbSnapshot(
+                    tps: tps, sparklinePoints: sparkline.points,
+                    trend: sparkline.regression.trend, trendColorMode: mode,
+                    dayTotalTokens: tokens, isExpanded: snapshot.isExpanded
+                ))
+            }
+    }
+
+    func setExpanded(_ expanded: Bool) {
+        update(OrbSnapshot(
+            tps: snapshot.tps, sparklinePoints: snapshot.sparklinePoints,
+            trend: snapshot.trend, trendColorMode: snapshot.trendColorMode,
+            dayTotalTokens: snapshot.dayTotalTokens, isExpanded: expanded
+        ))
+    }
+}
+
+@MainActor
+final class MenuBarLabelViewModel: ObservableObject {
+    @Published private(set) var accessibilityLabel = "Agent Pulse"
+
+    func update(_ value: String) {
+        guard value != accessibilityLabel else { return }
+        accessibilityLabel = value
     }
 }
 
@@ -83,6 +139,7 @@ final class ApplicationModel: ObservableObject {
     @Published private(set) var isOrbExpanded = false
     /// 悬浮球专用观察模型：只在 OrbSnapshot 变化时发布，隔离其余 @Published 的抖动。
     let orbViewModel: OrbViewModel
+    let menuBarLabelViewModel = MenuBarLabelViewModel()
 
     /// 合并 env 的双源字段状态与写回（R2 / cliproxy / 上报简单值同源）。
     let envSettings = EnvSettingsModel()
@@ -124,60 +181,60 @@ final class ApplicationModel: ObservableObject {
             isExpanded: false
         ))
         tokenCoordinator.summaryPublisher.sink { [weak self] value in
-            self?.tokenSummary = value
+            self?.publish(value, to: \.tokenSummary)
         }.store(in: &cancellables)
         tokenCoordinator.statusPublisher.sink { [weak self] value in
-            self?.tokenSyncStatus = value
+            self?.publish(value, to: \.tokenSyncStatus)
         }.store(in: &cancellables)
         tokenCoordinator.dashboardDaySeriesPublisher.sink { [weak self] value in
-            self?.dashboardDaySeries = value
+            self?.publish(value, to: \.dashboardDaySeries)
         }.store(in: &cancellables)
         metricsStore.$desktopActive.sink { [weak self] value in
-            self?.desktopActive = value.displayValue
+            self?.publish(value.displayValue, to: \.desktopActive)
         }.store(in: &cancellables)
         metricsStore.$totalTasks.sink { [weak self] value in
-            self?.totalTasks = value.displayValue
-            self?.totalTasksIsLowerBound = value.isPartial
+            self?.publish(value.displayValue, to: \.totalTasks)
+            self?.publish(value.isPartial, to: \.totalTasksIsLowerBound)
         }.store(in: &cancellables)
         metricsStore.$activeTasks.sink { [weak self] value in
-            self?.activeTasks = value.displayValue
+            self?.publish(value.displayValue, to: \.activeTasks)
         }.store(in: &cancellables)
         metricsStore.$taskBreakdown.sink { [weak self] in
-            self?.taskBreakdown = $0
+            self?.publish($0, to: \.taskBreakdown)
         }.store(in: &cancellables)
         metricsStore.$completedTotal.sink { [weak self] value in
-            self?.completedTotal = value.displayValue
-            self?.completedIsPartial = value.isPartial
+            self?.publish(value.displayValue, to: \.completedTotal)
+            self?.publish(value.isPartial, to: \.completedIsPartial)
         }.store(in: &cancellables)
         metricsStore.$completedScope.sink { [weak self] in
-            self?.completedScope = $0
+            self?.publish($0, to: \.completedScope)
         }.store(in: &cancellables)
         metricsStore.$completedIsLowerBound.sink { [weak self] in
-            self?.completedIsLowerBound = $0
+            self?.publish($0, to: \.completedIsLowerBound)
         }.store(in: &cancellables)
         metricsStore.$terminalActive.sink { [weak self] value in
-            self?.terminalActive = value.displayValue
+            self?.publish(value.displayValue, to: \.terminalActive)
         }.store(in: &cancellables)
         metricsStore.$tps.sink { [weak self] value in
-            self?.tps = value.displayValue
+            self?.publish(value.displayValue, to: \.tps)
         }.store(in: &cancellables)
         metricsStore.$tpsState.sink { [weak self] in
-            self?.tpsState = $0
+            self?.publish($0, to: \.tpsState)
         }.store(in: &cancellables)
         metricsStore.$tpsHistory.sink { [weak self] in
-            self?.tpsHistory = $0
+            self?.publish($0, to: \.tpsHistory)
         }.store(in: &cancellables)
         metricsStore.$sparkline.sink { [weak self] in
-            self?.sparkline = $0
+            self?.publish($0, to: \.sparkline)
         }.store(in: &cancellables)
         metricsStore.$modelTPSHistory.sink { [weak self] in
-            self?.modelTPSHistory = $0
+            self?.publish($0, to: \.modelTPSHistory)
         }.store(in: &cancellables)
         metricsStore.$dashboardSparklinePoints.sink { [weak self] in
-            self?.dashboardSparklinePoints = $0
+            self?.publish($0, to: \.dashboardSparklinePoints)
         }.store(in: &cancellables)
         metricsStore.$dashboardModelTPSHistory.sink { [weak self] in
-            self?.dashboardModelTPSHistory = $0
+            self?.publish($0, to: \.dashboardModelTPSHistory)
         }.store(in: &cancellables)
         // 合并 env 路径变化：仅同步给 UploadService（路径字符串），凭证不落盘。
         envSettings.$path
@@ -205,19 +262,21 @@ final class ApplicationModel: ObservableObject {
         subscribeOrbSnapshotInputs()
     }
 
-    /// 悬浮球的输入分布在多个 @Published 上。曲线的点与趋势已合成 Sparkline 单值，
-    /// 一轮采集只会各赋值一次；合成一路订阅后同一轮只重建并发布一次快照。
+    /// 数字与后台曲线各自就绪即提交；每次提交都从新载荷构造完整渲染状态。
     private func subscribeOrbSnapshotInputs() {
-        let metrics = Publishers.CombineLatest(
-            metricsStore.$tps,
-            metricsStore.$sparkline
-        ).map { _ in () }
-        let presentation = Publishers.CombineLatest(
-            $tokenSummary,
-            $trendColorMode
-        ).map { _ in () }
-        Publishers.Merge(metrics, presentation)
-            .sink { [weak self] _ in self?.refreshOrbSnapshot() }
+        orbViewModel.bind(
+            tps: metricsStore.$tps.map(\.displayValue).eraseToAnyPublisher(),
+            sparkline: metricsStore.$sparkline.eraseToAnyPublisher(),
+            dayTotalTokens: $tokenSummary.map { $0.day?.totalTokens }.eraseToAnyPublisher(),
+            colorMode: $trendColorMode.eraseToAnyPublisher()
+        ).store(in: &cancellables)
+        Publishers.CombineLatest4($totalTasks, $activeTasks, $tps, $sparkline)
+            .sink { [weak self] total, active, tps, sparkline in
+                let summary = "Tasks \(total.map(String.init) ?? "—") · Active \(active.map(String.init) ?? "—") · TPS \(tps.map { String(format: "%.1f", $0) } ?? "—")"
+                self?.menuBarLabelViewModel.update(
+                    "Agent Pulse，\(summary)，\(sparkline.regression.trend.accessibilityText)"
+                )
+            }
             .store(in: &cancellables)
     }
 
@@ -225,19 +284,12 @@ final class ApplicationModel: ObservableObject {
         "Tasks \(format(totalTasks)) · Active \(format(activeTasks)) · TPS \(format(tps))"
     }
 
-    /// 用当前悬浮球相关字段重建快照并推送给 OrbViewModel。
-    /// 仅在快照真正变化时发布（OrbViewModel.update 内部 Equatable 守卫），
-    /// 与悬浮球无关的 @Published 变化不会走到这里。
-    private func refreshOrbSnapshot() {
-        let snapshot = OrbSnapshot(
-            tps: tps,
-            sparklinePoints: sparklinePoints,
-            trend: sparklineRegression.trend,
-            trendColorMode: trendColorMode,
-            dayTotalTokens: tokenSummary.day?.totalTokens,
-            isExpanded: isOrbExpanded
-        )
-        orbViewModel.update(snapshot)
+    private func publish<Value: Equatable>(
+        _ value: Value,
+        to keyPath: ReferenceWritableKeyPath<ApplicationModel, Value>
+    ) {
+        guard self[keyPath: keyPath] != value else { return }
+        self[keyPath: keyPath] = value
     }
 
     func start() {
@@ -254,8 +306,9 @@ final class ApplicationModel: ObservableObject {
     }
 
     func setOrbExpanded(_ expanded: Bool) {
+        guard expanded != isOrbExpanded else { return }
         isOrbExpanded = expanded
-        refreshOrbSnapshot()
+        orbViewModel.setExpanded(expanded)
     }
 
     func toggleOrb() {

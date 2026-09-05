@@ -1,4 +1,3 @@
-import CryptoKit
 import CoreFoundation
 import Foundation
 
@@ -32,7 +31,7 @@ public enum CliProxyUsageParser {
 
     /// 目标 apikey 明文的 SHA256 hex（服务端 `api_key_hash` 的口径，已实测验证）。
     public static func apiKeyHash(for plaintextKey: String) -> String {
-        SHA256.hash(data: Data(plaintextKey.utf8)).map { String(format: "%02x", $0) }.joined()
+        ContentDigest.sha256(plaintextKey)
     }
 
     /// 目标 apikey 的稳定短身份（不含明文），用作账本 project / sessionHash 维度。
@@ -116,10 +115,13 @@ public enum CliProxyUsageParser {
             let counts = tokenCounts(item)
             guard counts.total > 0 else { continue }
             let timestamp = Date(timeIntervalSince1970: Double(timestampMS) / 1_000)
-            let upstreamIdentity = nonemptyString(item["event_hash"])
-                ?? exactInteger(item["id"]).map(String.init)
-            let eventID = upstreamIdentity.map { hash("cliproxy-analytics|\(identity)|\($0)") }
-                ?? hash("cliproxy-usage|\(identity)|\(model)|\(iso(timestamp))|\(usageIdentity(counts))")
+            guard let upstreamIdentity = nonemptyString(item["event_hash"])
+                ?? exactInteger(item["id"]).map(String.init) else {
+                // A dimension fingerprint cannot distinguish two requests in
+                // the same millisecond, nor safely share the legacy ID domain.
+                throw AnalyticsParseError.incompatibleSchema
+            }
+            let eventID = hash("cliproxy-analytics|\(identity)|\(upstreamIdentity)")
             guard seenIDs.insert(eventID).inserted else { continue }
             events.append(UsageEvent(
                 id: eventID,
@@ -242,6 +244,6 @@ public enum CliProxyUsageParser {
         String(format: "%.6f", date.timeIntervalSince1970)
     }
     private static func hash(_ value: String) -> String {
-        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+        ContentDigest.sha256(value)
     }
 }

@@ -1,4 +1,3 @@
-import CryptoKit
 import CoreFoundation
 import Foundation
 
@@ -85,9 +84,50 @@ public enum UsageJSONLParser {
         )
     }
 
+    static func parseIncrementalChunk(
+        data: Data, source: String, fileIdentity: String, modifiedAt: Date,
+        isSubagent: Bool, offset: Int64, size: Int64, lineOffset: Int,
+        state: UsageParserState
+    ) throws -> ParsedUsageFile {
+        let fileHash = fileID(for: fileIdentity)
+        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: true)
+        var diagnostics: [String] = []
+        var sessionEvents: [UsageSessionEvent] = []
+        var editEntries: [UsageEditEntry] = []
+        let events: [UsageEvent]
+        if lines.isEmpty {
+            events = []
+        } else if source == codexSource {
+            if let cursor = state.read("codex-cursor", as: CodexCursor.self),
+               !cursor.metadataFound,
+               lines.contains(where: { json($0).map { string($0["type"]) == "session_meta" } ?? false }) {
+                throw UsageIncrementalReadError.requiresRebuild
+            }
+            events = parseCodex(lines, source: source, fileHash: fileHash, sessionEvents: &sessionEvents,
+                                editEntries: &editEntries, diagnostics: &diagnostics, state: state, lineOffset: lineOffset)
+        } else {
+            events = parseClaude(lines, source: source, fileHash: fileHash, isSubagent: isSubagent,
+                                 sessionEvents: &sessionEvents, editEntries: &editEntries,
+                                 diagnostics: &diagnostics, state: state, lineOffset: lineOffset)
+        }
+        let degraded = (state.read("degraded", as: Bool.self) ?? false) || !diagnostics.isEmpty
+        if !diagnostics.isEmpty { state.write(true, key: "degraded") }
+        return ParsedUsageFile(events: events, sessionEvents: sessionEvents,
+                               checkpoint: UsageFileCheckpoint(fileID: fileHash, source: source,
+                                pathHash: fileHash, offset: offset, size: size, modifiedAt: modifiedAt,
+                                parserVersion: parserVersion, status: offset < size ? "partial" : (degraded ? "degraded" : "complete")),
+                               diagnostics: diagnostics, editEntries: editEntries)
+    }
+
+    static func codexCursorSeed(line: Data, fileIdentity: String) throws -> Data? {
+        guard let object = json(line), string(object["type"]) == "session_meta" else { return nil }
+        let metadata = codexMetadata([line], fileHash: fileID(for: fileIdentity))
+        return try JSONEncoder().encode(CodexCursor(metadata: metadata, metadataFound: true))
+    }
+
     // MARK: - Codex
 
-    private struct CodexMetadata {
+    private struct CodexMetadata: Codable {
         var sessionHash: String
         var rolloutKey: String
         var parentRolloutKey: String
@@ -97,9 +137,21 @@ public enum UsageJSONLParser {
         var hasParentConflict: Bool
     }
 
-    private static func parseCodex(_ lines: [Data.SubSequence], source: String, fileHash: String, sessionEvents: inout [UsageSessionEvent], editEntries: inout [UsageEditEntry], diagnostics: inout [String]) -> [UsageEvent] {
+    private struct CodexCursor: Codable {
+        var metadata: CodexMetadata
+        var metadataFound: Bool
+        var turnModel = "unknown"
+        var turnIdentity = "pre-context"
+        var seenFirstTurnContext = false
+        var previousCumulative: UsageTokenCounts?
+    }
+
+    private static func parseCodex(_ lines: [Data.SubSequence], source: String, fileHash: String, sessionEvents: inout [UsageSessionEvent], editEntries: inout [UsageEditEntry], diagnostics: inout [String], state: UsageParserState = UsageParserState(), lineOffset: Int = 0) -> [UsageEvent] {
         let sourceName = "codex"
-        let metadata = codexMetadata(lines, fileHash: fileHash)
+        var cursor = state.read("codex-cursor", as: CodexCursor.self)
+            ?? CodexCursor(metadata: codexMetadata(lines, fileHash: fileHash),
+                           metadataFound: lines.contains { json($0).map { string($0["type"]) == "session_meta" } ?? false })
+        let metadata = cursor.metadata
         // A Codex rollout file is the session boundary. Session identity must be
         // stable across archival moves (sessions/ -> archived_sessions/), so it is
         // keyed by the rollout's own stable id rather than the mutable file path.
@@ -112,20 +164,21 @@ public enum UsageJSONLParser {
             diagnostics.append("session_meta: conflicting parent references; lineage replay disabled")
         }
 
-        var turnModel = "unknown"
-        var turnIdentity = "pre-context"
-        var seenFirstTurnContext = false
-        var previousCumulative: UsageTokenCounts?
+        var turnModel = cursor.turnModel
+        var turnIdentity = cursor.turnIdentity
+        var seenFirstTurnContext = cursor.seenFirstTurnContext
+        var previousCumulative = cursor.previousCumulative
         var result: [UsageEvent] = []
-        var editAccumulator = CodexEditAccumulator(source: sourceName, project: metadata.project, sourceFileHash: fileHash)
-        var codexEventOccurrences = [String: Int]()
-        var seenSessionEventIDs = Set<String>()
+        var editAccumulator = CodexEditAccumulator(source: sourceName, project: metadata.project, sourceFileHash: fileHash, state: state)
+        var codexEventOccurrences = UsageParserMap<Int>("codex-occurrences", state: state)
+        var seenSessionEventIDs = UsageParserSet("session-identities", state: state)
         // 技能 / MCP count-only 事件统一按稳定的 session/turn/call 身份聚合；直接 MCP 与
         // programmatic JS 都由 mcpAccumulator 按 call_id 关联输出后结算。
-        var codexToolCandidates: [String: CodexToolCandidate] = [:]
-        var mcpAccumulator = CodexProgrammaticMCPAccumulator(source: sourceName, project: metadata.project)
+        var codexToolCandidates = UsageParserMap<CodexToolCandidate>("codex-tools", state: state)
+        var mcpAccumulator = CodexProgrammaticMCPAccumulator(source: sourceName, project: metadata.project, state: state)
 
-        for (index, line) in lines.enumerated() {
+        for (localIndex, line) in lines.enumerated() {
+            let index = lineOffset + localIndex
             guard let object = json(line) else { diagnostics.append("line \(index + 1): invalid json"); continue }
             let type = string(object["type"])
             let payload = dictionary(object["payload"])
@@ -270,6 +323,20 @@ public enum UsageJSONLParser {
             ))
         }
 
+        var unknownEvents = UsageParserMap<String>("codex-unknown", state: state)
+        let emittedUnknown = result.filter { isUnknownModel($0.model) }
+        for event in emittedUnknown { unknownEvents[event.id] = event.id }
+        if cursor.turnModel != turnModel, !metadata.hasParentReference, !isUnknownModel(turnModel) {
+            // The ledger joins the sharded identity index and corrects prior rows
+            // in SQL. A model change never materializes all earlier unknown rows.
+            state.codexUnknownModel = turnModel
+        }
+        cursor.turnModel = turnModel
+        cursor.turnIdentity = turnIdentity
+        cursor.seenFirstTurnContext = seenFirstTurnContext
+        cursor.previousCumulative = previousCumulative
+        state.write(cursor, key: "codex-cursor")
+
         // Only a rollout with no parent evidence can safely attribute pre-context unknown rows
         // to a model discovered later in this same file. IDs retain the emission-time model.
         if !metadata.hasParentReference, !isUnknownModel(turnModel) {
@@ -288,6 +355,15 @@ public enum UsageJSONLParser {
         editEntries.append(contentsOf: editAccumulator.finalize())
         // MCP 结算：直接 function_call 与 programmatic JS 都只在匹配 output 成功后计数。
         for pending in mcpAccumulator.finalize() {
+            if var candidate = codexToolCandidates[pending.identity] {
+                candidate.mcpCounts = pending.counts
+                if candidate.skillCounts.isEmpty && candidate.mcpCounts.isEmpty {
+                    codexToolCandidates[pending.identity] = nil
+                    state.removedEventIDs.insert(hash("\(sourceName)|tool-count-only|session:\(activitySessionHash)|\(pending.identity)"))
+                } else {
+                    codexToolCandidates[pending.identity] = candidate
+                }
+            }
             accumulateCodexToolCandidate(
                 into: &codexToolCandidates, identity: pending.identity,
                 model: pending.model, project: metadata.project, timestamp: pending.timestamp,
@@ -318,12 +394,23 @@ public enum UsageJSONLParser {
         let source: String
         let project: String
         let sourceFileHash: String
-        var pending: [String: UsageEditEntry] = [:]
-        var applied: [String: Bool] = [:]
+        var pending: UsageParserMap<UsageEditEntry>
+        var applied: UsageParserMap<Bool>
         /// call_id -> 该调用是否为 programmatic exec（决定用哪套输出成功 gate）。
-        var programmatic: [String: Bool] = [:]
+        var programmatic: UsageParserMap<Bool>
         /// call_id -> 已到达输出的两套判定，供乱序（输出先到）时结算。
-        var outputGate: [String: (legacy: Bool, programmatic: Bool)] = [:]
+        private struct Gate: Codable { let legacy: Bool; let programmatic: Bool }
+        private var outputGate: UsageParserMap<Gate>
+        private let state: UsageParserState
+
+        init(source: String, project: String, sourceFileHash: String, state: UsageParserState) {
+            self.source = source; self.project = project; self.sourceFileHash = sourceFileHash
+            self.state = state
+            pending = UsageParserMap("codex-edit-pending", state: state)
+            applied = UsageParserMap("codex-edit-applied", state: state)
+            programmatic = UsageParserMap("codex-edit-programmatic", state: state)
+            outputGate = UsageParserMap("codex-edit-gate", state: state)
+        }
 
         /// 观察一条 response_item。返回 true 表示：本记录是一笔可归桶的 apply_patch 调用，
         /// 但因缺少可用时间戳而被跳过（调用者据此发脱敏 diagnostic）。*_call_output 记录
@@ -333,7 +420,7 @@ public enum UsageJSONLParser {
             let itemType = (payload["type"] as? String) ?? ""
             if let callID = Self.callID(payload), itemType.hasSuffix("call_output") {
                 let output = Self.outputText(payload["output"])
-                let gate = (legacy: UsageEditLines.codexExecIsApplied(output),
+                let gate = Gate(legacy: UsageEditLines.codexExecIsApplied(output),
                             programmatic: UsageEditLines.codexProgrammaticExecIsApplied(output))
                 outputGate[callID] = gate
                 // 已知调用形态则立即结算；否则等 finalize 时按记录的形态选 gate。
@@ -372,8 +459,14 @@ public enum UsageJSONLParser {
             return false
         }
 
-        func finalize() -> [UsageEditEntry] {
-            pending.compactMap { id, entry in applied[id] == true ? entry : nil }
+        mutating func finalize() -> [UsageEditEntry] {
+            var result: [UsageEditEntry] = []
+            for id in pending.keys.union(applied.keys) {
+                guard let entry = pending[id] else { continue }
+                if applied[id] == true { result.append(entry) }
+                else { state.removedEditIDs.insert(id) }
+            }
+            return result
         }
 
         private static func callID(_ payload: [String: Any]) -> String? {
@@ -446,7 +539,7 @@ public enum UsageJSONLParser {
         }
     }
 
-    private struct CodexToolCandidate {
+    private struct CodexToolCandidate: Codable {
         let identity: String
         var model: String
         var project: String
@@ -456,7 +549,7 @@ public enum UsageJSONLParser {
     }
 
     private static func accumulateCodexToolCandidate(
-        into candidates: inout [String: CodexToolCandidate], identity: String,
+        into candidates: inout UsageParserMap<CodexToolCandidate>, identity: String,
         model: String, project: String, timestamp: Date,
         skillCounts: [String: Int], mcpCounts: [String: Int]
     ) {
@@ -518,28 +611,33 @@ public enum UsageJSONLParser {
     /// 「Script running with cell ID …」时记录 cell→origin，后续 wait 调用的输出据此归回原调用。
     /// 调用 / 输出可能乱序（输出先到），两侧都留痕，finalize 只吐已成功的。
     ///
-    /// 说明（跨扫描持久化缺口）：本累加器仅在「单次整文件扫描」内成立。要在增量追加扫描里
-    /// 跨批次续接一个仍在 running 的 wait-cell，需把未决调用（含 running cell / wait 关联）
-    /// 持久化到解析检查点。此处的 ParsedUsageFile / UsageFileCheckpoint 没有对应字段，
-    /// 故不做跨扫描续接，也不用进程内状态伪造。
+    /// Pending calls, outcomes and wait-cell links are checkpointed as statistics-only
+    /// keyed state, so calls and outputs can arrive in different scans.
     private struct CodexProgrammaticMCPAccumulator {
         let source: String
         let project: String
-        private var pending: [String: PendingMCP] = [:]
-        private var applied: [String: Bool] = [:]
-        private var outputOutcomes: [String: OutputGate] = [:]
-        private var runningByCell: [String: String] = [:]
-        private var waitOrigins: [String: String] = [:]
+        private var pending: UsageParserMap<PendingMCP>
+        private var applied: UsageParserMap<Bool>
+        private var outputOutcomes: UsageParserMap<OutputGate>
+        private var runningByCell: UsageParserMap<String>
+        private var runningCellsByOrigin: UsageParserMap<[String]>
+        private var waitOrigins: UsageParserMap<String>
 
-        init(source: String, project: String) {
+        init(source: String, project: String, state: UsageParserState) {
             self.source = source
             self.project = project
+            pending = UsageParserMap("mcp-pending", state: state)
+            applied = UsageParserMap("mcp-applied", state: state)
+            outputOutcomes = UsageParserMap("mcp-outcome", state: state)
+            runningByCell = UsageParserMap("mcp-running", state: state)
+            runningCellsByOrigin = UsageParserMap("mcp-running-origin", state: state)
+            waitOrigins = UsageParserMap("mcp-wait", state: state)
         }
 
-        private enum GateKind { case direct, programmatic }
-        private struct PendingMCP { let identity: String; let model: String; let timestamp: Date; let counts: [String: Int]; let gate: GateKind }
+        private enum GateKind: Codable { case direct, programmatic }
+        private struct PendingMCP: Codable { let identity: String; let model: String; let timestamp: Date; let counts: [String: Int]; let gate: GateKind }
         struct Resolved { let identity: String; let model: String; let timestamp: Date; let counts: [String: Int] }
-        private struct OutputGate {
+        private struct OutputGate: Codable {
             let programmaticApplied: Bool
             let programmaticResolved: Bool
             let directApplied: Bool
@@ -614,12 +712,16 @@ public enum UsageJSONLParser {
             }
             if !outcome.runningCellID.isEmpty {
                 runningByCell[outcome.runningCellID] = origin
+                var cells = runningCellsByOrigin[origin] ?? []
+                if !cells.contains(outcome.runningCellID) { cells.append(outcome.runningCellID) }
+                runningCellsByOrigin[origin] = cells
             }
             if outcome.programmaticResolved {
                 applied[origin] = outcome.programmaticApplied
-                for (cellID, cellOrigin) in runningByCell where cellOrigin == origin {
+                for cellID in runningCellsByOrigin[origin] ?? [] {
                     runningByCell[cellID] = nil
                 }
+                runningCellsByOrigin[origin] = nil
             }
         }
 
@@ -635,10 +737,12 @@ public enum UsageJSONLParser {
             }
         }
 
-        func finalize() -> [Resolved] {
+        mutating func finalize() -> [Resolved] {
             var out: [Resolved] = []
-            for (id, entry) in pending where applied[id] == true {
-                out.append(Resolved(identity: entry.identity, model: entry.model, timestamp: entry.timestamp, counts: entry.counts))
+            for id in pending.keys.union(applied.keys) {
+                guard let entry = pending[id] else { continue }
+                out.append(Resolved(identity: entry.identity, model: entry.model, timestamp: entry.timestamp,
+                                    counts: applied[id] == true ? entry.counts : [:]))
             }
             return out.sorted { $0.timestamp < $1.timestamp }
         }
@@ -742,7 +846,7 @@ public enum UsageJSONLParser {
 
     // MARK: - Claude
 
-    private struct ClaudeCandidate { var model: String; var project: String; var timestamp: Date; var counts: UsageTokenCounts; var index: Int; var sessionHash: String; var skillCounts: [String: Int] = [:]; var mcpCounts: [String: Int] = [:] }
+    private struct ClaudeCandidate: Codable { var model: String; var project: String; var timestamp: Date; var counts: UsageTokenCounts; var index: Int; var sessionHash: String; var skillCounts: [String: Int] = [:]; var mcpCounts: [String: Int] = [:] }
 
     /// 折叠同一 message.id 的多条转录行：一次真实 API 响应会被 Claude Code 按 content block
     /// 拆成多条 uuid 各异、usage 相同（或流式渐增）的行；按 message.id 归属、逐分量取最大，
@@ -764,7 +868,7 @@ public enum UsageJSONLParser {
         return merged
     }
 
-    private struct ClaudeToolCandidate {
+    private struct ClaudeToolCandidate: Codable {
         let identity: String
         var model: String
         var project: String
@@ -783,8 +887,15 @@ public enum UsageJSONLParser {
     private struct ClaudeEditAccumulator {
         let source: String
         let sourceFileHash: String
-        var pending: [String: UsageEditEntry] = [:]
-        var applied: [String: Bool] = [:]
+        var pending: UsageParserMap<UsageEditEntry>
+        var applied: UsageParserMap<Bool>
+        let state: UsageParserState
+
+        init(source: String, sourceFileHash: String, state: UsageParserState) {
+            self.source = source; self.sourceFileHash = sourceFileHash; self.state = state
+            pending = UsageParserMap("claude-edit-pending", state: state)
+            applied = UsageParserMap("claude-edit-applied", state: state)
+        }
 
         /// 观察一条 assistant / user 记录。返回 true 表示：本记录含至少一笔可归桶的编辑
         /// tool_use，但因缺少可用时间戳被跳过（调用者据此发脱敏 diagnostic）。tool_result
@@ -819,8 +930,14 @@ public enum UsageJSONLParser {
             return skippedForMissingTimestamp
         }
 
-        func finalize() -> [UsageEditEntry] {
-            pending.compactMap { id, entry in applied[id] == true ? entry : nil }
+        mutating func finalize() -> [UsageEditEntry] {
+            var result: [UsageEditEntry] = []
+            for id in pending.keys.union(applied.keys) {
+                guard let entry = pending[id] else { continue }
+                if applied[id] == true { result.append(entry) }
+                else { state.removedEditIDs.insert(id) }
+            }
+            return result
         }
     }
 
@@ -832,32 +949,30 @@ public enum UsageJSONLParser {
     /// seen 去重 streaming / fork 重刷造成的逐字节相同块（同一块只计一次）。
     /// 加密的 signature 字段不计入；redacted_thinking 无明文，thinking 主导的 turn 只会
     /// 在 thinking 侧低估 —— 是诚实下界，绝不高估。
-    private struct ClaudeTurnSplit {
+    private struct ClaudeTurnSplit: Codable {
         var thinkingChars: Int = 0
         var otherChars: Int = 0
-        var seen: Set<String> = []
-
-        mutating func mark(_ kind: String, _ payload: String) -> Bool {
-            seen.insert("\(kind)\u{0}\(payload)").inserted
-        }
     }
 
-    private static func parseClaude(_ lines: [Data.SubSequence], source: String, fileHash: String, isSubagent: Bool, sessionEvents: inout [UsageSessionEvent], editEntries: inout [UsageEditEntry], diagnostics: inout [String]) -> [UsageEvent] {
-        var messages: [String: ClaudeCandidate] = [:]
+    private static func parseClaude(_ lines: [Data.SubSequence], source: String, fileHash: String, isSubagent: Bool, sessionEvents: inout [UsageSessionEvent], editEntries: inout [UsageEditEntry], diagnostics: inout [String], state: UsageParserState = UsageParserState(), lineOffset: Int = 0) -> [UsageEvent] {
+        var messages = UsageParserMap<ClaudeCandidate>("claude-messages", state: state)
         // 记录每个候选 entry 归属的稳定 turn id（msg.id 优先，回退 uuid），
         // 用于扫描结束后按整 turn 字符比例做 thinking 拆分。空串表示不需要拆分。
-        var candidateStableID: [String: String] = [:]
-        var turnChars: [String: ClaudeTurnSplit] = [:]
-        var seenSessionEventIDs = Set<String>()
+        var candidateStableID = UsageParserMap<String>("claude-stable-id", state: state)
+        var turnChars = UsageParserMap<ClaudeTurnSplit>("claude-turn-chars", state: state)
+        var seenTurnBlocks = UsageParserSet("claude-turn-blocks", state: state)
+        var seenSessionEventIDs = UsageParserSet("session-identities", state: state)
         // 编辑累计器：跨全文件关联 tool_use 与 tool_result；子代理转录也计入代码行数
         // （代码行数只按 toolUseID 去重，不涉及会话计数放大问题）。
-        var editAccumulator = ClaudeEditAccumulator(source: source, sourceFileHash: fileHash)
+        var editAccumulator = ClaudeEditAccumulator(source: source, sourceFileHash: fileHash, state: state)
         // 所有结构化工具观测都按 source/session/message(turn) 稳定身份聚合。同一 turn 从
         // usage-less 重写为 usage-bearing 时只保留 token 事件，避免工具计数重复。
-        var toolCandidates: [String: ClaudeToolCandidate] = [:]
-        var usageToolIdentities = Set<String>()
-        var candidateToolIdentity: [String: String] = [:]
-        for (index, line) in lines.enumerated() {
+        var toolCandidates = UsageParserMap<ClaudeToolCandidate>("claude-tools", state: state)
+        var usageToolIdentities = UsageParserSet("claude-usage-tools", state: state)
+        var candidateToolIdentity = UsageParserMap<String>("claude-candidate-tool", state: state)
+        var toolMessageIDs = UsageParserMap<String>("claude-tool-message", state: state)
+        for (localIndex, line) in lines.enumerated() {
+            let index = lineOffset + localIndex
             guard let object = json(line) else { diagnostics.append("line \(index + 1): invalid json"); continue }
             let type = string(object["type"])
             let rawSessionID = string(object["sessionId"]) ?? string(object["session_id"])
@@ -940,7 +1055,7 @@ public enum UsageJSONLParser {
             let id = string(message["id"]) ?? string(object["uuid"]) ?? turnID
             // 累计该 turn 的 thinking / 其余输出字符（仅主转录需要，子代理不拆分）。
             if !isSubagent {
-                accumulateClaudeTurnChars(message: message, turnID: turnID, into: &turnChars)
+                accumulateClaudeTurnChars(message: message, turnID: turnID, into: &turnChars, seen: &seenTurnBlocks)
             }
             guard let timestamp = UsageTimestamp.parse(object["timestamp"]) else {
                 diagnostics.append("line \(index + 1): invalid timestamp (usage skipped)")
@@ -957,6 +1072,11 @@ public enum UsageJSONLParser {
             }
             candidateStableID[id] = turnID
             candidateToolIdentity[id] = toolIdentity
+            toolMessageIDs[toolIdentity] = id
+            state.removedEventIDs.insert(hash("\(source)|tool-count-only|\(toolIdentity)"))
+        }
+        for identity in toolCandidates.keys {
+            if let id = toolMessageIDs[identity] { _ = messages[id] }
         }
         editEntries.append(contentsOf: editAccumulator.finalize())
         var events = messages.sorted { $0.value.index < $1.value.index }.map { id, value -> UsageEvent in
@@ -1010,24 +1130,27 @@ public enum UsageJSONLParser {
     }
 
     /// 跨该 turn 的所有行累计 thinking 与其余输出（text / tool_use）的字符量。
-    private static func accumulateClaudeTurnChars(message: [String: Any], turnID: String, into turnChars: inout [String: ClaudeTurnSplit]) {
+    private static func accumulateClaudeTurnChars(message: [String: Any], turnID: String, into turnChars: inout UsageParserMap<ClaudeTurnSplit>, seen: inout UsageParserSet) {
         guard let content = message["content"] as? [Any] else { return }
         var split = turnChars[turnID] ?? ClaudeTurnSplit()
         for item in content {
             guard let part = item as? [String: Any] else { continue }
             switch string(part["type"]) {
             case "thinking":
-                if let value = string(part["thinking"]), !value.isEmpty, split.mark("t", value) {
+                if let value = string(part["thinking"]), !value.isEmpty,
+                   seen.insert("\(turnID)\u{0}t\u{0}\(hash(value))").inserted {
                     split.thinkingChars += value.utf8.count
                 }
             case "text":
-                if let value = string(part["text"]), !value.isEmpty, split.mark("x", value) {
+                if let value = string(part["text"]), !value.isEmpty,
+                   seen.insert("\(turnID)\u{0}x\u{0}\(hash(value))").inserted {
                     split.otherChars += value.utf8.count
                 }
             case "tool_use":
                 let name = string(part["name"]) ?? ""
                 let inputJSON = canonicalJSONValue(part["input"]) ?? ""
-                if name.utf8.count + inputJSON.utf8.count > 0, split.mark("u", "\(name)\u{0}\(inputJSON)") {
+                if name.utf8.count + inputJSON.utf8.count > 0,
+                   seen.insert("\(turnID)\u{0}u\u{0}\(hash("\(name)\u{0}\(inputJSON)"))").inserted {
                     split.otherChars += name.utf8.count + inputJSON.utf8.count
                 }
             default:
@@ -1085,7 +1208,7 @@ public enum UsageJSONLParser {
 
     // MARK: - Shared helpers
 
-    private static func appendSessionEvent(_ sink: inout [UsageSessionEvent], source: String, sessionHash: String, sourceFileHash: String, identitySessionScope: String, role: UsageSessionEvent.Role, object: [String: Any], seenIDs: inout Set<String>, diagnostics: inout [String], index: Int, occurrence: Int? = nil) {
+    private static func appendSessionEvent(_ sink: inout [UsageSessionEvent], source: String, sessionHash: String, sourceFileHash: String, identitySessionScope: String, role: UsageSessionEvent.Role, object: [String: Any], seenIDs: inout UsageParserSet, diagnostics: inout [String], index: Int, occurrence: Int? = nil) {
         guard let timestamp = UsageTimestamp.parse(object["timestamp"]) else {
             diagnostics.append("line \(index + 1): invalid timestamp (session event skipped)")
             return
@@ -1268,7 +1391,7 @@ public enum UsageJSONLParser {
     }
     private static func integer(_ value: Any?) -> Int64 { (value as? NSNumber)?.int64Value ?? Int64(value as? String ?? "") ?? 0 }
     private static func component(_ path: String) -> String { let value = URL(fileURLWithPath: path).lastPathComponent; return value.isEmpty ? "unknown" : value }
-    private static func hash(_ value: String) -> String { SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined() }
+    private static func hash(_ value: String) -> String { ContentDigest.sha256(value) }
     /// 原始 session id 的 SHA256 前 `hexLength` 个 hex 字符（默认 16，即前 8 字节）。
     /// content dedup key 传 32（前 16 字节），与参考实现的 `sha256[:16]` 逐字节一致。
     private static func shortHash(_ value: String, hexLength: Int = 16) -> String { String(hash(value).prefix(hexLength)) }

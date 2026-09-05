@@ -2864,17 +2864,12 @@ struct AgentPulseCoreVerification {
         try require(active.completed.value == 1, "archive or automation completion leaked into current completed count")
         try require(!active.activeCountsArePartial, "healthy active sources were marked partial")
 
-        let cachedProcessSnapshot = try await collector.scan(at: base.addingTimeInterval(1))
-        try require(cachedProcessSnapshot.taskBreakdown.codexCLI.totalTasks == 2, "process snapshot was not reused inside the cache window")
-        try require(cachedProcessSnapshot.taskBreakdown.claudeCLI.totalTasks == 4, "Claude process snapshot was not reused inside the cache window")
-        try require(scanner.scanCount == 1, "process scanner ran again inside the cache window")
-
-        let exited = try await collector.scan(at: base.addingTimeInterval(6))
-        try require(exited.terminalActive == 0, "exited terminal process did not disappear after process cache expiry")
-        try require(exited.taskBreakdown.codexCLI.totalTasks == 0, "closed Codex CLI remained in total after process cache expiry")
-        try require(exited.taskBreakdown.claudeCLI.totalTasks == 0, "closed Claude CLI remained in total after process cache expiry")
+        let exited = try await collector.scan(at: base.addingTimeInterval(1))
+        try require(exited.terminalActive == 0, "exited terminal process did not disappear at the next sample")
+        try require(exited.taskBreakdown.codexCLI.totalTasks == 0, "closed Codex CLI remained in total at the next sample")
+        try require(exited.taskBreakdown.claudeCLI.totalTasks == 0, "closed Claude CLI remained in total at the next sample")
         try require(exited.desktopActive == 3, "unchanged recent Desktop tasks did not survive cache reuse")
-        try require(scanner.scanCount == 2, "process scanner did not refresh after cache expiry")
+        try require(scanner.scanCount == 2, "process scanner must refresh on every sample")
 
         let timedOut = try await collector.scan(
             at: base.addingTimeInterval(CodexRuntimeMetricsConfiguration.activeTaskTimeoutSeconds + 1)
@@ -3051,15 +3046,11 @@ struct AgentPulseCoreVerification {
         try require(running.taskBreakdown.claudeDesktop.totalTasks == 2, "Claude Desktop total task count mismatch")
         try require(running.taskBreakdown.claudeDesktop.activeTasks == 1, "Claude Desktop active tail detection mismatch")
 
-        let cachedRunning = try await collector.scan(at: base.addingTimeInterval(1))
-        try require(cachedRunning.taskBreakdown.claudeDesktop.present, "Claude Desktop process snapshot was not reused inside the cache window")
-        try require(scanner.scanCount == 1, "Claude Desktop process scanner ran again inside the cache window")
-
-        let closed = try await collector.scan(at: base.addingTimeInterval(6))
+        let closed = try await collector.scan(at: base.addingTimeInterval(1))
         try require(!closed.taskBreakdown.claudeDesktop.present, "closed Claude Desktop remained present")
         try require(closed.taskBreakdown.claudeDesktop.totalTasks == 0, "closed Claude Desktop retained historical tasks")
         try require(closed.taskBreakdown.claudeDesktop.activeTasks == 0, "closed Claude Desktop retained active tasks")
-        try require(scanner.scanCount == 2, "Claude Desktop process scanner did not refresh after cache expiry")
+        try require(scanner.scanCount == 2, "Claude Desktop process scanner must refresh on every sample")
     }
 
     private static func verifyClaudeTPSIntegration() async throws {
@@ -3463,15 +3454,32 @@ struct AgentPulseCoreVerification {
             claudeSessionsDirectory: root.appendingPathComponent("missing-promoted-claude-sessions"),
             claudeProjectsDirectory: root.appendingPathComponent("missing-promoted-claude")
         )
-        let promotedCollector = try CodexRuntimeMetricsCollector(configuration: promotedConfiguration)
+        final class PromotedFileChanges: RuntimeFileChangeMonitoring, @unchecked Sendable {
+            private let lock = NSLock()
+            private var paths = Set<String>()
+            func record(_ url: URL) { lock.withLock { _ = paths.insert(url.path) } }
+            func takeChanges() -> RuntimeFileChanges {
+                lock.withLock {
+                    let changes = RuntimeFileChanges(paths: paths)
+                    paths.removeAll()
+                    return changes
+                }
+            }
+        }
+        let promotedChanges = PromotedFileChanges()
+        let promotedCollector = try CodexRuntimeMetricsCollector(
+            configuration: promotedConfiguration, fileChangeMonitor: promotedChanges
+        )
         _ = try await promotedCollector.scan(at: base)
         try appendLine(tokenEvent(at: base.addingTimeInterval(11), totalOutput: 200), to: promotedRollout)
+        promotedChanges.record(promotedRollout)
         let promotedBaseline = try await promotedCollector.scan(at: base.addingTimeInterval(11))
         try require(
             promotedBaseline.liveRate.modelTokensInWindow["unknown"] == nil,
             "promoting a completed-only file must rebuild its live baseline"
         )
         try appendLine(tokenEvent(at: base.addingTimeInterval(12), totalOutput: 380), to: promotedRollout)
+        promotedChanges.record(promotedRollout)
         let promotedDelta = try await promotedCollector.scan(at: base.addingTimeInterval(12))
         try requireApproximatelyEqual(
             promotedDelta.liveRate.modelTokensInWindow["codex-test-model"],
@@ -3936,7 +3944,7 @@ struct AgentPulseCoreVerification {
 
         let incremental = CliProxyUsageService { request in
             let body = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
-            try require((body?["from_ms"] as? NSNumber)?.int64Value == 1_235, "analytics must start one millisecond after the persisted watermark")
+            try require((body?["from_ms"] as? NSNumber)?.int64Value == 1_234, "analytics must include the persisted watermark to collect same-millisecond arrivals")
             return (secondPage, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
         }
         let identity = CliProxyUsageService.configuredSourceIdentities(atPath: file.path).first!

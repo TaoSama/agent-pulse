@@ -116,10 +116,11 @@ public struct TokenUsageReporter: Sendable {
         reporting: TokenReportingConfiguration
     ) -> UsageBatchReporting {
         let provider = ConfiguredCommandTokenProvider(configuration: reporting.tokenCommand.providerConfiguration)
+        let identity = TokenAccountIdentity(claimKeys: reporting.tokenAccountClaimKeys)
         let client = UsageIngestClient(
             configuration: configuration,
-            tokenSupplier: CommandTokenSupplier(provider: provider),
-            identity: TokenAccountIdentity(claimKeys: reporting.tokenAccountClaimKeys)
+            tokenSupplier: ReportTokenSupplier(supplier: CommandTokenSupplier(provider: provider), identity: identity),
+            identity: identity
         )
         return UsageBatchOrchestrator(client: client, configuration: reporting.batch.transportConfiguration)
     }

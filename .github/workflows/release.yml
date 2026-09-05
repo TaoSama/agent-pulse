@@ -1,0 +1,40 @@
+name: Release main
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# GitHub may replace pending runs. The controller drains every unreleased main
+# commit, so a replaced run cannot lose a release or a version increment.
+concurrency:
+  group: main-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 180
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify Xcode toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          swift package dump-package >/dev/null
+      - name: Publish all pending main revisions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/publish_release.py

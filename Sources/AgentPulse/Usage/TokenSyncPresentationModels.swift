@@ -109,11 +109,54 @@ struct TokenUsageSummary: Sendable, Equatable {
     static let empty = TokenUsageSummary()
 }
 
+struct UsageSnapshotRevisionGate {
+    private(set) var latestRevision: Int64 = 0
+
+    mutating func accept(_ revision: Int64) -> Bool {
+        guard revision > latestRevision else { return false }
+        latestRevision = revision
+        return true
+    }
+}
+
+struct TokenUsageSummarySnapshot: Sendable {
+    let revision: Int64
+    let summary: TokenUsageSummary
+}
+
 /// 本地凭证配置状态
 enum TokenConfigurationStatus: String, Sendable, Equatable {
     case ready
     case missing
     case invalid
+}
+
+/// Uses committed identity results, since the final migration page can resolve or reject a
+/// source inside the ledger transaction after the network collection has already completed.
+enum CliProxyCollectionPresentation {
+    static func diagnostic(
+        states: [CliProxyCollectionState], failedSourceCount: Int, sourceCount: Int
+    ) -> String? {
+        var messages: [String] = []
+        if failedSourceCount > 0 {
+            messages.append("部分 CPA 来源采集失败（\(failedSourceCount)/\(sourceCount)），下轮重试")
+        }
+        let mixed = states.filter { $0.endpoint == .mixed }.count
+        if mixed > 0 {
+            messages.append("CPA 历史来源身份混用（\(mixed) 个来源），已暂停这些来源入账，需核对配置和历史数据")
+        }
+        let unresolved = states.filter { $0.endpoint == .unresolved }.count
+        if unresolved > 0 {
+            messages.append("CPA 历史身份核对未通过（\(unresolved) 个来源），本轮未入账，将重新核对")
+        }
+        let detecting = states.filter {
+            $0.endpoint == .detectingAnalytics || $0.endpoint == .detectingLegacy
+        }.count
+        if detecting > 0 {
+            messages.append("正在核对 CPA 历史来源身份（\(detecting) 个来源）")
+        }
+        return messages.isEmpty ? nil : messages.joined(separator: "；")
+    }
 }
 
 /// 一轮「扫描 → 上报」链路的阶段。用于把整体进度分解为带权重的顺序阶段，
@@ -281,6 +324,8 @@ struct TokenSyncStatus: Sendable, Equatable {
     var cliProxySourceCount: Int = 0
     /// cliproxyapi 采集错误（脱敏）；nil 表示无错误或未配置。
     var cliProxyError: String? = nil
+    /// Local collection failures do not change reporting configuration or disable retries.
+    var scanError: String? = nil
 
     /// 当前扫描阶段；scanningInProgress == false 时为 nil。仅用于进度展示。
     var scanPhase: TokenScanPhase? = nil
