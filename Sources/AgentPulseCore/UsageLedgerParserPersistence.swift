@@ -4,30 +4,36 @@ import SQLite3
 /// Parser state stores statistics and hashed identities only. Completed identities
 /// remain addressable for out-of-order records; each identity has a single value.
 /// Replacement staging holds one generation per file and is discarded on abort,
-/// successful publication, or reopening the store after an interrupted process.
+/// successful publication, or closing the connection. Disk-backed TEMP storage
+/// avoids writing these non-recoverable intermediate values through the main WAL.
 extension UsageLedgerStore {
     private static let parserPublishBatchSize = 128
 
     func initializeParserPersistenceUnlocked() throws {
-        try exec("""
+        try transaction {
+            try exec("""
             CREATE TABLE IF NOT EXISTS usage_parser_state(
               file_id TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL,
               PRIMARY KEY(file_id,key)
             ) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS usage_parser_replacements(
+            DROP TABLE IF EXISTS main.usage_parser_stage;
+            DROP TABLE IF EXISTS main.usage_parser_replacements;
+            CREATE TEMP TABLE IF NOT EXISTS usage_parser_replacements(
               file_id TEXT PRIMARY KEY, hostname TEXT NOT NULL
             ) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS usage_parser_stage(
+            CREATE TEMP TABLE IF NOT EXISTS usage_parser_stage(
               file_id TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL,
               value BLOB NOT NULL, PRIMARY KEY(file_id,kind,key)
             ) WITHOUT ROWID;
-            DELETE FROM usage_parser_stage;
-            DELETE FROM usage_parser_replacements;
             """)
+        }
+        // Only obsolete scratch tables are dropped. Their pages can be reused;
+        // this does not promise a smaller database file or run VACUUM. Durable
+        // raw rows, parser state and checkpoints retain their publication transaction.
     }
 
     func resetParserPersistenceUnlocked() throws {
-        try exec("DELETE FROM usage_parser_state; DELETE FROM usage_parser_stage; DELETE FROM usage_parser_replacements;")
+        try exec("DELETE FROM usage_parser_state; DELETE FROM temp.usage_parser_stage; DELETE FROM temp.usage_parser_replacements;")
     }
 
     func migrateParserFileIdentityUnlocked(from oldID: String, to newID: String) throws {
@@ -47,7 +53,7 @@ extension UsageLedgerStore {
         try queue.sync {
             let staging = try hasParserReplacementUnlocked(fileID: fileID)
             let sql = staging
-                ? "SELECT value FROM usage_parser_stage WHERE file_id=? AND kind='state' AND key=?;"
+                ? "SELECT value FROM temp.usage_parser_stage WHERE file_id=? AND kind='state' AND key=?;"
                 : "SELECT value FROM usage_parser_state WHERE file_id=? AND key=?;"
             let statement = try prepare(sql)
             defer { sqlite3_finalize(statement) }
@@ -74,7 +80,7 @@ extension UsageLedgerStore {
                 let fileID = checkpoint.fileID
                 if batch.replacesFile {
                     try abortParserReplacementUnlocked(fileID: fileID)
-                    let statement = try prepare("INSERT INTO usage_parser_replacements(file_id,hostname) VALUES(?,?);")
+                    let statement = try prepare("INSERT INTO temp.usage_parser_replacements(file_id,hostname) VALUES(?,?);")
                     defer { sqlite3_finalize(statement) }
                     try bind(statement, 1, fileID); try bind(statement, 2, hostname); try done(statement)
                 }
@@ -87,7 +93,7 @@ extension UsageLedgerStore {
                         try deleteParserStateUnlocked(fileID: fileID)
                         let copy = try prepare("""
                             INSERT INTO usage_parser_state(file_id,key,value)
-                            SELECT file_id,key,value FROM usage_parser_stage WHERE file_id=? AND kind='state';
+                            SELECT file_id,key,value FROM temp.usage_parser_stage WHERE file_id=? AND kind='state';
                             """)
                         defer { sqlite3_finalize(copy) }
                         try bind(copy, 1, fileID); try done(copy)
@@ -128,14 +134,14 @@ extension UsageLedgerStore {
     }
 
     private func hasParserReplacementUnlocked(fileID: String) throws -> Bool {
-        let statement = try prepare("SELECT 1 FROM usage_parser_replacements WHERE file_id=?;")
+        let statement = try prepare("SELECT 1 FROM temp.usage_parser_replacements WHERE file_id=?;")
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, fileID)
         return try step(statement) == SQLITE_ROW
     }
 
     private func abortParserReplacementUnlocked(fileID: String) throws {
-        for table in ["usage_parser_stage", "usage_parser_replacements"] {
+        for table in ["temp.usage_parser_stage", "temp.usage_parser_replacements"] {
             let statement = try prepare("DELETE FROM \(table) WHERE file_id=?;")
             defer { sqlite3_finalize(statement) }
             try bind(statement, 1, fileID); try done(statement)
@@ -150,7 +156,7 @@ extension UsageLedgerStore {
 
     private func stageParserBatchUnlocked(_ batch: UsageIncrementalBatch, hostname: String) throws {
         let fileID = batch.parsed.checkpoint.fileID
-        let owner = try prepare("SELECT hostname FROM usage_parser_replacements WHERE file_id=?;")
+        let owner = try prepare("SELECT hostname FROM temp.usage_parser_replacements WHERE file_id=?;")
         defer { sqlite3_finalize(owner) }
         try bind(owner, 1, fileID)
         guard try step(owner) == SQLITE_ROW, text(owner, 0) == hostname else {
@@ -176,9 +182,9 @@ extension UsageLedgerStore {
     private func backfillParserUnknownModelUnlocked(fileID: String, model: String, staging: Bool) throws {
         if staging {
             let statement = try prepare("""
-                UPDATE usage_parser_stage SET value=json_set(CAST(value AS TEXT),'$.model',?)
+                UPDATE temp.usage_parser_stage SET value=json_set(CAST(value AS TEXT),'$.model',?)
                 WHERE file_id=? AND kind='event' AND key IN (
-                  SELECT json_extract(CAST(value AS TEXT),'$') FROM usage_parser_stage
+                  SELECT json_extract(CAST(value AS TEXT),'$') FROM temp.usage_parser_stage
                   WHERE file_id=? AND kind='state' AND key>='codex-unknown:' AND key<'codex-unknown;'
                 );
                 """)
@@ -206,7 +212,7 @@ extension UsageLedgerStore {
     }
 
     private func stageParserValuesUnlocked<Value: Encodable>(_ values: [(String, Value)], kind: String, fileID: String) throws {
-        let statement = try prepare("INSERT OR REPLACE INTO usage_parser_stage(file_id,kind,key,value) VALUES(?,?,?,?);")
+        let statement = try prepare("INSERT OR REPLACE INTO temp.usage_parser_stage(file_id,kind,key,value) VALUES(?,?,?,?);")
         defer { sqlite3_finalize(statement) }
         let encoder = JSONEncoder()
         for (key, value) in values {
@@ -217,7 +223,7 @@ extension UsageLedgerStore {
     }
 
     private func deleteParserStageKeysUnlocked(_ keys: [String], kind: String, fileID: String) throws {
-        let statement = try prepare("DELETE FROM usage_parser_stage WHERE file_id=? AND kind=? AND key=?;")
+        let statement = try prepare("DELETE FROM temp.usage_parser_stage WHERE file_id=? AND kind=? AND key=?;")
         defer { sqlite3_finalize(statement) }
         for key in keys {
             sqlite3_reset(statement); sqlite3_clear_bindings(statement)
@@ -226,7 +232,7 @@ extension UsageLedgerStore {
     }
 
     private func writeParserStateUnlocked(_ changes: UsageParserStateChanges, fileID: String, staging: Bool) throws {
-        let table = staging ? "usage_parser_stage" : "usage_parser_state"
+        let table = staging ? "temp.usage_parser_stage" : "usage_parser_state"
         let remove = try prepare("DELETE FROM \(table) WHERE file_id=? AND key=?" + (staging ? " AND kind='state';" : ";"))
         defer { sqlite3_finalize(remove) }
         for key in changes.removedKeys {
@@ -234,7 +240,7 @@ extension UsageLedgerStore {
             try bind(remove, 1, fileID); try bind(remove, 2, key); try done(remove)
         }
         let sql = staging
-            ? "INSERT OR REPLACE INTO usage_parser_stage(file_id,key,value,kind) VALUES(?,?,?,'state');"
+            ? "INSERT OR REPLACE INTO temp.usage_parser_stage(file_id,key,value,kind) VALUES(?,?,?,'state');"
             : "INSERT OR REPLACE INTO usage_parser_state(file_id,key,value) VALUES(?,?,?);"
         let insert = try prepare(sql)
         defer { sqlite3_finalize(insert) }
@@ -258,7 +264,7 @@ extension UsageLedgerStore {
     }
 
     private func streamParserStageUnlocked<Value: Decodable>(_ type: Value.Type, kind: String, fileID: String, consume: ([Value]) throws -> Void) throws {
-        let statement = try prepare("SELECT value FROM usage_parser_stage WHERE file_id=? AND kind=? ORDER BY key;")
+        let statement = try prepare("SELECT value FROM temp.usage_parser_stage WHERE file_id=? AND kind=? ORDER BY key;")
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, fileID); try bind(statement, 2, kind)
         let decoder = JSONDecoder()
