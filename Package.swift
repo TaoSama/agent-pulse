@@ -64,6 +64,7 @@ let package = Package(
                 "CodexStatusCollectorTests.swift",
                 "Fixtures",
                 "ModelsAndTPSWindowTests.swift",
+                "ParserStagingStorageTests.swift",
                 "SQLiteSnapshotStoreTests.swift",
                 "StorageLifecycleTests.swift",
                 "UsageRecordTimestampTests.swift",

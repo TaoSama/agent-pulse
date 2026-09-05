@@ -19,10 +19,6 @@ func modelPaletteColor(for model: String, among models: [String]) -> Color {
     return modelTPSPalette[index % modelTPSPalette.count]
 }
 
-private func modelTPSColor(for model: String, in series: [ModelTPSHistory]) -> Color {
-    modelPaletteColor(for: model, among: series.map(\.model))
-}
-
 extension SparklineTrend {
     func color(for mode: TrendColorMode) -> Color {
         switch self {
@@ -95,11 +91,12 @@ private struct SparklineView: View {
     let trend: SparklineTrend
     let colorMode: TrendColorMode
     var lineWidth: CGFloat = 2
+    var fallbackTPS: Double? = nil
 
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
     var body: some View {
-        let shape = SparklineShape(values: points.map(\.normalized))
+        let shape = SparklineShape(values: CompactTPSGeometry.normalizedValues(points: points, fallbackTPS: fallbackTPS))
         let highContrast = colorSchemeContrast == .increased
         let color = trend.color(for: colorMode)
 
@@ -308,16 +305,18 @@ struct MenuBarSummaryView: View {
                         points: model.sparklinePoints,
                         trend: model.sparklineRegression.trend,
                         colorMode: model.trendColorMode,
-                        lineWidth: 1.8
+                        lineWidth: 1.8,
+                        fallbackTPS: model.tps
                     )
                     .frame(width: 126, height: 42)
                 }
-                if !model.modelTPSHistory.isEmpty {
+                if !model.currentModelTPS.isEmpty {
+                    let currentModels = model.currentModelTPS
                     Divider().overlay(Color.white.opacity(0.22))
                     HStack(alignment: .top, spacing: 12) {
-                        CompactModelTPSLegend(series: model.modelTPSHistory)
+                        CompactModelTPSLegend(series: currentModels)
                             .frame(maxWidth: .infinity, alignment: .topLeading)
-                        ModelTPSSparkline(series: model.modelTPSHistory)
+                        ModelTPSSparkline(series: model.modelTPSHistory, paletteModels: currentModels.map(\.model))
                             .frame(width: 126)
                             .frame(minHeight: 54, maxHeight: .infinity)
                     }
@@ -531,7 +530,6 @@ struct OrbView: View {
     var body: some View {
         let snap = viewModel.snapshot
         let trend = snap.trend
-        let points = Self.visibleSparklinePoints(from: snap)
         ZStack {
             Circle().fill(snap.isExpanded ? Self.selectedShell : Color.black)
             Circle()
@@ -539,10 +537,11 @@ struct OrbView: View {
                 .padding(Self.shellThickness)
             VStack(spacing: 1) {
                 SparklineView(
-                    points: points,
+                    points: snap.sparklinePoints,
                     trend: trend,
                     colorMode: snap.trendColorMode,
-                    lineWidth: 1.35
+                    lineWidth: 1.35,
+                    fallbackTPS: snap.tps
                 )
                     .frame(width: 30, height: 12)
                 Text(formatTPS(snap.tps))
@@ -565,17 +564,6 @@ struct OrbView: View {
         )
     }
 
-    private static func visibleSparklinePoints(from snapshot: OrbSnapshot) -> [SparklinePoint] {
-        if snapshot.sparklinePoints.contains(where: { $0.normalized?.isFinite == true }) {
-            return snapshot.sparklinePoints
-        }
-        guard let tps = snapshot.tps, tps.isFinite, tps >= 0 else { return snapshot.sparklinePoints }
-        let start = Date(timeIntervalSince1970: 0)
-        return [
-            SparklinePoint(time: start, value: tps, normalized: 0.5),
-            SparklinePoint(time: start.addingTimeInterval(1), value: tps, normalized: 0.5),
-        ]
-    }
 }
 
 struct OrbTaskListItem: Identifiable {
@@ -629,6 +617,8 @@ private struct OrbTPSCard: View {
     private var trendColor: Color { model.sparklineRegression.trend.color(for: model.trendColorMode) }
 
     var body: some View {
+        let currentModels = model.currentModelTPS
+        let paletteModels = currentModels.map(\.model)
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 12) {
                 Text(formatTPS(model.tps))
@@ -639,18 +629,20 @@ private struct OrbTPSCard: View {
                 OrbCombinedSparkline(
                     total: model.sparklinePoints,
                     models: model.modelTPSHistory,
-                    totalColor: trendColor
+                    paletteModels: paletteModels,
+                    totalColor: trendColor,
+                    fallbackTPS: model.tps
                 )
                 .frame(width: 120, height: 40)
             }
 
             // 全部模型图例集中一处：色条 + 模型名 + 当前 TPS。总曲线仍画在图上，但不占图例行。
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(model.modelTPSHistory) { item in
+                ForEach(currentModels) { item in
                     OrbTPSLegendRow(
-                        color: modelTPSColor(for: item.model, in: model.modelTPSHistory),
+                        color: modelPaletteColor(for: item.model, among: paletteModels),
                         name: item.model,
-                        value: item.latestTPS,
+                        value: item.tps,
                         bold: false
                     )
                 }
@@ -668,25 +660,26 @@ private struct OrbTPSCard: View {
 private struct OrbCombinedSparkline: View {
     let total: [SparklinePoint]
     let models: [ModelTPSHistory]
+    let paletteModels: [String]
     let totalColor: Color
+    let fallbackTPS: Double?
 
     var body: some View {
         Canvas { context, size in
-            // 共享纵轴上界：总曲线与所有模型曲线的真实最大值（总曲线通常最大）。
-            let totalValues = total.compactMap(\.value)
-            let modelValues = models.flatMap { $0.points.compactMap(\.value) }
-            let upper = max((totalValues + modelValues).max() ?? 1, 1)
-
             // 先画各模型细线，总曲线最后画在最上层。
             for item in models {
                 context.stroke(
-                    Self.path(for: item.points, size: size, upper: upper),
-                    with: .color(modelTPSColor(for: item.model, in: models)),
+                    SparklineShape(values: CompactTPSGeometry.normalizedValues(
+                        points: item.points, referencePoints: total
+                    )).path(in: CGRect(origin: .zero, size: size)),
+                    with: .color(modelPaletteColor(for: item.model, among: paletteModels)),
                     style: StrokeStyle(lineWidth: 1.2, lineCap: .round, lineJoin: .round)
                 )
             }
             context.stroke(
-                Self.path(for: total, size: size, upper: upper),
+                SparklineShape(values: CompactTPSGeometry.normalizedValues(
+                    points: total, fallbackTPS: fallbackTPS
+                )).path(in: CGRect(origin: .zero, size: size)),
                 with: .color(totalColor),
                 style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round)
             )
@@ -694,29 +687,13 @@ private struct OrbCombinedSparkline: View {
         .accessibilityHidden(true)
     }
 
-    /// 把点集映射为屏幕路径；遇缺口（nil）断开，不跨缺口连线造假。
-    private static func path(for points: [SparklinePoint], size: CGSize, upper: Double) -> Path {
-        var path = Path()
-        let denominator = Double(max(1, points.count - 1))
-        var hasPrevious = false
-        for (index, point) in points.enumerated() {
-            guard let value = point.value, value.isFinite else { hasPrevious = false; continue }
-            let location = CGPoint(
-                x: size.width * Double(index) / denominator,
-                y: size.height * (1 - min(max(value / upper, 0), 1))
-            )
-            if hasPrevious { path.addLine(to: location) } else { path.move(to: location) }
-            hasPrevious = true
-        }
-        return path
-    }
 }
 
 /// 气泡 TPS 图例单行：色条 + 名称 + 一位小数 TPS。
 private struct OrbTPSLegendRow: View {
     let color: Color
     let name: String
-    let value: Double
+    let value: Double?
     let bold: Bool
 
     var body: some View {
@@ -726,7 +703,7 @@ private struct OrbTPSLegendRow: View {
                 .font(.system(size: 11, weight: bold ? .semibold : .medium))
                 .lineLimit(1)
             Spacer(minLength: 4)
-            Text(String(format: "%.1f", value))
+            Text(formatTPS(value))
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
         }
         .foregroundStyle(Color.white)
@@ -762,6 +739,7 @@ struct TPSDashboardView: View {
     @State private var span: DashboardTPSSpan = .fifteenMinutes
 
     var body: some View {
+        let currentModels = legendSeries
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading) {
@@ -776,7 +754,7 @@ struct TPSDashboardView: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(model.sparklineRegression.trend.color(for: model.trendColorMode))
                 }
-                .help("最新一桶的瞬时 TPS，与曲线最右点一致")
+                .help("当前 output TPS · 180 秒滑窗均值，与悬浮球及菜单栏一致；下方曲线按所选历史跨度分桶")
             }
             Picker("时间跨度", selection: $span) {
                 ForEach(DashboardTPSSpan.allCases) { option in
@@ -788,14 +766,15 @@ struct TPSDashboardView: View {
             .frame(maxWidth: 320, alignment: .leading)
             HStack(alignment: .top, spacing: 18) {
                 ModelTPSLegend(
-                    series: legendSeries,
+                    series: currentModels,
                     totalColor: model.sparklineRegression.trend.color(for: model.trendColorMode),
-                    totalTPS: latestTotalTPS
+                    totalTPS: model.currentTPS.totalTPS
                 )
                     .frame(width: 190, alignment: .topLeading)
                 TPSAxisChartView(
                     points: displayPoints,
                     modelSeries: displayModelSeries,
+                    paletteModels: currentModels.map(\.model),
                     span: span,
                     trend: model.sparklineRegression.trend,
                     colorMode: model.trendColorMode
@@ -822,10 +801,8 @@ struct TPSDashboardView: View {
         span == .oneDay ? model.dashboardDaySeries.total : model.dashboardSparklinePoints
     }
 
-    /// 看板统一「当前值」口径：当前跨度总曲线最右一个有效桶的瞬时 TPS。
-    /// 与曲线最右点严格一致（前三档=最后一个 5s 桶，1 天=最后一个 30min 桶）。
-    /// 短窗天然会抖、模型停顿时归零，这是所选「真正瞬时」口径的预期表现。
-    private var latestTotalTPS: Double {
+    /// 所选历史跨度的最后有效桶，仅用于历史摘要，不冒充当前 180 秒读数。
+    private var latestHistoricalTPS: Double {
         Self.latestValue(of: displayPoints) ?? 0
     }
 
@@ -835,7 +812,7 @@ struct TPSDashboardView: View {
     }
 
     /// 分模型曲线：前三档来自每秒不重叠桶，1 天来自账本 day series。
-    /// latestTPS 统一取各自曲线最右有效桶的瞬时值，与图例数字口径一致。
+    /// 历史末桶只用于筛选/排序历史曲线，当前图例读数另取 currentTPS。
     /// 过滤：窗口内全程无输出（latestTPS==0 且无任何非零桶）的模型不进图例 / 曲线；
     /// 占位名（`<synthetic>` 归一后的 unknown 展示名）也剔除，避免图例出现无意义的 0.0 行。
     private var displayModelSeries: [ModelTPSHistory] {
@@ -863,17 +840,17 @@ struct TPSDashboardView: View {
     /// 未知 / 占位模型的展示名（账本合成占位归一后的名字），不进看板图例。
     private static let placeholderModelName = "n"
 
-    /// 图例分模型行：与曲线同源、latestTPS 取各自曲线最右有效桶的瞬时值。
-    private var legendSeries: [ModelTPSHistory] {
-        displayModelSeries
+    /// 当前值包含当前采样中的全部模型，不随历史跨度筛选而漏掉当前产出。
+    private var legendSeries: [CurrentTPSModelValue] {
+        model.currentTPS.models(including: displayModelSeries.map(\.model))
     }
 
     private var summary: String {
-        // 峰值/平均基于当前跨度曲线（与图形一致）；当前值取曲线最右点（与右上角总数一致）。
+        // 历史桶口径保留原样，明确与右上角当前 180 秒读数的区别。
         let values = displayPoints.compactMap(\.value)
         guard !values.isEmpty else { return "暂无 TPS 数据" }
         let average = values.reduce(0, +) / Double(values.count)
-        return String(format: "当前 %.1f · 峰值 %.1f · 平均 %.1f TPS", latestTotalTPS, values.max() ?? 0, average)
+        return String(format: "历史最后有效桶 %.1f · 峰值 %.1f · 平均 %.1f TPS", latestHistoricalTPS, values.max() ?? 0, average)
     }
 
     private var trendRateText: String {
@@ -890,13 +867,8 @@ struct TPSDashboardView: View {
     private var tpsStatusText: String {
         switch model.tpsState {
         case .live:
-            // 右上角大数字 = 当前跨度曲线最右有效桶的瞬时 TPS（与曲线最右点一致）。
-            // 曲线全缺口时回落到 180s 口径，避免 live 状态下显示 0/—。
-            if let latest = Self.latestValue(of: displayPoints) {
-                return String(format: "%.1f TPS", latest)
-            }
-            return model.tps.map { String(format: "%.1f TPS", $0) } ?? "—"
-        case .zero: return "0.0 TPS · zero"
+            return model.tps.map { String(format: "%.1f TPS · 180 秒", $0) } ?? "—"
+        case .zero: return "0.0 TPS · 180 秒"
         case .noData: return "no data"
         case .stale: return "stale"
         case .unavailable: return "unavailable"
@@ -905,7 +877,7 @@ struct TPSDashboardView: View {
 }
 
 private struct ModelTPSLegend: View {
-    let series: [ModelTPSHistory]
+    let series: [CurrentTPSModelValue]
     /// 总曲线（图中最粗的那条）的颜色与当前值，作为图例首行，避免主曲线在图例里缺席。
     var totalColor: Color? = nil
     var totalTPS: Double? = nil
@@ -921,20 +893,20 @@ private struct ModelTPSLegend: View {
                         .font(.caption.weight(.semibold))
                         .lineLimit(1)
                     Spacer(minLength: 4)
-                    Text(String(format: "%.1f", totalTPS ?? 0))
+                    Text(formatTPS(totalTPS))
                         .font(.caption.monospacedDigit().weight(.semibold))
                 }
             }
             ForEach(series) { item in
                 HStack(spacing: 8) {
                     Capsule()
-                        .fill(modelTPSColor(for: item.model, in: series))
+                        .fill(modelPaletteColor(for: item.model, among: series.map(\.model)))
                         .frame(width: 26, height: 3)
                     Text(item.model)
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
                     Spacer(minLength: 4)
-                    Text(String(format: "%.1f", item.latestTPS))
+                    Text(formatTPS(item.tps))
                         .font(.caption.monospacedDigit().weight(.semibold))
                 }
             }
@@ -945,25 +917,26 @@ private struct ModelTPSLegend: View {
             }
         }
         .padding(.top, 28)
+        .help("当前 output TPS · 180 秒滑窗均值")
     }
 }
 
 private struct CompactModelTPSLegend: View {
-    let series: [ModelTPSHistory]
+    let series: [CurrentTPSModelValue]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             ForEach(series) { item in
                 HStack(spacing: 6) {
                     Capsule()
-                        .fill(modelTPSColor(for: item.model, in: series))
+                        .fill(modelPaletteColor(for: item.model, among: series.map(\.model)))
                         .frame(width: 18, height: 3)
                     Text(item.model)
                         .font(.system(size: 10, weight: .medium))
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
                     Spacer(minLength: 3)
-                    Text(String(format: "%.1f", item.latestTPS))
+                    Text(formatTPS(item.tps))
                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                         .frame(minWidth: 34, alignment: .trailing)
                 }
@@ -974,6 +947,7 @@ private struct CompactModelTPSLegend: View {
 
 private struct ModelTPSSparkline: View {
     let series: [ModelTPSHistory]
+    let paletteModels: [String]
 
     var body: some View {
         Canvas { context, size in
@@ -997,7 +971,7 @@ private struct ModelTPSSparkline: View {
                 }
                 context.stroke(
                     path,
-                    with: .color(modelTPSColor(for: item.model, in: series)),
+                    with: .color(modelPaletteColor(for: item.model, among: paletteModels)),
                     style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round)
                 )
             }
@@ -1009,6 +983,7 @@ private struct ModelTPSSparkline: View {
 private struct TPSAxisChartView: View {
     let points: [SparklinePoint]
     let modelSeries: [ModelTPSHistory]
+    let paletteModels: [String]
     let span: DashboardTPSSpan
     let trend: SparklineTrend
     let colorMode: TrendColorMode
@@ -1068,7 +1043,7 @@ private struct TPSAxisChartView: View {
                         )
                         context.stroke(
                             modelCurve,
-                            with: .color(modelTPSColor(for: series.model, in: modelSeries)),
+                            with: .color(modelPaletteColor(for: series.model, among: paletteModels)),
                             style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round)
                         )
                     }

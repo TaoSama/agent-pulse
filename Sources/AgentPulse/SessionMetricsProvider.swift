@@ -29,6 +29,7 @@ public struct TPSPoint: Sendable, Equatable, Identifiable {
 public struct ModelTPSHistory: Sendable, Equatable, Identifiable {
     public var id: String { model }
     public let model: String
+    /// 历史派生的辅助值；当前读数统一取 CurrentTPSPresentation。
     public let latestTPS: Double
     public let points: [SparklinePoint]
 
@@ -93,6 +94,7 @@ public final class MetricsStore: ObservableObject {
     @Published public private(set) var terminalActive: MetricValue<Int> = .unavailable(reason: "正在读取会话")
     @Published public private(set) var tps: MetricValue<Double> = .unavailable(reason: "正在读取会话")
     @Published public private(set) var tpsState: LiveRateState = .noData
+    @Published private(set) var currentTPS: CurrentTPSPresentation = .empty
     @Published public private(set) var tpsHistory: [TPSPoint] = []
     /// 点与趋势同源，合成一个值一次发布：分开发布会让订阅方看到新点配旧趋势的中间态。
     @Published public private(set) var sparkline: Sparkline = .empty
@@ -193,8 +195,7 @@ public final class MetricsStore: ObservableObject {
             publish(result.completed.scope, to: \.completedScope)
             publish(result.completed.isLowerBound, to: \.completedIsLowerBound)
             // 数字无需等待任何曲线计算；有效变化在当前调用栈同步交给 UI。
-            publish(result.liveRate.state, to: \.tpsState)
-            publish(metric(from: result.liveRate), to: \.tps)
+            applyLiveRate(result.liveRate)
             tpsHistory = result.history.compactMap { sample in
                 guard let value = sample.tps else { return nil }
                 return TPSPoint(timestamp: sample.timestamp, tokensPerSecond: value, state: sample.state)
@@ -237,6 +238,13 @@ public final class MetricsStore: ObservableObject {
         return partial ? .partial(value) : .value(value)
     }
 
+    /// 当前总量与模型值原子发布，不能等到后台历史曲线完成后再更新模型数字。
+    func applyLiveRate(_ sample: LiveRateSample) {
+        publish(CurrentTPSPresentation(sample: sample), to: \.currentTPS)
+        publish(sample.state, to: \.tpsState)
+        publish(metric(from: sample), to: \.tps)
+    }
+
     /// 值未变时跳过赋值。@Published 的 setter 无条件触发 objectWillChange，
     /// 而每秒采集里绝大多数字段实际未变；重复发布会让订阅方反复重建 SwiftUI 订阅。
     private func publish<Value: Equatable>(
@@ -263,6 +271,9 @@ public final class MetricsStore: ObservableObject {
     }
 
     private func applyUnavailable(reason: String) {
+        applyLiveRate(LiveRateSample(
+            timestamp: Date(), state: .unavailable, tokensInWindow: nil, latestSignalAt: nil
+        ))
         publish(.unavailable(reason: reason), to: \.totalTasks)
         publish(.unavailable(reason: reason), to: \.activeTasks)
         publish(.unavailable, to: \.taskBreakdown)
@@ -295,8 +306,7 @@ public final class MetricsStore: ObservableObject {
         }
         completedScope = snapshot.completed.scope
         completedIsLowerBound = snapshot.completed.isLowerBound
-        publish(snapshot.liveRate.state, to: \.tpsState)
-        publish(metric(from: snapshot.liveRate), to: \.tps)
+        applyLiveRate(snapshot.liveRate)
         let sparkline = await Self.derivePrimarySeries(history: restored.history, end: snapshot.timestamp)
         guard !Task.isCancelled else { return }
         publish(sparkline, to: \.sparkline)
@@ -363,7 +373,7 @@ public final class MetricsStore: ObservableObject {
             $0.state == .live || $0.state == .zero
         })?.modelTokensInWindow ?? [:]
         return models.compactMap { model in
-            // 图例数字（latestTPS）始终用 180s 口径，稳定且与右上角总数可加。
+            // 保留历史序列的排序依据；此值不再用作当前图例读数。
             let latestTokens = currentModels[model] ?? 0
             let latestTPS = latestTokens / Double(LiveRateSample.windowSeconds)
             guard latestTPS > 0 || history.contains(where: { ($0.modelTokensInWindow[model] ?? 0) > 0 }) else {
@@ -401,7 +411,7 @@ public final class MetricsStore: ObservableObject {
         dashboardModelTPSHistory = makeDashboardModelTPSHistory(from: samples, end: end, span: dashboardSpan)
     }
 
-    /// 看板分模型不重叠桶曲线：与总曲线同栅格；latestTPS 仍 180s 口径（图例数字不变）。
+    /// 看板分模型不重叠桶曲线：与总曲线同栅格，当前图例由原子采样快照提供。
     private nonisolated func makeDashboardModelTPSHistory(
         from history: [LiveRateSample],
         end: Date,

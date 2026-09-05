@@ -31,12 +31,7 @@ struct OrbSnapshot: Equatable {
 
     /// 悬浮球没有时间轴，只比较真正参与绘制的值。
     var renderedSparklineValues: [Double?] {
-        let values = sparklinePoints.map { point in
-            point.normalized.flatMap { $0.isFinite ? $0 : nil }
-        }
-        if values.contains(where: { $0 != nil }) { return values }
-        if let tps, tps.isFinite, tps >= 0 { return [0.5, 0.5] }
-        return []
+        CompactTPSGeometry.normalizedValues(points: sparklinePoints, fallbackTPS: tps)
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
@@ -117,8 +112,12 @@ final class ApplicationModel: ObservableObject {
     @Published private(set) var completedScope: PulseScope = .allLocal
     @Published private(set) var completedIsLowerBound = false
     @Published private(set) var terminalActive: Int?
-    @Published private(set) var tps: Double?
-    @Published private(set) var tpsState: LiveRateState = .noData
+    @Published private(set) var currentTPS: CurrentTPSPresentation = .empty
+    var tps: Double? { currentTPS.totalTPS }
+    var tpsState: LiveRateState { currentTPS.state }
+    var currentModelTPS: [CurrentTPSModelValue] {
+        currentTPS.models(including: modelTPSHistory.map(\.model))
+    }
     @Published private(set) var tpsHistory: [TPSPoint] = []
     /// 点与趋势同源，作为一个值镜像，避免视图看到新点配旧趋势的中间态。
     @Published private(set) var sparkline: Sparkline = .empty
@@ -215,11 +214,8 @@ final class ApplicationModel: ObservableObject {
         metricsStore.$terminalActive.sink { [weak self] value in
             self?.publish(value.displayValue, to: \.terminalActive)
         }.store(in: &cancellables)
-        metricsStore.$tps.sink { [weak self] value in
-            self?.publish(value.displayValue, to: \.tps)
-        }.store(in: &cancellables)
-        metricsStore.$tpsState.sink { [weak self] in
-            self?.publish($0, to: \.tpsState)
+        metricsStore.$currentTPS.sink { [weak self] in
+            self?.publish($0, to: \.currentTPS)
         }.store(in: &cancellables)
         metricsStore.$tpsHistory.sink { [weak self] in
             self?.publish($0, to: \.tpsHistory)
@@ -265,13 +261,14 @@ final class ApplicationModel: ObservableObject {
     /// 数字与后台曲线各自就绪即提交；每次提交都从新载荷构造完整渲染状态。
     private func subscribeOrbSnapshotInputs() {
         orbViewModel.bind(
-            tps: metricsStore.$tps.map(\.displayValue).eraseToAnyPublisher(),
+            tps: $currentTPS.map(\.totalTPS).eraseToAnyPublisher(),
             sparkline: metricsStore.$sparkline.eraseToAnyPublisher(),
             dayTotalTokens: $tokenSummary.map { $0.day?.totalTokens }.eraseToAnyPublisher(),
             colorMode: $trendColorMode.eraseToAnyPublisher()
         ).store(in: &cancellables)
-        Publishers.CombineLatest4($totalTasks, $activeTasks, $tps, $sparkline)
-            .sink { [weak self] total, active, tps, sparkline in
+        Publishers.CombineLatest4($totalTasks, $activeTasks, $currentTPS, $sparkline)
+            .sink { [weak self] total, active, current, sparkline in
+                let tps = current.totalTPS
                 let summary = "Tasks \(total.map(String.init) ?? "—") · Active \(active.map(String.init) ?? "—") · TPS \(tps.map { String(format: "%.1f", $0) } ?? "—")"
                 self?.menuBarLabelViewModel.update(
                     "Agent Pulse，\(summary)，\(sparkline.regression.trend.accessibilityText)"
