@@ -16,6 +16,7 @@ private actor FakeCPA {
     let targetHash: String
     var events: [RemoteEvent]
     var analyticsSupported = true
+    var omitAnalyticsIdentity = false
     var failAtRequest: Int?
     var requestCount = 0
     var legacyRequests = 0
@@ -26,6 +27,7 @@ private actor FakeCPA {
     }
     func append(_ event: RemoteEvent) { events.append(event) }
     func setSupported(_ supported: Bool) { analyticsSupported = supported }
+    func setOmitAnalyticsIdentity(_ omit: Bool) { omitAnalyticsIdentity = omit }
     func failRequest(_ request: Int?) { failAtRequest = request }
     func legacyCount() -> Int { legacyRequests }
     func transport(_ request: URLRequest) throws -> (Data, URLResponse) {
@@ -55,8 +57,10 @@ private actor FakeCPA {
     }
     func analyticsData(_ page: [RemoteEvent], hasMore: Bool = false) throws -> Data {
         let items: [[String: Any]] = page.map {
-            ["id": $0.id, "event_hash": "event-\($0.id)", "timestamp_ms": $0.timestamp,
+            var item: [String: Any] = ["timestamp_ms": $0.timestamp,
              "api_key_hash": targetHash, "resolved_model": "test-model", "output_tokens": 1, "total_tokens": 1]
+            if !omitAnalyticsIdentity { item["id"] = $0.id; item["event_hash"] = "event-\($0.id)" }
+            return item
         }
         return try JSONSerialization.data(withJSONObject: ["events": [
             "items": items, "has_more": hasMore, "next_before_ms": page.last?.timestamp ?? 0,
@@ -146,16 +150,41 @@ private actor FakeIngest: HTTPRequestSending {
     func count() -> Int { requests }
 }
 
-private final class OversizedProtocol: URLProtocol, @unchecked Sendable {
+private final class ResponseProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var started: Set<URL> = []
+    private var stopped: Set<URL> = []
+    func record(_ url: URL, stopped: Bool = false) {
+        lock.lock(); defer { lock.unlock() }
+        if stopped { self.stopped.insert(url) } else { started.insert(url) }
+    }
+    func contains(_ url: URL, stopped: Bool = false) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return stopped ? self.stopped.contains(url) : started.contains(url)
+    }
+}
+
+private final class BoundedResponseProtocol: URLProtocol, @unchecked Sendable {
+    static let probe = ResponseProbe()
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
+        let size = Int(request.value(forHTTPHeaderField: "X-Fixture-Size") ?? "0")!
+        let mode = request.value(forHTTPHeaderField: "X-Fixture-Mode") ?? "chunked"
+        let headers = mode == "declared" ? ["Content-Length": String(size)] : ["Transfer-Encoding": "chunked"]
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: 200,
-            httpVersion: nil, headerFields: ["Transfer-Encoding": "chunked"])!, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(repeating: 65, count: 128))
-        client?.urlProtocolDidFinishLoading(self)
+            httpVersion: nil, headerFields: headers)!, cacheStoragePolicy: .notAllowed)
+        let body = Self.body(size)
+        let transportChunkBytes = 997
+        for offset in stride(from: 0, to: size, by: transportChunkBytes) {
+            client?.urlProtocol(self, didLoad: body.subdata(in: offset..<min(size, offset + transportChunkBytes)))
+        }
+        Self.probe.record(request.url!)
+        if mode == "error" { client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost)) }
+        else if mode != "hanging" { client?.urlProtocolDidFinishLoading(self) }
     }
-    override func stopLoading() {}
+    override func stopLoading() { Self.probe.record(request.url!, stopped: true) }
+    static func body(_ size: Int) -> Data { Data((0..<size).map { UInt8($0 % 251) }) }
 }
 
 @main
@@ -163,11 +192,12 @@ private struct CliProxyPipelineVerification {
     static func main() async throws {
         try await verifyLateEventsAndRecovery()
         try await verifyProtocolMigration()
+        try await verifyMissingAnalyticsIdentity()
         try await verifyCommitCancellation()
         try await verifyBoundedBackfill()
         try await verifyTokenReuse()
         try await verifyResponseBound()
-        print("CliProxyPipelineVerification: PASS (late events, persisted audit, protocol migration, atomic retry, token reuse, byte limit)")
+        print("CliProxyPipelineVerification: PASS (late events, persisted audit, protocol migration, missing analytics identity, atomic retry, token reuse, buffered byte limit and cancellation)")
     }
 
     private static func verifyLateEventsAndRecovery() async throws {
@@ -230,6 +260,29 @@ private struct CliProxyPipelineVerification {
         for _ in 0..<2 { try await unknown.round(remote, auditPages: 4) }
         try check(unknown.states()[unknown.identity]?.endpoint == .unresolved && unknown.tokens() == 1,
                   "unmatched legacy data must fail closed without removal")
+    }
+
+    private static func verifyMissingAnalyticsIdentity() async throws {
+        let remote = FakeCPA(events: [.init(id: 1, timestamp: 10_000_000)], key: Fixture.key)
+        await remote.setOmitAnalyticsIdentity(true)
+        let discovering = try Fixture()
+        let fallback = try await discovering.round(remote)
+        try check(fallback.endpoint == .legacy && discovering.tokens() == 1,
+                  "missing both analytics identities must allow discovery legacy fallback")
+        try check(await remote.legacyCount() == 1, "discovery did not call legacy exactly once")
+
+        await remote.setOmitAnalyticsIdentity(false)
+        let pinned = try Fixture()
+        let established = try await pinned.round(remote)
+        try check(established.endpoint == .analytics, "valid analytics fixture did not pin protocol")
+        let before = try pinned.states()
+        await remote.setOmitAnalyticsIdentity(true)
+        do { try await pinned.round(remote); throw CheckFailure.assertion("identity-free analytics accepted") }
+        catch let error as CliProxyUsageError {
+            try check(error == .protocolIdentityUnresolved, "missing identity must fail closed for pinned analytics")
+        }
+        try check(await remote.legacyCount() == 1, "pinned analytics must not fall back after identity loss")
+        try check(pinned.states() == before && pinned.tokens() == 1, "missing identity changed committed state")
     }
 
     private static func verifyTokenReuse() async throws {
@@ -311,13 +364,51 @@ private struct CliProxyPipelineVerification {
 
     private static func verifyResponseBound() async throws {
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [OversizedProtocol.self]
+        configuration.protocolClasses = [BoundedResponseProtocol.self]
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
+        func request(_ size: Int, mode: String = "chunked") -> URLRequest {
+            var request = URLRequest(url: URL(string: "https://fixture.invalid/" + UUID().uuidString)!)
+            request.setValue(String(size), forHTTPHeaderField: "X-Fixture-Size")
+            request.setValue(mode, forHTTPHeaderField: "X-Fixture-Mode")
+            return request
+        }
+        let bufferBytes = 16 * 1024
+        for size in [0, 1, bufferBytes - 1, bufferBytes, bufferBytes + 1, 2 * bufferBytes + 3] {
+            let (data, _) = try await CliProxyUsageService.boundedResponse(for: request(size),
+                session: session, maximumBytes: max(1, size))
+            try check(data == BoundedResponseProtocol.body(size), "buffer boundary or final tail corrupted at \(size)")
+        }
+        for (size, limit, mode) in [(1, 0, "chunked"), (bufferBytes + 1, bufferBytes, "hanging"),
+                                    (65, 64, "declared")] {
+            let request = request(size, mode: mode)
+            do {
+                _ = try await CliProxyUsageService.boundedResponse(for: request, session: session, maximumBytes: limit)
+                throw CheckFailure.assertion("oversized response accepted")
+            } catch let error as CliProxyUsageError { try check(error == .responseTooLarge, "stream byte bound") }
+            if mode == "hanging" { try await waitForResponseProbe(request.url!, stopped: true) }
+        }
         do {
-            _ = try await CliProxyUsageService.boundedResponse(for: URLRequest(url: URL(string: "https://fixture.invalid")!),
-                                                               session: session, maximumBytes: 64)
-            throw CheckFailure.assertion("chunked oversized response accepted")
-        } catch let error as CliProxyUsageError { try check(error == .responseTooLarge, "stream byte bound") }
+            _ = try await CliProxyUsageService.boundedResponse(for: request(100, mode: "error"), session: session)
+            throw CheckFailure.assertion("stream error swallowed")
+        } catch let error as URLError { try check(error.code == .networkConnectionLost, "stream error changed") }
+        let pending = request(1, mode: "hanging")
+        let task = Task { try await CliProxyUsageService.boundedResponse(for: pending, session: session) }
+        try await waitForResponseProbe(pending.url!)
+        task.cancel()
+        var cancellationObserved = false
+        do { _ = try await task.value; throw CheckFailure.assertion("cancelled response succeeded") }
+        catch is CancellationError { cancellationObserved = true }
+        catch let error as URLError { cancellationObserved = error.code == .cancelled }
+        try check(cancellationObserved, "request cancellation changed")
+        try await waitForResponseProbe(pending.url!, stopped: true)
+    }
+
+    private static func waitForResponseProbe(_ url: URL, stopped: Bool = false) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while !BoundedResponseProtocol.probe.contains(url, stopped: stopped) {
+            try check(Date() < deadline, "URLSession did not \(stopped ? "cancel" : "start") underlying task")
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
     }
 }

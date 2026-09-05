@@ -11,6 +11,69 @@ final class CoordinatorRecoveryTests: XCTestCase {
     private static let pollingInterval: Duration = .milliseconds(10)
     private static let conditionTimeout: Duration = .seconds(3)
 
+    func testClockCancellationBeforeRegistrationResumesTheSleeper() async throws {
+        let clock = CoordinatorTestClock()
+        var completed = false
+        let sleeper = Task { @MainActor in
+            defer { completed = true }
+            do {
+                try await clock.sleep(60, beforeRegistration: {
+                    // Cancel after checkCancellation, while the cancellation
+                    // handler is installed but no continuation has been stored.
+                    withUnsafeCurrentTask { $0?.cancel() }
+                })
+                XCTFail("cancellation before registration must throw")
+            } catch is CancellationError {
+                // Expected: the queued actor cancellation finds the registered sleeper.
+            } catch {
+                XCTFail("unexpected clock error: \(error)")
+            }
+        }
+        defer { sleeper.cancel() }
+        do {
+            try await eventually("cancellation before registration lost the continuation") { completed }
+        } catch {
+            // Drain a stranded continuation if this regresses, so the failing
+            // test does not leave an unstructured task suspended indefinitely.
+            await clock.advance()
+            await sleeper.value
+            throw error
+        }
+        await sleeper.value
+        let pending = await clock.pendingCount
+        XCTAssertEqual(pending, 0)
+    }
+
+    func testClockAlreadyCancelledTaskDoesNotRegisterASleeper() async throws {
+        let clock = CoordinatorTestClock()
+        var completed = false
+        let sleeper = Task { @MainActor in
+            defer { completed = true }
+            withUnsafeCurrentTask { $0?.cancel() }
+            do {
+                try await clock.sleep(60, beforeRegistration: {
+                    XCTFail("an already-cancelled task reached continuation registration")
+                })
+                XCTFail("an already-cancelled sleep must throw")
+            } catch is CancellationError {
+                // Expected: the initial cancellation check rejects registration.
+            } catch {
+                XCTFail("unexpected clock error: \(error)")
+            }
+        }
+        defer { sleeper.cancel() }
+        do {
+            try await eventually("an already-cancelled clock sleep failed to complete") { completed }
+        } catch {
+            await clock.advance()
+            await sleeper.value
+            throw error
+        }
+        await sleeper.value
+        let pending = await clock.pendingCount
+        XCTAssertEqual(pending, 0)
+    }
+
     func testFailedLedgerBootstrapRetriesAutomaticallyAndStartsCollection() async throws {
         let fixture = try makeFixture()
         try FileManager.default.createDirectory(at: fixture.sourceRoot, withIntermediateDirectories: false)
@@ -270,10 +333,14 @@ private actor CoordinatorTestClock {
     var pendingCount: Int { sleepers.count }
     var pendingIntervals: [TimeInterval] { sleepers.values.map(\.interval) }
 
-    func sleep(_ interval: TimeInterval) async throws {
+    func sleep(_ interval: TimeInterval, beforeRegistration: (@Sendable () -> Void)? = nil) async throws {
         let id = UUID()
         try Task.checkCancellation()
         try await withTaskCancellationHandler {
+            // This hook is synchronous. Registration and this operation remain
+            // in one actor turn; onCancel can only enqueue cancel(id) behind it.
+            // Do not introduce a suspension here or retain cancelled-ID tombstones.
+            beforeRegistration?()
             try await withCheckedThrowingContinuation { continuation in
                 sleepers[id] = Sleep(interval: interval, continuation: continuation)
             }

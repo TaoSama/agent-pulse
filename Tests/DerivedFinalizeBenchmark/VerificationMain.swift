@@ -45,6 +45,10 @@ enum DerivedFinalizeBenchmark {
 
         let filesPerSource = 100
         let eventsPerFile = max(1, targetEventCount / (sources.count * filesPerSource))
+        let eventsPerSession = 20
+        // Small accepted fixtures still exercise the session aggregation path.
+        // Counts at 20k/200k keep the existing complete-group distribution.
+        let sessionsPerFile = max(1, eventsPerFile / eventsPerSession)
 
         print("Generating synthetic ledger: target=\(targetEventCount) events,",
               "\(sources.count) sources x \(filesPerSource) files x \(eventsPerFile) events/file")
@@ -75,7 +79,7 @@ enum DerivedFinalizeBenchmark {
                     let project = projects[Int(rng.next() % UInt64(projects.count))]
                     let bucketIdx = Int(rng.next() % UInt64(bucketCount))
                     let ts = baseTime.addingTimeInterval(TimeInterval(bucketIdx) * TimeInterval(bucketMs) / 1000)
-                    let sessionHash = "sess-\(source)-\(fileIdx)-\(i / 20)"
+                    let sessionHash = "sess-\(source)-\(fileIdx)-\(i / eventsPerSession)"
 
                     let input = Int64(rng.next() % 5000)
                     let output = Int64(rng.next() % 2000)
@@ -139,8 +143,7 @@ enum DerivedFinalizeBenchmark {
                 }
 
                 var sessionEvents: [UsageSessionEvent] = []
-                let sessionCount = eventsPerFile / 20
-                for s in 0..<sessionCount {
+                for s in 0..<sessionsPerFile {
                     let sess = "sess-\(source)-\(fileIdx)-\(s)"
                     let ts = baseTime.addingTimeInterval(TimeInterval(s) * 60)
                     sessionEvents.append(UsageSessionEvent(
@@ -182,6 +185,9 @@ enum DerivedFinalizeBenchmark {
         let rawEventCount = try ledger.eventCount()
         try benchmarkRequire(rawEventCount == totalRecorded, "fixture must preserve every raw event")
         let rawSessionEventCount = try ledger.sessionEventCount()
+        let expectedSessionEventCount = sources.count * filesPerSource * sessionsPerFile * 2
+        try benchmarkRequire(rawSessionEventCount == expectedSessionEventCount,
+                             "fixture must record exactly \(expectedSessionEventCount) session activity events")
         print("Recorded \(totalRecorded) events across \(sources.count * filesPerSource) files")
         print("usage_events rows: \(rawEventCount)")
         print("usage_session_events rows: \(rawSessionEventCount)")

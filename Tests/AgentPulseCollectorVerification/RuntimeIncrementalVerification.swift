@@ -4,6 +4,7 @@ import Foundation
 /// Work-count assertions verify bounded parsing without machine-speed thresholds.
 enum RuntimeIncrementalVerification {
     static func run() async throws {
+        try verifyCleanupPreservesOriginalFailure()
         try await withFixture("desktop", verifyDesktopAppendRecovery)
         try await withFixture("models", verifySingleDecodeAndModelSearch)
         try await withFixture("aggregate", verifyAggregateReplacementAndRemoval)
@@ -18,10 +19,37 @@ enum RuntimeIncrementalVerification {
         let fixture = try Fixture(name)
         do {
             try await body(fixture)
-            try FileManager.default.removeItem(at: fixture.root)
         } catch {
-            try FileManager.default.removeItem(at: fixture.root)
-            throw error
+            try rethrowAfterCleanup(error, cleanup: {
+                try FileManager.default.removeItem(at: fixture.root)
+            })
+        }
+        try FileManager.default.removeItem(at: fixture.root)
+    }
+
+    private static func rethrowAfterCleanup(
+        _ originalError: any Error,
+        cleanup: () throws -> Void,
+        reportFailure: (any Error) -> Void = { NSLog("Fixture cleanup also failed: %@", String(describing: $0)) }
+    ) throws -> Never {
+        do {
+            try cleanup()
+        } catch {
+            reportFailure(error)
+        }
+        throw originalError
+    }
+
+    private static func verifyCleanupPreservesOriginalFailure() throws {
+        enum Failure: Error, Equatable { case original, cleanup }
+        var reportedCleanupFailure = false
+        do {
+            try rethrowAfterCleanup(Failure.original, cleanup: { throw Failure.cleanup }, reportFailure: {
+                reportedCleanupFailure = ($0 as? Failure) == .cleanup
+            })
+        } catch {
+            try require((error as? Failure) == .original && reportedCleanupFailure,
+                        "cleanup failure must be reported without replacing the original failure")
         }
     }
 
@@ -254,8 +282,9 @@ enum RuntimeIncrementalVerification {
             try require(recovered.diagnostics.discoveryFullScans == 2,
                         "recovery reconciles the affected root once")
         } catch {
-            try FileManager.default.setAttributes([.posixPermissions: restoredPermissions], ofItemAtPath: inaccessible.path)
-            throw error
+            try rethrowAfterCleanup(error, cleanup: {
+                try FileManager.default.setAttributes([.posixPermissions: restoredPermissions], ofItemAtPath: inaccessible.path)
+            })
         }
     }
 

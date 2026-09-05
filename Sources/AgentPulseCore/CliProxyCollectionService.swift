@@ -20,6 +20,7 @@ public struct CliProxyCollectionOptions: Sendable {
 extension CliProxyUsageService {
     private static let maximumConcurrentSources = 2
     private static let initialRealtimeWindowMS: Int64 = 30 * 60 * 1_000
+    private static let responseBufferBytes = 16 * 1024
 
     /// New activity is collected immediately; a separate persisted descending
     /// sweep eventually revisits all historical timestamps, including late
@@ -236,11 +237,19 @@ extension CliProxyUsageService {
         }
         var data = Data()
         data.reserveCapacity(Int(max(0, response.expectedContentLength)))
+        let bufferCapacity = min(maximumBytes, responseBufferBytes)
+        var buffer: [UInt8] = []
+        buffer.reserveCapacity(bufferCapacity)
         do {
             for try await byte in bytes {
-                guard data.count < maximumBytes else { throw CliProxyUsageError.responseTooLarge }
-                data.append(byte)
+                guard buffer.count < maximumBytes - data.count else { throw CliProxyUsageError.responseTooLarge }
+                buffer.append(byte)
+                if buffer.count == bufferCapacity {
+                    data.append(contentsOf: buffer)
+                    buffer.removeAll(keepingCapacity: true)
+                }
             }
+            data.append(contentsOf: buffer)
         } catch {
             bytes.task.cancel()
             throw error
