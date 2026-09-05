@@ -13,7 +13,7 @@ TARGETS = (
     "RuntimeHeaderParityVerification", "NaturalKeyGuardVerification",
     "SecureConfigVerification", "LedgerRebuildVerification",
     "ScanProgressSmootherVerification", "DerivedFinalizeEquivalence",
-    "DerivedFinalizeBenchmark", "IncrementalParserVerification", "CliProxyPipelineVerification",
+    "DerivedFinalizeBenchmark", "IncrementalParserVerification", "ParserMemoryVerification", "CliProxyPipelineVerification",
 )
 
 
@@ -27,6 +27,8 @@ def main():
     # it is intentionally not an offline gate. Pure reconcile checks live in tests.
     environment.pop("AGENT_PULSE_RECONCILE_REQUIRE_LIVE", None)
     environment.pop("BENCH_REQUIRE_RATIO", None)
+    # The offline gate always asserts the bounded default parser-memory fixture.
+    environment.update(PARSER_MEMORY_SCALE="1", PARSER_MEMORY_OBSERVE="0")
     subprocess.run(["python3", str(PROJECT / "scripts/test_release.py")], cwd=PROJECT, check=True)
     subprocess.run(["swift", "build", "-c", args.configuration], cwd=PROJECT, env=environment, check=True)
     subprocess.run(["swift", "test", "-c", args.configuration], cwd=PROJECT, env=environment, check=True)

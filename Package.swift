@@ -66,6 +66,7 @@ let package = Package(
                 "ModelsAndTPSWindowTests.swift",
                 "SQLiteSnapshotStoreTests.swift",
                 "StorageLifecycleTests.swift",
+                "UsageRecordTimestampTests.swift",
             ],
             sources: ["VerificationMain.swift"]
         ),
@@ -152,6 +153,11 @@ let package = Package(
             name: "IncrementalParserVerification",
             dependencies: ["AgentPulseCore"],
             path: "Tests/IncrementalParserVerification"
+        ),
+        .executableTarget(
+            name: "ParserMemoryVerification",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/ParserMemoryVerification"
         ),
         .executableTarget(
             name: "CliProxyPipelineVerification",

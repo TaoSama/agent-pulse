@@ -125,55 +125,61 @@ extension UsageJSONLParser {
         }
 
         func emit(_ data: Data, final: Bool) throws {
-            try checkCancellation()
-            let state = UsageParserState(lookup: lookup)
-            let nextOffset = current.offset + Int64(data.count)
-            let parseData: Data
-            if current.endedWithoutNewline && data.starts(with: [0x0D, 0x0A]) {
-                parseData = Data(data.dropFirst(2))
-            } else if current.endedWithoutNewline && data.first == 0x0A {
-                parseData = Data(data.dropFirst())
-            } else {
-                parseData = data
+            // A scan is one long-running dispatch work item. Foundation's JSON
+            // temporaries must not survive until that entire work item returns.
+            try autoreleasepool {
+                try checkCancellation()
+                let state = UsageParserState(lookup: lookup)
+                let nextOffset = current.offset + Int64(data.count)
+                let parseData: Data
+                if current.endedWithoutNewline && data.starts(with: [0x0D, 0x0A]) {
+                    parseData = Data(data.dropFirst(2))
+                } else if current.endedWithoutNewline && data.first == 0x0A {
+                    parseData = Data(data.dropFirst())
+                } else {
+                    parseData = data
+                }
+                let parsed = try parseIncrementalChunk(data: parseData, source: source, fileIdentity: fileIdentity,
+                                                  modifiedAt: modified, isSubagent: isSubagent,
+                                                  offset: nextOffset, size: size,
+                                                  lineOffset: current.lineCount, state: state)
+                current.offset = nextOffset
+                if !data.isEmpty { current.endedWithoutNewline = data.last != 0x0A }
+                current.lineCount += parseData.split(separator: 0x0A, omittingEmptySubsequences: true).count
+                current.tailLength = min(Self.guardBytes, Int(current.offset))
+                try handle.seek(toOffset: UInt64(current.offset - Int64(current.tailLength)))
+                current.tailHash = streamHash(try handle.read(upToCount: current.tailLength) ?? Data())
+                try handle.seek(toOffset: UInt64(fetchedOffset))
+                state.write(current, key: "stream-cursor")
+                let changes = try state.changes()
+                let batch = UsageIncrementalBatch(parsed: parsed, stateChanges: changes,
+                                                 removedEventIDs: Array(state.removedEventIDs),
+                                                 removedEditIDs: Array(state.removedEditIDs), replacesFile: replacesFile,
+                                                 isFinalBatch: final, codexUnknownModel: state.codexUnknownModel)
+                try onBatch(batch)
+                // The callback persists state. Retain only cursor-sized local state;
+                // subsequent batches read keyed values from that committed store.
+                replacesFile = false
+                batches += 1
             }
-            let parsed = try parseIncrementalChunk(data: parseData, source: source, fileIdentity: fileIdentity,
-                                              modifiedAt: modified, isSubagent: isSubagent,
-                                              offset: nextOffset, size: size,
-                                              lineOffset: current.lineCount, state: state)
-            current.offset = nextOffset
-            if !data.isEmpty { current.endedWithoutNewline = data.last != 0x0A }
-            current.lineCount += parseData.split(separator: 0x0A, omittingEmptySubsequences: true).count
-            current.tailLength = min(Self.guardBytes, Int(current.offset))
-            try handle.seek(toOffset: UInt64(current.offset - Int64(current.tailLength)))
-            current.tailHash = streamHash(try handle.read(upToCount: current.tailLength) ?? Data())
-            try handle.seek(toOffset: UInt64(fetchedOffset))
-            state.write(current, key: "stream-cursor")
-            let changes = try state.changes()
-            let batch = UsageIncrementalBatch(parsed: parsed, stateChanges: changes,
-                                             removedEventIDs: Array(state.removedEventIDs),
-                                             removedEditIDs: Array(state.removedEditIDs), replacesFile: replacesFile,
-                                             isFinalBatch: final, codexUnknownModel: state.codexUnknownModel)
-            try onBatch(batch)
-            // The callback persists state. Retain only cursor-sized local state;
-            // subsequent batches read keyed values from that committed store.
-            replacesFile = false
-            batches += 1
         }
 
         do {
             while fetchedOffset < size {
-                try checkCancellation()
-                let amount = Int(min(Int64(Self.readChunkBytes), size - fetchedOffset))
-                guard let chunk = try handle.read(upToCount: amount), !chunk.isEmpty else {
-                    throw UsageIncrementalReadError.fileChangedDuringRead
-                }
-                fetchedOffset += Int64(chunk.count)
-                pending.append(chunk)
-                if pending.count >= Self.batchBytes, let newline = pending.lastIndex(of: 0x0A) {
-                    let end = pending.index(after: newline)
-                    let complete = Data(pending[..<end])
-                    pending = Data(pending[end...])
-                    try emit(complete, final: false)
+                try autoreleasepool {
+                    try checkCancellation()
+                    let amount = Int(min(Int64(Self.readChunkBytes), size - fetchedOffset))
+                    guard let chunk = try handle.read(upToCount: amount), !chunk.isEmpty else {
+                        throw UsageIncrementalReadError.fileChangedDuringRead
+                    }
+                    fetchedOffset += Int64(chunk.count)
+                    pending.append(chunk)
+                    if pending.count >= Self.batchBytes, let newline = pending.lastIndex(of: 0x0A) {
+                        let end = pending.index(after: newline)
+                        let complete = Data(pending[..<end])
+                        pending = Data(pending[end...])
+                        try emit(complete, final: false)
+                    }
                 }
             }
             if let newline = pending.lastIndex(of: 0x0A) {
@@ -224,18 +230,22 @@ extension UsageJSONLParser {
         var remaining = size
         var pending = Data()
         while remaining > 0 {
-            try checkCancellation()
-            guard let chunk = try handle.read(upToCount: Int(min(Int64(readChunkBytes), remaining))),
-                  !chunk.isEmpty else { throw UsageIncrementalReadError.fileChangedDuringRead }
-            remaining -= Int64(chunk.count)
-            pending.append(chunk)
-            if let newline = pending.lastIndex(of: 0x0A) {
-                let end = pending.index(after: newline)
-                for line in pending[..<end].split(separator: 0x0A, omittingEmptySubsequences: true) {
-                    if let seed = try codexCursorSeed(line: Data(line), fileIdentity: fileIdentity) { return seed }
+            let seed: Data? = try autoreleasepool {
+                try checkCancellation()
+                guard let chunk = try handle.read(upToCount: Int(min(Int64(readChunkBytes), remaining))),
+                      !chunk.isEmpty else { throw UsageIncrementalReadError.fileChangedDuringRead }
+                remaining -= Int64(chunk.count)
+                pending.append(chunk)
+                if let newline = pending.lastIndex(of: 0x0A) {
+                    let end = pending.index(after: newline)
+                    for line in pending[..<end].split(separator: 0x0A, omittingEmptySubsequences: true) {
+                        if let seed = try codexCursorSeed(line: Data(line), fileIdentity: fileIdentity) { return seed }
+                    }
+                    pending = Data(pending[end...])
                 }
-                pending = Data(pending[end...])
+                return nil
             }
+            if let seed { return seed }
         }
         return try codexCursorSeed(line: pending, fileIdentity: fileIdentity)
     }
