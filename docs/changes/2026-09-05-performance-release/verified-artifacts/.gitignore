@@ -1,7 +1,0 @@
-# Desktop evidence can contain unrelated private windows; keep it local.
-midscene_run/
-midscene-split/
-midscene-merged/
-screenshots/
-preview/
-report.html

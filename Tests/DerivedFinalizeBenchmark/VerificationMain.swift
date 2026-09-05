@@ -46,9 +46,14 @@ enum DerivedFinalizeBenchmark {
         let filesPerSource = 100
         let eventsPerFile = max(1, targetEventCount / (sources.count * filesPerSource))
         let eventsPerSession = 20
-        // Small accepted fixtures still exercise the session aggregation path.
+        // Include the final partial group. eventsPerFile is positive, so this
+        // ceiling division avoids overflowing an addition before division.
         // Counts at 20k/200k keep the existing complete-group distribution.
-        let sessionsPerFile = max(1, eventsPerFile / eventsPerSession)
+        let sessionsPerFile = 1 + (eventsPerFile - 1) / eventsPerSession
+        if targetEventCount == 4_200 {
+            try benchmarkRequire(eventsPerFile == 21 && sessionsPerFile == 2,
+                                 "4200-event fixture must create two sessions per 21-event file")
+        }
 
         print("Generating synthetic ledger: target=\(targetEventCount) events,",
               "\(sources.count) sources x \(filesPerSource) files x \(eventsPerFile) events/file")
@@ -155,6 +160,8 @@ enum DerivedFinalizeBenchmark {
                         sourceFileHash: fileID, role: .assistant, timestamp: ts.addingTimeInterval(30)
                     ))
                 }
+                try benchmarkRequire(Set(events.map(\.sessionHash)) == Set(sessionEvents.map(\.sessionHash)),
+                                     "every token-event session must have activity events, including a partial final session")
 
                 var editEntries: [UsageEditEntry] = []
                 let editCount = min(5, eventsPerFile / 10)
@@ -188,6 +195,10 @@ enum DerivedFinalizeBenchmark {
         let expectedSessionEventCount = sources.count * filesPerSource * sessionsPerFile * 2
         try benchmarkRequire(rawSessionEventCount == expectedSessionEventCount,
                              "fixture must record exactly \(expectedSessionEventCount) session activity events")
+        if targetEventCount == 4_200 {
+            try benchmarkRequire(rawSessionEventCount == 800,
+                                 "4200-event fixture must persist 400 sessions with 800 activity events")
+        }
         print("Recorded \(totalRecorded) events across \(sources.count * filesPerSource) files")
         print("usage_events rows: \(rawEventCount)")
         print("usage_session_events rows: \(rawSessionEventCount)")

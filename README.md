@@ -388,12 +388,13 @@ AGENT_PULSE_RECONCILE_REQUIRE_LIVE=1 swift run ReconcileParityVerification
 - TPS 为固定 180 秒 output-only 速率，区间线性摊分是缺少逐 token 时间戳时的稳定估计，不能还原微观逐 token 速度。
 - Completed 是可读本地 rollout 的下界，无法证明为非 automation 的记录不计入。
 - 费用采用内置 fallback 单价估算，只用于本地观察，不构成账单数据。
+- macOS 文件监听无法创建或启动时，实时采集器会初始化失败；目前没有持续全量扫描兜底，避免监听故障导致长期高 CPU/I/O。
 
 ---
 
 ## 📁 文档
 
-调研与设计资料位于 `docs/`；每项变更使用 `docs/changes/yyyy-mm-dd-change-name/` 独立归档，持久知识沉淀到 `docs/cookbook/`、`docs/pitfall/`、`docs/runbook/`。
+持久知识沉淀到 `docs/cookbook/`、`docs/pitfall/`、`docs/runbook/`；变更记录与验证结论保留在 Git 提交、PR 和 CI 中。
 
 ---
 
