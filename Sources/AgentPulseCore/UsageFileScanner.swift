@@ -87,49 +87,51 @@ public enum UsageFileScanner {
                 return resolved.path == root.path ? [root] : [root, resolved]
             } : []
         for file in manifest.files {
-            try checkCancellation()
-            let source = manifest.source.source
-            let identity = fileIdentity(for: file.url, source: source)
-            let fileID = UsageJSONLParser.fileID(for: identity)
-            present.append(fileID)
-            onFile()
-            if checkpoints[fileID] == nil, source == UsageJSONLParser.codexSource {
-                for legacy in legacyIdentities(for: file.url, roots: legacyRoots) {
-                    let oldFileID = UsageJSONLParser.fileID(for: legacy)
-                    guard checkpoints[oldFileID] != nil else { continue }
-                    if let migrated = try ledger.migrateFileIdentityIfCheckpointMatches(
-                        from: oldFileID, to: fileID, expectedSource: source,
-                        expectedSize: file.size, expectedModifiedAt: file.modifiedAt,
-                        expectedParserVersion: UsageJSONLParser.parserVersion
-                    ) {
-                        checkpoints.removeValue(forKey: oldFileID)
-                        checkpoints[fileID] = migrated
-                        break
+            try autoreleasepool {
+                try checkCancellation()
+                let source = manifest.source.source
+                let identity = fileIdentity(for: file.url, source: source)
+                let fileID = UsageJSONLParser.fileID(for: identity)
+                present.append(fileID)
+                onFile()
+                if checkpoints[fileID] == nil, source == UsageJSONLParser.codexSource {
+                    for legacy in legacyIdentities(for: file.url, roots: legacyRoots) {
+                        let oldFileID = UsageJSONLParser.fileID(for: legacy)
+                        guard checkpoints[oldFileID] != nil else { continue }
+                        if let migrated = try ledger.migrateFileIdentityIfCheckpointMatches(
+                            from: oldFileID, to: fileID, expectedSource: source,
+                            expectedSize: file.size, expectedModifiedAt: file.modifiedAt,
+                            expectedParserVersion: UsageJSONLParser.parserVersion
+                        ) {
+                            checkpoints.removeValue(forKey: oldFileID)
+                            checkpoints[fileID] = migrated
+                            break
+                        }
                     }
                 }
-            }
-            let checkpoint = checkpoints[fileID]
-            if let checkpoint, checkpoint.status == "complete",
-               checkpoint.parserVersion == UsageJSONLParser.parserVersion,
-               checkpoint.size == file.size,
-               abs(checkpoint.modifiedAt.timeIntervalSince(file.modifiedAt)) < 0.001 {
-                continue
-            }
-            do {
-                _ = try UsageJSONLParser.readIncrementally(
-                    fileURL: file.url, source: source, fileIdentity: identity,
-                    isSubagent: manifest.source.includeSubagents && isSubagent(file.url),
-                    previousCheckpoint: checkpoint,
-                    stateLookup: { try ledger.parserState(fileID: fileID, key: $0) },
-                    onBatch: { batch in
-                        try ledger.recordIncremental(batch: batch, hostname: hostname)
-                        checkpoints[fileID] = batch.parsed.checkpoint
-                    },
-                    checkCancellation: checkCancellation
-                )
-            } catch {
-                try ledger.abortParserReplacement(fileID: fileID)
-                throw error
+                let checkpoint = checkpoints[fileID]
+                if let checkpoint, checkpoint.status == "complete",
+                   checkpoint.parserVersion == UsageJSONLParser.parserVersion,
+                   checkpoint.size == file.size,
+                   abs(checkpoint.modifiedAt.timeIntervalSince(file.modifiedAt)) < 0.001 {
+                    return
+                }
+                do {
+                    _ = try UsageJSONLParser.readIncrementally(
+                        fileURL: file.url, source: source, fileIdentity: identity,
+                        isSubagent: manifest.source.includeSubagents && isSubagent(file.url),
+                        previousCheckpoint: checkpoint,
+                        stateLookup: { try ledger.parserState(fileID: fileID, key: $0) },
+                        onBatch: { batch in
+                            try ledger.recordIncremental(batch: batch, hostname: hostname)
+                            checkpoints[fileID] = batch.parsed.checkpoint
+                        },
+                        checkCancellation: checkCancellation
+                    )
+                } catch {
+                    try ledger.abortParserReplacement(fileID: fileID)
+                    throw error
+                }
             }
         }
         return present

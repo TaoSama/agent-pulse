@@ -262,14 +262,23 @@ extension UsageLedgerStore {
         defer { sqlite3_finalize(statement) }
         try bind(statement, 1, fileID); try bind(statement, 2, kind)
         let decoder = JSONDecoder()
-        var values: [Value] = []
-        while try step(statement) == SQLITE_ROW {
-            values.append(try decoder.decode(type, from: parserBlob(statement, column: 0)))
-            if values.count == Self.parserPublishBatchSize {
-                try consume(values); values.removeAll(keepingCapacity: true)
+        var exhausted = false
+        while !exhausted {
+            // Publishing a large replacement remains one atomic transaction,
+            // but decoded values and Foundation temporaries live for one batch.
+            try autoreleasepool {
+                var values: [Value] = []
+                values.reserveCapacity(Self.parserPublishBatchSize)
+                while values.count < Self.parserPublishBatchSize {
+                    guard try step(statement) == SQLITE_ROW else {
+                        exhausted = true
+                        break
+                    }
+                    values.append(try decoder.decode(type, from: parserBlob(statement, column: 0)))
+                }
+                if !values.isEmpty { try consume(values) }
             }
         }
-        if !values.isEmpty { try consume(values) }
     }
 
     private func writeParserRawBatchUnlocked(events: [UsageEvent], sessions: [UsageSessionEvent], edits: [UsageEditEntry], removedEvents: [String], removedEdits: [String], fileID: String, hostname: String) throws {

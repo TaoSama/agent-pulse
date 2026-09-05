@@ -182,6 +182,7 @@ public enum UsageJSONLParser {
             guard let object = json(line) else { diagnostics.append("line \(index + 1): invalid json"); continue }
             let type = string(object["type"])
             let payload = dictionary(object["payload"])
+            let recordTimestamp = UsageTimestamp.parse(object["timestamp"])
 
             if type == "turn_context" {
                 if let authoritativeModel = nonemptyString(payload["model"]) {
@@ -199,8 +200,7 @@ public enum UsageJSONLParser {
             if type == "response_item" {
                 // 缺时间戳的调用记录无法归桶：不生成可计入 entry，仅发脱敏 diagnostic；
                 // 但 *_call_output 记录仍照常处理，保证已有 pending 的成功 gate 不被漏掉。
-                let editTimestamp = UsageTimestamp.parse(object["timestamp"])
-                if editAccumulator.observe(payload: payload, model: turnModel, timestamp: editTimestamp) {
+                if editAccumulator.observe(payload: payload, model: turnModel, timestamp: recordTimestamp) {
                     diagnostics.append("line \(index + 1): edit call skipped (missing timestamp)")
                 }
                 // Codex 无 Skill tool。技能调用两种信号（一条记录至多命中其一，不重复计数）：
@@ -213,7 +213,7 @@ public enum UsageJSONLParser {
                     recordSkillCounts = UsageToolMetrics.countCodexSkillMarkers(object)
                 }
                 if !recordSkillCounts.isEmpty,
-                   let toolTimestamp = UsageTimestamp.parse(object["timestamp"]) {
+                   let toolTimestamp = recordTimestamp {
                     accumulateCodexToolCandidate(
                         into: &codexToolCandidates,
                         identity: codexToolIdentity(payload: payload, turnIdentity: turnIdentity),
@@ -224,9 +224,8 @@ public enum UsageJSONLParser {
                 // programmatic MCP：custom_tool_call(name=exec) 的 JS 里 tools.mcp__… 调用，
                 // 按 call_id 与其 *_call_output 关联，输出成功（Script completed）才计入。
                 // 缺时间戳的调用记录跳过并上报；其输出记录仍处理以结算 gate。
-                let mcpTimestamp = UsageTimestamp.parse(object["timestamp"])
                 if mcpAccumulator.observe(
-                    payload: payload, model: turnModel, timestamp: mcpTimestamp,
+                    payload: payload, model: turnModel, timestamp: recordTimestamp,
                     identity: codexToolIdentity(payload: payload, turnIdentity: turnIdentity)
                 ) {
                     diagnostics.append("line \(index + 1): mcp call skipped (missing timestamp)")
@@ -239,13 +238,13 @@ public enum UsageJSONLParser {
             let sessionRole: UsageSessionEvent.Role = (type == "session_meta")
                 ? .syntheticUser
                 : (type == "turn_context" ? .user : .assistant)
-            if UsageTimestamp.parse(object["timestamp"]) != nil {
+            if recordTimestamp != nil {
                 appendSessionEvent(
                     &sessionEvents, source: sourceName, sessionHash: activitySessionHash,
                     sourceFileHash: fileHash,
                     identitySessionScope: activitySessionHash,
                     role: sessionRole,
-                    object: object, seenIDs: &seenSessionEventIDs,
+                    object: object, timestamp: recordTimestamp, seenIDs: &seenSessionEventIDs,
                     diagnostics: &diagnostics, index: index,
                     occurrence: index
                 )
@@ -283,7 +282,7 @@ public enum UsageJSONLParser {
             }
 
             guard counts.total > 0 else { continue }
-            guard let timestamp = UsageTimestamp.parse(object["timestamp"]) else {
+            guard let timestamp = recordTimestamp else {
                 diagnostics.append("line \(index + 1): invalid timestamp (usage skipped)")
                 continue
             }
@@ -976,6 +975,8 @@ public enum UsageJSONLParser {
             guard let object = json(line) else { diagnostics.append("line \(index + 1): invalid json"); continue }
             let type = string(object["type"])
             let rawSessionID = string(object["sessionId"]) ?? string(object["session_id"])
+            let recordTimestamp = (type == "assistant" || type == "user")
+                ? UsageTimestamp.parse(object["timestamp"]) : nil
             // 保留真实 sessionHash（每行自带 sessionId）；缺失时才以文件兜底。
             let sessionHash = rawSessionID.map { shortHash($0) } ?? shortHash(fileHash)
 
@@ -984,13 +985,12 @@ public enum UsageJSONLParser {
             if type == "assistant" || type == "user" {
                 // 缺时间戳的编辑 tool_use 无法归桶：跳过并发脱敏 diagnostic；
                 // 但 tool_result 仍照常处理，保证已有 pending 的 applied gate 不被漏掉。
-                let editTimestamp = UsageTimestamp.parse(object["timestamp"])
                 let editMessage = dictionary(object["message"])
                 if editAccumulator.observe(
                     object,
                     model: string(editMessage["model"]) ?? "unknown",
                     project: string(object["cwd"]).map(component) ?? "unknown",
-                    timestamp: editTimestamp
+                    timestamp: recordTimestamp
                 ) {
                     diagnostics.append("line \(index + 1): edit call skipped (missing timestamp)")
                 }
@@ -1012,7 +1012,7 @@ public enum UsageJSONLParser {
                     &sessionEvents, source: source, sessionHash: sessionHash,
                     sourceFileHash: fileHash,
                     identitySessionScope: rawSessionID == nil ? "missing-session" : sessionHash,
-                    role: role, object: object,
+                    role: role, object: object, timestamp: recordTimestamp,
                     seenIDs: &seenSessionEventIDs,
                     diagnostics: &diagnostics, index: index
                 )
@@ -1027,7 +1027,7 @@ public enum UsageJSONLParser {
             let recordSkillCounts = UsageToolMetrics.countSkillToolUses(object)
             let recordMCPCounts = UsageToolMetrics.countMCPToolUses(object)
             if !recordSkillCounts.isEmpty || !recordMCPCounts.isEmpty,
-               let timestamp = UsageTimestamp.parse(object["timestamp"]) {
+               let timestamp = recordTimestamp {
                 let model = string(message["model"]) ?? "unknown"
                 let project = string(object["cwd"]).map(component) ?? "unknown"
                 if var existing = toolCandidates[toolIdentity] {
@@ -1057,7 +1057,7 @@ public enum UsageJSONLParser {
             if !isSubagent {
                 accumulateClaudeTurnChars(message: message, turnID: turnID, into: &turnChars, seen: &seenTurnBlocks)
             }
-            guard let timestamp = UsageTimestamp.parse(object["timestamp"]) else {
+            guard let timestamp = recordTimestamp else {
                 diagnostics.append("line \(index + 1): invalid timestamp (usage skipped)")
                 continue
             }
@@ -1208,8 +1208,8 @@ public enum UsageJSONLParser {
 
     // MARK: - Shared helpers
 
-    private static func appendSessionEvent(_ sink: inout [UsageSessionEvent], source: String, sessionHash: String, sourceFileHash: String, identitySessionScope: String, role: UsageSessionEvent.Role, object: [String: Any], seenIDs: inout UsageParserSet, diagnostics: inout [String], index: Int, occurrence: Int? = nil) {
-        guard let timestamp = UsageTimestamp.parse(object["timestamp"]) else {
+    private static func appendSessionEvent(_ sink: inout [UsageSessionEvent], source: String, sessionHash: String, sourceFileHash: String, identitySessionScope: String, role: UsageSessionEvent.Role, object: [String: Any], timestamp: Date?, seenIDs: inout UsageParserSet, diagnostics: inout [String], index: Int, occurrence: Int? = nil) {
+        guard let timestamp else {
             diagnostics.append("line \(index + 1): invalid timestamp (session event skipped)")
             return
         }
