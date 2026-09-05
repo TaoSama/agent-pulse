@@ -252,15 +252,21 @@ extension UsageLedgerStore {
     }
 
     private func publishParserStageUnlocked(fileID: String, hostname: String) throws {
+        // The caller already captured every old owner/key and deleted this file's
+        // raw rows. Stage keys are unique per kind, so publication only inserts;
+        // append/correction bookkeeping must not repeat for each decoded batch.
         try streamParserStageUnlocked(UsageEvent.self, kind: "event", fileID: fileID) { events in
-            try writeParserRawBatchUnlocked(events: events, sessions: [], edits: [], removedEvents: [], removedEdits: [], fileID: fileID, hostname: hostname)
+            let kept = try unfrozenParserRowsUnlocked(events: events, sessions: [], hostname: hostname)
+            try insertRawEvents(kept.events, fileID: fileID, hostname: hostname)
         }
         try streamParserStageUnlocked(UsageSessionEvent.self, kind: "session", fileID: fileID) { sessions in
-            try writeParserRawBatchUnlocked(events: [], sessions: sessions, edits: [], removedEvents: [], removedEdits: [], fileID: fileID, hostname: hostname)
+            let kept = try unfrozenParserRowsUnlocked(events: [], sessions: sessions, hostname: hostname)
+            try insertRawSessionEvents(kept.sessions, fileID: fileID, hostname: hostname)
         }
         try streamParserStageUnlocked(UsageEditEntry.self, kind: "edit", fileID: fileID) { edits in
-            try writeParserRawBatchUnlocked(events: [], sessions: [], edits: edits, removedEvents: [], removedEdits: [], fileID: fileID, hostname: hostname)
+            try insertRawEditEntries(edits, fileID: fileID, hostname: hostname)
         }
+        try markParserRowsDirtyUnlocked(fileID: fileID, allRows: true)
     }
 
     private func streamParserStageUnlocked<Value: Decodable>(_ type: Value.Type, kind: String, fileID: String, consume: ([Value]) throws -> Void) throws {
@@ -287,7 +293,7 @@ extension UsageLedgerStore {
         }
     }
 
-    private func writeParserRawBatchUnlocked(events: [UsageEvent], sessions: [UsageSessionEvent], edits: [UsageEditEntry], removedEvents: [String], removedEdits: [String], fileID: String, hostname: String) throws {
+    private func unfrozenParserRowsUnlocked(events: [UsageEvent], sessions: [UsageSessionEvent], hostname: String) throws -> (events: [UsageEvent], sessions: [UsageSessionEvent]) {
         let frozen = try frozenBeforeMsUnlocked(hostname)
         let keptEvents = events.filter { frozen <= 0 || millis($0.timestamp) >= frozen }
         let keptSessions = sessions.filter { frozen <= 0 || millis($0.timestamp) >= frozen }
@@ -296,6 +302,11 @@ extension UsageLedgerStore {
             let key = frozenDroppedEventsKey(hostname)
             try setIntUnlocked(key: key, value: (try readIntUnlocked(key: key) ?? 0) + Int64(dropped))
         }
+        return (keptEvents, keptSessions)
+    }
+
+    private func writeParserRawBatchUnlocked(events: [UsageEvent], sessions: [UsageSessionEvent], edits: [UsageEditEntry], removedEvents: [String], removedEdits: [String], fileID: String, hostname: String) throws {
+        let (keptEvents, keptSessions) = try unfrozenParserRowsUnlocked(events: events, sessions: sessions, hostname: hostname)
         try prepareParserKeysUnlocked()
         let keys = try prepare("INSERT OR IGNORE INTO temp_parser_keys(kind,id,source) VALUES(?,?,?);")
         defer { sqlite3_finalize(keys) }
