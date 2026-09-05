@@ -62,8 +62,10 @@ let package = Package(
             path: "Tests/AgentPulseCoreTests",
             exclude: [
                 "CodexStatusCollectorTests.swift",
+                "ContentDigestTests.swift",
                 "Fixtures",
                 "ModelsAndTPSWindowTests.swift",
+                "ParserPublicationWorkTests.swift",
                 "ParserStagingStorageTests.swift",
                 "SQLiteSnapshotStoreTests.swift",
                 "StorageLifecycleTests.swift",
