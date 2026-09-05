@@ -34,7 +34,7 @@ final class OrbPublicationTests: XCTestCase {
             points: values.enumerated().map { index, normalized in
                 SparklinePoint(
                     time: Date(timeIntervalSince1970: seconds + Double(index)),
-                    value: normalized.map { $0 * raw }, normalized: normalized
+                    value: raw, normalized: normalized
                 )
             },
             regression: SparklineRegression(
@@ -71,7 +71,7 @@ final class OrbPublicationTests: XCTestCase {
         withExtendedLifetime((binding, observation)) {}
     }
 
-    func testTimestampAndUnusedNormalizationDoNotInvalidateOrb() async {
+    func testTimestampAndUnusedRawValuesDoNotInvalidateOrb() async {
         let inputs = Inputs()
         let model = model()
         let binding = bind(inputs, to: model)
@@ -79,15 +79,9 @@ final class OrbPublicationTests: XCTestCase {
         var count = 0
         let observation = model.$snapshot.dropFirst().sink { _ in count += 1 }
 
-        let shifted = curve([0, 0.5, 1], at: 500)
-        inputs.sparkline = Sparkline(
-            points: shifted.points.map {
-                SparklinePoint(time: $0.time, value: $0.value, normalized: $0.normalized.map { 1 - $0 })
-            },
-            regression: shifted.regression
-        )
+        inputs.sparkline = curve([0, 0.5, 1], at: 500, raw: 999)
         XCTAssertEqual(count, 0)
-        inputs.sparkline = curve([0, 0.7, 1], at: 501)
+        inputs.sparkline = curve([0, 0.7, 1], at: 500, raw: 999)
         XCTAssertEqual(count, 1)
         XCTAssertEqual(model.snapshot.renderedSparklineValues, [0, 0.7, 1])
         withExtendedLifetime((binding, observation)) {}

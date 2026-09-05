@@ -125,31 +125,46 @@ final class TPSPresentationConsistencyTests: XCTestCase {
         withExtendedLifetime((binding, rates, curves)) {}
     }
 
-    func testCompactGeometryUsesRawValuesAndPreservesGapsAndPeaks() async throws {
-        let points = makePoints([0, 50, nil, 100], normalized: [1, 0, 0.5, 0])
-        let values = CompactTPSGeometry.normalizedValues(points: points)
-        XCTAssertEqual(values.count, points.count)
-        XCTAssertEqual(values, [0, 0.5, nil, 1])
-        XCTAssertNil(values[2], "不能把历史缺口插值成真实样本")
-        let low = try XCTUnwrap(values[0])
-        let middle = try XCTUnwrap(values[1])
-        let high = try XCTUnwrap(values[3])
-        XCTAssertLessThan(low, middle)
-        XCTAssertLessThan(middle, high)
-        XCTAssertEqual(middle - low, high - middle, accuracy: 1e-12, "原始 TPS 必须线性共用尺度")
+    func testCompactTotalPreservesContinuousCoreCurveAcrossStaleAndMissingEdges() async throws {
+        let history = [
+            sample(.noData, secondsLater: -8),
+            sample(secondsLater: -6),
+            sample(.stale, secondsLater: -4),
+            LiveRateSample(timestamp: sampledAt.addingTimeInterval(-2), state: .live,
+                           tokensInWindow: 5_400, latestSignalAt: sampledAt.addingTimeInterval(-2)),
+            sample(.noData),
+        ]
+        let curve = SparklineAnalysis.makeSparkline(from: history, end: sampledAt, windowSeconds: 8)
+        let rawValues = curve.points.map(\.value)
+        XCTAssertEqual(rawValues, [nil, nil, 10, nil, nil, nil, 30, nil, nil],
+                       "真实重采样须保留首尾缺失和中间 stale，不得篡改历史数据补缺")
 
-        let outliers = makePoints(Array(repeating: 10, count: 20) + [20, 1_000])
-        let outlierValues = CompactTPSGeometry.normalizedValues(points: outliers)
-        XCTAssertLessThan(try XCTUnwrap(outlierValues[20]), try XCTUnwrap(outlierValues[21]),
-                          "分位裁剪不能把 20 与 1000 的真实峰值压到同一高度")
-        XCTAssertEqual(points.map(\.value), [0, 50, nil, 100], "几何转换不改历史统计值")
+        // normalized 必须来自现有 Core 插值、平滑流程，而不是测试手填的绘图值。
+        let expected = curve.points.map(\.normalized)
+        XCTAssertEqual(expected.count, 9)
+        XCTAssertEqual(expected.compactMap { $0 }.count, 9)
+        let values = CompactTPSGeometry.normalizedValues(points: curve.points)
+        XCTAssertEqual(values, expected, "三入口公共总线投影须直接保留 Core 的连贯形状")
+        for value in values {
+            let finite = try XCTUnwrap(value, "显示总线不能因 raw 缺口断开")
+            XCTAssertTrue(finite.isFinite && (0...1).contains(finite))
+        }
+        XCTAssertLessThan(try XCTUnwrap(values.first.flatMap { $0 }),
+                          try XCTUnwrap(values.last.flatMap { $0 }), "不能用一条平线冒充真实趋势")
+        let snapshot = OrbSnapshot(
+            tps: nil, sparklinePoints: curve.points, trend: curve.regression.trend,
+            trendColorMode: .risingGreen, dayTotalTokens: nil, isExpanded: false
+        )
+        XCTAssertEqual(snapshot.renderedSparklineValues, expected,
+                       "悬浮球须与菜单、气泡共用同一连贯总线；当前无读数也不抹掉历史趋势")
+        XCTAssertEqual(curve.points.map(\.value), rawValues)
     }
 
-    func testCompactModelCurvesShareTheTotalScale() async {
+    func testCompactModelCurvesKeepTheirSharedRawReferenceScale() async {
         let total = makePoints([0, 50, nil, 100])
         let alpha = makePoints([0, 30, nil, 60])
         let beta = makePoints([0, 20, nil, 40])
-        let totalGeometry = CompactTPSGeometry.normalizedValues(points: total)
+        let totalGeometry = CompactTPSGeometry.normalizedValues(points: total, referencePoints: total)
         let alphaGeometry = CompactTPSGeometry.normalizedValues(points: alpha, referencePoints: total)
         let betaGeometry = CompactTPSGeometry.normalizedValues(points: beta, referencePoints: total)
         XCTAssertEqual(alphaGeometry, [0, 0.3, nil, 0.6])
@@ -161,17 +176,17 @@ final class TPSPresentationConsistencyTests: XCTestCase {
         XCTAssertNil(betaGeometry[2])
     }
 
-    func testOrbAndCompactGeometryShareRawShapeAndFallbackSemantics() async {
-        let points = makePoints([0, nil, 20, 40], normalized: [1, 1, 1, 0])
-        let snapshot = OrbSnapshot(
-            tps: 10, sparklinePoints: points, trend: .rising,
-            trendColorMode: .risingGreen, dayTotalTokens: nil, isExpanded: false
+    func testCompactTotalFallsBackOnlyWhenCoreHasNoDrawableCurve() async {
+        let missing = SparklineAnalysis.makeSparkline(
+            from: [sample(.noData, secondsLater: -8), sample(.stale)], end: sampledAt, windowSeconds: 8
         )
-        XCTAssertEqual(snapshot.renderedSparklineValues,
-                       CompactTPSGeometry.normalizedValues(points: points, fallbackTPS: 10))
-        let invalid = makePoints([nil, .nan, .infinity, -1])
-        XCTAssertEqual(CompactTPSGeometry.normalizedValues(points: invalid), [])
-        XCTAssertEqual(CompactTPSGeometry.normalizedValues(points: invalid, fallbackTPS: 0), [0.5, 0.5])
+        XCTAssertEqual(missing.points.count, 9)
+        XCTAssertTrue(missing.points.allSatisfy { $0.value == nil && $0.normalized == nil })
+        XCTAssertEqual(CompactTPSGeometry.normalizedValues(points: missing.points), [])
+        XCTAssertEqual(CompactTPSGeometry.normalizedValues(points: missing.points, fallbackTPS: 0), [0.5, 0.5])
+        let invalid = makePoints([10, 20], normalized: [.nan, .infinity])
+        XCTAssertEqual(CompactTPSGeometry.normalizedValues(points: invalid), [],
+                       "总线不能改拿 raw 伪造无效 normalized 的形状")
         XCTAssertEqual(CompactTPSGeometry.normalizedValues(points: [], fallbackTPS: 10), [0.5, 0.5])
         XCTAssertEqual(CompactTPSGeometry.normalizedValues(points: [], fallbackTPS: .nan), [])
         XCTAssertEqual(CompactTPSGeometry.normalizedValues(points: [], fallbackTPS: -1), [])

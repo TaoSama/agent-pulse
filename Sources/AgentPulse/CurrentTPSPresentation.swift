@@ -63,16 +63,22 @@ struct CurrentTPSModelValue: Sendable, Equatable, Identifiable {
     let tps: Double?
 }
 
-/// 悬浮球、气泡、菜单小图共享投影。保留真实峰和缺口，只把值映射到屏幕坐标。
+/// 悬浮球、气泡、菜单小图共享投影；总曲线复用 Core 已补点、平滑和归一化的结果。
 enum CompactTPSGeometry {
+    /// 总曲线直接使用绘图值，避免重复计算；没有绘图点时用有效当前读数显示平线。
     static func normalizedValues(points: [SparklinePoint], fallbackTPS: Double? = nil) -> [Double?] {
-        guard points.contains(where: { validValue($0.value) != nil }) else {
+        let values = points.map { point -> Double? in
+            guard let value = point.normalized, value.isFinite else { return nil }
+            return value
+        }
+        guard values.contains(where: { $0 != nil }) else {
             if let fallbackTPS, fallbackTPS.isFinite, fallbackTPS >= 0 { return [0.5, 0.5] }
             return []
         }
-        return normalizedValues(points: points, referencePoints: points)
+        return values
     }
 
+    /// 分模型历史保留原始 TPS 投影及缺口，以参考历史的原始峰值为标尺。
     static func normalizedValues(points: [SparklinePoint], referencePoints: [SparklinePoint]) -> [Double?] {
         let upper = max(referencePoints.compactMap { validValue($0.value) }.max() ?? 1, 1)
         return points.map { point in validValue(point.value).map { min($0 / upper, 1) } }
