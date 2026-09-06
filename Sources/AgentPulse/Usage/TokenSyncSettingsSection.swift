@@ -31,13 +31,8 @@ struct TokenSyncSettingsSection: View {
                 .foregroundStyle(Color.white)
                 .fixedSize(horizontal: true, vertical: false)
             Spacer(minLength: 12)
-            Picker("扫描和上报间隔", selection: reportIntervalBinding) {
-                ForEach(TokenReportInterval.allCases) { interval in
-                    Text(interval.title).tag(interval)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            StableSegmentedPicker(label: "扫描和上报间隔", options: TokenReportInterval.allCases,
+                                  selection: reportIntervalBinding, title: { $0.title })
             .tint(.white)
             .colorScheme(.dark)
             .frame(maxWidth: 300, alignment: .trailing)

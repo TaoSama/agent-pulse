@@ -564,7 +564,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms)
                 SELECT DISTINCT ?, ?, e.source || ? || e.event_id, ?
                 FROM temp_usage_dirty_files f
-                CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_file
+                CROSS JOIN usage_events e INDEXED BY sqlite_autoindex_usage_events_1
                   ON e.hostname=? AND e.source_file_hash = f.file_id;
                 """)
             defer { sqlite3_finalize(logical) }
@@ -579,7 +579,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms)
                 SELECT DISTINCT ?, ?, e.source || ? || e.session_hash, ?
                 FROM temp_usage_dirty_files f
-                CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_file
+                CROSS JOIN usage_events e INDEXED BY sqlite_autoindex_usage_events_1
                   ON e.hostname=? AND e.source_file_hash = f.file_id;
                 """)
             defer { sqlite3_finalize(eventSessions) }
@@ -594,7 +594,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 INSERT OR IGNORE INTO usage_dirty_keys(hostname,kind,key,created_at_ms)
                 SELECT DISTINCT ?, ?, e.source || ? || e.model || ? || e.project || ? || CAST((e.timestamp_ms / ?) * ? AS TEXT), ?
                 FROM temp_usage_dirty_files f
-                CROSS JOIN usage_events e INDEXED BY idx_usage_events_host_file
+                CROSS JOIN usage_events e INDEXED BY sqlite_autoindex_usage_events_1
                   ON e.hostname=? AND e.source_file_hash = f.file_id;
                 """)
             defer { sqlite3_finalize(eventBuckets) }
@@ -1048,11 +1048,26 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// scoped 版仅比全量版多一个 JOIN temp_scope_events，把参与去重的原始行限定在脏闭包
     /// 覆盖的 logical 组内。分组维度与全量逐字相同，所以增量结果等于全量结果在该作用域上的
     /// 投影——等价性来自共用同一份 SQL，而不是两套实现凑出来的巧合。
-    private static func logicalEventsSQL(scoped: Bool) -> String {
-        scoped ? logicalEventsScopedSQL : logicalEventsFullSQL
+    private static func logicalEventsSQL(scoped: Bool, sequentialFullScan: Bool = false) -> String {
+        scoped ? logicalEventsScopedSQL : logicalEventsFullSQL(sequential: sequentialFullScan)
     }
 
-    private static let logicalEventsFullSQL = """
+    /// Two covering-index range probes avoid counting or scanning all host keys.
+    /// If every row belongs to this host, a time-index walk only adds random
+    /// table lookups before the same mandatory logical-ID sort.
+    func fullLogicalEventsSQLUnlocked(hostname: String) throws -> String {
+        let statement = try prepare("""
+            SELECT EXISTS(SELECT 1 FROM usage_events INDEXED BY idx_usage_events_host_time WHERE hostname<? LIMIT 1)
+                OR EXISTS(SELECT 1 FROM usage_events INDEXED BY idx_usage_events_host_time WHERE hostname>? LIMIT 1);
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, hostname)
+        try bind(statement, 2, hostname)
+        guard try step(statement) == SQLITE_ROW else { throw error() }
+        return Self.logicalEventsSQL(scoped: false, sequentialFullScan: sqlite3_column_int(statement, 0) == 0)
+    }
+
+    private static func logicalEventsFullSQL(sequential: Bool) -> String { """
             CREATE TEMP TABLE temp_logical_events AS
             WITH active_files AS (
                 SELECT file_id FROM usage_files WHERE scan_status <> 'missing'
@@ -1069,7 +1084,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                         WHEN source_file_hash IN (SELECT file_id FROM active_files) THEN 2
                         ELSE 1
                     END AS tier
-                FROM usage_events
+                FROM usage_events \(sequential ? "NOT INDEXED" : "")
                 WHERE hostname = ?
             ),
             ranked AS (
@@ -1107,7 +1122,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 GROUP BY source, event_id
             )
             SELECT * FROM logical_dedup;
-        """
+        """ }
 
     private static let logicalEventsScopedSQL = """
             CREATE TEMP TABLE temp_logical_events AS
@@ -1430,7 +1445,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try exec("DROP TABLE IF EXISTS temp_lineage_events;")
         try exec("DROP TABLE IF EXISTS temp_deduped_events;")
         let bucketMs = Self.bucketMilliseconds
-        let logicalSQL = Self.logicalEventsSQL(scoped: false)
+        let logicalSQL = try fullLogicalEventsSQLUnlocked(hostname: hostname)
         do {
             let logicalStmt = try prepare(logicalSQL)
             defer { sqlite3_finalize(logicalStmt) }
@@ -2052,7 +2067,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try? exec("DROP TABLE IF EXISTS temp_deduped_events;")
         }
         do {
-            let statement = try prepare(Self.logicalEventsSQL(scoped: false))
+            let statement = try prepare(fullLogicalEventsSQLUnlocked(hostname: hostname))
             defer { sqlite3_finalize(statement) }
             try bind(statement, 1, hostname)
             try done(statement)
@@ -4890,12 +4905,18 @@ public final class UsageLedgerStore: @unchecked Sendable {
             // 更慢。恢复 hostname/time 顺序索引并换稳定名字：旧名字只清理一次，后续启动全部为 no-op。
             return "DROP INDEX IF EXISTS idx_usage_events_host;"
                 + "DROP INDEX IF EXISTS idx_usage_events_host_logical;"
+                // The v8 primary key starts with source_file_hash and serves the
+                // same file lookup. Reclaim only the redundant secondary tree;
+                // freed pages remain reusable without a database-wide VACUUM.
+                + "DROP INDEX IF EXISTS idx_usage_events_file;"
+                // Dedup lookups are host-scoped and use the partial covering
+                // indexes below; full derivation deduplicates materialized TEMP rows.
+                + "DROP INDEX IF EXISTS idx_usage_events_lineage;"
+                + "DROP INDEX IF EXISTS idx_usage_events_dedup;"
                 + "CREATE INDEX IF NOT EXISTS idx_usage_events_host_time ON usage_events(hostname,timestamp_ms,event_id,source_file_hash);"
-                // record() asks for the old raw rows of exactly one file before replacing them.
-                // The existing single-column file index is not selective enough on multi-host,
-                // multi-GB ledgers; SQLite can spend the scan hot path walking unrelated rows.
-                + "CREATE INDEX IF NOT EXISTS idx_usage_events_host_file ON usage_events(hostname,source_file_hash);"
-                + "CREATE INDEX IF NOT EXISTS idx_usage_events_dedup ON usage_events(codex_dedup_key);"
+                // File-scoped lookups use the file-leading primary key and still
+                // filter hostname; no extra B-tree is needed for the same rows.
+                + "DROP INDEX IF EXISTS idx_usage_events_host_file;"
                 // 增量闭包的两条正向边（logical→lineage、logical→content）把脏键表 JOIN 回
                 // usage_events，连接列是 (source, event_id)。缺索引时每条边都全表扫描，50k 行
                 // fixture 上两条边合计 0.25 秒，且随账本线性恶化——大库上增量会比全量还慢。
@@ -4925,7 +4946,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_time ON usage_session_events(timestamp_ms);"
                 + "CREATE INDEX IF NOT EXISTS idx_session_events_host_file_dirty ON usage_session_events(hostname,source_file_hash,source,session_hash);"
         case "usage_edit_entries":
-            return "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_host ON usage_edit_entries(hostname,timestamp_ms,tool_use_id,source_file_hash);"
+            return "DROP INDEX IF EXISTS idx_usage_edit_entries_file;"
+                + "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_host ON usage_edit_entries(hostname,timestamp_ms,tool_use_id,source_file_hash);"
                 + "CREATE INDEX IF NOT EXISTS idx_usage_edit_entries_host_file_dirty ON usage_edit_entries(hostname,source_file_hash,source,model,project,timestamp_ms,tool_use_id);"
                 // 增量 finalize 按脏 tool_use_id 反查该 ID 当前在册的全部 bucket。v8 rebuild 路径
                 // 建过同名索引，但 v10 存量库不走那条路径，只能在这里补建。少了它这次反查会退化成
@@ -5173,7 +5195,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return UsageToolMetrics.normalizeSkills(decoded).sorted()
     }
 
-    private func encodeStringIntMap(_ values: [String: Int]) -> String {
+    func encodeStringIntMap(_ values: [String: Int]) -> String {
         let normalized = UsageToolMetrics.normalizeCounts(values)
         guard let data = try? JSONEncoder.sorted.encode(normalized) else { return "{}" }
         return String(decoding: data, as: UTF8.self)

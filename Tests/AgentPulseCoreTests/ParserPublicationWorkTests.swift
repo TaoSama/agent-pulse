@@ -14,6 +14,7 @@ final class ParserPublicationWorkTests: XCTestCase {
         var scopedStatements = 0
         var stageStreams = 0
         var eventInserts = 0
+        var typedStageCleanups = 0
         var vmSteps = 0
 
         func record(_ statement: OpaquePointer, event: UInt32) {
@@ -27,11 +28,14 @@ final class ParserPublicationWorkTests: XCTestCase {
                 dirtyCaptures += 1
             }
             for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
-                if sql.hasPrefix("DELETE FROM \(table) WHERE source_file_hash=?") { rawDeletes += 1 }
+                if sql.hasPrefix("DELETE FROM \(table) WHERE source_file_hash") { rawDeletes += 1 }
             }
             if sql.contains("temp_parser_keys") { scopedStatements += 1 }
             if sql.hasPrefix("SELECT value FROM temp.usage_parser_stage") { stageStreams += 1 }
-            if sql.hasPrefix("INSERT INTO usage_events ") { eventInserts += 1 }
+            if sql.hasPrefix("INSERT INTO usage_events(") || sql.hasPrefix("INSERT INTO usage_events ") { eventInserts += 1 }
+            if sql.hasPrefix("DELETE FROM temp.usage_stage_"), sql.hasSuffix("WHERE source_file_hash=?;") {
+                typedStageCleanups += 1
+            }
         }
     }
 
@@ -104,7 +108,9 @@ final class ParserPublicationWorkTests: XCTestCase {
     func testEOFBookkeepingIsPerFileRatherThanPerDecodedBatch() throws {
         let rowCounts = [1, 129, 1025]
         let expectedDirtyCapturesPerFile = 16 // Eight key queries for each of old and new generations.
-        let expectedRawDeletesPerFile = 3
+        // Only the event table has an old generation in this fixture.
+        // Fresh session/edit tables must bypass diff DELETE/UPDATE entirely.
+        let expectedRawDeletesPerFile = 1
         for count in rowCounts {
             let store = try makeStore()
             try store.recordIncremental(batch: batch([event("old")], replace: true), hostname: hostname)
@@ -121,13 +127,103 @@ final class ParserPublicationWorkTests: XCTestCase {
             XCTAssertEqual(observed.dirtyCaptures, expectedDirtyCapturesPerFile, "rows=\(count)")
             XCTAssertEqual(observed.rawDeletes, expectedRawDeletesPerFile, "rows=\(count)")
             XCTAssertEqual(observed.scopedStatements, 0, "EOF must not rebuild per-batch correction keys")
-            XCTAssertEqual(observed.stageStreams, 3)
-            XCTAssertEqual(observed.eventInserts, count)
+            XCTAssertEqual(observed.stageStreams, 0, "typed publication must not decode a generic JSON event stream")
+            XCTAssertEqual(observed.eventInserts, 1, "event publication must be one set operation regardless of row count")
+            XCTAssertEqual(observed.typedStageCleanups, 3, "each typed stage must be cleared once at EOF")
             XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_events;"), Int64(count))
             XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_session_events;"), Int64(count))
             XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_edit_entries;"), Int64(count))
             print("EOF rows=\(count): dirty=\(observed.dirtyCaptures), deletes=\(observed.rawDeletes), VM=\(observed.vmSteps), cacheMiss=\(cacheMisses), cacheWrite=\(cacheWrites)")
         }
+    }
+
+    private func observeRawMutations(_ store: UsageLedgerStore) throws {
+        try store.exec("CREATE TEMP TABLE raw_mutations(table_name TEXT, operation TEXT);")
+        for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
+            for operation in ["INSERT", "UPDATE", "DELETE"] {
+                try store.exec("""
+                    CREATE TEMP TRIGGER observe_\(table)_\(operation) AFTER \(operation) ON main.\(table)
+                    BEGIN INSERT INTO raw_mutations VALUES('\(table)','\(operation)'); END;
+                    """)
+            }
+        }
+    }
+
+    func testIdenticalReplacementDoesNotMutateRawRows() throws {
+        let store = try makeStore()
+        let unchanged = batch([event("same", skills: ["b": 2, "a": 1])],
+            sessions: [session("same")], edits: [edit("same")], replace: true)
+        try store.recordIncremental(batch: unchanged, hostname: hostname)
+        try store.finalizeDerived(hostname: hostname)
+        try store.exec("UPDATE usage_events SET created_at_ms=123;")
+        try observeRawMutations(store)
+        try store.recordIncremental(batch: unchanged, hostname: hostname)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM raw_mutations;"), 0)
+        XCTAssertEqual(try scalar(store, "SELECT created_at_ms FROM usage_events;"), 123)
+        XCTAssertEqual(try scalar(store, "SELECT output_tokens FROM usage_events;"), 1)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_dirty_keys;"), 0)
+        XCTAssertFalse(try store.requiresDerivationCompletion())
+    }
+
+    func testUnchangedReplacementPreservesCheckpointTierAndSourceGateInvalidation() throws {
+        let store = try makeStore()
+        let unchanged = batch([event("same")], replace: true)
+        try store.recordIncremental(batch: unchanged, hostname: hostname)
+        try store.finalizeDerived(hostname: hostname)
+        // Isolate checkpoint attribution from raw mutations: returning or newly
+        // registered files become active-tier candidates even with identical rows.
+        for checkpointChange in [
+            "UPDATE usage_files SET scan_status='missing';",
+            "DELETE FROM usage_files;"
+        ] {
+            try store.exec(checkpointChange)
+            try store.recordIncremental(batch: unchanged, hostname: hostname)
+            XCTAssertGreaterThan(try scalar(store, "SELECT COUNT(*) FROM usage_dirty_keys;"), 0)
+            XCTAssertTrue(try store.requiresDerivationCompletion())
+            try store.finalizeDerived(hostname: hostname)
+        }
+        // A new measurable source must invalidate derived code metrics even when
+        // it produces no raw rows. A second identical empty scan must be a no-op.
+        try store.recordIncremental(batch: batch(replace: true), hostname: hostname)
+        try store.finalizeDerived(hostname: hostname)
+        let empty = batch(replace: true, source: "new-empty-source")
+        try store.recordIncremental(batch: empty, hostname: hostname)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_edit_metric_sources WHERE source='new-empty-source';"), 1)
+        XCTAssertTrue(try store.requiresDerivationCompletion())
+        try store.finalizeDerived(hostname: hostname)
+        try store.recordIncremental(batch: empty, hostname: hostname)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_dirty_keys;"), 0)
+        XCTAssertFalse(try store.requiresDerivationCompletion())
+    }
+
+    func testReplacementMutatesOnlyChangedMissingAndNewRowsForEachKind() throws {
+        let store = try makeStore()
+        let ids = ["same", "changed", "removed"]
+        try store.recordIncremental(batch: batch(ids.map { event($0) }, sessions: ids.map { session($0) },
+            edits: ids.map { edit($0) }, replace: true), hostname: hostname)
+        try observeRawMutations(store)
+        try store.recordIncremental(batch: batch([event("same"), event("changed", output: 7), event("new")],
+            sessions: [session("same"), session("changed", at: time.addingTimeInterval(1)), session("new")],
+            edits: [edit("same"), edit("changed", at: time.addingTimeInterval(1)), edit("new")],
+            replace: true), hostname: hostname)
+        for table in ["usage_events", "usage_session_events", "usage_edit_entries"] {
+            for operation in ["INSERT", "UPDATE", "DELETE"] {
+                XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM raw_mutations WHERE table_name='\(table)' AND operation='\(operation)';"), 1)
+            }
+            XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM \(table);"), 3)
+        }
+        XCTAssertEqual(try scalar(store, "SELECT SUM(output_tokens) FROM usage_events;"), 9)
+    }
+
+    func testParsedCorrectionsRemainAuthoritativeForAppendAndReplacement() throws {
+        let store = try makeStore()
+        try store.recordIncremental(batch: batch([event("shared", output: 80, strategy: .cumulativeMax)], replace: true), hostname: hostname)
+        try store.recordIncremental(batch: batch([event("shared", output: 7, strategy: .cumulativeMax)]), hostname: hostname)
+        // Incremental parser batches already contain the reconciled value;
+        // writeParserRawBatchUnlocked replaces the touched event identities.
+        XCTAssertEqual(try scalar(store, "SELECT output_tokens FROM usage_events;"), 7)
+        try store.recordIncremental(batch: batch([event("shared", output: 7, strategy: .cumulativeMax)], replace: true), hostname: hostname)
+        XCTAssertEqual(try scalar(store, "SELECT output_tokens FROM usage_events;"), 7)
     }
 
     func testFrozenBoundaryAndDroppedCountersMatchAppendForAllKinds() throws {
@@ -159,7 +255,7 @@ final class ParserPublicationWorkTests: XCTestCase {
             event("shared", output: 30, strategy: .cumulativeMax, skills: ["skill": 5]),
             event("shared", output: 12, strategy: .cumulativeMax, skills: ["skill": 3])
         ], replace: true, final: false), hostname: hostname)
-        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM temp.usage_parser_stage WHERE kind='event';"), 1)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM temp.usage_stage_events_candidate;"), 1)
         try store.recordIncremental(batch: batch([
             event("shared", output: 7, strategy: .cumulativeMax, skills: ["skill": 1])
         ], state: 2), hostname: hostname)
@@ -181,6 +277,36 @@ final class ParserPublicationWorkTests: XCTestCase {
         XCTAssertEqual(try store.checkpoint(fileID: fileID)?.offset, 0)
         XCTAssertEqual(try store.parserState(fileID: fileID, key: "state"), Data([2]))
         XCTAssertEqual(try store.readTextUnlocked(key: UsageLedgerStore.rawDerivationPendingKey), "1")
+    }
+
+    func testTypedSessionStageKeepsLatestSourceForTheSameIdentity() throws {
+        let store = try makeStore()
+        let old = UsageSessionEvent(id: "shared", source: "old", sessionHash: "session",
+            sourceFileHash: fileID, role: .user, timestamp: time)
+        let new = UsageSessionEvent(id: "shared", source: "new", sessionHash: "session",
+            sourceFileHash: fileID, role: .assistant, timestamp: time)
+        try store.recordIncremental(batch: batch(sessions: [old], replace: true, final: false), hostname: hostname)
+        try store.recordIncremental(batch: batch(sessions: [new]), hostname: hostname)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_session_events;"), 1)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_session_events WHERE source='new' AND role='assistant';"), 1)
+    }
+
+    func testTypedStageRemovalsAndUnknownModelBackfill() throws {
+        let store = try makeStore()
+        let first = batch([event("removed"), event("kept")], edits: [edit("removed"), edit("kept")], replace: true, final: false)
+        let staged = UsageIncrementalBatch(parsed: first.parsed,
+            stateChanges: UsageParserStateChanges(values: ["codex-unknown:fixture": try JSONEncoder().encode("kept")], removedKeys: []),
+            removedEventIDs: [], removedEditIDs: [], replacesFile: true, isFinalBatch: false)
+        try store.recordIncremental(batch: staged, hostname: hostname)
+        let last = batch([event("kept")], edits: [edit("kept")])
+        try store.recordIncremental(batch: UsageIncrementalBatch(parsed: last.parsed,
+            stateChanges: last.stateChanges, removedEventIDs: ["removed", "kept"],
+            removedEditIDs: ["removed", "kept"], replacesFile: false, isFinalBatch: true,
+            codexUnknownModel: "resolved-model"), hostname: hostname)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_events;"), 1)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_events WHERE event_id='kept' AND model='resolved-model';"), 1)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_edit_entries WHERE tool_use_id='kept';"), 1)
+        XCTAssertEqual(try scalar(store, "SELECT COUNT(*) FROM usage_edit_entries;"), 1)
     }
 
     func testCheckpointFailureRollsBackNewRowsDirtyKeysAndFrozenCounter() throws {

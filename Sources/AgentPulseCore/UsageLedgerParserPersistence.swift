@@ -7,8 +7,6 @@ import SQLite3
 /// successful publication, or closing the connection. Disk-backed TEMP storage
 /// avoids writing these non-recoverable intermediate values through the main WAL.
 extension UsageLedgerStore {
-    private static let parserPublishBatchSize = 128
-
     func initializeParserPersistenceUnlocked() throws {
         try transaction {
             try exec("""
@@ -21,11 +19,15 @@ extension UsageLedgerStore {
             CREATE TEMP TABLE IF NOT EXISTS usage_parser_replacements(
               file_id TEXT PRIMARY KEY, hostname TEXT NOT NULL
             ) WITHOUT ROWID;
+            CREATE TEMP TABLE IF NOT EXISTS usage_parser_ready(
+              file_id TEXT PRIMARY KEY, checkpoint BLOB NOT NULL
+            ) WITHOUT ROWID;
             CREATE TEMP TABLE IF NOT EXISTS usage_parser_stage(
               file_id TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL,
               value BLOB NOT NULL, PRIMARY KEY(file_id,kind,key)
             ) WITHOUT ROWID;
             """)
+            try initializeTypedStageTablesUnlocked()
         }
         // Only obsolete scratch tables are dropped. Their pages can be reused;
         // this does not promise a smaller database file or run VACUUM. Durable
@@ -33,7 +35,7 @@ extension UsageLedgerStore {
     }
 
     func resetParserPersistenceUnlocked() throws {
-        try exec("DELETE FROM usage_parser_state; DELETE FROM temp.usage_parser_stage; DELETE FROM temp.usage_parser_replacements;")
+        try exec("DELETE FROM usage_parser_state; DELETE FROM temp.usage_parser_stage; DELETE FROM temp.usage_parser_replacements; DELETE FROM temp.usage_parser_ready;"); try resetTypedParserStageUnlocked()
     }
 
     func migrateParserFileIdentityUnlocked(from oldID: String, to newID: String) throws {
@@ -68,6 +70,14 @@ extension UsageLedgerStore {
     }
 
     public func recordIncremental(batch: UsageIncrementalBatch, hostname: String) throws {
+        _ = try recordIncremental(batch: batch, hostname: hostname, deferPublication: false)
+    }
+
+    func recordIncrementalForScan(batch: UsageIncrementalBatch, hostname: String) throws -> Bool {
+        try recordIncremental(batch: batch, hostname: hostname, deferPublication: true)
+    }
+
+    private func recordIncremental(batch: UsageIncrementalBatch, hostname: String, deferPublication: Bool) throws -> Bool {
         let parsed = batch.parsed
         let checkpoint = parsed.checkpoint
         guard checkpoint.offset >= 0, checkpoint.offset <= checkpoint.size else {
@@ -75,6 +85,7 @@ extension UsageLedgerStore {
         }
         try validateAttribution(events: parsed.events, sessionEvents: parsed.sessionEvents,
                                 editEntries: parsed.editEntries, fileID: checkpoint.fileID)
+        var committed = false
         try queue.sync {
             try transaction {
                 let fileID = checkpoint.fileID
@@ -85,20 +96,17 @@ extension UsageLedgerStore {
                     try bind(statement, 1, fileID); try bind(statement, 2, hostname); try done(statement)
                 }
                 if try hasParserReplacementUnlocked(fileID: fileID) {
+                    guard try !parserReplacementIsReadyUnlocked(fileID: fileID) else {
+                        throw UsageLedgerError.invalidCheckpoint
+                    }
                     try stageParserBatchUnlocked(batch, hostname: hostname)
                     if batch.isFinalBatch {
-                        try markParserRowsDirtyUnlocked(fileID: fileID, allRows: true)
-                        try deleteRawForFileUnlocked(fileID: fileID)
-                        try publishParserStageUnlocked(fileID: fileID, hostname: hostname)
-                        try deleteParserStateUnlocked(fileID: fileID)
-                        let copy = try prepare("""
-                            INSERT INTO usage_parser_state(file_id,key,value)
-                            SELECT file_id,key,value FROM temp.usage_parser_stage WHERE file_id=? AND kind='state';
-                            """)
-                        defer { sqlite3_finalize(copy) }
-                        try bind(copy, 1, fileID); try done(copy)
-                        try finishParserBatchUnlocked(checkpoint, hostname: hostname)
-                        try abortParserReplacementUnlocked(fileID: fileID)
+                        if deferPublication {
+                            try markParserReplacementReadyUnlocked(checkpoint)
+                        } else {
+                            try publishParserReplacementUnlocked(checkpoint, hostname: hostname)
+                            committed = true
+                        }
                     }
                 } else {
                     try writeParserRawBatchUnlocked(events: parsed.events, sessions: parsed.sessionEvents,
@@ -109,16 +117,21 @@ extension UsageLedgerStore {
                         try backfillParserUnknownModelUnlocked(fileID: fileID, model: model, staging: false)
                     }
                     try finishParserBatchUnlocked(checkpoint, hostname: hostname)
+                    committed = true
                 }
             }
         }
+        return committed
     }
 
-    private func finishParserBatchUnlocked(_ checkpoint: UsageFileCheckpoint, hostname: String) throws {
+    func finishParserBatchUnlocked(_ checkpoint: UsageFileCheckpoint, hostname: String, rawChanged: Bool = true) throws {
         let previous = try prepare("SELECT scan_status FROM usage_files WHERE file_id=?;")
         defer { sqlite3_finalize(previous) }
         try bind(previous, 1, checkpoint.fileID)
-        if try step(previous) == SQLITE_ROW, text(previous, 0) == "missing", checkpoint.status != "missing" {
+        let hadCheckpoint = try step(previous) == SQLITE_ROW
+        let wasActive = hadCheckpoint && text(previous, 0) != "missing"
+        let tierChanged = wasActive != (checkpoint.status != "missing")
+        if tierChanged && (!rawChanged || (hadCheckpoint && !wasActive)) {
             // Returning files change ownership tier even when their bytes have not
             // changed. Every identity in the file can now displace another winner.
             try markParserRowsDirtyUnlocked(fileID: checkpoint.fileID, allRows: true)
@@ -127,7 +140,12 @@ extension UsageLedgerStore {
             try markEditMetricSourceUnlocked(checkpoint.source, hostname: hostname)
         }
         try writeCheckpoint(checkpoint)
-        try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
+        let dirty = try prepare("SELECT 1 FROM usage_dirty_keys LIMIT 1;")
+        defer { sqlite3_finalize(dirty) }
+        let hasDirtyKeys = try step(dirty) == SQLITE_ROW
+        if rawChanged || tierChanged || hasDirtyKeys {
+            try setTextUnlocked(key: Self.rawDerivationPendingKey, value: "1")
+        }
         if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
             try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
         }
@@ -140,12 +158,13 @@ extension UsageLedgerStore {
         return try step(statement) == SQLITE_ROW
     }
 
-    private func abortParserReplacementUnlocked(fileID: String) throws {
-        for table in ["temp.usage_parser_stage", "temp.usage_parser_replacements"] {
+    func abortParserReplacementUnlocked(fileID: String) throws {
+        for table in ["temp.usage_parser_stage", "temp.usage_parser_replacements", "temp.usage_parser_ready"] {
             let statement = try prepare("DELETE FROM \(table) WHERE file_id=?;")
             defer { sqlite3_finalize(statement) }
             try bind(statement, 1, fileID); try done(statement)
         }
+        try abortTypedParserStageUnlocked(fileID: fileID)
     }
 
     func deleteParserStateUnlocked(fileID: String) throws {
@@ -162,14 +181,14 @@ extension UsageLedgerStore {
         guard try step(owner) == SQLITE_ROW, text(owner, 0) == hostname else {
             throw UsageLedgerError.invalidCheckpoint
         }
-        try stageParserValuesUnlocked(batch.parsed.events.map { ($0.id, $0) }, kind: "event", fileID: fileID)
-        try stageParserValuesUnlocked(batch.parsed.sessionEvents.map { ($0.id, $0) }, kind: "session", fileID: fileID)
-        try stageParserValuesUnlocked(batch.parsed.editEntries.map { ($0.toolUseID, $0) }, kind: "edit", fileID: fileID)
+        try stageTypedEventsUnlocked(batch.parsed.events, fileID: fileID, hostname: hostname)
+        try stageTypedSessionsUnlocked(batch.parsed.sessionEvents, fileID: fileID, hostname: hostname)
+        try stageTypedEditsUnlocked(batch.parsed.editEntries, fileID: fileID, hostname: hostname)
         // An emitted authoritative event wins over a deletion marker in the same batch.
         let emitted = Set(batch.parsed.events.map(\.id))
         let emittedEdits = Set(batch.parsed.editEntries.map(\.toolUseID))
-        try deleteParserStageKeysUnlocked(batch.removedEventIDs.filter { !emitted.contains($0) }, kind: "event", fileID: fileID)
-        try deleteParserStageKeysUnlocked(batch.removedEditIDs.filter { !emittedEdits.contains($0) }, kind: "edit", fileID: fileID)
+        try deleteTypedStageRemovedEventsUnlocked(batch.removedEventIDs.filter { !emitted.contains($0) }, fileID: fileID)
+        try deleteTypedStageRemovedEditsUnlocked(batch.removedEditIDs.filter { !emittedEdits.contains($0) }, fileID: fileID)
         try writeParserStateUnlocked(batch.stateChanges, fileID: fileID, staging: true)
         if let model = batch.codexUnknownModel {
             try backfillParserUnknownModelUnlocked(fileID: fileID, model: model, staging: true)
@@ -181,15 +200,7 @@ extension UsageLedgerStore {
     /// list of events or identifiers in the parser's resident memory.
     private func backfillParserUnknownModelUnlocked(fileID: String, model: String, staging: Bool) throws {
         if staging {
-            let statement = try prepare("""
-                UPDATE temp.usage_parser_stage SET value=json_set(CAST(value AS TEXT),'$.model',?)
-                WHERE file_id=? AND kind='event' AND key IN (
-                  SELECT json_extract(CAST(value AS TEXT),'$') FROM temp.usage_parser_stage
-                  WHERE file_id=? AND kind='state' AND key>='codex-unknown:' AND key<'codex-unknown;'
-                );
-                """)
-            defer { sqlite3_finalize(statement) }
-            try bind(statement, 1, model); try bind(statement, 2, fileID); try bind(statement, 3, fileID); try done(statement)
+            try backfillTypedStageUnknownModelUnlocked(fileID: fileID, model: model)
             return
         }
         try prepareParserKeysUnlocked()
@@ -211,26 +222,6 @@ extension UsageLedgerStore {
         try exec("DELETE FROM temp_parser_keys;")
     }
 
-    private func stageParserValuesUnlocked<Value: Encodable>(_ values: [(String, Value)], kind: String, fileID: String) throws {
-        let statement = try prepare("INSERT OR REPLACE INTO temp.usage_parser_stage(file_id,kind,key,value) VALUES(?,?,?,?);")
-        defer { sqlite3_finalize(statement) }
-        let encoder = JSONEncoder()
-        for (key, value) in values {
-            sqlite3_reset(statement); sqlite3_clear_bindings(statement)
-            try bind(statement, 1, fileID); try bind(statement, 2, kind); try bind(statement, 3, key)
-            try bindParserBlob(statement, index: 4, value: encoder.encode(value)); try done(statement)
-        }
-    }
-
-    private func deleteParserStageKeysUnlocked(_ keys: [String], kind: String, fileID: String) throws {
-        let statement = try prepare("DELETE FROM temp.usage_parser_stage WHERE file_id=? AND kind=? AND key=?;")
-        defer { sqlite3_finalize(statement) }
-        for key in keys {
-            sqlite3_reset(statement); sqlite3_clear_bindings(statement)
-            try bind(statement, 1, fileID); try bind(statement, 2, kind); try bind(statement, 3, key); try done(statement)
-        }
-    }
-
     private func writeParserStateUnlocked(_ changes: UsageParserStateChanges, fileID: String, staging: Bool) throws {
         let table = staging ? "temp.usage_parser_stage" : "usage_parser_state"
         let remove = try prepare("DELETE FROM \(table) WHERE file_id=? AND key=?" + (staging ? " AND kind='state';" : ";"))
@@ -240,56 +231,22 @@ extension UsageLedgerStore {
             try bind(remove, 1, fileID); try bind(remove, 2, key); try done(remove)
         }
         let sql = staging
-            ? "INSERT OR REPLACE INTO temp.usage_parser_stage(file_id,key,value,kind) VALUES(?,?,?,'state');"
-            : "INSERT OR REPLACE INTO usage_parser_state(file_id,key,value) VALUES(?,?,?);"
+            ? """
+                INSERT INTO temp.usage_parser_stage(file_id,key,value,kind) VALUES(?,?,?,'state')
+                ON CONFLICT(file_id,kind,key) DO UPDATE SET value=excluded.value
+                WHERE usage_parser_stage.value IS NOT excluded.value;
+                """
+            : """
+                INSERT INTO usage_parser_state(file_id,key,value) VALUES(?,?,?)
+                ON CONFLICT(file_id,key) DO UPDATE SET value=excluded.value
+                WHERE usage_parser_state.value IS NOT excluded.value;
+                """
         let insert = try prepare(sql)
         defer { sqlite3_finalize(insert) }
         for (key, data) in changes.values {
             sqlite3_reset(insert); sqlite3_clear_bindings(insert)
             try bind(insert, 1, fileID); try bind(insert, 2, key)
             try bindParserBlob(insert, index: 3, value: data); try done(insert)
-        }
-    }
-
-    private func publishParserStageUnlocked(fileID: String, hostname: String) throws {
-        // The caller already captured every old owner/key and deleted this file's
-        // raw rows. Stage keys are unique per kind, so publication only inserts;
-        // append/correction bookkeeping must not repeat for each decoded batch.
-        try streamParserStageUnlocked(UsageEvent.self, kind: "event", fileID: fileID) { events in
-            let kept = try unfrozenParserRowsUnlocked(events: events, sessions: [], hostname: hostname)
-            try insertRawEvents(kept.events, fileID: fileID, hostname: hostname)
-        }
-        try streamParserStageUnlocked(UsageSessionEvent.self, kind: "session", fileID: fileID) { sessions in
-            let kept = try unfrozenParserRowsUnlocked(events: [], sessions: sessions, hostname: hostname)
-            try insertRawSessionEvents(kept.sessions, fileID: fileID, hostname: hostname)
-        }
-        try streamParserStageUnlocked(UsageEditEntry.self, kind: "edit", fileID: fileID) { edits in
-            try insertRawEditEntries(edits, fileID: fileID, hostname: hostname)
-        }
-        try markParserRowsDirtyUnlocked(fileID: fileID, allRows: true)
-    }
-
-    private func streamParserStageUnlocked<Value: Decodable>(_ type: Value.Type, kind: String, fileID: String, consume: ([Value]) throws -> Void) throws {
-        let statement = try prepare("SELECT value FROM temp.usage_parser_stage WHERE file_id=? AND kind=? ORDER BY key;")
-        defer { sqlite3_finalize(statement) }
-        try bind(statement, 1, fileID); try bind(statement, 2, kind)
-        let decoder = JSONDecoder()
-        var exhausted = false
-        while !exhausted {
-            // Publishing a large replacement remains one atomic transaction,
-            // but decoded values and Foundation temporaries live for one batch.
-            try autoreleasepool {
-                var values: [Value] = []
-                values.reserveCapacity(Self.parserPublishBatchSize)
-                while values.count < Self.parserPublishBatchSize {
-                    guard try step(statement) == SQLITE_ROW else {
-                        exhausted = true
-                        break
-                    }
-                    values.append(try decoder.decode(type, from: parserBlob(statement, column: 0)))
-                }
-                if !values.isEmpty { try consume(values) }
-            }
         }
     }
 
@@ -377,13 +334,13 @@ extension UsageLedgerStore {
         }
     }
 
-    private func parserBlob(_ statement: OpaquePointer?, column: Int32) -> Data {
+    func parserBlob(_ statement: OpaquePointer?, column: Int32) -> Data {
         let size = Int(sqlite3_column_bytes(statement, column))
         guard size > 0, let bytes = sqlite3_column_blob(statement, column) else { return Data() }
         return Data(bytes: bytes, count: size)
     }
 
-    private func bindParserBlob(_ statement: OpaquePointer?, index: Int32, value: Data) throws {
+    func bindParserBlob(_ statement: OpaquePointer?, index: Int32, value: Data) throws {
         guard value.count <= Int(Int32.max) else {
             throw UsageLedgerError.sqlite("parser statistics exceed SQLite value limit")
         }

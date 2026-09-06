@@ -16,7 +16,8 @@ final class ParserStagingStorageTests: XCTestCase {
     }
 
     private func batch(_ id: String?, output: Int64 = 0, offset: Int64,
-                       replace: Bool = false, final: Bool = true, state: UInt8) -> UsageIncrementalBatch {
+                       replace: Bool = false, final: Bool = true, state: UInt8, file: String? = nil) -> UsageIncrementalBatch {
+        let fileID = file ?? self.fileID
         let events = id.map {
             [UsageEvent(id: $0, source: "claude", model: "model", project: "project",
                         timestamp: time, counts: UsageTokenCounts(output: output),
@@ -94,7 +95,8 @@ final class ParserStagingStorageTests: XCTestCase {
         XCTAssertEqual(try store.parserState(fileID: fileID, key: "state"), Data([2]))
         try store.recordIncremental(batch: batch("new-b", output: 7, offset: 60, final: false, state: 3), hostname: hostname)
         XCTAssertEqual(try store.parserState(fileID: fileID, key: "state"), Data([3]))
-        XCTAssertEqual(try scalar(store.db, "SELECT COUNT(*) FROM temp.usage_parser_stage WHERE kind='event';"), 2)
+        XCTAssertEqual(try scalar(store.db, "SELECT COUNT(*) FROM temp.usage_stage_events_candidate;"), 2)
+        XCTAssertEqual(try scalar(store.db, "SELECT COUNT(*) FROM temp.usage_parser_stage WHERE kind<>'state';"), 0)
         XCTAssertEqual(try scalar(db, "PRAGMA main.data_version;"), version)
         XCTAssertEqual(try walFrames(db), frames)
         XCTAssertEqual(try scalar(db, "SELECT COUNT(*) FROM main.sqlite_schema WHERE name IN ('usage_parser_stage','usage_parser_replacements');"), 0)
@@ -110,6 +112,7 @@ final class ParserStagingStorageTests: XCTestCase {
         try assertHistory(db, output: 10, offset: 90, state: 4)
         XCTAssertGreaterThan(try scalar(db, "PRAGMA main.data_version;"), version)
         XCTAssertEqual(try scalar(store.db, "SELECT COUNT(*) FROM temp.usage_parser_stage;"), 0)
+        XCTAssertEqual(try scalar(store.db, "SELECT COUNT(*) FROM temp.usage_stage_events_candidate;"), 0)
         XCTAssertEqual(try scalar(store.db, "PRAGMA wal_autocheckpoint;"), autoCheckpoint)
         XCTAssertEqual(try scalar(store.db, "PRAGMA checkpoint_fullfsync;"), fullSync)
     }
@@ -123,7 +126,7 @@ final class ParserStagingStorageTests: XCTestCase {
         XCTAssertThrowsError(try store.recordIncremental(batch: batch(nil, offset: 60, state: 3), hostname: hostname))
         try assertHistory(store.db, output: 20, offset: 100, state: 1)
         XCTAssertEqual(try store.parserState(fileID: fileID, key: "state"), Data([2]))
-        XCTAssertEqual(try scalar(store.db, "SELECT COUNT(*) FROM temp.usage_parser_stage WHERE kind='event';"), 1)
+        XCTAssertEqual(try scalar(store.db, "SELECT COUNT(*) FROM temp.usage_stage_events_candidate;"), 1)
         try store.exec("DROP TRIGGER fail_staging_checkpoint;")
         try store.recordIncremental(batch: batch(nil, offset: 60, state: 3), hostname: hostname)
         try assertHistory(store.db, output: 8, offset: 60, state: 3)
@@ -141,6 +144,7 @@ final class ParserStagingStorageTests: XCTestCase {
         XCTAssertEqual(try reopened.parserState(fileID: fileID, key: "state"), Data([1]))
         XCTAssertEqual(try scalar(reopened.db, "SELECT COUNT(*) FROM temp.usage_parser_stage;"), 0)
         XCTAssertEqual(try scalar(reopened.db, "SELECT COUNT(*) FROM temp.usage_parser_replacements;"), 0)
+        XCTAssertEqual(try scalar(reopened.db, "SELECT COUNT(*) FROM temp.usage_stage_events_candidate;"), 0)
     }
 
     func testLegacyPersistentScratchTablesAreRemovedWithoutDeletingHistory() throws {
@@ -164,5 +168,24 @@ final class ParserStagingStorageTests: XCTestCase {
         XCTAssertEqual(try scalar(reopened.db, "SELECT COUNT(*) FROM temp.sqlite_schema WHERE name IN ('usage_parser_stage','usage_parser_replacements');"), 2)
         XCTAssertEqual(try scalar(reopened.db, "SELECT value FROM main.fixture_unrelated;"), 7)
         try assertHistory(reopened.db, output: 20, offset: 100, state: 1)
+    }
+
+    func testInterleavedFilePublicationAndAbortPreserveOtherStagedGeneration() throws {
+        let store = try UsageLedgerStore(path: databasePath())
+        try store.recordIncremental(batch: batch("shared", output: 8, offset: 30,
+            replace: true, final: false, state: 2, file: "other-file"), hostname: hostname)
+        try store.recordIncremental(batch: batch("shared", output: 3, offset: 30,
+            replace: true, final: false, state: 3), hostname: hostname)
+        try store.recordIncremental(batch: batch(nil, offset: 60, state: 4), hostname: hostname)
+        XCTAssertEqual(try store.parserState(fileID: "other-file", key: "state"), Data([2]))
+        // Beginning and aborting another generation must not clear the pending file.
+        try store.recordIncremental(batch: batch("aborted", output: 99, offset: 30,
+            replace: true, final: false, state: 5), hostname: hostname)
+        try store.abortParserReplacement(fileID: fileID)
+        try store.recordIncremental(batch: batch(nil, offset: 60, state: 6, file: "other-file"), hostname: hostname)
+        XCTAssertEqual(try scalar(store.db, "SELECT COUNT(*) FROM usage_events;"), 2)
+        XCTAssertEqual(try scalar(store.db, "SELECT SUM(output_tokens) FROM usage_events;"), 11)
+        XCTAssertEqual(try store.parserState(fileID: fileID, key: "state"), Data([4]))
+        XCTAssertEqual(try store.parserState(fileID: "other-file", key: "state"), Data([6]))
     }
 }

@@ -756,13 +756,8 @@ struct TPSDashboardView: View {
                 }
                 .help("当前 output TPS · 180 秒滑窗均值，与悬浮球及菜单栏一致；下方曲线按所选历史跨度分桶")
             }
-            Picker("时间跨度", selection: $span) {
-                ForEach(DashboardTPSSpan.allCases) { option in
-                    Text(option.title).tag(option)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            StableSegmentedPicker(label: "时间跨度", options: DashboardTPSSpan.allCases,
+                                  selection: $span, title: { $0.title })
             .frame(maxWidth: 320, alignment: .leading)
             HStack(alignment: .top, spacing: 18) {
                 ModelTPSLegend(

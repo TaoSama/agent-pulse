@@ -198,9 +198,15 @@ public enum UsageJSONLParser {
             // 编辑关联：response_item 里的 apply_patch 调用与其执行输出（按 call_id 关联）。
             // 用当前 turn 的 model 与会话 project 归属；缺时间戳的调用行以 0 时间兜底归桶。
             if type == "response_item" {
+                let itemType = (payload["type"] as? String) ?? ""
+                let hasCallID = ["call_id", "id"].contains { key in
+                    (payload[key] as? String).map { !$0.isEmpty } ?? false
+                }
+                let output = itemType.hasSuffix("call_output") && hasCallID
+                    ? CodexEditAccumulator.outputText(payload["output"]) : ""
                 // 缺时间戳的调用记录无法归桶：不生成可计入 entry，仅发脱敏 diagnostic；
                 // 但 *_call_output 记录仍照常处理，保证已有 pending 的成功 gate 不被漏掉。
-                if editAccumulator.observe(payload: payload, model: turnModel, timestamp: recordTimestamp) {
+                if editAccumulator.observe(payload: payload, output: output, model: turnModel, timestamp: recordTimestamp) {
                     diagnostics.append("line \(index + 1): edit call skipped (missing timestamp)")
                 }
                 // Codex 无 Skill tool。技能调用两种信号（一条记录至多命中其一，不重复计数）：
@@ -225,7 +231,7 @@ public enum UsageJSONLParser {
                 // 按 call_id 与其 *_call_output 关联，输出成功（Script completed）才计入。
                 // 缺时间戳的调用记录跳过并上报；其输出记录仍处理以结算 gate。
                 if mcpAccumulator.observe(
-                    payload: payload, model: turnModel, timestamp: recordTimestamp,
+                    payload: payload, output: output, model: turnModel, timestamp: recordTimestamp,
                     identity: codexToolIdentity(payload: payload, turnIdentity: turnIdentity)
                 ) {
                     diagnostics.append("line \(index + 1): mcp call skipped (missing timestamp)")
@@ -415,10 +421,9 @@ public enum UsageJSONLParser {
         /// 但因缺少可用时间戳而被跳过（调用者据此发脱敏 diagnostic）。*_call_output 记录
         /// 不依赖自身时间戳，永远参与成功 gate 结算，返回 false。
         @discardableResult
-        mutating func observe(payload: [String: Any], model: String, timestamp: Date?) -> Bool {
+        mutating func observe(payload: [String: Any], output: String, model: String, timestamp: Date?) -> Bool {
             let itemType = (payload["type"] as? String) ?? ""
             if let callID = Self.callID(payload), itemType.hasSuffix("call_output") {
-                let output = Self.outputText(payload["output"])
                 let gate = Gate(legacy: UsageEditLines.codexExecIsApplied(output),
                             programmatic: UsageEditLines.codexProgrammaticExecIsApplied(output))
                 outputGate[callID] = gate
@@ -513,7 +518,7 @@ public enum UsageJSONLParser {
         /// 把 *_call_output 的 output 字段归一为可判定成功的字符串。
         /// output 可能是字符串、含 output/text/content 等字段的对象，或 programmatic 形态的
         /// [{type:"input_text",text:…}] 数组（按 input_text 文本以换行拼接）。
-        private static func outputText(_ value: Any?) -> String {
+        static func outputText(_ value: Any?) -> String {
             if let s = value as? String { return s }
             if let items = value as? [Any] {
                 var parts: [String] = []
@@ -647,7 +652,7 @@ public enum UsageJSONLParser {
         /// （JS 里可达的 tools.mcp__…），但因缺少可用时间戳被跳过（调用者据此发脱敏 diagnostic）。
         /// wait 调用与 *_call_output 记录不依赖自身时间戳，返回 false。
         @discardableResult
-        mutating func observe(payload: [String: Any], model: String, timestamp: Date?, identity: String) -> Bool {
+        mutating func observe(payload: [String: Any], output: String, model: String, timestamp: Date?, identity: String) -> Bool {
             let itemType = (payload["type"] as? String) ?? ""
             let name = ((payload["name"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             if itemType == "custom_tool_call" || itemType == "function_call" {
@@ -679,7 +684,6 @@ public enum UsageJSONLParser {
             }
             if itemType == "custom_tool_call_output" || itemType == "function_call_output" {
                 guard let id = Self.callID(payload) else { return false }
-                let output = Self.outputText(payload["output"])
                 let programmatic = UsageEditLines.codexProgrammaticExecOutcome(output)
                 let outcome = OutputGate(
                     programmaticApplied: programmatic.applied,
@@ -763,29 +767,6 @@ public enum UsageJSONLParser {
             return ""
         }
 
-        private static func outputText(_ value: Any?) -> String {
-            if let s = value as? String { return s }
-            if let items = value as? [Any] {
-                var parts: [String] = []
-                for item in items {
-                    guard let m = item as? [String: Any] else { continue }
-                    if (m["type"] as? String) == "input_text", let text = m["text"] as? String, !text.isEmpty {
-                        parts.append(text)
-                    }
-                }
-                return parts.joined(separator: "\n")
-            }
-            if let object = value as? [String: Any] {
-                for key in ["output", "text", "content", "stdout"] {
-                    if let s = object[key] as? String { return s }
-                }
-                if let data = try? JSONSerialization.data(withJSONObject: object),
-                   let s = String(data: data, encoding: .utf8) {
-                    return s
-                }
-            }
-            return ""
-        }
     }
 
     private static func codexMetadata(_ lines: [Data.SubSequence], fileHash: String) -> CodexMetadata {

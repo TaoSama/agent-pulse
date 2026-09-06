@@ -256,9 +256,13 @@ public enum UsageEditLines {
     }
 
     static func firstNonEmptyLine(_ output: String) -> String {
-        for raw in output.split(separator: "\n", omittingEmptySubsequences: false) {
-            let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        var start = output.startIndex
+        while start < output.endIndex {
+            let end = output[start...].firstIndex(of: "\n") ?? output.endIndex
+            let trimmed = output[start..<end].trimmingCharacters(in: .whitespaces)
             if !trimmed.isEmpty { return trimmed }
+            guard end < output.endIndex else { break }
+            start = output.index(after: end)
         }
         return ""
     }
