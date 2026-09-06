@@ -300,13 +300,17 @@ final class OrbWindowController {
 
 @MainActor
 final class DashboardWindowController: NSWindowController, NSWindowDelegate {
-    private let model: ApplicationModel
+    private let makeContentView: () -> NSView
     private var outsideClickMonitor: Any?
     private var localClickMonitor: Any?
     private var ignoreGlobalClicksUntil: TimeInterval = 0
 
-    init(model: ApplicationModel) {
-        self.model = model
+    convenience init(model: ApplicationModel) {
+        self.init(makeContentView: { NSHostingView(rootView: TPSDashboardView(model: model)) })
+    }
+
+    init(makeContentView: @escaping () -> NSView) {
+        self.makeContentView = makeContentView
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 820, height: 520),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -320,7 +324,8 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate {
         // the event monitors below continue to handle clicks inside this app.
         window.hidesOnDeactivate = true
         window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: TPSDashboardView(model: model))
+        // The dashboard has no live view graph until it is opened.
+        window.contentView = nil
         super.init(window: window)
         window.delegate = self
         NotificationCenter.default.addObserver(
@@ -341,7 +346,7 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate {
         guard let window else { return }
         // 每次打开都重建根视图，让 TPSDashboardView 的 @State（时间跨度）复位到默认，
         // 不记忆上次选择。
-        window.contentView = NSHostingView(rootView: TPSDashboardView(model: model))
+        prepareContent()
         let targetPoint = frame?.center ?? NSEvent.mouseLocation
         let screen = ScreenPlacement.screen(containing: targetPoint)
         window.setFrame(ScreenPlacement.centered(window.frame.size, on: screen), display: false)
@@ -357,6 +362,11 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         stopOutsideClickMonitors()
+        window?.contentView = nil
+    }
+
+    func prepareContent() {
+        window?.contentView = makeContentView()
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -391,9 +401,12 @@ final class DashboardWindowController: NSWindowController, NSWindowDelegate {
         localClickMonitor = nil
     }
 
-    private func dismiss() {
+    func dismiss() {
         stopOutsideClickMonitors()
         window?.orderOut(nil)
+        // orderOut alone leaves the hosting view observing live model updates.
+        // show() already creates a fresh root, so retain only the window geometry.
+        window?.contentView = nil
     }
 }
 

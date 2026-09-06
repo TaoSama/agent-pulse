@@ -25,16 +25,9 @@ struct TokenSummaryCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 8) {
-                Picker("Token 统计窗口", selection: $selectedWindow) {
-                    ForEach(TokenUsageWindow.allCases) { window in
-                        Text(window.title)
-                            .tag(window)
-                            .accessibilityLabel(window.accessibilityLabel)
-                            .accessibilityAddTraits(selectedWindow == window ? .isSelected : [])
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+                StableSegmentedPicker(label: "Token 统计窗口", options: TokenUsageWindow.allCases,
+                                      selection: $selectedWindow, title: { $0.title },
+                                      optionAccessibilityLabel: { $0.accessibilityLabel })
                 .tint(.white)
                 .colorScheme(.dark)
                 .accessibilityLabel("Token 统计窗口")

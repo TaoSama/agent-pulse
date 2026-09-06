@@ -14,6 +14,14 @@ public struct UsageParserStateChanges: Sendable {
 /// A batch reads only the identities it touches. The ledger owns durable state;
 /// this short-lived cache never loads an entire session's history.
 final class UsageParserState {
+    private let decoder = JSONDecoder()
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        // State publication compares encoded values. Dictionary iteration order
+        // must not turn identical statistics into a durable rewrite.
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
     let lookup: (String) throws -> Data?
     var values: [String: Data] = [:]
     var removedKeys = Set<String>()
@@ -30,7 +38,7 @@ final class UsageParserState {
         do {
             if removedKeys.contains(key) { return nil }
             guard let data = try values[key] ?? lookup(key) else { return nil }
-            return try JSONDecoder().decode(Value.self, from: data)
+            return try decoder.decode(Value.self, from: data)
         } catch {
             if firstError == nil { firstError = error }
             return nil
@@ -40,7 +48,7 @@ final class UsageParserState {
     func write<Value: Codable>(_ value: Value?, key: String) {
         do {
             if let value {
-                values[key] = try JSONEncoder().encode(value)
+                values[key] = try encoder.encode(value)
                 removedKeys.remove(key)
             } else {
                 values[key] = nil
