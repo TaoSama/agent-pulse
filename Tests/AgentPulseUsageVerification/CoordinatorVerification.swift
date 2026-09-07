@@ -128,15 +128,21 @@ enum CoordinatorVerification {
         try require(scan.contains("progressReporter.enterPhase(.summarizing")
                     && scan.contains("progressReporter.advance(.summarizing, done: done, total: total, detail: detail)"),
                     "summary window calculation must publish progress")
-        try require(source.contains("progress: ((Int, Int, String) -> Void)? = nil")
-                    && source.contains("completeWindow(.day)")
-                    && source.contains("completeWindow(.all)"),
-                    "summaries must keep snapshot semantics while reporting each existing window")
+        try require(source.contains("progress: (@Sendable (Int, Int, String) -> Void)? = nil")
+                    && source.contains("ledger.summarySnapshot(containing: date, calendar: calendar) { done, total, window in")
+                    && source.contains("progress?(done, total, windowProgressDetail(window))"),
+                    "summaries must keep snapshot semantics while reporting real ledger window progress")
+        let ledgerSource = try ledgerSource()
+        try require(ledgerSource.contains("progress?(index, requestedWindows.count, window)")
+                    && ledgerSource.contains("progress?(index + 1, requestedWindows.count, window)"),
+                    "summarySnapshot must report progress around each real window query")
         let reporter = try functionBody(matching: "private final class ScanProgressReporter", in: source)
         try require(reporter.contains("normalizedWeights(for: activePhases)")
                     && source.contains("activeScanPhases(compactionEnabled: Bool)"),
                     "progress reporter must normalize weights for only the active scan phases")
         let report = try functionBody(named: "reportNow", in: source)
+        try require(report.contains("publishDeferredNetworkReportProgress()"),
+                    "reporting delayed by CPA collection must remain visible through existing progress fields")
         try require(report.contains("applyReportProgress(")
                     && source.contains("private func applyReportProgress("),
                     "report ACKs must update the existing progress fields")

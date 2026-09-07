@@ -3151,16 +3151,21 @@ public final class UsageLedgerStore: @unchecked Sendable {
     public func summarySnapshot(
         containing date: Date, hostname: String? = nil, calendar: Calendar = .current,
         prices: [UsageModelPrice] = [], includeWindowSummaries: Bool = true,
-        outputRange: DateInterval? = nil
+        outputRange: DateInterval? = nil,
+        progress: (@Sendable (_ done: Int, _ total: Int, _ window: UsageSummaryWindow?) -> Void)? = nil
     ) throws -> UsageLedgerSummarySnapshot {
         try queue.sync {
             try exec("BEGIN DEFERRED;")
             do {
                 let windows: [UsageLedgerSummaryWindowSnapshot]
                 if includeWindowSummaries {
-                    windows = try [UsageSummaryWindow.day, .week, .month].map { window in
-                        try summaryWindowUnlocked(window: window, containing: date, hostname: hostname, calendar: calendar, prices: prices)
-                    } + [try summaryWindowUnlocked(window: nil, containing: date, hostname: hostname, calendar: calendar, prices: prices)]
+                    let requestedWindows: [UsageSummaryWindow?] = [UsageSummaryWindow.day, .week, .month, nil]
+                    windows = try requestedWindows.enumerated().map { index, window in
+                        progress?(index, requestedWindows.count, window)
+                        let snapshot = try summaryWindowUnlocked(window: window, containing: date, hostname: hostname, calendar: calendar, prices: prices)
+                        progress?(index + 1, requestedWindows.count, window)
+                        return snapshot
+                    }
                 } else {
                     windows = []
                 }

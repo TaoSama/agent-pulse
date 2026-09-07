@@ -731,6 +731,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     self.finishNetworkCollection(generation: generation)
                     return
                 }
+                guard let self, generation == self.networkGeneration else { return }
+                self.updateStatus {
+                    $0.cliProxyConfigured = true
+                    $0.cliProxySourceCount = states.count
+                    $0.cliProxyError = nil
+                }
                 let collected = try await service.collectUsage(atPath: configPath, statesByIdentity: states)
                 let committed = await Self.runOffMain(queue: Self.networkWorkerQueue) { gate in
                     var committedStates = states
@@ -754,7 +760,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     return NetworkCollectionOutcome(states: finalStates, snapshot: snapshot)
                 }
                 let outcome = try committed.get()
-                guard let self, generation == self.networkGeneration, !Task.isCancelled else { return }
+                guard generation == self.networkGeneration, !Task.isCancelled else { return }
                 self.updateStatus {
                     $0.cliProxyConfigured = collected.sourceCount > 0
                     $0.cliProxySourceCount = collected.sourceCount
@@ -788,6 +794,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         if shouldReport, status.reportingEnabled {
             if scanTask != nil { reportAfterCurrentScan = true }
             else { reportNow() }
+        } else if status.reportingInProgress, status.scanPhase == .cliproxy, reportTask == nil {
+            updateStatus { status in
+                status.reportingInProgress = false
+                Self.clearScanProgress(&status)
+            }
         }
     }
 
@@ -898,7 +909,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         // 防重入；且不在扫描进行时上报，避免与 rebuild 竞争。
         guard reportTask == nil, scanTask == nil else { return }
         // rebuild pending 期间绝不发网络请求：必须先完整重扫全部来源并清除 pending。
-        if networkTask != nil { reportAfterNetworkCollection = true; return }
+        if networkTask != nil {
+            reportAfterNetworkCollection = true
+            publishDeferredNetworkReportProgress()
+            return
+        }
         refreshConfigurationAuthority()
         let current = statusSubject.value
         guard current.reportingEnabled else {
@@ -969,6 +984,22 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 result = .failure(error)
             }
             self?.finishReport(generation: generation, result: result)
+        }
+    }
+
+    /// 本地文件扫描完成后，如果 CPA 网络采集仍在收尾，上报会等待它。
+    /// 继续复用现有 scan progress 字段，避免菜单栏看起来已经空闲或卡住。
+    private func publishDeferredNetworkReportProgress() {
+        updateStatus { status in
+            status.reportingInProgress = true
+            status.reportingError = nil
+            status.scanPhase = .cliproxy
+            status.scanDone = 0
+            status.scanTotal = max(0, status.cliProxySourceCount)
+            status.scanProgress = max(status.scanProgress ?? 0, 0.95)
+            status.scanDetailText = status.cliProxySourceCount > 0
+                ? "等待 CPA 采集完成（\(status.cliProxySourceCount) 个来源）"
+                : "等待 CPA 采集完成"
         }
     }
 
@@ -1689,14 +1720,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         containing date: Date,
         calendar: Calendar,
         mergedEnvURL: URL,
-        progress: ((Int, Int, String) -> Void)? = nil
+        progress: (@Sendable (Int, Int, String) -> Void)? = nil
     ) throws -> TokenUsageSummarySnapshot {
-        let snapshot = try ledger.summarySnapshot(containing: date, calendar: calendar)
-        let totalWindows = TokenUsageWindow.allCases.count
-        var completedWindows = 0
-        func completeWindow(_ window: TokenUsageWindow) {
-            completedWindows += 1
-            progress?(completedWindows, totalWindows, windowProgressDetail(window))
+        let snapshot = try ledger.summarySnapshot(containing: date, calendar: calendar) { done, total, window in
+            progress?(done, total, windowProgressDetail(window))
         }
         var realModels: [TokenUsageWindow: [UsageModelTokenSummary]] = [:]
         var summary = TokenUsageSummary.empty
@@ -1706,19 +1733,15 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             case .day:
                 summary.day = value
                 realModels[.day] = item.models
-                completeWindow(.day)
             case .week:
                 summary.week = value
                 realModels[.week] = item.models
-                completeWindow(.week)
             case .month:
                 summary.month = value
                 realModels[.month] = item.models
-                completeWindow(.month)
             case nil:
                 summary.all = value
                 realModels[.all] = item.models
-                completeWindow(.all)
             }
         }
         return TokenUsageSummarySnapshot(
@@ -1728,6 +1751,15 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 enabled: isVirtualBaselineUser(mergedEnvURL: mergedEnvURL)
             )
         )
+    }
+
+    nonisolated private static func windowProgressDetail(_ window: UsageSummaryWindow?) -> String {
+        guard let window else { return windowProgressDetail(.all) }
+        switch window {
+        case .day: return windowProgressDetail(.day)
+        case .week: return windowProgressDetail(.week)
+        case .month: return windowProgressDetail(.month)
+        }
     }
 
     nonisolated private static func windowProgressDetail(_ window: TokenUsageWindow) -> String {
