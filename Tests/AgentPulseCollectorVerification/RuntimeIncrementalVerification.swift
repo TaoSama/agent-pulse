@@ -5,6 +5,7 @@ import Foundation
 enum RuntimeIncrementalVerification {
     static func run() async throws {
         try verifyCleanupPreservesOriginalFailure()
+        try await withFixture("codex-usage-envelope", verifyCodexUsageEnvelope)
         try await withFixture("desktop", verifyDesktopAppendRecovery)
         try await withFixture("models", verifySingleDecodeAndModelSearch)
         try await withFixture("aggregate", verifyAggregateReplacementAndRemoval)
@@ -105,6 +106,43 @@ enum RuntimeIncrementalVerification {
         fixture.scanner.setRunning(true)
         let reopened = try await collector.scan(at: fixture.time(9))
         try require(reopened.taskBreakdown.claudeDesktop.present, "process startup visible on next sample")
+    }
+
+    private static func verifyCodexUsageEnvelope(_ fixture: Fixture) async throws {
+        let url = fixture.sessions.appendingPathComponent("rollout-usage.jsonl")
+        let historicalOutput = 10_865_456
+        func auxiliary(_ type: String, at second: Int) throws -> String {
+            try fixture.json([
+                "type": type,
+                "timestamp": ISO8601DateFormatter().string(from: fixture.time(second)),
+                "payload": ["latest_token_usage_record": [
+                    "thread_token_usage": ["output_tokens": historicalOutput]
+                ]]
+            ])
+        }
+        try fixture.write(try fixture.meta("usage") + fixture.token(100, at: 0)
+            + auxiliary("compacted", at: 0), to: url)
+        let collector = try fixture.collector()
+        _ = try await collector.scan(at: fixture.now)
+        let mirror = try fixture.json([
+            "type": "token_usage_record",
+            "timestamp": ISO8601DateFormatter().string(from: fixture.time(1)),
+            "payload": ["usage": ["output_tokens": 30],
+                        "thread_token_usage": ["output_tokens": historicalOutput]]
+        ])
+        try fixture.append(try mirror + auxiliary("compacted", at: 1)
+            + fixture.token(130, at: 1), to: url)
+        let result = try await collector.scan(at: fixture.time(1))
+        try require(result.liveRate.tokensInWindow == 30,
+                    "Codex auxiliary usage and compaction must not replay history or double count output")
+        try fixture.append(try auxiliary("compacted", at: 2), to: url)
+        let compacted = try await collector.scan(at: fixture.time(2))
+        try require(compacted.liveRate.tokensInWindow == 30,
+                    "compaction alone must not emit output")
+        try fixture.append(try fixture.token(150, at: 3), to: url)
+        let continued = try await collector.scan(at: fixture.time(3))
+        try require(continued.liveRate.tokensInWindow == 50,
+                    "authoritative cumulative baseline must survive compaction")
     }
 
     private static func verifySingleDecodeAndModelSearch(_ fixture: Fixture) async throws {

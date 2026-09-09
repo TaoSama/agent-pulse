@@ -179,7 +179,10 @@ final class OrbWindowController {
         guard expanded || !bubblePanels.isEmpty else { return }
         expanded = false
         model.setOrbExpanded(false)
-        bubblePanels.forEach { $0.orderOut(nil) }
+        bubblePanels.forEach {
+            $0.orderOut(nil)
+            $0.contentView = nil
+        }
         bubblePanels.removeAll()
         stopOutsideClickMonitors()
     }

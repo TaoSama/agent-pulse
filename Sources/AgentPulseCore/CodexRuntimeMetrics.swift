@@ -1237,7 +1237,8 @@ public actor CodexRuntimeMetricsCollector {
                         }
                     }
                 }
-                guard let object, let parsed = parseTokenLine(line, object: object, now: now) else { continue }
+                guard let object, let parsed = parseTokenLine(line, object: object, now: now,
+                                                             isCodexFile: isCodexFile) else { continue }
                 tokenDiagnostics.parsedOutputObservations += 1
                 tokenDiagnostics.baselineObservations += 1
                 // 子 agent 继承前缀跟踪：一旦某条 token 时间戳越过 meta 时间簇，标记已越过。
@@ -1501,7 +1502,8 @@ public actor CodexRuntimeMetricsCollector {
             }
 
             guard liveTrackedPaths.contains(file.path),
-                  let parsed = parseTokenLine(data, object: object, now: now) else { continue }
+                  let parsed = parseTokenLine(data, object: object, now: now,
+                                              isCodexFile: tokenFileProviders[file.path] != .claude) else { continue }
             tokenDiagnostics.parsedOutputObservations += 1
             // 子 agent 继承前缀：时间戳仍在 meta 时间簇内的 token 属于父线程副本，不产出 TPS 事件。
             // 但仍推进 previousTotal/previousTimestamp 基线，使越过前缀后的第一条真实产出从继承末值
@@ -1687,7 +1689,31 @@ public actor CodexRuntimeMetricsCollector {
         return readable.split(whereSeparator: { $0 == 0x0A }).map { Data($0) }
     }
 
-    private func parseTokenLine(_ line: Data, object: [String: Any], now: Date) -> ParsedTokenLine? {
+    private func parseTokenLine(
+        _ line: Data, object: [String: Any], now: Date, isCodexFile: Bool
+    ) -> ParsedTokenLine? {
+        if isCodexFile {
+            if object["type"] as? String == "assistant",
+               let message = object["message"] as? [String: Any],
+               let usage = message["usage"] as? [String: Any],
+               let tokens = outputTokens(usage),
+               let identity = parsedMessageIdentity(object) {
+                return ParsedTokenLine(timestamp: parsedTimestamp(from: object, fallback: now),
+                                       tokens: tokens, total: nil, messageIdentity: identity,
+                                       model: knownModelName(object))
+            }
+            // Other Codex records can embed historical usage or mirror this observation.
+            guard object["type"] as? String == "event_msg",
+                  let payload = object["payload"] as? [String: Any],
+                  payload["type"] as? String == "token_count",
+                  let info = payload["info"] as? [String: Any] else { return nil }
+            let total = (info["total_token_usage"] as? [String: Any]).flatMap(outputTokens)
+            let tokens = (info["last_token_usage"] as? [String: Any]).flatMap(outputTokens)
+            guard total != nil || tokens != nil else { return nil }
+            return ParsedTokenLine(timestamp: parsedTimestamp(from: object, fallback: now),
+                                   tokens: tokens ?? 0, total: total, messageIdentity: nil,
+                                   model: knownModelName(object))
+        }
         guard line.containsASCIIKeyword(Self.tokenKeyword)
                 || line.containsASCIIKeyword(Self.usageKeyword) else {
             return nil
