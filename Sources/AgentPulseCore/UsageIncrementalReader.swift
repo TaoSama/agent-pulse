@@ -61,18 +61,12 @@ extension UsageJSONLParser {
         onBatch: (UsageIncrementalBatch) throws -> Void,
         checkCancellation: () throws -> Void = {}
     ) throws -> UsageIncrementalReadResult {
-        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-        guard attributes[.type] as? FileAttributeType == .typeRegular,
-              let sizeNumber = attributes[.size] as? NSNumber,
-              let fileNumber = attributes[.systemFileNumber] as? NSNumber,
-              let created = attributes[.creationDate] as? Date,
-              let modified = attributes[.modificationDate] as? Date else {
-            throw UsageIncrementalReadError.invalidFile
-        }
-        let size = sizeNumber.int64Value
-        let handle = try FileHandle(forReadingFrom: fileURL)
+        let handle = try UsageIncrementalFileGuard.open(fileURL: fileURL)
         defer { handle.closeFile() }
-        let prefix = try handle.read(upToCount: min(Self.guardBytes, Int(size))) ?? Data()
+        var fileGuard = try UsageIncrementalFileGuard(handle: handle, fileURL: fileURL)
+        let size = fileGuard.size
+        let modified = fileGuard.modifiedAt
+        let prefix = try fileGuard.read(offset: 0, count: Int(min(Int64(Self.guardBytes), size)))
         var cursor: UsageStreamCursor?
         if let checkpoint = previousCheckpoint,
            checkpoint.parserVersion == parserVersion,
@@ -80,24 +74,27 @@ extension UsageJSONLParser {
             cursor = try JSONDecoder().decode(UsageStreamCursor.self, from: saved)
         }
         var replacesFile = true
+        var consumedTail = Data()
         if let saved = cursor, let checkpoint = previousCheckpoint,
            saved.version == parserVersion,
-           saved.fileNumber == fileNumber.uint64Value, saved.creationDate == created,
-           saved.offset == checkpoint.offset, saved.offset <= size,
+           saved.fileNumber == fileGuard.fileNumber, fileGuard.matchesCreationDate(saved.creationDate),
+           saved.offset == checkpoint.offset, saved.offset >= 0, saved.offset <= size,
+           (0...Self.guardBytes).contains(saved.prefixLength), saved.prefixLength <= prefix.count,
+           (0...Self.guardBytes).contains(saved.tailLength), Int64(saved.tailLength) <= saved.offset,
            saved.prefixHash == streamHash(Data(prefix.prefix(saved.prefixLength))),
            (size != checkpoint.size || abs(modified.timeIntervalSince(checkpoint.modifiedAt)) < 0.001) {
-            try handle.seek(toOffset: UInt64(max(0, saved.offset - Int64(saved.tailLength))))
-            let tail = try handle.read(upToCount: saved.tailLength) ?? Data()
+            let tail = try fileGuard.read(offset: saved.offset - Int64(saved.tailLength), count: saved.tailLength)
             replacesFile = streamHash(tail) != saved.tailHash
+            if !replacesFile { consumedTail = tail }
             if !replacesFile, saved.endedWithoutNewline, size > saved.offset {
-                try handle.seek(toOffset: UInt64(saved.offset))
-                let separator = try handle.read(upToCount: 2) ?? Data()
+                let separator = try fileGuard.read(offset: saved.offset, count: Int(min(2, size - saved.offset)))
                 replacesFile = separator.first != 0x0A && !separator.starts(with: [0x0D, 0x0A])
             }
         }
         if replacesFile {
-            cursor = UsageStreamCursor(version: parserVersion, fileNumber: fileNumber.uint64Value,
-                                       creationDate: created, offset: 0, lineCount: 0,
+            consumedTail = Data()
+            cursor = UsageStreamCursor(version: parserVersion, fileNumber: fileGuard.fileNumber,
+                                       creationDate: fileGuard.creationDate, offset: 0, lineCount: 0,
                                        tailHash: streamHash(Data()), tailLength: 0,
                                        prefixHash: streamHash(prefix), prefixLength: prefix.count,
                                        endedWithoutNewline: false)
@@ -105,6 +102,7 @@ extension UsageJSONLParser {
         guard var current = cursor else { throw UsageIncrementalReadError.invalidState }
         if !replacesFile, let checkpoint = previousCheckpoint,
            checkpoint.size == size, abs(modified.timeIntervalSince(checkpoint.modifiedAt)) < 0.001 {
+            try fileGuard.validate(prefix: prefix, tail: consumedTail, offset: current.offset)
             return UsageIncrementalReadResult(bytesRead: 0, committedOffset: current.offset, batchCount: 0)
         }
         let initialCodexCursor: Data?
@@ -118,6 +116,7 @@ extension UsageJSONLParser {
         let startOffset = current.offset
         var fetchedOffset = current.offset
         var pending = Data()
+        var completeLength = 0
         var batches = 0
         func lookup(_ key: String) throws -> Data? {
             if replacesFile { return key == "codex-cursor" ? initialCodexCursor : nil }
@@ -146,16 +145,23 @@ extension UsageJSONLParser {
                 current.offset = nextOffset
                 if !data.isEmpty { current.endedWithoutNewline = data.last != 0x0A }
                 current.lineCount += parseData.split(separator: 0x0A, omittingEmptySubsequences: true).count
-                current.tailLength = min(Self.guardBytes, Int(current.offset))
-                try handle.seek(toOffset: UInt64(current.offset - Int64(current.tailLength)))
-                current.tailHash = streamHash(try handle.read(upToCount: current.tailLength) ?? Data())
-                try handle.seek(toOffset: UInt64(fetchedOffset))
+                // Fingerprint the bytes parsed above, never a later filesystem read.
+                if data.count >= Self.guardBytes {
+                    consumedTail = Data(data.suffix(Self.guardBytes))
+                } else {
+                    consumedTail.append(data)
+                    consumedTail = Data(consumedTail.suffix(Self.guardBytes))
+                }
+                current.tailLength = consumedTail.count
+                current.tailHash = streamHash(consumedTail)
                 state.write(current, key: "stream-cursor")
                 let changes = try state.changes()
                 let batch = UsageIncrementalBatch(parsed: parsed, stateChanges: changes,
                                                  removedEventIDs: Array(state.removedEventIDs),
                                                  removedEditIDs: Array(state.removedEditIDs), replacesFile: replacesFile,
                                                  isFinalBatch: final, codexUnknownModel: state.codexUnknownModel)
+                try checkCancellation()
+                try fileGuard.validate(prefix: prefix, tail: consumedTail, offset: current.offset)
                 try onBatch(batch)
                 // The callback persists state. Retain only cursor-sized local state;
                 // subsequent batches read keyed values from that committed store.
@@ -173,22 +179,24 @@ extension UsageJSONLParser {
                         throw UsageIncrementalReadError.fileChangedDuringRead
                     }
                     fetchedOffset += Int64(chunk.count)
+                    if let newline = chunk.lastIndex(of: 0x0A) {
+                        completeLength = pending.count + chunk.distance(from: chunk.startIndex, to: newline) + 1
+                    }
                     pending.append(chunk)
-                    if pending.count >= Self.batchBytes, let newline = pending.lastIndex(of: 0x0A) {
-                        let end = pending.index(after: newline)
-                        let complete = Data(pending[..<end])
-                        pending = Data(pending[end...])
+                    if pending.count >= Self.batchBytes, completeLength > 0 {
+                        let complete = Data(pending.prefix(completeLength))
+                        pending = Data(pending.dropFirst(completeLength))
+                        completeLength = 0
                         try emit(complete, final: false)
                     }
                 }
             }
-            if let newline = pending.lastIndex(of: 0x0A) {
-                let next = pending.index(after: newline)
-                let remainder = Data(pending[next...])
+            if completeLength > 0 {
+                let remainder = Data(pending.dropFirst(completeLength))
                 if completeJSONRecord(remainder) {
                     try emit(pending, final: true)
                 } else {
-                    try emit(Data(pending[...newline]), final: true)
+                    try emit(Data(pending.prefix(completeLength)), final: true)
                 }
             } else if completeJSONRecord(pending) {
                 try emit(pending, final: true)
@@ -235,13 +243,14 @@ extension UsageJSONLParser {
                 guard let chunk = try handle.read(upToCount: Int(min(Int64(readChunkBytes), remaining))),
                       !chunk.isEmpty else { throw UsageIncrementalReadError.fileChangedDuringRead }
                 remaining -= Int64(chunk.count)
+                let previousLength = pending.count
                 pending.append(chunk)
-                if let newline = pending.lastIndex(of: 0x0A) {
-                    let end = pending.index(after: newline)
-                    for line in pending[..<end].split(separator: 0x0A, omittingEmptySubsequences: true) {
+                if let newline = chunk.lastIndex(of: 0x0A) {
+                    let completeLength = previousLength + chunk.distance(from: chunk.startIndex, to: newline) + 1
+                    for line in pending.prefix(completeLength).split(separator: 0x0A, omittingEmptySubsequences: true) {
                         if let seed = try codexCursorSeed(line: Data(line), fileIdentity: fileIdentity) { return seed }
                     }
-                    pending = Data(pending[end...])
+                    pending = Data(pending.dropFirst(completeLength))
                 }
                 return nil
             }
