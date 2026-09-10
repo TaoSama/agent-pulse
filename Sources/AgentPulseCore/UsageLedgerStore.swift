@@ -63,18 +63,21 @@ public enum UsageHostnameState: Sendable, Equatable {
 
 /// finalizeDerived 结果，含上报资格门禁。
 public struct UsageFinalizeResult: Sendable, Equatable {
-    /// 是否可安全上报。false 时存在无法证明的潜在重复（例如继承回放但无完整 total 快照）。
+    /// 本地派生是否已完成、可供上报。去重风险仅在 warnings 中提示。
     public let reportingEligible: Bool
     /// 门禁被 blocked 的原因（reportingEligible == false 时给出）。
     public let blockedReasons: [String]
+    /// 本地去重的不确定性，仅供提示，不阻断上报。
+    public let warnings: [String]
     /// 本次因血缘证明被折叠（去重）的事件数。
     public let collapsedInheritedEvents: Int
     /// 本次因内容型去重键（codexDedupKey）被折叠的事件数（fork/subagent 回放重复）。
     public let collapsedContentDuplicates: Int
 
-    public init(reportingEligible: Bool, blockedReasons: [String], collapsedInheritedEvents: Int, collapsedContentDuplicates: Int = 0) {
+    public init(reportingEligible: Bool, blockedReasons: [String], collapsedInheritedEvents: Int, collapsedContentDuplicates: Int = 0, warnings: [String] = []) {
         self.reportingEligible = reportingEligible
         self.blockedReasons = blockedReasons
+        self.warnings = warnings
         self.collapsedInheritedEvents = collapsedInheritedEvents
         self.collapsedContentDuplicates = collapsedContentDuplicates
     }
@@ -1307,8 +1310,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
                try dirtyKeyCountUnlocked(hostname: hostname) == 0 {
                 finalizeDiagnostics.strategy = "noChange"
                 return UsageFinalizeResult(
-                    reportingEligible: try readTextUnlocked(key: reportingEligibleKey(hostname)) != "0",
-                    blockedReasons: [], collapsedInheritedEvents: 0
+                    reportingEligible: true,
+                    blockedReasons: [], collapsedInheritedEvents: 0,
+                    warnings: Self.derivationWarnings(identityConflicts: try identityConflictCountUnlocked(hostname: hostname))
                 )
             }
             var result = UsageFinalizeResult(reportingEligible: true, blockedReasons: [], collapsedInheritedEvents: 0)
@@ -1494,15 +1498,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
             }
         }
 
-        // 不可证明的继承回放：inherited 但无 total snapshot（无 lineage 指纹），无法证明是否重复。
-        // 上报为累计值幂等 upsert，重复由服务端吸收自愈，因此不阻断上报；仅在 blockedReasons 留信息性说明。
-        var blockedReasons: [String] = []
-        if unprovableInherited > 0 {
-            blockedReasons.append("\(unprovableInherited) inherited replay event(s) without total snapshot cannot be proven duplicate; reporting proceeds (idempotent upsert self-heals)")
-        }
-        if identityConflicts > 0 {
-            blockedReasons.append("\(identityConflicts) logical event(s) have conflicting identity (session/model/project) across same-tier files; reporting blocked")
-        }
+        let warnings = Self.derivationWarnings(
+            unprovableInherited: unprovableInherited, identityConflicts: identityConflicts
+        )
 
         // bucket token 聚合：直接 GROUP BY，不加载事件到 Swift。
         let bucketSQL = """
@@ -1665,10 +1663,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
         advanceStage() // 6) session 聚合完成
 
-        // 全量收尾：把本轮的完整冲突集落盘。identityConflicts 是 reportingEligible 的唯一门禁，
-        // 增量路径的 updateScopedIdentityConflictsUnlocked 只替换作用域内的键，依赖这里先
-        // 建立全量基线。不写的话表永远为空，作用域外的历史冲突会丢，
-        // 导致 eligible 误判为 true。仅追加持久化写入，不改全量自身的计算。
+        // 全量建立冲突基线，供增量路径保留作用域外的诊断；冲突不影响上报资格。
         try rebuildIdentityConflictsUnlocked(hostname: hostname)
 
         try exec("DROP TABLE IF EXISTS temp_logical_events;")
@@ -1726,8 +1721,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try setIntUnlocked(key: revisionKey(hostname), value: newRevision - 1)
         }
 
-        let eligible = identityConflicts == 0
-        try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
+        try setTextUnlocked(key: reportingEligibleKey(hostname), value: "1")
         advanceStage() // 8) session 差异写完成
 
         // 持久化 logical 组 -> bucket 自然键映射，供增量 finalize 把旧 bucket 纳入作用域。
@@ -1745,19 +1739,39 @@ public final class UsageLedgerStore: @unchecked Sendable {
         try? exec("DROP TABLE IF EXISTS temp_deduped_events;")
 
         return UsageFinalizeResult(
-            reportingEligible: eligible,
-            blockedReasons: blockedReasons,
+            reportingEligible: true,
+            blockedReasons: [],
             collapsedInheritedEvents: collapsedInheritedEvents,
-            collapsedContentDuplicates: collapsedContentDuplicates
+            collapsedContentDuplicates: collapsedContentDuplicates,
+            warnings: warnings
         )
     }
 
     public func reportingEligible(hostname: String) throws -> Bool {
         try queue.sync {
             // 任一采集/派生阶段未完成都必须 fail-closed，绝不上报陈旧或不完整派生。
-            guard try !hasLocalDerivationPendingUnlocked() else { return false }
-            return (try readTextUnlocked(key: reportingEligibleKey(hostname)) ?? "1") == "1"
+            // 旧 reporting_eligible=0 只记录身份冲突，已降为提示，不再作为门禁。
+            return try !hasLocalDerivationPendingUnlocked()
         }
+    }
+
+    /// 从持久化冲突表恢复提示，不需要扫描原始事件或重算派生。
+    public func reportingWarnings(hostname: String) throws -> [String] {
+        try queue.sync {
+            guard try tableExistsUnlocked("usage_identity_conflicts") else { return [] }
+            return Self.derivationWarnings(identityConflicts: try identityConflictCountUnlocked(hostname: hostname))
+        }
+    }
+
+    private static func derivationWarnings(unprovableInherited: Int = 0, identityConflicts: Int) -> [String] {
+        var warnings: [String] = []
+        if unprovableInherited > 0 {
+            warnings.append("\(unprovableInherited) inherited replay event(s) without total snapshot cannot be proven duplicate; reporting proceeds with local aggregates")
+        }
+        if identityConflicts > 0 {
+            warnings.append("\(identityConflicts) logical event(s) have conflicting identity (session/model/project) across same-tier files; reporting proceeds with local aggregates")
+        }
+        return warnings
     }
 
 
@@ -1790,10 +1804,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
     /// identity 冲突键的物化视图。
     ///
-    /// reportingEligible 是上报门禁，必须精确。全量路径靠一次全表 GROUP BY 数冲突组；
-    /// 增量路径不能这么做，那正是要消掉的 10 秒。所以把「当前处于冲突态的 logical 组」
-    /// 持久化成稀疏表：全量重算整表重建，增量重算只增删作用域内的键。
-    /// 表内该 hostname 无行 <=> 无冲突 <=> eligible。
+    /// 持久化当前存在身份冲突的 logical 组，供全量、增量与无变化路径显示诊断。
+    /// 全量重算整表重建，增量重算只增删作用域内的键，避免重复全表 GROUP BY。
     private func ensureIdentityConflictTableUnlocked() throws {
         try exec("""
             CREATE TABLE IF NOT EXISTS usage_identity_conflicts(
@@ -2520,10 +2532,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 ))
             }
         }
-        // 3) identity 冲突：只替换作用域内的键，其余不动。eligible 由整表是否为空判定，仍然精确。
+        // 3) identity 冲突：只替换作用域内的键，其余不动，提示保留完整冲突数。
         try updateScopedIdentityConflictsUnlocked(hostname: hostname)
 
-        var blockedReasons: [String] = []
         var unprovableInherited = 0
         do {
             let statement = try prepare(
@@ -2534,13 +2545,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 unprovableInherited = Int(sqlite3_column_int64(statement, 0))
             }
         }
-        if unprovableInherited > 0 {
-            blockedReasons.append("\(unprovableInherited) inherited replay event(s) without total snapshot cannot be proven duplicate; reporting proceeds (idempotent upsert self-heals)")
-        }
         let identityConflicts = try identityConflictCountUnlocked(hostname: hostname)
-        if identityConflicts > 0 {
-            blockedReasons.append("\(identityConflicts) logical event(s) have conflicting identity (session/model/project) across same-tier files; reporting blocked")
-        }
+        let warnings = Self.derivationWarnings(
+            unprovableInherited: unprovableInherited, identityConflicts: identityConflicts
+        )
 
         // 4) 折叠统计只覆盖作用域内的组。这两个数是遥测/信息性输出（生产无消费者），
         //    语义相应收窄为「本轮重算的组里折叠了多少」，与增量口径一致。
@@ -2729,8 +2737,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try setIntUnlocked(key: revisionKey(hostname), value: newRevision - 1)
         }
 
-        let eligible = identityConflicts == 0
-        try setTextUnlocked(key: reportingEligibleKey(hostname), value: eligible ? "1" : "0")
+        try setTextUnlocked(key: reportingEligibleKey(hostname), value: "1")
         advanceStage() // 8) session 差异写完成
 
         // 更新作用域内 logical 组的 bucket 映射：先删旧映射，再从 temp_deduped_events 写入新的。
@@ -2752,10 +2759,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
             """)
 
         return UsageFinalizeResult(
-            reportingEligible: eligible,
-            blockedReasons: blockedReasons,
+            reportingEligible: true,
+            blockedReasons: [],
             collapsedInheritedEvents: collapsedInheritedEvents,
-            collapsedContentDuplicates: collapsedContentDuplicates
+            collapsedContentDuplicates: collapsedContentDuplicates,
+            warnings: warnings
         )
     }
 
