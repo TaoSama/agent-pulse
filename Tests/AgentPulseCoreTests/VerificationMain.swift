@@ -769,7 +769,7 @@ struct AgentPulseCoreVerification {
     }
 
 
-    // 4) Codex 继承回放去重（血缘证明）+ 无法证明时 reporting blocked 失效保护。
+    // 4) Codex 继承回放去重（血缘证明）+ 无法证明时保留非阻断提示。
     private static func verifyV2InheritedReplayDedup() throws {
         // 4a) 父与子（subagent）各自文件都含相同 total 快照 -> 血缘指纹一致 -> 折叠为一，可上报。
         let dbA = tempUsageDB(); defer { cleanupDB(dbA) }
@@ -803,9 +803,8 @@ struct AgentPulseCoreVerification {
         try require(resultA.collapsedInheritedEvents == 1, "one inherited event collapsed")
         try require(resultA.reportingEligible, "provable dedup keeps reporting eligible")
 
-        // 4b) 继承回放但只有 last_token_usage（无完整 total 快照）-> 无法证明是否重复，但
-        //     不再 fail-closed 阻断上报（上报为累计值幂等 upsert，重复由服务端吸收自愈）。
-        //     仍保留一条信息性说明在 blockedReasons 里，但 reportingEligible 保持 true。
+        // 4b) 继承回放但只有 last_token_usage（无完整 total 快照）-> 无法证明是否重复，
+        //     仅在 warnings 提示，继续上报现有本地聚合；不宣称服务端会修正聚合内部重复。
         let dbB = tempUsageDB(); defer { cleanupDB(dbB) }
         let ledgerB = try UsageLedgerStore(path: dbB.path)
         func lastLine(_ ts: String, out: Int) -> String {
@@ -820,8 +819,9 @@ struct AgentPulseCoreVerification {
         try require(cnp.events[0].lineageFingerprint.isEmpty, "no total snapshot => no lineage fingerprint")
         try ledgerB.record(events: cnp.events, sessionEvents: cnp.sessionEvents, checkpoint: cnp.checkpoint, hostname: "h")
         let resultB = try ledgerB.finalizeDerived(hostname: "h")
-        try require(resultB.reportingEligible, "unprovable inherited replay must NOT block reporting (idempotent upsert self-heals duplicates)")
-        try require(!resultB.blockedReasons.isEmpty, "informational note must still be surfaced for the unprovable replay")
+        try require(resultB.reportingEligible, "unprovable inherited replay must not block reporting")
+        try require(resultB.blockedReasons.isEmpty, "informational warnings must not appear in blocked reasons")
+        try require(resultB.warnings.contains(where: { $0.contains("inherited replay") }), "unprovable replay warning must remain visible")
         let eligibleFlag = try ledgerB.reportingEligible(hostname: "h")
         try require(eligibleFlag, "reportingEligible(hostname:) reflects the non-blocking policy")
     }
@@ -1210,7 +1210,7 @@ struct AgentPulseCoreVerification {
     // 7b) v8 legacy/owned 去重：聚合前按归属优先级选行
     //     (ownedActive > ownedHistory > legacy)，有更高优先级时完全忽略低级旧行；
     //     删除/mark missing active 后历史仍保留；token/session/edit 同口径；
-    //     overwrite 同 tier 计数冲突 fail-closed。
+    //     overwrite 同 tier 计数冲突取 max，身份冲突仅提示。
     private static func verifyV8LegacyOwnedDedup() throws {
         func open(_ path: String) throws -> OpaquePointer? {
             var handle: OpaquePointer?
@@ -1394,8 +1394,8 @@ struct AgentPulseCoreVerification {
                         "counts-only overwrite conflict must converge to the max (completed) count, not first row or sum")
         }
 
-        // 7b) overwrite 同 tier 身份冲突仍 fail-closed：同一 event 在两文件观测到不同 session，
-        //     属真正的身份矛盾（非截断态差异），必须阻断上报，绝不静默取一。
+        // 7b) overwrite 同 tier 身份冲突：同一 event 在两文件观测到不同 session，
+        //     保留身份矛盾提示，继续上报现有本地聚合。
         do {
             let db = tempUsageDB(); defer { cleanupDB(db) }
             _ = try UsageLedgerStore(path: db.path)
@@ -1407,8 +1407,10 @@ struct AgentPulseCoreVerification {
             sqlite3_close(handle)
             let ledger = try UsageLedgerStore(path: db.path)
             let result = try ledger.finalizeDerived(hostname: "h")
-            try require(!result.reportingEligible && !result.blockedReasons.isEmpty,
-                        "identity (session) conflict across same-tier files must still fail-closed")
+            try require(result.reportingEligible && result.blockedReasons.isEmpty,
+                        "identity (session) conflict across same-tier files must not block reporting")
+            try require(result.warnings.contains(where: { $0.contains("conflicting identity") }),
+                        "identity conflict must remain visible as a warning")
         }
 
         // 8) overwrite 同 tier 仅 timestamp 不同不阻断：claude-code 同一 message.id 跨文件

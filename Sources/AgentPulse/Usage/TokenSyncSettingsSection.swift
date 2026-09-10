@@ -114,6 +114,9 @@ struct TokenSyncSettingsSection: View {
                 if let detail = authority.detail {
                     SettingsFootnote(detail, tone: authority.tone)
                 }
+                if let warning = model.tokenSyncStatus.reportingWarnings.first {
+                    SettingsFootnote(warning, tone: .warning)
+                }
 
                 SettingsToggleRow(
                     title: "本机上报（谁开谁报）",

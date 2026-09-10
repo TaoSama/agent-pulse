@@ -24,6 +24,7 @@ enum CoordinatorVerification {
         try verifyAutoReportIntervalIsConfigurable(source)
         try verifyOperationTimestampsPersistAcrossLaunches(source)
         try verifyNoChangeRoundSkipsFinalize(source)
+        try verifyReportingWarningsAreSeparateFromBlocking(source)
         print("TokenSyncCoordinator verification passed")
     }
 
@@ -484,6 +485,27 @@ enum CoordinatorVerification {
             scanNowBody.contains("ledger.reportingEligible(hostname:"),
             "scanNow 跳过分支未从 reportingEligible 读回上报资格（会伪造 eligible）"
         )
+    }
+
+    private static func verifyReportingWarningsAreSeparateFromBlocking(_ source: String) throws {
+        let scan = try functionBody(matching: "private func scanNow(chainedReport:", in: source)
+        try require(scan.contains("warnings: try ledger.reportingWarnings(hostname: hostname)")
+                    && scan.contains("blockedReasons: eligible ? [] : priorBlockedReasons"),
+                    "unchanged scans must recover durable warnings independently and clear obsolete blocking reasons")
+        let finishScan = try functionBody(named: "finishScan", in: source)
+        try require(finishScan.contains("status.reportingEligible = outcome.finalize.reportingEligible")
+                    && finishScan.contains("status.reportingBlockedReasons = outcome.finalize.blockedReasons")
+                    && finishScan.contains("status.reportingWarnings = outcome.finalize.warnings"),
+                    "scan results must publish warnings separately from reporting eligibility and blocking reasons")
+        let report = try functionBody(named: "reportNow", in: source)
+        try require(!report.contains("reportingWarnings") && !report.contains("reportingBlockedReasons"),
+                    "reportNow must use durable readiness instead of gating on displayed warnings")
+        let gate = try functionBody(named: "isRebuildCompletionPending", in: source)
+        try require(gate.contains("ledger.requiresRebuildCompletion()")
+                    && gate.contains("ledger.requiresDerivationCompletion()")
+                    && gate.contains("return rebuildPending || derivationPending")
+                    && !gate.contains("reportingWarnings"),
+                    "durable reporting gate must retain rebuild and derivation protection independently of warnings")
     }
 
     private static func localDate(

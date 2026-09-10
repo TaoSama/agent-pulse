@@ -122,6 +122,7 @@ let package = Package(
             sources: [
                 "VerificationMain.swift",
                 "CoordinatorVerification.swift",
+                "ReportingWarningsVerification.swift",
             ]
         ),
         .executableTarget(

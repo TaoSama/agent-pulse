@@ -13,6 +13,7 @@ enum DerivedFinalizeEquivalence {
         try verifySQLiteReadFailure()
         try verifyNetworkBucketRelocation()
         try verifySummarySnapshot()
+        try verifyDerivationWarningsDoNotBlockReporting()
         let rounds = try parseRounds(ProcessInfo.processInfo.environment["EQUIV_ROUNDS"])
         // UInt64("0xBEEF") 是 nil —— Swift 的十进制初始化器不认 0x 前缀。直接用它会让每个
         // 带前缀的 EQUIV_SEED 都静默落回默认种子，看起来跑了多种子其实只跑了一个。

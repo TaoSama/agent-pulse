@@ -22,7 +22,7 @@ private final class ReportProgressRecorder: @unchecked Sendable {
     }
 }
 
-private final class ScriptedBatchClient: UsageBatchReporting, @unchecked Sendable {
+final class ScriptedBatchClient: UsageBatchReporting, @unchecked Sendable {
     private let lock = NSLock()
     private let failOnCall: Int?
     private let fixedResponse: UsageIngestResponse?
@@ -93,6 +93,7 @@ enum AgentPulseUsageVerification {
         try await verifyPartialAckAndRecovery()
         try await verifyMalformedAcknowledgementsRemainPending()
         try await verifyCancellationKeepsBatchPending()
+        try await ReportingWarningsVerification.run()
         try await CoordinatorVerification.run()
         print("AgentPulseUsage verification passed")
     }
@@ -349,7 +350,7 @@ enum AgentPulseUsageVerification {
         )
     }
 
-    private static func makeReporter(client: ScriptedBatchClient, hostname: String) -> TokenUsageReporter {
+    static func makeReporter(client: ScriptedBatchClient, hostname: String) -> TokenUsageReporter {
         let configuration = readyConfiguration(hostname: hostname)
         return TokenUsageReporter(
             configurationLoader: { _ in configuration },

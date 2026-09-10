@@ -310,6 +310,8 @@ struct TokenSyncStatus: Sendable, Equatable {
     var reportingEligible: Bool
     /// 上报被阻止的原因（reportingEligible == false 时给出，脱敏）。
     var reportingBlockedReasons: [String]
+    /// Data-quality warnings never disable reporting.
+    var reportingWarnings: [String] = []
     /// 待上报（dirty）bucket 行数。
     var pendingBuckets: Int
     /// 待上报（dirty）session 行数。
@@ -364,7 +366,7 @@ struct TokenSyncStatus: Sendable, Equatable {
         // 2) 配好但被门禁挡。上报未开启时这只是本地信息，非活跃故障：降为中性提示，
         //    不用红色报警（此时本机根本不上报，门禁不构成问题）；开启上报后才是真正的红色阻断。
         if !reportingEligible {
-            let detail = reportingBlockedReasons.first ?? "存在无法证明的潜在重复，已阻止上报"
+            let detail = reportingBlockedReasons.first ?? "本地采集或派生尚未完成，暂不可上报"
             if reportingEnabled {
                 return ReportingAuthorityPresentation(
                     state: .blocked, title: "上报被门禁阻止", detail: detail, tone: .negative

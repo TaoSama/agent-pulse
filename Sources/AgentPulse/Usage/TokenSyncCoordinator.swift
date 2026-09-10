@@ -235,6 +235,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     ledger: ledger, hostname: hostname,
                     summary: try Self.summaries(from: ledger, containing: Date(), calendar: calendar, mergedEnvURL: envURL),
                     eligible: try ledger.reportingEligible(hostname: hostname),
+                    warnings: try ledger.reportingWarnings(hostname: hostname),
                     pending: recoveryPending ? (0, 0) : try ledger.pendingCounts(hostname: hostname),
                     recoveryPending: recoveryPending
                 )
@@ -255,6 +256,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 self.updateStatus {
                     $0.scanError = nil
                     $0.reportingEligible = initial.eligible
+                    $0.reportingWarnings = initial.warnings
                     $0.pendingBuckets = initial.pending.buckets
                     $0.pendingSessions = initial.pending.sessions
                 }
@@ -608,7 +610,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                         reportingEligible: eligible,
                         blockedReasons: eligible ? [] : priorBlockedReasons,
                         collapsedInheritedEvents: 0,
-                        collapsedContentDuplicates: 0
+                        collapsedContentDuplicates: 0,
+                        warnings: try ledger.reportingWarnings(hostname: hostname)
                     )
                 }
                 let postFinalizeDetail = try Self.pendingProgressDetail(from: ledger, hostname: hostname)
@@ -856,6 +859,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 status.scanError = nil
                 status.reportingEligible = outcome.finalize.reportingEligible
                 status.reportingBlockedReasons = outcome.finalize.blockedReasons
+                status.reportingWarnings = outcome.finalize.warnings
                 if acceptedSnapshot {
                     status.pendingBuckets = outcome.pending.buckets
                     status.pendingSessions = outcome.pending.sessions
@@ -1190,6 +1194,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let hostname: String
         let summary: TokenUsageSummarySnapshot
         let eligible: Bool
+        let warnings: [String]
         let pending: (buckets: Int, sessions: Int)
         let recoveryPending: Bool
     }
