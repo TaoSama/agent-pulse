@@ -43,7 +43,9 @@ public struct CliProxyUsageService: Sendable {
     public static let maxAnalyticsResponseBytes = 16 * 1024 * 1024
 
     /// 请求超时（秒）。全量明细可能较大，给足时间但设硬上限。
-    private static let requestTimeout: TimeInterval = 60
+    // The legacy endpoint performs a full usage aggregation before sending
+    // headers; large installations can legitimately exceed one minute.
+    private static let requestTimeout: TimeInterval = 180
 
     // MARK: - 依赖
 
