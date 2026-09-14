@@ -520,7 +520,13 @@ enum ReconcileParityVerification {
         // 6) GET reconcile。
         let response: ReconcileResponse
         do {
-            response = try await ReconcileClient().fetch(configuration: configuration, baseURL: baseURL, token: token)
+            // reporting.json.path is the ingest endpoint (/api/usage/ingest).
+            // Reconcile is a separate fixed read endpoint and must not reuse
+            // the write path, otherwise the live verifier reports a misleading
+            // 404 even when ingest is healthy.
+            var reconcileConfiguration = configuration
+            reconcileConfiguration.path = "/api/usage/reconcile"
+            response = try await ReconcileClient().fetch(configuration: reconcileConfiguration, baseURL: baseURL, token: token)
         } catch let error as ReconcileFetchError {
             return .skipped("拉取 upstream reconcile 失败（\(desensitize(error))）")
         } catch {
