@@ -998,7 +998,6 @@ public actor CodexRuntimeMetricsCollector {
                     diagnostics.excludedAggregateFiles += 1
                     continue
                 }
-                guard !liveTrackedPaths.contains(canonicalURL.path) else { continue }
                 let size = entry.size
                 let modifiedAt = entry.modifiedAt
                 guard size > 0 else {
@@ -1010,6 +1009,7 @@ public actor CodexRuntimeMetricsCollector {
                    size <= Self.maximumFullInitialReadBytes {
                     completedMetricFiles[canonicalURL.path] = canonicalURL
                 }
+                guard !liveTrackedPaths.contains(canonicalURL.path) else { continue }
                 guard now.timeIntervalSince(modifiedAt) <= Self.recentFileInterval else {
                     diagnostics.excludedStaleFiles += 1
                     continue
@@ -1052,6 +1052,12 @@ public actor CodexRuntimeMetricsCollector {
         }
 
         var filesByPath = completedMetricFiles
+        // Previously parsed Codex files remain eligible for reconciliation after
+        // live expiry, independently of the cold historical-read size limit.
+        for path in fileCache.keys
+            where tokenFileProviders[path] == .codex && discoveryIndex.containsFile(path) {
+            filesByPath[path] = URL(fileURLWithPath: path)
+        }
         for path in liveTrackedPaths {
             filesByPath[path] = URL(fileURLWithPath: path)
         }
@@ -1116,7 +1122,15 @@ public actor CodexRuntimeMetricsCollector {
             apply(cached.summary, now: now, accumulator: &accumulator)
             return
         }
-        if allowIncrementalRead, let cached = fileCache[file.path],
+        // Reconcile a resumed file even if its notification was missed. The first
+        // live read rebuilds its baseline so old output is never replayed.
+        let resumedLiveTracking = !liveTrackedPaths.contains(file.path)
+            && liveTrackedPaths.count < Self.maximumTrackedFiles
+            && (signature.size ?? 0) > 0
+            && signature.modifiedAt.map { now.timeIntervalSince($0) <= Self.recentFileInterval } == true
+            && shouldTrackLiveJSONL(file)
+        if resumedLiveTracking { liveTrackedPaths.insert(file.path) }
+        if allowIncrementalRead, !resumedLiveTracking, let cached = fileCache[file.path],
            cached.initializedForLiveTracking || !liveTrackedPaths.contains(file.path),
            canReadIncrementally(from: cached, to: signature),
            let updated = updateIncrementally(file: file, cached: cached, signature: signature, now: now) {

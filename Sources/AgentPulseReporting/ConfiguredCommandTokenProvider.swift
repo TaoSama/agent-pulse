@@ -75,12 +75,25 @@ public struct ProcessResult: Sendable, Equatable {
 /// intentionally discarded rather than captured or logged, because helper
 /// diagnostics may echo token material.
 public struct SubprocessRunner: ProcessRunning {
+    private static let defaultSystemPath = "/usr/bin:/bin:/usr/sbin:/sbin"
     public init() {}
+
+    public static func helperEnvironment(executable: String, inherited: [String: String]) -> [String: String] {
+        var environment = inherited
+        guard executable.hasPrefix("/") else { return environment }
+        // GUI launches do not inherit the shell PATH. Script helpers often
+        // resolve their runtime via /usr/bin/env beside the configured binary.
+        let directory = URL(fileURLWithPath: executable).deletingLastPathComponent().path
+        let path = environment["PATH"] ?? defaultSystemPath
+        environment["PATH"] = ([directory] + path.split(separator: ":").map(String.init)).joined(separator: ":")
+        return environment
+    }
 
     public func run(executable: String, arguments: [String], timeout: TimeInterval) throws -> ProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        process.environment = Self.helperEnvironment(executable: executable, inherited: ProcessInfo.processInfo.environment)
 
         let stdoutPipe = Pipe()
         process.standardOutput = stdoutPipe
