@@ -1537,11 +1537,18 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             return "网络传输失败，请稍后重试"
         case IngestClientError.malformedResponse:
             return "上报响应无法解析"
-        case TokenProviderError.launchFailed, TokenProviderError.commandFailed,
-             TokenProviderError.malformedOutput,
-             TokenProviderError.unsuccessfulResponse, TokenProviderError.missingToken,
-             TokenProviderError.timedOut:
-            return "本地凭证获取失败"
+        case TokenProviderError.launchFailed:
+            return "凭证命令无法启动，请检查可执行文件路径"
+        case let TokenProviderError.commandFailed(exitCode):
+            return "凭证命令执行失败（退出码 \(exitCode)），请检查登录状态和运行环境"
+        case TokenProviderError.timedOut:
+            return "凭证命令超时，请检查登录状态和网络"
+        case TokenProviderError.malformedOutput:
+            return "凭证命令未返回有效 JSON"
+        case TokenProviderError.unsuccessfulResponse:
+            return "凭证服务返回失败，请检查登录状态"
+        case TokenProviderError.missingToken:
+            return "凭证响应缺少 token，请检查字段配置"
         case TokenProviderError.configurationMissing:
             return "本地凭证未配置"
         default:

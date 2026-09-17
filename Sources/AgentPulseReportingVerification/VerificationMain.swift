@@ -127,6 +127,13 @@ struct AgentPulseReportingVerification {
         // Real subprocess: a long sleep is terminated at the deadline and never
         // returns output; a large stdout is drained without deadlock.
         let runner = SubprocessRunner()
+        let environment = SubprocessRunner.helperEnvironment(
+            executable: "/opt/homebrew/bin/helper", inherited: ["PATH": "/usr/bin:/bin", "HOME": "/fixture"])
+        try expect(environment["PATH"] == "/opt/homebrew/bin:/usr/bin:/bin", "GUI helper runtime directory missing")
+        try expect(environment["HOME"] == "/fixture", "helper must preserve inherited environment")
+        try expect(SubprocessRunner.helperEnvironment(executable: "helper", inherited: ["PATH": "/usr/bin"])["PATH"] == "/usr/bin", "relative helper must not add working directory to PATH")
+        let fallback = SubprocessRunner.helperEnvironment(executable: "/usr/local/bin/helper", inherited: [:])
+        try expect(fallback["PATH"] == "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "missing PATH must retain system tools")
         let start = Date()
         do { _ = try runner.run(executable: "/bin/sleep", arguments: ["5"], timeout: 0.3); try expect(false, "expected timedOut from sleep") }
         catch let e as TokenProviderError { try expect(e == .timedOut, "sleep should time out: \(e)") }

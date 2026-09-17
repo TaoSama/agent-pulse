@@ -12,6 +12,7 @@ enum RuntimeIncrementalVerification {
         try await withFixture("discovery", verifyImmediateDiscoveryAndRecovery)
         try await withFixture("notifications", verifyRealNotifications)
         try await withFixture("historical-change", verifyHistoricalChangeAtTrackingCapacity)
+        try await withFixture("historical-resume", verifyHistoricalResumeWithoutNotification)
         try await withFixture("permission-recovery", verifySubdirectoryPermissionRecovery)
         try await withFixture("alias-events", verifyAliasChangesAndDeletion)
     }
@@ -288,6 +289,45 @@ enum RuntimeIncrementalVerification {
                     "notified history must update next tick even when it cannot join the live set")
         try require(updated.filesReadIncrementally == 1,
                     "historical append must bypass the stale-signature fast path and read only its append")
+    }
+
+    private static func verifyHistoricalResumeWithoutNotification(_ fixture: Fixture) async throws {
+        let url = fixture.sessions.appendingPathComponent("rollout-resumed.jsonl")
+        let context = try fixture.json(["type": "turn_context", "payload": ["model": "gpt-6-astra"]])
+        try fixture.write(try fixture.meta("resumed") + context + fixture.token(100, at: 0), to: url)
+        let historicalAge: TimeInterval = 3_600
+        try FileManager.default.setAttributes(
+            [.modificationDate: fixture.now.addingTimeInterval(-historicalAge)], ofItemAtPath: url.path
+        )
+        let collector = try fixture.collector()
+        let cold = try await collector.scan(at: fixture.now)
+        try require(cold.diagnostics.trackedLiveFiles == 0, "historical file must start outside live tracking")
+
+        let reconciliationSecond = 300
+        try fixture.append(try fixture.token(200, at: reconciliationSecond), to: url)
+        _ = fixture.changes.takeChanges()
+        try FileManager.default.setAttributes(
+            [.modificationDate: fixture.time(reconciliationSecond)], ofItemAtPath: url.path
+        )
+        let resumed = try await collector.scan(at: fixture.time(reconciliationSecond))
+        try require(resumed.diagnostics.trackedLiveFiles == 1,
+                    "signature reconciliation must promote resumed history even without a file notification")
+        try require(resumed.liveRate.tokensInWindow == 0,
+                    "resumed history must establish a baseline without replaying its previous tokens")
+
+        try fixture.append(try fixture.token(380, at: reconciliationSecond + 1), to: url)
+        _ = fixture.changes.takeChanges()
+        let output = try await collector.scan(at: fixture.time(reconciliationSecond + 1))
+        try require(output.liveRate.modelTokensInWindow["gpt-6-astra"] == 180,
+                    "resumed Desktop output must contribute exactly its next cumulative delta")
+        try require(output.liveRate.tps == 1 && output.diagnostics.discoveryFullScans == 1,
+                    "resume recovery must preserve the 180-second denominator without full rediscovery")
+
+        let trackingRetentionSeconds = 1_800
+        let expired = try await collector.scan(at: fixture.time(reconciliationSecond + trackingRetentionSeconds + 2))
+        try require(expired.diagnostics.trackedLiveFiles == 0
+                    && expired.taskBreakdown.codexDesktop.totalTasks == 1,
+                    "expired live tracking must retain the known Desktop file for later signature reconciliation")
     }
 
     private static func verifySubdirectoryPermissionRecovery(_ fixture: Fixture) async throws {
