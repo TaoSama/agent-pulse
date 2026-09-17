@@ -13,6 +13,7 @@ enum RuntimeIncrementalVerification {
         try await withFixture("notifications", verifyRealNotifications)
         try await withFixture("historical-change", verifyHistoricalChangeAtTrackingCapacity)
         try await withFixture("historical-resume", verifyHistoricalResumeWithoutNotification)
+        try await RuntimeTrackingRecoveryVerification.run()
         try await withFixture("permission-recovery", verifySubdirectoryPermissionRecovery)
         try await withFixture("alias-events", verifyAliasChangesAndDeletion)
     }

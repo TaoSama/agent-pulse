@@ -1052,6 +1052,12 @@ public actor CodexRuntimeMetricsCollector {
         }
 
         var filesByPath = completedMetricFiles
+        // Previously parsed Codex files remain eligible for reconciliation after
+        // live expiry, independently of the cold historical-read size limit.
+        for path in fileCache.keys
+            where tokenFileProviders[path] == .codex && discoveryIndex.containsFile(path) {
+            filesByPath[path] = URL(fileURLWithPath: path)
+        }
         for path in liveTrackedPaths {
             filesByPath[path] = URL(fileURLWithPath: path)
         }
