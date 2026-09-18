@@ -74,7 +74,6 @@ final class RuntimeFileDiscoveryIndex {
         }
         for path in sourcePaths {
             let url = URL(fileURLWithPath: path).standardizedFileURL
-            guard !url.pathComponents.contains("subagents") else { continue }
             for root in roots where !recoveredRoots.contains(root.path) {
                 if root.path == path || root.path.hasPrefix(path + "/") {
                     rebuild(root)
@@ -170,7 +169,6 @@ final class RuntimeFileDiscoveryIndex {
             return
         }
         for case let url as URL in enumerator {
-            if url.lastPathComponent == "subagents" { enumerator.skipDescendants(); continue }
             if let entry = entry(at: url) { files[root.path, default: [:]][Self.sourcePath(url.path)] = entry }
         }
     }
@@ -179,8 +177,7 @@ final class RuntimeFileDiscoveryIndex {
         guard url.pathExtension.lowercased() == "jsonl" else { return nil }
         metadataReads += 1
         let canonical = url.resolvingSymlinksInPath().standardizedFileURL
-        guard !canonical.pathComponents.contains("subagents"),
-              let values = try? canonical.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
+        guard let values = try? canonical.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
               values.isRegularFile == true, let size = values.fileSize,
               let modifiedAt = values.contentModificationDate else { return nil }
         return Entry(url: canonical, size: size, modifiedAt: modifiedAt)

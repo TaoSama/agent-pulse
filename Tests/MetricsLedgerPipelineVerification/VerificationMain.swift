@@ -44,6 +44,7 @@ struct MetricsLedgerPipelineVerification {
         try verifier.verifyIncrementalWorkStaysScoped()
         try verifier.verifyFrozenCompactionPreservesTotalsAndDropsRaw()
         try verifier.verifyStandaloneFrozenCompactionRunsWithoutRecompute()
+        try verifier.verifyCompactionSpaceReclamationFailuresPreserveCommittedStatistics()
         try verifier.verifyFrozenLateEventsAreDropped()
         try verifier.verifyFrozenWatermarkIsMonotonicAndBucketAligned()
         try verifier.verifyDegradedFileVetoesFrozenAdvance()
@@ -842,6 +843,89 @@ private struct MetricsLedgerPipelineVerifier {
         try withDatabase(database) { db in
             try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='old';") == 0, "独立压实必须删除冻结区原始行")
             try require(try scalarInt(db, "SELECT COUNT(*) FROM usage_events WHERE event_id='new';") == 1, "独立压实必须保留活跃原始行")
+        }
+    }
+
+    /// 维护阶段失败不得丢失或阻断已经提交的派生统计。
+    func verifyCompactionSpaceReclamationFailuresPreserveCommittedStatistics() throws {
+        enum Scenario: CaseIterable { case insufficientSpace, capacityUnavailable, vacuumFailure, success }
+        enum InjectedFailure: Error { case unavailable }
+        for scenario in Scenario.allCases {
+            for legacyFinalize in [false, true] {
+                let database = try temporaryDatabaseURL()
+                defer { cleanupDatabase(at: database) }
+                var vacuumCalls = 0
+                let environment = UsageCompactionEnvironment(
+                    availableCapacity: { _ in
+                        if scenario == .capacityUnavailable { throw InjectedFailure.unavailable }
+                        return scenario == .insufficientSpace ? 0 : Int64.max
+                    },
+                    vacuumOverride: {
+                        vacuumCalls += 1
+                        if scenario == .vacuumFailure { throw InjectedFailure.unavailable }
+                    }
+                )
+                let ledger = try UsageLedgerStore(path: database.path, compactionEnvironment: environment)
+                let host = "host-a"
+                let old = agedTimestamp(daysAgo: 60)
+                let recent = agedTimestamp(daysAgo: 1)
+                for (id, timestamp, input) in [("old", old, Int64(100)), ("recent", recent, Int64(40))] {
+                    try ledger.record(
+                        events: [tokenEvent(id: id, source: "codex", session: id, file: id, ts: timestamp, input: input)],
+                        sessionEvents: [], editEntries: [],
+                        checkpoint: completeCheckpoint(id, source: "codex", ts: timestamp), hostname: host
+                    )
+                }
+                let reclamation: UsageSpaceReclamationResult
+                if legacyFinalize {
+                    let result = try ledger.finalizeDerived(hostname: host, compactFrozen: true)
+                    reclamation = try unwrap(result.spaceReclamation, "legacy finalize must expose reclamation outcome")
+                    try require(result.reportingEligible, "maintenance failure must not block reporting of committed statistics")
+                    try require(result.warnings.isEmpty == (scenario == .success), "legacy finalize must report maintenance warnings")
+                } else {
+                    _ = try ledger.finalizeDerived(hostname: host)
+                    let progress = CompactionProgressRecorder()
+                    let result = try ledger.compactFrozenRaw(hostname: host) { step, done, total in
+                        progress.append(step: step, done: done, total: total)
+                    }
+                    reclamation = result.spaceReclamation
+                    try require(result.compacted && result.deletedRows == 1, "deleted raw rows must remain committed despite maintenance outcome")
+                    let expectedStep: UsageCompactionStep = scenario == .success ? .vacuum : scenario == .vacuumFailure ? .failedVacuum : .skippedVacuum
+                    try require(progress.events.last?.0 == expectedStep && progress.events.last?.1 == UsageCompactionStep.total,
+                                "compaction progress must distinguish skipped or failed reclamation from completed vacuum")
+                    if scenario == .insufficientSpace || scenario == .capacityUnavailable {
+                        try require(!progress.events.contains { $0.0 == .vacuum }, "skipped reclamation must never report running VACUUM")
+                    }
+                }
+                switch scenario {
+                case .insufficientSpace:
+                    guard case let .skippedInsufficientSpace(required, available) = reclamation else {
+                        throw VerificationFailure.assertion("low capacity must skip reclamation")
+                    }
+                    var pageCount: Int64 = 0
+                    var pageSize: Int64 = 0
+                    try withDatabase(database) { db in
+                        pageCount = try scalarInt(db, "PRAGMA page_count;")
+                        pageSize = try scalarInt(db, "PRAGMA page_size;")
+                    }
+                    try require(required == pageCount * pageSize * 2 + 64 * 1_024 * 1_024 && available == 0,
+                                "capacity estimate must account for logical database pages and temporary space")
+                    try require(vacuumCalls == 0, "low capacity must not start VACUUM")
+                case .capacityUnavailable:
+                    try require(reclamation == .skippedCapacityUnavailable && vacuumCalls == 0, "failed capacity probe must skip VACUUM")
+                case .vacuumFailure:
+                    try require(reclamation == .failed && vacuumCalls == 1, "VACUUM failure must be returned explicitly")
+                case .success:
+                    try require(reclamation == .completed && vacuumCalls == 1, "sufficient space must run VACUUM once")
+                }
+                try require(try ledger.eventCount() == 1, "frozen deletion must remain committed")
+                try require(try frozenValue(database, host: host) > 0, "frozen watermark must remain committed")
+                try require(try ledger.buckets(hostname: host).reduce(Int64(0)) { $0 + $1.counts.input } == 140,
+                            "space reclamation outcome must not change aggregate statistics")
+                _ = try ledger.finalizeDerived(hostname: host)
+                try require(try ledger.buckets(hostname: host).reduce(Int64(0)) { $0 + $1.counts.input } == 140,
+                            "subsequent ordinary finalize must preserve the committed frozen statistics")
+            }
         }
     }
 
