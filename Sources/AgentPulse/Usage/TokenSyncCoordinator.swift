@@ -563,7 +563,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 let needsRebuild = try ledger.requiresRebuildCompletion()
                 let needsFinalize = baselineRecovery != .deferred && (needsDerivation || needsRebuild)
                 let dirtyDetail = try Self.dirtyProgressDetail(from: ledger, hostname: hostname)
-                let finalize: UsageFinalizeResult
+                var finalize: UsageFinalizeResult
                 if baselineRecovery == .deferred {
                     // 大库无法廉价恢复增量基线时，必须显式跑一次全量 finalize 来建立基线并
                     // 清除 raw_derivation_pending。否则每轮都会继续 deferred，导致上报永久被门禁。
@@ -624,12 +624,22 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 }
                 if compactionEnabled {
                     progressReporter.enterPhase(.compacting, total: UsageCompactionStep.total, detail: "准备冻结压实")
-                    _ = try ledger.compactFrozenRaw(hostname: hostname) { update in
+                    let compaction = try ledger.compactFrozenRaw(hostname: hostname) { update in
                         progressReporter.advance(
                             .compacting,
                             done: update.done,
                             total: update.total,
                             detail: Self.compactionProgressDetail(update)
+                        )
+                    }
+                    if let warning = compaction.spaceReclamation.warning {
+                        finalize = UsageFinalizeResult(
+                            reportingEligible: finalize.reportingEligible,
+                            blockedReasons: finalize.blockedReasons,
+                            collapsedInheritedEvents: finalize.collapsedInheritedEvents,
+                            collapsedContentDuplicates: finalize.collapsedContentDuplicates,
+                            warnings: finalize.warnings + [warning],
+                            spaceReclamation: compaction.spaceReclamation
                         )
                     }
                     progressReporter.completePhase(.compacting, detail: "冻结压实已检查")
@@ -1620,6 +1630,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         case .deleteFrozenRaw: label = "删除冻结原始行"
         case .vacuum: label = "VACUUM 回收空间"
         case .skippedVacuum: return "无需 VACUUM"
+        case .failedVacuum: return "VACUUM 回收失败"
         }
         guard progress.deletedRows > 0 else { return label }
         if progress.step == .deleteFrozenRaw, progress.lastBatchRows > 0 {

@@ -252,6 +252,8 @@ public actor CodexRuntimeMetricsCollector {
     private struct TrackedTokenEvent {
         let sample: TPSSample
         let sessionKey: String
+        let messageIdentity: String?
+        let isSubagent: Bool
     }
 
     private struct TokenWindowTotals {
@@ -905,23 +907,32 @@ public actor CodexRuntimeMetricsCollector {
         var entry = ClaudeDesktopFileCacheEntry(signature: signature)
         let data: Data
         do {
-            let handle = try FileHandle(forReadingFrom: url)
-            do {
-                if let cached,
-                   cached.signature.resourceIdentifier == signature.resourceIdentifier,
-                   cached.signature.createdAt == signature.createdAt,
-                   size > (cached.signature.size ?? 0),
-                   cached.readOffset >= UInt64(cached.tailGuard.count) {
-                    try handle.seek(toOffset: cached.readOffset - UInt64(cached.tailGuard.count))
-                    let guarded = try handle.read(upToCount: cached.tailGuard.count) ?? Data()
-                    if guarded == cached.tailGuard { entry = cached }
+            if let cached,
+               cached.signature.resourceIdentifier == signature.resourceIdentifier,
+               cached.signature.createdAt == signature.createdAt,
+               size >= (cached.signature.size ?? 0),
+               cached.readOffset >= UInt64(cached.tailGuard.count) {
+                let guardOffset = cached.readOffset - UInt64(cached.tailGuard.count)
+                guard size >= Int(guardOffset) else {
+                    throw RuntimeFileSnapshotReader.ReadError.unexpectedEnd
                 }
-                try handle.seek(toOffset: entry.readOffset)
-                data = try handle.readToEnd() ?? Data()
-                try handle.close()
-            } catch {
-                try handle.close()
-                throw error
+                let guarded = try RuntimeFileSnapshotReader.read(
+                    from: url,
+                    offset: guardOffset,
+                    byteCount: cached.tailGuard.count
+                )
+                guard guarded == cached.tailGuard else {
+                    throw RuntimeFileSnapshotReader.ReadError.unexpectedEnd
+                }
+                entry = cached
+                let appendBytes = size - Int(cached.readOffset)
+                data = try RuntimeFileSnapshotReader.read(
+                    from: url,
+                    offset: cached.readOffset,
+                    byteCount: appendBytes
+                )
+            } else {
+                data = try RuntimeFileSnapshotReader.read(from: url, byteCount: size)
             }
         } catch {
             return .unreadable
@@ -1085,7 +1096,11 @@ public actor CodexRuntimeMetricsCollector {
         // Expire retained event arrays even when a file stops changing. Otherwise
         // an idle file keeps copying its final busy window into every new sample.
         if var cached = fileCache[file.path], !cached.summary.tokenEvents.isEmpty {
-            cached.summary.tokenEvents.removeAll { !eventCanOverlapWindow($0.sample, referenceDate: now) }
+            cached.summary.tokenEvents.removeAll {
+                $0.sample.tokenCount > 0
+                    ? !eventCanOverlapWindow($0.sample, referenceDate: now)
+                    : !identityAnchorWithinWindow($0.sample, referenceDate: now)
+            }
             fileCache[file.path] = cached
         }
         if let cached = fileCache[file.path],
@@ -1148,7 +1163,7 @@ public actor CodexRuntimeMetricsCollector {
                 fileData = try readInitialRuntimeWindow(from: file, size: size)
                 readIsTailOnly = true
             } else {
-                fileData = try Data(contentsOf: file, options: [.mappedIfSafe])
+                fileData = try RuntimeFileSnapshotReader.read(from: file, byteCount: signature.size ?? 0)
                 readIsTailOnly = false
             }
         } catch {
@@ -1176,6 +1191,7 @@ public actor CodexRuntimeMetricsCollector {
         // 子 agent 文件才需要继承前缀锚点：取首行 session_meta 的时间戳作为时间簇基准。
         // 顶层文件 metaStartedAt 为 nil，crossedInheritedPrefix 恒 true（不做任何前缀跳过）。
         let isSubagentFile = meta?.threadSource == "subagent"
+            || file.pathComponents.contains("subagents")
         let metaStartedAt: Date? = isSubagentFile
             ? {
                 let firstLine = contents.prefix(while: { !$0.isNewline })
@@ -1183,7 +1199,6 @@ public actor CodexRuntimeMetricsCollector {
             }()
             : nil
         var crossedInheritedPrefix = (metaStartedAt == nil)
-        let source = meta.flatMap { CodexSessionParser.source(forOriginator: $0.originator) }
         var completedIdentities = Set<String>()
         var lifecycleStarted = false
         var previousTotal: Int?
@@ -1193,14 +1208,21 @@ public actor CodexRuntimeMetricsCollector {
         var latestOutputSignal: Date?
         var messageUsage: [String: MessageUsage] = [:]
         var messageSequence: UInt64 = 0
+        var baselineTokenEvents: [TrackedTokenEvent] = []
         var tokenDiagnostics = TokenDiagnostics()
+        let source: PulseSource = switch tokenFileProviders[file.path] {
+        case .claude: .cli
+        case .codex, nil:
+            meta.flatMap { CodexSessionParser.source(forOriginator: $0.originator) } ?? .cli
+        }
         // 会话级 model 播种无条件执行（不受 live-track 门禁）：Codex 的 turn_context 全生命周期
         // 只在文件顶部出现一次，其后正文再无 model 声明。若首解析时文件未 live-tracked 就跳过播种，
         // cache 里 currentModel 会一直是 nil；待该文件晋升 live-tracked 走增量路径时，增量预播种只回看
         // 当前追加批次（顶部 turn_context 早已消费），永远拿不到 model → 整段 output 归 "unknown"。
         // 首解析即无条件播种、存入 cache，可让 model 成为会话级粘性值，杜绝这条 nil 竞态。
-        if let contextModel = latestTurnContextModel(in: fileData) {
-            currentModel = contextModel
+        let latestContext = latestTurnContext(in: fileData)
+        if latestContext.found {
+            currentModel = latestContext.model
             hasSeenTurnContext = true
         } else {
             currentModel = latestKnownModel(in: fileData)
@@ -1219,8 +1241,8 @@ public actor CodexRuntimeMetricsCollector {
                 runtimeJSONRecordsDecoded += 1
                 let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
                 if let object {
-                    if let model = turnContextModel(object) {
-                        currentModel = model
+                    if isTurnContext(object) {
+                        currentModel = turnContextModel(object)
                         hasSeenTurnContext = true
                     } else if !hasSeenTurnContext, let model = knownModelName(object) {
                         currentModel = model
@@ -1284,6 +1306,22 @@ public actor CodexRuntimeMetricsCollector {
                         lastSeen: now,
                         sequence: messageSequence
                     )
+                    // Keep an identity-only anchor for baseline records. The
+                    // token window uses these zero-token records to suppress a
+                    // later subagent copy even when the parent produced no
+                    // retained event during the initial scan.
+                    baselineTokenEvents.append(TrackedTokenEvent(
+                        sample: TPSSample(
+                            timestamp: parsed.timestamp,
+                            tokenCount: 0,
+                            durationSeconds: 0,
+                            source: source,
+                            model: parsed.model ?? currentModel
+                        ),
+                        sessionKey: file.path,
+                        messageIdentity: identity,
+                        isSubagent: isSubagentFile
+                    ))
                 }
             }
             pruneMessageUsage(&messageUsage, now: now)
@@ -1295,6 +1333,31 @@ public actor CodexRuntimeMetricsCollector {
                 ) : .empty
             completedIdentities = completed.identities
             lifecycleStarted = CodexSessionParser.lastLifecycle(inSessionContents: contents) == .started
+            // Non-live files still contribute identity anchors. This lets a
+            // parent transcript parsed only as a baseline suppress an
+            // equivalent Claude subagent copy in the 180-second window.
+            for line in completeLines(in: fileData, skippingLeadingPartialLine: false) {
+                guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+                      let parsed = parseTokenLine(
+                          line,
+                          object: object,
+                          now: now,
+                          isCodexFile: isCodexFile
+                      ),
+                      let identity = parsed.messageIdentity else { continue }
+                baselineTokenEvents.append(TrackedTokenEvent(
+                    sample: TPSSample(
+                        timestamp: parsed.timestamp,
+                        tokenCount: 0,
+                        durationSeconds: 0,
+                        source: source,
+                        model: parsed.model ?? currentModel
+                    ),
+                    sessionKey: file.path,
+                    messageIdentity: identity,
+                    isSubagent: isSubagentFile
+                ))
+            }
         }
 
         let taskActivityAt = [signature.modifiedAt, latestOutputSignal].compactMap { $0 }.max()
@@ -1321,7 +1384,7 @@ public actor CodexRuntimeMetricsCollector {
             desktopTask: desktopTask,
             codexCLITask: codexCLITask,
             latestOutputSignal: latestOutputSignal,
-            tokenEvents: []
+            tokenEvents: baselineTokenEvents
         )
         fileCache[file.path] = FileCacheEntry(
             signature: signature,
@@ -1346,13 +1409,14 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     private func readInitialRuntimeWindow(from file: URL, size: Int) throws -> Data {
-        let handle = try FileHandle(forReadingFrom: file)
-        defer { try? handle.close() }
-        let firstLine = try handle.read(upToCount: Self.maximumInitialHeaderBytes) ?? Data()
         let tailOffset = UInt64(max(0, size - Self.maximumAppendReadBytes))
-        try handle.seek(toOffset: tailOffset)
-        var tail = try handle.readToEnd() ?? Data()
-        if tailOffset == 0 { return tail }
+        if tailOffset == 0 {
+            return try RuntimeFileSnapshotReader.read(from: file, byteCount: size)
+        }
+        let headerBytes = min(size, Self.maximumInitialHeaderBytes)
+        let firstLine = try RuntimeFileSnapshotReader.read(from: file, byteCount: headerBytes)
+        let tailBytes = size - Int(tailOffset)
+        var tail = try RuntimeFileSnapshotReader.read(from: file, offset: tailOffset, byteCount: tailBytes)
         if let firstNewline = tail.firstIndex(of: 0x0A) {
             tail = Data(tail[tail.index(after: firstNewline)...])
         } else {
@@ -1387,14 +1451,22 @@ public actor CodexRuntimeMetricsCollector {
     ) -> FileCacheEntry? {
         let appendedData: Data
         do {
-            let handle = try FileHandle(forReadingFrom: file)
             guard cached.readOffset >= UInt64(cached.tailGuard.count) else { return nil }
             let guardOffset = cached.readOffset - UInt64(cached.tailGuard.count)
-            try handle.seek(toOffset: guardOffset)
-            let guardedAppend = try handle.readToEnd() ?? Data()
-            try handle.close()
-            guard guardedAppend.starts(with: cached.tailGuard) else { return nil }
-            appendedData = Data(guardedAppend.dropFirst(cached.tailGuard.count))
+            guard let snapshotSize = signature.size,
+                  snapshotSize >= Int(cached.readOffset),
+                  snapshotSize >= Int(guardOffset) else { return nil }
+            let guardData = try RuntimeFileSnapshotReader.read(
+                from: file,
+                offset: guardOffset,
+                byteCount: cached.tailGuard.count
+            )
+            guard guardData == cached.tailGuard else { return nil }
+            appendedData = try RuntimeFileSnapshotReader.read(
+                from: file,
+                offset: cached.readOffset,
+                byteCount: snapshotSize - Int(cached.readOffset)
+            )
         } catch {
             return nil
         }
@@ -1430,7 +1502,9 @@ public actor CodexRuntimeMetricsCollector {
             ?? false
         var latestOutputSignal = cached.summary.latestOutputSignal
         var tokenEvents = cached.summary.tokenEvents.filter {
-            eventCanOverlapWindow($0.sample, referenceDate: now)
+            $0.sample.tokenCount > 0
+                ? eventCanOverlapWindow($0.sample, referenceDate: now)
+                : identityAnchorWithinWindow($0.sample, referenceDate: now)
         }
         var previousTotal = cached.previousTotalOutput
         var previousTimestamp = cached.previousOutputTimestamp
@@ -1444,13 +1518,19 @@ public actor CodexRuntimeMetricsCollector {
         // nil 时触发，稳态零开销；per-file 数据反查，不会跨会话误判。
         if currentModel == nil {
             let batch = Data(appendedData.prefix(completeLength))
-            if let seeded = latestTurnContextModel(in: batch) {
-                currentModel = seeded
+            let seeded = latestTurnContext(in: batch)
+            if seeded.found {
+                currentModel = seeded.model
                 hasSeenTurnContext = true
             }
         }
         var messageUsage = cached.messageUsage
         var messageSequence = cached.messageSequence
+        let source: PulseSource = switch tokenFileProviders[file.path] {
+        case .claude: .cli
+        case .codex, nil:
+            cached.meta.flatMap { CodexSessionParser.source(forOriginator: $0.originator) } ?? .cli
+        }
         // 子 agent 继承前缀状态从 cache 恢复：未越过前缀时，前缀 token 只更新 previousTotal 基线、
         // 不产出事件，避免复算父会话累计量（并消除该段的 unknown 归属）。顶层文件 metaStartedAt 为 nil、
         // crossedInheritedPrefix 恒 true，走原逻辑不受影响。
@@ -1464,11 +1544,8 @@ public actor CodexRuntimeMetricsCollector {
         // previousTotal 天然去重），不经过这里；此指纹对 codex 恒不命中，仅为 incremental 源兜底。
         var seenIncrementalFingerprints = Set<String>()
         var tokenDiagnostics = cached.tokenDiagnostics
-        let source: PulseSource = switch tokenFileProviders[file.path] {
-        case .claude: .cli
-        case .codex, nil:
-            cached.meta.flatMap { CodexSessionParser.source(forOriginator: $0.originator) } ?? .cli
-        }
+        let isSubagentFile = cached.meta?.threadSource == "subagent"
+            || file.pathComponents.contains("subagents")
         let isInteractive = cached.meta.map { meta in
             meta.isTopLevel && meta.cwd.map {
                 !CodexSessionParser.isUnderAutomation(cwd: $0, automationRoots: configuration.automationRoots)
@@ -1482,8 +1559,8 @@ public actor CodexRuntimeMetricsCollector {
             do {
                 // 权威 turn 模型只从 turn_context 事件取；仅当从未见过 turn_context
                 // 时才回退到宽松的 knownModelName，避免被非权威 model 字段污染。
-                if let model = turnContextModel(object) {
-                    currentModel = model
+                if isTurnContext(object) {
+                    currentModel = turnContextModel(object)
                     hasSeenTurnContext = true
                 } else if !hasSeenTurnContext, let model = knownModelName(object) {
                     currentModel = model
@@ -1555,7 +1632,9 @@ public actor CodexRuntimeMetricsCollector {
                                 source: source,
                                 model: parsed.model ?? currentModel
                             ),
-                            sessionKey: file.path
+                            sessionKey: file.path,
+                            messageIdentity: nil,
+                            isSubagent: isSubagentFile
                         ))
                     } else if total < previousTotal {
                         tokenDiagnostics.counterResetObservations += 1
@@ -1608,7 +1687,9 @@ public actor CodexRuntimeMetricsCollector {
                             source: source,
                             model: parsed.model ?? currentModel
                         ),
-                        sessionKey: file.path
+                        sessionKey: file.path,
+                        messageIdentity: parsed.messageIdentity,
+                        isSubagent: isSubagentFile
                     ))
                 }
             }
@@ -1778,11 +1859,16 @@ public actor CodexRuntimeMetricsCollector {
         return model.isEmpty ? nil : model
     }
 
+    private func isTurnContext(_ object: [String: Any]) -> Bool {
+        object["type"] as? String == "turn_context"
+    }
+
     /// baseline 预读阶段确定“最近一次 turn 的模型”。优先反向扫描 `turn_context`
     /// 事件的权威模型；只有在整段数据里都找不到 turn_context 时，才回退到
     /// 宽松的 `knownModelName`，保证不丢模型也不误判成 Other。
     private func latestKnownModel(in data: Data) -> String? {
-        if let contextModel = latestTurnContextModel(in: data) { return contextModel }
+        let context = latestTurnContext(in: data)
+        if context.found { return context.model }
         var searchEnd = data.endIndex
         let needle = Data("\"model\"".utf8)
         while searchEnd > data.startIndex,
@@ -1791,7 +1877,7 @@ public actor CodexRuntimeMetricsCollector {
                 .map { data.index(after: $0) } ?? data.startIndex
             let lineEnd = data[match.upperBound..<data.endIndex].firstIndex(of: 0x0A) ?? data.endIndex
             modelSearchRecordsDecoded += 1
-            if let object = (try? JSONSerialization.jsonObject(with: data[lineStart..<lineEnd])) as? [String: Any],
+            if let object = (try? JSONSerialization.jsonObject(with: Data(data[lineStart..<lineEnd]))) as? [String: Any],
                let model = knownModelName(object) {
                 return model
             }
@@ -1800,7 +1886,10 @@ public actor CodexRuntimeMetricsCollector {
         return nil
     }
 
-    private func latestTurnContextModel(in data: Data) -> String? {
+    private func latestTurnContext(in data: Data) -> (found: Bool, model: String?) {
+        // Parse complete lines backwards. A recent turn_context without a
+        // model is authoritative and must clear the previous turn's model;
+        // searching earlier lines would cross that boundary.
         var searchEnd = data.endIndex
         let needle = Data("turn_context".utf8)
         while searchEnd > data.startIndex,
@@ -1808,14 +1897,18 @@ public actor CodexRuntimeMetricsCollector {
             let lineStart = data[data.startIndex..<match.lowerBound].lastIndex(of: 0x0A)
                 .map { data.index(after: $0) } ?? data.startIndex
             let lineEnd = data[match.upperBound..<data.endIndex].firstIndex(of: 0x0A) ?? data.endIndex
+            let line = data[lineStart..<lineEnd]
             modelSearchRecordsDecoded += 1
-            if let object = (try? JSONSerialization.jsonObject(with: data[lineStart..<lineEnd])) as? [String: Any],
-               let model = turnContextModel(object) {
-                return model
+            guard let object = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any] else {
+                searchEnd = lineStart
+                continue
+            }
+            if isTurnContext(object) {
+                return (true, turnContextModel(object))
             }
             searchEnd = lineStart
         }
-        return nil
+        return (false, nil)
     }
 
     private func knownUsageTokens(_ object: [String: Any]) -> Int? {
@@ -1899,21 +1992,22 @@ public actor CodexRuntimeMetricsCollector {
     }
 
     private func parsedMessageIdentity(_ object: [String: Any]) -> String? {
-        guard let message = object["message"] as? [String: Any] else { return nil }
-        var messageID = (message["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let message = object["message"] as? [String: Any]
+        var messageID = (message?["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if messageID.isEmpty {
             messageID = (object["uuid"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
-        guard !messageID.isEmpty else { return nil }
-        var sessionID = ""
-        for key in ["sessionId", "session_id"] {
-            let candidate = (object[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if !candidate.isEmpty {
-                sessionID = candidate
-                break
+        if messageID.isEmpty {
+            for key in ["message_id", "messageId"] {
+                messageID = (object[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !messageID.isEmpty { break }
             }
         }
-        return sessionID + "\u{0}" + messageID
+        guard !messageID.isEmpty else { return nil }
+        // Anthropic message IDs are stable across the parent transcript and
+        // its subagent copy. Do not prefix the local session ID: that would
+        // make cross-file copies look like independent output.
+        return messageID
     }
 
     private func parsedTimestamp(from object: [String: Any], fallback: Date) -> Date {
@@ -1968,11 +2062,29 @@ public actor CodexRuntimeMetricsCollector {
             && start <= referenceDate.addingTimeInterval(Self.futureTimestampTolerance)
     }
 
+    private func identityAnchorWithinWindow(_ sample: TPSSample, referenceDate: Date) -> Bool {
+        sample.timestamp >= referenceDate.addingTimeInterval(-TPSWindow.windowSeconds)
+            && sample.timestamp <= referenceDate.addingTimeInterval(Self.futureTimestampTolerance)
+    }
+
     private func tokenWindowTotals(_ events: [TrackedTokenEvent], at now: Date) -> TokenWindowTotals {
         var totals = TokenWindowTotals()
+        let topLevelIdentities = Set(events.compactMap { event in
+            event.isSubagent ? nil : event.messageIdentity
+        })
+        let subagentOwners = Dictionary(grouping: events.compactMap { event -> (String, String)? in
+            guard event.isSubagent, let identity = event.messageIdentity else { return nil }
+            return (identity, event.sessionKey)
+        }, by: { $0.0 }).reduce(into: [String: String]()) { result, entry in
+            result[entry.key] = entry.value.map { $0.1 }.min()
+        }
         for event in events {
             let sample = event.sample
             guard sample.isValid, eventCanOverlapWindow(sample, referenceDate: now) else { continue }
+            if let identity = event.messageIdentity, event.isSubagent {
+                guard !topLevelIdentities.contains(identity),
+                      subagentOwners[identity] == event.sessionKey else { continue }
+            }
             let model = sample.model ?? "unknown"
             let tokens = TPSWindow.includedTokens(for: sample, referenceDate: now)
             let short = TPSWindow.includedTokens(for: sample, referenceDate: now,
@@ -2006,11 +2118,6 @@ public actor CodexRuntimeMetricsCollector {
     private func shouldTrackLiveJSONL(_ url: URL) -> Bool {
         let name = url.lastPathComponent.lowercased()
         guard name.hasSuffix(".jsonl") else { return false }
-        // 排除 Claude 子会话转录（subagents/*.jsonl）：子会话把父响应以不同 message.id / 文件路径
-        // 重新落盘，跨文件无法按 message 身份折叠，会把同一次真实 output 重复计入实时 TPS
-        // （实测把速率放大到约 3 倍）。与任务计数扫描（discoverFiles 中排除 subagents）口径对齐，
-        // 只统计顶层会话文件。
-        guard !url.pathComponents.contains("subagents") else { return false }
         return !["summary", "aggregate", "snapshot", "live-rate", "live_rate"].contains {
             name.contains($0)
         }

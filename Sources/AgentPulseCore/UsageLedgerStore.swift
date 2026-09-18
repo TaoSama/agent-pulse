@@ -73,13 +73,15 @@ public struct UsageFinalizeResult: Sendable, Equatable {
     public let collapsedInheritedEvents: Int
     /// 本次因内容型去重键（codexDedupKey）被折叠的事件数（fork/subagent 回放重复）。
     public let collapsedContentDuplicates: Int
+    public let spaceReclamation: UsageSpaceReclamationResult?
 
-    public init(reportingEligible: Bool, blockedReasons: [String], collapsedInheritedEvents: Int, collapsedContentDuplicates: Int = 0, warnings: [String] = []) {
+    public init(reportingEligible: Bool, blockedReasons: [String], collapsedInheritedEvents: Int, collapsedContentDuplicates: Int = 0, warnings: [String] = [], spaceReclamation: UsageSpaceReclamationResult? = nil) {
         self.reportingEligible = reportingEligible
         self.blockedReasons = blockedReasons
         self.warnings = warnings
         self.collapsedInheritedEvents = collapsedInheritedEvents
         self.collapsedContentDuplicates = collapsedContentDuplicates
+        self.spaceReclamation = spaceReclamation
     }
 }
 
@@ -98,6 +100,7 @@ public enum UsageCompactionStep: Int, Sendable, Equatable, CaseIterable {
     case deleteFrozenRaw = 2
     case vacuum = 3
     case skippedVacuum = 4
+    case failedVacuum = 5
 
     public static var total: Int { 3 }
 }
@@ -121,10 +124,14 @@ public struct UsageCompactionProgress: Sendable, Equatable {
 public struct UsageCompactionResult: Sendable, Equatable {
     public let advancedTo: Int64
     public let compacted: Bool
+    public let deletedRows: Int64
+    public let spaceReclamation: UsageSpaceReclamationResult
 
-    public init(advancedTo: Int64, compacted: Bool) {
+    public init(advancedTo: Int64, compacted: Bool, deletedRows: Int64 = 0, spaceReclamation: UsageSpaceReclamationResult = .notNeeded) {
         self.advancedTo = advancedTo
         self.compacted = compacted
+        self.deletedRows = deletedRows
+        self.spaceReclamation = spaceReclamation
     }
 }
 
@@ -161,14 +168,16 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private var finalizeDiagnostics = UsageFinalizeDiagnostics()
     private var isFinalizing = false
     private var summarySnapshotRevision: Int64 = 0
+    private let compactionEnvironment: UsageCompactionEnvironment
     public var lastFinalizeDiagnostics: UsageFinalizeDiagnostics { queue.sync { finalizeDiagnostics } }
     /// 数据库主文件路径；用于对 db 及其 WAL/SHM 边车文件收紧 POSIX 权限（0600）。
     private let path: String
     /// 用量库仅当前用户可读写：库中含项目路径、hostname 等可识别信息，禁止同机其它用户读取。
     private static let filePermissions: Int16 = 0o600
 
-    public init(path: String) throws {
+    public init(path: String, compactionEnvironment: UsageCompactionEnvironment = .init()) throws {
         self.path = path
+        self.compactionEnvironment = compactionEnvironment
         var handle: OpaquePointer?
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         guard sqlite3_open_v2(path, &handle, flags, nil) == SQLITE_OK, let handle else {
@@ -1092,7 +1101,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
             ),
             ranked AS (
                 SELECT *,
-                    DENSE_RANK() OVER (PARTITION BY source, event_id ORDER BY tier DESC) AS tier_rank
+                    DENSE_RANK() OVER (PARTITION BY source, event_id ORDER BY tier DESC) AS tier_rank,
+                    ROW_NUMBER() OVER (PARTITION BY source, event_id
+                        ORDER BY tier DESC, (output_tokens + reasoning_output_tokens) DESC,
+                                 reasoning_output_tokens DESC) AS output_rank
                 FROM tiered
             ),
             top_tier AS (
@@ -1105,10 +1117,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     COALESCE(MAX(CASE WHEN project <> 'unknown' THEN project END), MAX(project)) AS project,
                     MIN(timestamp_ms) AS timestamp_ms,
                     MAX(input_tokens) AS input_tokens,
-                    MAX(output_tokens) AS output_tokens,
+                    MAX(CASE WHEN output_rank = 1 THEN output_tokens END) AS output_tokens,
                     MAX(cached_input_tokens) AS cached_input_tokens,
                     MAX(cache_creation_input_tokens) AS cache_creation_input_tokens,
-                    MAX(reasoning_output_tokens) AS reasoning_output_tokens,
+                    MAX(CASE WHEN output_rank = 1 THEN reasoning_output_tokens END) AS reasoning_output_tokens,
                     MAX(total_tokens) AS total_tokens,
                     MAX(session_hash) AS session_hash,
                     MIN(inherited) AS inherited,
@@ -1151,7 +1163,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
             ),
             ranked AS (
                 SELECT *,
-                    DENSE_RANK() OVER (PARTITION BY source, event_id ORDER BY tier DESC) AS tier_rank
+                    DENSE_RANK() OVER (PARTITION BY source, event_id ORDER BY tier DESC) AS tier_rank,
+                    ROW_NUMBER() OVER (PARTITION BY source, event_id
+                        ORDER BY tier DESC, (output_tokens + reasoning_output_tokens) DESC,
+                                 reasoning_output_tokens DESC) AS output_rank
                 FROM tiered
             ),
             top_tier AS (
@@ -1164,10 +1179,10 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     COALESCE(MAX(CASE WHEN project <> 'unknown' THEN project END), MAX(project)) AS project,
                     MIN(timestamp_ms) AS timestamp_ms,
                     MAX(input_tokens) AS input_tokens,
-                    MAX(output_tokens) AS output_tokens,
+                    MAX(CASE WHEN output_rank = 1 THEN output_tokens END) AS output_tokens,
                     MAX(cached_input_tokens) AS cached_input_tokens,
                     MAX(cache_creation_input_tokens) AS cache_creation_input_tokens,
-                    MAX(reasoning_output_tokens) AS reasoning_output_tokens,
+                    MAX(CASE WHEN output_rank = 1 THEN reasoning_output_tokens END) AS reasoning_output_tokens,
                     MAX(total_tokens) AS total_tokens,
                     MAX(session_hash) AS session_hash,
                     MIN(inherited) AS inherited,
@@ -1349,8 +1364,17 @@ public final class UsageLedgerStore: @unchecked Sendable {
                     }
                 }
             }
-            // VACUUM 必须在事务外执行（SQLite 限制）；失败无害，下一轮压实后重试即可回收。
-            if didCompact { try? exec("VACUUM;") }
+            if compactFrozen {
+                let reclamation = reclaimCompactedSpaceUnlocked(didCompact: didCompact)
+                result = UsageFinalizeResult(
+                    reportingEligible: result.reportingEligible,
+                    blockedReasons: result.blockedReasons,
+                    collapsedInheritedEvents: result.collapsedInheritedEvents,
+                    collapsedContentDuplicates: result.collapsedContentDuplicates,
+                    warnings: result.warnings + (reclamation.warning.map { [$0] } ?? []),
+                    spaceReclamation: reclamation
+                )
+            }
             return result
         }
     }
@@ -3680,7 +3704,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
     ///   > legacy（source_file_hash 为空的历史 append/upsert 行）。
     /// 有更高 tier 时，同 logical id 的低 tier 行被完全丢弃（不并入计数）；仅当无任何 owned 行时保留 legacy。
     /// 相同 tier 内跨文件仍按既有稳定规则合并：
-    /// - cumulativeMax：逐维取 max（含 total）；skill/mcp 取 max；model=unknown 时保留已知 model。
+    /// - cumulativeMax：output/reasoning 成对取总输出最大的一次观测，其余计数逐维取 max；
+    ///   skill/mcp 取 max；model=unknown 时保留已知 model。
     /// - overwrite：确定性选择一行（按 source_file_hash 已在 SQL 端稳定排序，取首个出现者），
     ///   但 skill/mcp 仍取 max，避免不同文件观测到的工具计数彼此抹除。
     /// inherited/hasTotalSnapshot/lineageFingerprint 取「更能证明」的值（hasTotalSnapshot 优先真），
@@ -3723,8 +3748,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
         var mismatched: [String] = []
         // counts-only 差异不再 fail-closed：同一 logical event id 在自然键已锁定
         //（source/model/project/session + 派生层 hostname/bucket）下的计数矛盾，
-        // 本质是同一次生成的截断中途快照 vs 完成态。与服务端 incremental GREATEST
-        // upsert 一致地逐列取 max（见 mergeSameTierRawEvents），不再阻断上报。
+        // 本质是同一次生成的截断中途快照 vs 完成态，或 output/reasoning 拆分差异。
+        // 输出分量成对选取，其余计数取 max（见 mergeSameTierRawEvents），不再阻断上报。
         // 仅 session/model/project 这类身份维度不一致才视为真冲突、保持 fail-closed。
         if existing.sessionHash != event.sessionHash { mismatched.append("session") }
         // model=unknown 允许被已知 model 补齐，不算冲突；两个都非空且不同才算。
@@ -3738,32 +3763,24 @@ public final class UsageLedgerStore: @unchecked Sendable {
         return "overwrite duplicate event \(existing.source)/\(existing.id) has conflicting identity \(mismatched.joined(separator: ",")) across files; kept deterministic first row and blocked reporting"
     }
 
-    /// 同 tier 内跨文件相同 logical id 的稳定合并（既有语义，不改）。
+    /// output/reasoning 是同一次输出的拆分，不能逐列取 max 制造不存在的 token。
+    /// 总输出相同时保留 reasoning 较多的观测，使主转录的细分不被未拆分副本抹掉。
+    /// 与 logicalEventsFullSQL / logicalEventsScopedSQL 的 output_rank 使用相同排序。
     private func mergeSameTierRawEvents(existing: RawEvent, incoming event: RawEvent) -> RawEvent {
             let cumulative = existing.mergeStrategy == "cumulativeMax" || event.mergeStrategy == "cumulativeMax"
-            let mergedCounts: UsageTokenCounts
-            if cumulative {
-                mergedCounts = UsageTokenCounts(
-                    input: max(existing.counts.input, event.counts.input),
-                    output: max(existing.counts.output, event.counts.output),
-                    cachedInput: max(existing.counts.cachedInput, event.counts.cachedInput),
-                    cacheCreationInput: max(existing.counts.cacheCreationInput, event.counts.cacheCreationInput),
-                    reasoningOutput: max(existing.counts.reasoningOutput, event.counts.reasoningOutput),
-                    reportedTotal: max(existing.counts.reportedTotal, event.counts.reportedTotal)
-                )
-            } else {
-                // overwrite 同 tier 计数差异 = 同一 event 的截断中途快照 vs 完成态；
-                // 逐列取 max，与服务端 incremental GREATEST upsert 收敛到同一累计值，
-                // 重复上报（客户端 max vs 服务端 GREATEST）天然幂等自愈。
-                mergedCounts = UsageTokenCounts(
-                    input: max(existing.counts.input, event.counts.input),
-                    output: max(existing.counts.output, event.counts.output),
-                    cachedInput: max(existing.counts.cachedInput, event.counts.cachedInput),
-                    cacheCreationInput: max(existing.counts.cacheCreationInput, event.counts.cacheCreationInput),
-                    reasoningOutput: max(existing.counts.reasoningOutput, event.counts.reasoningOutput),
-                    reportedTotal: max(existing.counts.reportedTotal, event.counts.reportedTotal)
-                )
-            }
+            let existingOutput = UInt64(existing.counts.output) + UInt64(existing.counts.reasoningOutput)
+            let incomingOutput = UInt64(event.counts.output) + UInt64(event.counts.reasoningOutput)
+            let preferIncomingOutput = incomingOutput > existingOutput
+                || (incomingOutput == existingOutput && event.counts.reasoningOutput > existing.counts.reasoningOutput)
+            let outputCounts = preferIncomingOutput ? event.counts : existing.counts
+            let mergedCounts = UsageTokenCounts(
+                input: max(existing.counts.input, event.counts.input),
+                output: outputCounts.output,
+                cachedInput: max(existing.counts.cachedInput, event.counts.cachedInput),
+                cacheCreationInput: max(existing.counts.cacheCreationInput, event.counts.cacheCreationInput),
+                reasoningOutput: outputCounts.reasoningOutput,
+                reportedTotal: max(existing.counts.reportedTotal, event.counts.reportedTotal)
+            )
             let preferKnownModel: String = {
                 if existing.model != "unknown" { return existing.model }
                 if event.model != "unknown" { return event.model }
@@ -4346,18 +4363,56 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 }
             }
             emit(.deleteFrozenRaw, UsageCompactionStep.deleteFrozenRaw.rawValue)
-            if didCompact {
+            let reclamation = reclaimCompactedSpaceUnlocked(didCompact: didCompact) {
                 emit(.vacuum, UsageCompactionStep.deleteFrozenRaw.rawValue)
-                try withSQLiteProgressHeartbeat({
-                    emit(.vacuum, UsageCompactionStep.deleteFrozenRaw.rawValue)
-                }) {
+            }
+            let finalStep: UsageCompactionStep
+            switch reclamation {
+            case .completed: finalStep = .vacuum
+            case .failed: finalStep = .failedVacuum
+            default: finalStep = .skippedVacuum
+            }
+            emit(finalStep, UsageCompactionStep.total)
+            return UsageCompactionResult(
+                advancedTo: advancedTo, compacted: didCompact,
+                deletedRows: deletedRows, spaceReclamation: reclamation
+            )
+        }
+    }
+
+    private func reclaimCompactedSpaceUnlocked(
+        didCompact: Bool, heartbeat: (() -> Void)? = nil
+    ) -> UsageSpaceReclamationResult {
+        guard didCompact else { return .notNeeded }
+        let requiredBytes: Int64
+        let availableBytes: Int64
+        do {
+            requiredBytes = try UsageCompactionEnvironment.requiredCapacity(
+                pageCount: scalar64("PRAGMA page_count;"), pageSize: scalar64("PRAGMA page_size;")
+            )
+            availableBytes = try compactionEnvironment.availableCapacity(
+                URL(fileURLWithPath: path).deletingLastPathComponent()
+            )
+            guard availableBytes >= 0 else { return .skippedCapacityUnavailable }
+        } catch {
+            return .skippedCapacityUnavailable
+        }
+        guard availableBytes >= requiredBytes else {
+            return .skippedInsufficientSpace(requiredBytes: requiredBytes, availableBytes: availableBytes)
+        }
+        do {
+            heartbeat?()
+            try withSQLiteProgressHeartbeat({ heartbeat?() }) {
+                if let vacuum = compactionEnvironment.vacuumOverride {
+                    try vacuum()
+                } else {
                     try exec("VACUUM;")
                 }
-            } else {
-                emit(.skippedVacuum, UsageCompactionStep.deleteFrozenRaw.rawValue)
             }
-            emit(didCompact ? .vacuum : .skippedVacuum, UsageCompactionStep.total)
-            return UsageCompactionResult(advancedTo: advancedTo, compacted: didCompact)
+            return .completed
+        } catch {
+            // 冻结与删行已经提交，回收失败只影响文件大小，不撤销可用的统计结果。
+            return .failed
         }
     }
 
@@ -5308,6 +5363,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         }
     }
     private func scalar(_ sql: String) throws -> Int32 { let s = try prepare(sql); defer { sqlite3_finalize(s) }; guard try step(s) == SQLITE_ROW else { throw error() }; return sqlite3_column_int(s, 0) }
+    private func scalar64(_ sql: String) throws -> Int64 { let s = try prepare(sql); defer { sqlite3_finalize(s) }; guard try step(s) == SQLITE_ROW else { throw error() }; return sqlite3_column_int64(s, 0) }
     func prepare(_ sql: String) throws -> OpaquePointer? { var s: OpaquePointer?; guard sqlite3_prepare_v2(db, sql, -1, &s, nil) == SQLITE_OK else { throw error() }; return s }
     func bind(_ s: OpaquePointer?, _ index: Int32, _ value: String) throws { guard sqlite3_bind_text(s, index, value, -1, usageSQLiteTransient) == SQLITE_OK else { throw error() } }
     func bind(_ s: OpaquePointer?, _ index: Int32, _ value: Int64) throws { guard sqlite3_bind_int64(s, index, value) == SQLITE_OK else { throw error() } }
