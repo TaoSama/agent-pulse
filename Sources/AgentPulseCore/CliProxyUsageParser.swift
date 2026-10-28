@@ -5,7 +5,7 @@ import Foundation
 ///
 /// 该端点返回全量、无界、按 `endpoint → model → details[]` 分组的逐请求明细，
 /// 不支持任何服务端过滤。本解析器在**本地**按目标 apikey 的 SHA256 与每条明细的
-/// `access_token_sha256`（兼容旧版 `api_key_hash`）精确比对，只提取目标 key 的用量，映射为账本可直接 record 的
+/// `api_key_hash`（兼容缺失该字段时的 `access_token_sha256`）精确比对，只提取目标 key 的用量，映射为账本可直接 record 的
 /// `UsageEvent`，复用既有 finalizeDerived / 上报链路。
 ///
 /// 隐私：产出的 `UsageEvent` 只含 hash 后的 key 身份、resolved model、token 计数与
@@ -29,7 +29,7 @@ public enum CliProxyUsageParser {
     /// 解析器版本；字段口径或去重策略变化时递增。
     public static let parserVersion = 1
 
-    /// 目标 apikey 明文的 SHA256 hex（服务端 access-token identity 的口径）。
+    /// 目标 apikey 明文的 SHA256 hex（服务端 API-key identity 的口径）。
     public static func apiKeyHash(for plaintextKey: String) -> String {
         ContentDigest.sha256(plaintextKey)
     }
@@ -105,11 +105,12 @@ public enum CliProxyUsageParser {
         var events: [UsageEvent] = []
         var seenIDs = Set<String>()
         for item in items {
-            // CPA renamed the analytics identity field from api_key_hash to
-            // access_token_sha256. Accept both wire shapes while retaining
-            // exact target-key matching.
-            let itemTargetHash = nonemptyString(item["access_token_sha256"])
-                ?? nonemptyString(item["api_key_hash"])
+            // api_key_hash identifies the configured API key. Some CPA
+            // variants omit it and expose only access_token_sha256, so keep
+            // that as a compatibility fallback; it must not override the
+            // API-key identity when both fields are present.
+            let itemTargetHash = nonemptyString(item["api_key_hash"])
+                ?? nonemptyString(item["access_token_sha256"])
             guard itemTargetHash?.lowercased() == targetHash else { continue }
             let model = nonemptyString(item["resolved_model"])
                 ?? nonemptyString(item["analytics_model"])
