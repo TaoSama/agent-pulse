@@ -77,10 +77,12 @@ extension UsageLedgerStore {
             // can no longer compare evidence with raw rows and would remain
             // stuck in detectingAnalytics forever. Evidence with no legacy
             // matches is sufficient to resume the proven analytics protocol.
-            if state.requiresIdentityCheck,
-               try hasProvenAnalyticsIdentityUnlocked(identity: identity, hostname: hostname) {
-                state.endpoint = .analytics
-                state.resetAudit()
+            if try hasProvenAnalyticsIdentityUnlocked(identity: identity, hostname: hostname) {
+                if state.requiresIdentityCheck {
+                    state.endpoint = .analytics
+                    state.resetAudit()
+                }
+                state.skipHistoricalAudit = true
             }
             return state
         }

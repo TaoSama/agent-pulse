@@ -18,7 +18,9 @@ public struct CliProxyCollectionOptions: Sendable {
 }
 
 extension CliProxyUsageService {
-    private static let maximumConcurrentSources = 2
+    // Run all configured sources concurrently. A slow historical audit on one
+    // CPA must not starve a realtime source queued behind it.
+    private static let maximumConcurrentSources = 3
     private static let initialRealtimeWindowMS: Int64 = 30 * 60 * 1_000
     private static let responseBufferBytes = 16 * 1024
 
@@ -117,29 +119,32 @@ extension CliProxyUsageService {
             try await advanceBackfill(configuration, writer: writer, state: &state, options: options)
         }
 
-        let auditTo = state.auditThroughMS ?? nowMS
-        let cursor: AuditCursor
-        do {
-            cursor = try await stageAnalytics(configuration, writer: writer, fromMS: 1, toMS: auditTo,
-                beforeMS: state.auditBeforeMS, beforeID: state.auditBeforeID,
-                budget: options.auditPageBudget, options: options)
-        } catch AnalyticsFallback.unsupported where state.endpoint == .detectingAnalytics
-            && state.auditBeforeMS == nil {
-            state.endpoint = .detectingLegacy
-            state.resetAudit()
-            try writer.append(try await fetchLegacyUsage(configuration))
-            return writer.finish(identity: configuration.identity, state: state, migrationPassComplete: true)
-        } catch AnalyticsFallback.unsupported {
-            throw CliProxyUsageError.protocolIdentityUnresolved
-        }
-        state.auditedPages += cursor.pages
-        let complete = cursor.beforeMS == nil
-        if complete {
-            state.resetAudit()
-        } else {
-            state.auditThroughMS = auditTo
-            state.auditBeforeMS = cursor.beforeMS
-            state.auditBeforeID = cursor.beforeID
+        var complete = true
+        if !state.skipHistoricalAudit {
+            let auditTo = state.auditThroughMS ?? nowMS
+            let cursor: AuditCursor
+            do {
+                cursor = try await stageAnalytics(configuration, writer: writer, fromMS: 1, toMS: auditTo,
+                    beforeMS: state.auditBeforeMS, beforeID: state.auditBeforeID,
+                    budget: options.auditPageBudget, options: options)
+            } catch AnalyticsFallback.unsupported where state.endpoint == .detectingAnalytics
+                && state.auditBeforeMS == nil {
+                state.endpoint = .detectingLegacy
+                state.resetAudit()
+                try writer.append(try await fetchLegacyUsage(configuration))
+                return writer.finish(identity: configuration.identity, state: state, migrationPassComplete: true)
+            } catch AnalyticsFallback.unsupported {
+                throw CliProxyUsageError.protocolIdentityUnresolved
+            }
+            state.auditedPages += cursor.pages
+            complete = cursor.beforeMS == nil
+            if complete {
+                state.resetAudit()
+            } else {
+                state.auditThroughMS = auditTo
+                state.auditBeforeMS = cursor.beforeMS
+                state.auditBeforeID = cursor.beforeID
+            }
         }
         return writer.finish(identity: configuration.identity, state: state,
                              migrationPassComplete: state.requiresIdentityCheck && complete)

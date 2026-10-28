@@ -22,16 +22,42 @@ public struct CliProxyCollectionState: Codable, Sendable, Equatable {
     public var backfill: CliProxyBackfillCursor?
     public var queuedBackfillFromMS: Int64?
     public var queuedBackfillThroughMS: Int64?
+    /// A compacted source whose analytics identity was already proven has no
+    /// raw rows left to audit. Keep polling the realtime window, but don't
+    /// restart an unbounded historical sweep on every launch.
+    public var skipHistoricalAudit: Bool
 
     public init(endpoint: Endpoint = .discover, incrementalThroughMS: Int64 = 0,
                 auditThroughMS: Int64? = nil, auditBeforeMS: Int64? = nil,
-                auditBeforeID: Int64? = nil, auditedPages: Int = 0) {
+                auditBeforeID: Int64? = nil, auditedPages: Int = 0,
+                skipHistoricalAudit: Bool = false) {
         self.endpoint = endpoint
         self.incrementalThroughMS = incrementalThroughMS
         self.auditThroughMS = auditThroughMS
         self.auditBeforeMS = auditBeforeMS
         self.auditBeforeID = auditBeforeID
         self.auditedPages = auditedPages
+        self.skipHistoricalAudit = skipHistoricalAudit
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case endpoint, incrementalThroughMS, auditThroughMS, auditBeforeMS,
+             auditBeforeID, auditedPages, backfill, queuedBackfillFromMS,
+             queuedBackfillThroughMS, skipHistoricalAudit
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        endpoint = try values.decodeIfPresent(Endpoint.self, forKey: .endpoint) ?? .discover
+        incrementalThroughMS = try values.decodeIfPresent(Int64.self, forKey: .incrementalThroughMS) ?? 0
+        auditThroughMS = try values.decodeIfPresent(Int64.self, forKey: .auditThroughMS)
+        auditBeforeMS = try values.decodeIfPresent(Int64.self, forKey: .auditBeforeMS)
+        auditBeforeID = try values.decodeIfPresent(Int64.self, forKey: .auditBeforeID)
+        auditedPages = try values.decodeIfPresent(Int.self, forKey: .auditedPages) ?? 0
+        backfill = try values.decodeIfPresent(CliProxyBackfillCursor.self, forKey: .backfill)
+        queuedBackfillFromMS = try values.decodeIfPresent(Int64.self, forKey: .queuedBackfillFromMS)
+        queuedBackfillThroughMS = try values.decodeIfPresent(Int64.self, forKey: .queuedBackfillThroughMS)
+        skipHistoricalAudit = try values.decodeIfPresent(Bool.self, forKey: .skipHistoricalAudit) ?? false
     }
 
     public var requiresIdentityCheck: Bool {
