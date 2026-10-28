@@ -108,8 +108,8 @@ public enum CliProxyUsageParser {
             // CPA renamed the analytics identity field from api_key_hash to
             // access_token_sha256. Accept both wire shapes while retaining
             // exact target-key matching.
-            let itemTargetHash = string(item["access_token_sha256"])
-                ?? string(item["api_key_hash"])
+            let itemTargetHash = nonemptyString(item["access_token_sha256"])
+                ?? nonemptyString(item["api_key_hash"])
             guard itemTargetHash?.lowercased() == targetHash else { continue }
             let model = nonemptyString(item["resolved_model"])
                 ?? nonemptyString(item["analytics_model"])
