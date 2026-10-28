@@ -71,7 +71,18 @@ extension UsageLedgerStore {
 
     private func cliProxyStateUnlocked(identity: String, hostname: String) throws -> CliProxyCollectionState {
         if let value = try readTextUnlocked(key: cliProxyStateKey(identity: identity, hostname: hostname)) {
-            return try JSONDecoder().decode(CliProxyCollectionState.self, from: Data(value.utf8))
+            var state = try JSONDecoder().decode(CliProxyCollectionState.self, from: Data(value.utf8))
+            // Raw network events may have been compacted after an analytics
+            // identity was proven. In that case the persisted migration state
+            // can no longer compare evidence with raw rows and would remain
+            // stuck in detectingAnalytics forever. Evidence with no legacy
+            // matches is sufficient to resume the proven analytics protocol.
+            if state.requiresIdentityCheck,
+               try hasProvenAnalyticsIdentityUnlocked(identity: identity, hostname: hostname) {
+                state.endpoint = .analytics
+                state.resetAudit()
+            }
+            return state
         }
         let statement = try prepare("""
             SELECT 1 FROM usage_events
@@ -83,6 +94,36 @@ extension UsageLedgerStore {
         try bind(statement, 3, CliProxyUsageParser.source)
         try bind(statement, 4, identity)
         return CliProxyCollectionState(endpoint: try step(statement) == SQLITE_ROW ? .detectingAnalytics : .discover)
+    }
+
+    private func hasProvenAnalyticsIdentityUnlocked(identity: String, hostname: String) throws -> Bool {
+        let table = try prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;")
+        defer { sqlite3_finalize(table) }
+        try bind(table, 1, "usage_cliproxy_identity_matches")
+        guard try step(table) == SQLITE_ROW else { return false }
+        let statement = try prepare("""
+            SELECT
+                (SELECT COUNT(*) FROM usage_events
+                 WHERE source_file_hash=? AND hostname=? AND source=? AND project=?) AS raw_count,
+                (SELECT COUNT(*) FROM usage_cliproxy_identity_matches
+                 WHERE hostname=? AND identity=? AND endpoint='analytics') AS analytics_count,
+                (SELECT COUNT(*) FROM usage_cliproxy_identity_matches
+                 WHERE hostname=? AND identity=? AND endpoint='legacy') AS legacy_count;
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bind(statement, 1, Self.cliProxyFileID)
+        try bind(statement, 2, hostname)
+        try bind(statement, 3, CliProxyUsageParser.source)
+        try bind(statement, 4, identity)
+        try bind(statement, 5, hostname)
+        try bind(statement, 6, identity)
+        try bind(statement, 7, hostname)
+        try bind(statement, 8, identity)
+        guard try step(statement) == SQLITE_ROW else { return false }
+        let rawCount = sqlite3_column_int64(statement, 0)
+        let analyticsCount = sqlite3_column_int64(statement, 1)
+        let legacyCount = sqlite3_column_int64(statement, 2)
+        return analyticsCount > 0 && legacyCount == 0 && rawCount == 0
     }
 
     private func cliProxyStateKey(identity: String, hostname: String) -> String {
