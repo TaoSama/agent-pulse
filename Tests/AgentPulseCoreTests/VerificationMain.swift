@@ -3906,7 +3906,7 @@ struct AgentPulseCoreVerification {
                 let include = body?["include"] as? [String: Any]
                 let eventsPage = include?["events_page"] as? [String: Any]
                 let filters = body?["filters"] as? [String: Any]
-                try require((filters?["api_key_hashes"] as? [String]) == [targetHash], "analytics must filter by target hash")
+                try require((filters?["access_token_sha256s"] as? [String]) == [targetHash], "analytics must filter by target hash")
                 let data = eventsPage?["before_id"] == nil ? firstPage : secondPage
                 return (data, HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
             }
@@ -3923,7 +3923,7 @@ struct AgentPulseCoreVerification {
                 "items": [
                     [
                         "event_hash": "same-shape-a", "timestamp_ms": 3_000,
-                        "api_key_hash": targetHash, "resolved_model": "model-a",
+                        "access_token_sha256": targetHash, "resolved_model": "model-a",
                         "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
                     ],
                     [

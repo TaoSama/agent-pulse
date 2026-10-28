@@ -207,7 +207,9 @@ extension CliProxyUsageService {
         var paging: [String: Any] = ["limit": limit]
         if let beforeMS, let beforeID { paging["before_ms"] = beforeMS; paging["before_id"] = beforeID }
         let payload: [String: Any] = ["from_ms": fromMS, "to_ms": toMS,
-            "filters": ["api_key_hashes": [CliProxyUsageParser.apiKeyHash(for: configuration.targetAPIKey)]],
+            // Current CPA deployments expose the target identity as
+            // access_token_sha256; api_key_hash is the legacy wire name.
+            "filters": ["access_token_sha256s": [CliProxyUsageParser.apiKeyHash(for: configuration.targetAPIKey)]],
             "include": ["events_page": paging]]
         var request = authorizedRequest(url: configuration.analyticsURL, method: "POST", managementKey: configuration.managementKey)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
