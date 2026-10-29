@@ -26,11 +26,16 @@ public struct CliProxyCollectionState: Codable, Sendable, Equatable {
     /// audit has become a slow backlog. Keep polling the realtime window, but
     /// don't let an unbounded historical sweep block fresh usage forever.
     public var skipHistoricalAudit: Bool
+    /// One-time bounded recovery sweep for compacted sources. This is kept
+    /// separate from the realtime watermark so a restart cannot skip the
+    /// backlog that accumulated while the app was offline.
+    public var historicalBackfillComplete: Bool
 
     public init(endpoint: Endpoint = .discover, incrementalThroughMS: Int64 = 0,
                 auditThroughMS: Int64? = nil, auditBeforeMS: Int64? = nil,
                 auditBeforeID: Int64? = nil, auditedPages: Int = 0,
-                skipHistoricalAudit: Bool = false) {
+                skipHistoricalAudit: Bool = false,
+                historicalBackfillComplete: Bool = false) {
         self.endpoint = endpoint
         self.incrementalThroughMS = incrementalThroughMS
         self.auditThroughMS = auditThroughMS
@@ -38,12 +43,14 @@ public struct CliProxyCollectionState: Codable, Sendable, Equatable {
         self.auditBeforeID = auditBeforeID
         self.auditedPages = auditedPages
         self.skipHistoricalAudit = skipHistoricalAudit
+        self.historicalBackfillComplete = historicalBackfillComplete
     }
 
     private enum CodingKeys: String, CodingKey {
         case endpoint, incrementalThroughMS, auditThroughMS, auditBeforeMS,
              auditBeforeID, auditedPages, backfill, queuedBackfillFromMS,
-             queuedBackfillThroughMS, skipHistoricalAudit
+             queuedBackfillThroughMS, skipHistoricalAudit,
+             historicalBackfillComplete
     }
 
     public init(from decoder: Decoder) throws {
@@ -58,6 +65,7 @@ public struct CliProxyCollectionState: Codable, Sendable, Equatable {
         queuedBackfillFromMS = try values.decodeIfPresent(Int64.self, forKey: .queuedBackfillFromMS)
         queuedBackfillThroughMS = try values.decodeIfPresent(Int64.self, forKey: .queuedBackfillThroughMS)
         skipHistoricalAudit = try values.decodeIfPresent(Bool.self, forKey: .skipHistoricalAudit) ?? false
+        historicalBackfillComplete = try values.decodeIfPresent(Bool.self, forKey: .historicalBackfillComplete) ?? false
     }
 
     public var requiresIdentityCheck: Bool {

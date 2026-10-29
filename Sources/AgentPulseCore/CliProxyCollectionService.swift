@@ -8,7 +8,9 @@ public struct CliProxyCollectionOptions: Sendable {
     public let maximumStagingBytes: Int
 
     public init(pageSize: Int = 5_000, auditPageBudget: Int = 8, incrementalPageBudget: Int = 2,
-                backfillPageBudget: Int = 2, maximumStagingBytes: Int = 256 * 1024 * 1024) {
+                // A one-time seven-day recovery should finish in one or two
+                // rounds; its staging cap still bounds the memory footprint.
+                backfillPageBudget: Int = 16, maximumStagingBytes: Int = 256 * 1024 * 1024) {
         self.pageSize = min(5_000, max(1, pageSize))
         self.auditPageBudget = min(32, max(1, auditPageBudget))
         self.incrementalPageBudget = min(32, max(1, incrementalPageBudget))
@@ -22,6 +24,7 @@ extension CliProxyUsageService {
     // CPA must not starve a realtime source queued behind it.
     private static let maximumConcurrentSources = 3
     private static let initialRealtimeWindowMS: Int64 = 30 * 60 * 1_000
+    private static let compactedRecoveryWindowMS: Int64 = 7 * 24 * 60 * 60 * 1_000
     private static let responseBufferBytes = 16 * 1024
 
     /// New activity is collected immediately; a separate persisted descending
@@ -107,6 +110,22 @@ extension CliProxyUsageService {
                 }
                 state.endpoint = .analytics
                 state.incrementalThroughMS = nowMS
+            if state.skipHistoricalAudit,
+               !state.historicalBackfillComplete,
+               state.backfill == nil {
+                let recoveryFrom = state.auditThroughMS.map { max(1, $0 + 1) }
+                    ?? max(1, nowMS - Self.compactedRecoveryWindowMS)
+                if recoveryFrom < nowMS {
+                    state.backfill = CliProxyBackfillCursor(
+                        fromMS: recoveryFrom,
+                        throughMS: nowMS,
+                        beforeMS: nil,
+                        beforeID: nil
+                    )
+                } else {
+                    state.historicalBackfillComplete = true
+                }
+            }
             } catch AnalyticsFallback.unsupported where original.endpoint == .discover {
                 // Discovery can fall back only before any analytics page was
                 // accepted. Established sources never mix two ID domains.
@@ -117,6 +136,9 @@ extension CliProxyUsageService {
                 throw CliProxyUsageError.protocolIdentityUnresolved
             }
             try await advanceBackfill(configuration, writer: writer, state: &state, options: options)
+            if state.skipHistoricalAudit, state.backfill == nil {
+                state.historicalBackfillComplete = true
+            }
         }
 
         var complete = true
