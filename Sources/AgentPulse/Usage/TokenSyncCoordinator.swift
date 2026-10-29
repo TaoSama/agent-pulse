@@ -216,7 +216,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     private func initializeLedger(storedHostname: String, authorityHostname: String) {
         guard initializationTask == nil else { return }
         let calendar = usageSummaryCalendar
-        let envURL = mergedEnvURL
         let factory = ledgerFactory
         initializationGeneration &+= 1
         let generation = initializationGeneration
@@ -233,7 +232,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 let recoveryPending = try Self.isRebuildCompletionPending(ledger: ledger)
                 return LedgerInitialization(
                     ledger: ledger, hostname: hostname,
-                    summary: try Self.summaries(from: ledger, containing: Date(), calendar: calendar, mergedEnvURL: envURL),
+                    summary: try Self.summaries(from: ledger, containing: Date(), calendar: calendar),
                     eligible: try ledger.reportingEligible(hostname: hostname),
                     warnings: try ledger.reportingWarnings(hostname: hostname),
                     pending: recoveryPending ? (0, 0) : try ledger.pendingCounts(hostname: hostname),
@@ -459,7 +458,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let localSourcesURL = localCollectionURL
         let injectedScanRoots = self.injectedScanRoots
         let summaryCalendar = usageSummaryCalendar
-        let summaryEnvURL = self.mergedEnvURL
         let compactionEnabled = statusSubject.value.compactionEnabled
         scanGeneration &+= 1
         let generation = scanGeneration
@@ -649,8 +647,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 let summary = try Self.summaries(
                     from: ledger,
                     containing: Date(),
-                    calendar: summaryCalendar,
-                    mergedEnvURL: summaryEnvURL
+                    calendar: summaryCalendar
                 ) { done, total, detail in
                     progressReporter.advance(.summarizing, done: done, total: total, detail: detail)
                 }
@@ -722,7 +719,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let service = cliProxyService
         let configPath = Self.cliProxyConfigPath(defaults: defaults)
         let calendar = usageSummaryCalendar
-        let envURL = mergedEnvURL
         networkGeneration &+= 1
         let generation = networkGeneration
         networkTask = Task { [weak self] in
@@ -767,7 +763,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                         return NetworkCollectionOutcome(states: finalStates, snapshot: nil)
                     }
                     let snapshot = NetworkSnapshot(
-                        summary: try Self.summaries(from: ledger, containing: Date(), calendar: calendar, mergedEnvURL: envURL),
+                        summary: try Self.summaries(from: ledger, containing: Date(), calendar: calendar),
                         pending: try ledger.pendingCounts(hostname: hostname)
                     )
                     return NetworkCollectionOutcome(states: finalStates, snapshot: snapshot)
@@ -1737,12 +1733,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     /// 四个窗口共享同一参考时刻与时区，并从所有 hostname 的 derived bucket 查询。
-    /// `mergedEnvURL` 仅用于按身份 gate 展示层虚拟基线（读 0600 env 的 USER 哨兵），不写库、不上报。
+    /// 日 / 周 / 月展示真实账本值；「全部」窗口保留展示层虚拟 bucket。
     nonisolated private static func summaries(
         from ledger: UsageLedgerStore,
         containing date: Date,
         calendar: Calendar,
-        mergedEnvURL: URL,
         progress: (@Sendable (Int, Int, String) -> Void)? = nil
     ) throws -> TokenUsageSummarySnapshot {
         let snapshot = try ledger.summarySnapshot(containing: date, calendar: calendar) { done, total, window in
@@ -1771,7 +1766,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             revision: snapshot.revision,
             summary: TokenWindowVirtualBuckets.apply(
                 to: summary, realModels: realModels,
-                enabled: isVirtualBaselineUser(mergedEnvURL: mergedEnvURL)
+                enabled: true
             )
         )
     }
@@ -1792,17 +1787,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         case .month: return "月窗口"
         case .all: return "全部窗口"
         }
-    }
-
-    /// 虚拟基线身份哨兵：仅当合并 env 的 USER 等于此值时，才对 week/month/all 套展示层基线。
-    nonisolated private static let virtualBaselineUserSentinel = "me"
-
-    /// 是否为「本人身份」——只读 0600 合并 env 的 USER，与哨兵大小写/首尾空白归一后精确比较。
-    /// 判据随用即弃：不落 UserDefaults / SQLite / 日志，也不进任何上传字段；他人环境无此标记即走纯真实。
-    nonisolated private static func isVirtualBaselineUser(mergedEnvURL: URL) -> Bool {
-        guard let env = try? EnvFile.load(url: mergedEnvURL) else { return false }
-        let user = (env["USER"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !user.isEmpty && user == virtualBaselineUserSentinel
     }
 
     nonisolated private static func windowSummary(from summary: UsageSummary) -> TokenUsageWindowSummary {

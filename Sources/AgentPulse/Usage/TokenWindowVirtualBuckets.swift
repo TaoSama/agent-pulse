@@ -5,17 +5,17 @@ import Foundation
 ///
 /// 口径「目标 = 起点，之后只加新增」：
 /// - 日窗口：纯真实——总数 / 缓存 / 分模型均来自真实账本，不叠加基线。
-/// - 周 / 月 / 全部：显示总数 = 标量基线(目标 − 锚定真实) + 实时真实总量 = 目标 + 锚定后的新增；
+/// - 全部窗口：显示总数 = 标量基线(目标 − 锚定真实) + 实时真实总量 = 目标 + 锚定后的新增；
 ///   分模型 = 目标各模型基线 + 实时真实（余量并入 unknown，模型名用账本原始名）；
 ///   缓存 / 创建同样各自「目标起点 + 锚定后新增」，命中率由放大后的 cached /(new + cached) 重算。
+/// - 日 / 周 / 月窗口：只展示真实账本值。
 ///
 /// 边界（务必保持）：只作用于展示层 `TokenUsageSummary`，绝不改写 SQLite 账本、绝不进入上报 payload、
 /// 不落盘、不写日志。
 enum TokenWindowVirtualBuckets {
-    /// 覆盖周 / 月 / 全部三窗口为「目标起点 + 新增」；日窗口只补真实分模型明细。
+    /// 仅「全部」窗口使用「目标起点 + 新增」；日 / 周 / 月只展示真实账本值。
     /// `realModels` 为各窗口真实的按模型 token（原始名）。
-    /// `enabled == false`（默认）时四窗口全走纯真实账本口径，不叠加任何虚拟基线——
-    /// 由调用方按身份 gate（合并 env 的 USER 哨兵）决定，见 `TokenSyncCoordinator`。
+    /// `enabled == false`（默认）时四窗口全走纯真实账本口径，不叠加任何虚拟基线。
     static func apply(
         to summary: TokenUsageSummary,
         realModels: [TokenUsageWindow: [UsageModelTokenSummary]],
@@ -31,8 +31,8 @@ enum TokenWindowVirtualBuckets {
             result.all = withRealModels(summary.all, models: realModels[.all] ?? [])
             return result
         }
-        result.week = baselinePlusReal(summary.week, window: .week, real: realModels[.week] ?? [])
-        result.month = baselinePlusReal(summary.month, window: .month, real: realModels[.month] ?? [])
+        result.week = withRealModels(summary.week, models: realModels[.week] ?? [])
+        result.month = withRealModels(summary.month, models: realModels[.month] ?? [])
         result.all = baselinePlusReal(summary.all, window: .all, real: realModels[.all] ?? [])
         return result
     }
