@@ -84,6 +84,15 @@ extension UsageLedgerStore {
                 }
                 state.skipHistoricalAudit = true
             }
+            // A bounded audit that has already crossed several pages is a
+            // slow-source backlog, not a reason to block fresh increments.
+            // Persist the fast path after the current cursor has made enough
+            // progress to establish that the source is stable.
+            if state.endpoint == .analytics,
+               state.auditedPages >= 8,
+               state.auditBeforeMS != nil {
+                state.skipHistoricalAudit = true
+            }
             return state
         }
         let statement = try prepare("""

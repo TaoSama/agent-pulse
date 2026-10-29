@@ -22,9 +22,9 @@ public struct CliProxyCollectionState: Codable, Sendable, Equatable {
     public var backfill: CliProxyBackfillCursor?
     public var queuedBackfillFromMS: Int64?
     public var queuedBackfillThroughMS: Int64?
-    /// A compacted source whose analytics identity was already proven has no
-    /// raw rows left to audit. Keep polling the realtime window, but don't
-    /// restart an unbounded historical sweep on every launch.
+    /// A proven source with compacted raw rows, or a source whose bounded
+    /// audit has become a slow backlog. Keep polling the realtime window, but
+    /// don't let an unbounded historical sweep block fresh usage forever.
     public var skipHistoricalAudit: Bool
 
     public init(endpoint: Endpoint = .discover, incrementalThroughMS: Int64 = 0,
