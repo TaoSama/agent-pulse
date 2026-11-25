@@ -252,6 +252,10 @@ enum CoordinatorVerification {
                     && !collection.contains("CliProxy")
                     && !source.contains("CliProxyUsageService"),
                     "Aster collection must remain independent of reporting opt-in and CPA/env discovery")
+        let scan = try functionBody(matching: "func scanNow(chainedReport: Bool)", in: source)
+        try require(scan.contains("ledger.isAsterHistoryComplete(hostname: hostname)")
+                    && scan.contains("if compactionEnabled, antigravityComplete, asterHistoryComplete"),
+                    "compaction must wait for configured Aster history to reach its lower bound")
     }
 
     /// 设备标识改名弹窗必须只依赖 effectiveHostname（权威或本地），不得挂在 configReady/

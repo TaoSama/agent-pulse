@@ -156,6 +156,8 @@ struct AsterUsageVerification {
         do {
             let path = directory.appendingPathComponent("usage.sqlite3").path
             let ledger = try UsageLedgerStore(path: path)
+            try require(try !ledger.isAsterHistoryComplete(hostname: hostname),
+                        "a new Aster history has no completion marker")
             let frozenDate = Date(timeIntervalSince1970: 1_795_392_000) // 2026-11-23T00:00:00Z
             try writeFrozen(path: path, milliseconds: Int64(frozenDate.timeIntervalSince1970 * 1_000))
             let payload = try data([
@@ -169,6 +171,8 @@ struct AsterUsageVerification {
                         "initial history must request the frozen lower bound and stop at that boundary")
             try require(try ledger.buckets(hostname: hostname).first?.counts.total == 150,
                         "frozen history must stay excluded")
+            try require(try ledger.isAsterHistoryComplete(hostname: hostname),
+                        "reaching the frozen lower bound completes Aster history")
             try FileManager.default.removeItem(at: directory)
         } catch {
             try FileManager.default.removeItem(at: directory)

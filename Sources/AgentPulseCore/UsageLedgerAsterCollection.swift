@@ -3,6 +3,10 @@ import Foundation
 extension UsageLedgerStore {
     private func asterStateKey(_ hostname: String) -> String { "aster_collection_v1\u{1}" + hostname }
 
+    public func isAsterHistoryComplete(hostname: String) throws -> Bool {
+        try asterCollectionState(hostname: hostname).historyComplete
+    }
+
     func asterCollectionLowerBound(hostname: String) throws -> Date? {
         try queue.sync {
             let frozen = try frozenBeforeMsUnlocked(hostname)

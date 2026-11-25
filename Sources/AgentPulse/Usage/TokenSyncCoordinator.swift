@@ -487,6 +487,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let injectedScanRoots = self.injectedScanRoots
         let summaryCalendar = usageSummaryCalendar
         let compactionEnabled = statusSubject.value.compactionEnabled
+        let asterConfigured = managedSettings?.asterManagementKey != nil
         scanGeneration &+= 1
         let generation = scanGeneration
         // 进度回调：worker 各阶段 / 逐文件回报聚合快照，跨线程回到主 actor 更新 status；
@@ -680,7 +681,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 if antigravityComplete, try ledger.requiresRebuildCompletion() {
                     try ledger.markRebuildCompleted()
                 }
-                if compactionEnabled, antigravityComplete {
+                let asterHistoryComplete = if compactionEnabled, asterConfigured {
+                    try ledger.isAsterHistoryComplete(hostname: hostname)
+                } else {
+                    true
+                }
+                if compactionEnabled, antigravityComplete, asterHistoryComplete {
                     progressReporter.enterPhase(.compacting, total: UsageCompactionStep.total, detail: "准备冻结压实")
                     let compaction = try ledger.compactFrozenRaw(hostname: hostname) { update in
                         progressReporter.advance(
@@ -701,6 +707,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                         )
                     }
                     progressReporter.completePhase(.compacting, detail: "冻结压实已检查")
+                } else if compactionEnabled, !asterHistoryComplete {
+                    progressReporter.completePhase(.compacting, detail: "Aster 历史用量待采完，下轮再压实")
                 }
                 // summarizing 聚合日/周/月/全部四个窗口：登记总数为窗口数，显示「n/4 窗口」。
                 progressReporter.enterPhase(.summarizing, total: TokenUsageWindow.allCases.count)
