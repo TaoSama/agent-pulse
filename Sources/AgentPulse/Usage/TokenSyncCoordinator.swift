@@ -183,7 +183,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         // 冷启动展示账本中所有 hostname 的派生数据。canonical hostname 仅决定后续采集与上报身份。
         summarySubject = CurrentValueSubject(.empty)
 
-        let canReport = !baseURL.isEmpty && !effectiveHostname.isEmpty && authority.status == .ready
+        let canReport = !baseURL.isEmpty && !authority.hostname.isEmpty && authority.status == .ready
         let reporting = legacyEnvURL == nil ? storedReporting : canReport && storedReporting
         if legacyEnvURL != nil && storedReporting && !canReport {
             // 配置已失效时持久化关闭，避免配置日后恢复后自动“复活”上报。
@@ -250,7 +250,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 self.ledger = initial.ledger
                 self.summaryRevisionGate = UsageSnapshotRevisionGate()
                 self.daySeriesRevisionGate = UsageSnapshotRevisionGate()
-                if authorityHostname.isEmpty, storedHostname.isEmpty, !initial.hostname.isEmpty {
+                if authorityHostname.isEmpty, storedHostname.isEmpty, !initial.hostname.isEmpty,
+                   Self.normalize(self.defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "").isEmpty {
                     self.defaults.set(initial.hostname, forKey: DefaultsKey.canonicalHostname)
                 }
                 self.rebuildRecoveryPending = initial.recoveryPending
@@ -319,7 +320,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         refreshConfigurationAuthority()
         let current = statusSubject.value
         guard !current.ingestBaseURL.isEmpty,
-              current.canonicalHostname != nil,
+              !configurationAuthority().hostname.isEmpty,
               current.configurationStatus == .ready else {
             updateStatus { status in
                 status.reportingEnabled = false
@@ -415,6 +416,15 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         if stopAutoLoop {
             reconcileAutoLoop()
         }
+    }
+
+    /// 首次仅本地采集时允许手动设置设备标识，上报仍使用 1Password 的设备标识。
+    func setInitialLocalHostname(_ hostname: String) {
+        let hostname = Self.normalize(hostname)
+        guard !hostname.isEmpty, status.canonicalHostname == nil else { return }
+        defaults.set(hostname, forKey: DefaultsKey.canonicalHostname)
+        refreshConfigurationAuthority()
+        if isRunning, initializationTask == nil { beginStartup() }
     }
 
     // MARK: - Scan (production chain)
@@ -573,6 +583,19 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     nil
                 }
                 let antigravityFailures = antigravity.map { $0.failedDatabases + $0.failedDirectories } ?? 0
+                let antigravityPending = antigravity?.pendingDatabases ?? 0
+                let antigravityRejected = antigravity?.rejectedRows ?? 0
+                let antigravityComplete = antigravityFailures == 0 && antigravityPending == 0
+                var antigravityWarnings: [String] = []
+                if antigravityFailures > 0 {
+                    antigravityWarnings.append("\(antigravityFailures) 处读取失败，下轮重试")
+                }
+                if antigravityPending > 0 {
+                    antigravityWarnings.append("\(antigravityPending) 个数据库的历史用量待续采")
+                }
+                if antigravityRejected > 0 {
+                    antigravityWarnings.append("\(antigravityRejected) 条用量暂不可读，下轮重试")
+                }
                 progressReporter.completePhase(.scanning)
                 // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
                 // 无变化轮（raw 派生 dirty 位未置 且 无 rebuild 待完成）跳过 O(全库) 重算：
@@ -641,10 +664,10 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 progressReporter.completePhase(.finalizing, detail: postFinalizeDetail)
                 // Optional databases may be temporarily unavailable. Keep any explicit rebuild
                 // pending until the Antigravity scan also succeeds.
-                if antigravityFailures == 0, try ledger.requiresRebuildCompletion() {
+                if antigravityComplete, try ledger.requiresRebuildCompletion() {
                     try ledger.markRebuildCompleted()
                 }
-                if compactionEnabled, antigravityFailures == 0 {
+                if compactionEnabled, antigravityComplete {
                     progressReporter.enterPhase(.compacting, total: UsageCompactionStep.total, detail: "准备冻结压实")
                     let compaction = try ledger.compactFrozenRaw(hostname: hostname) { update in
                         progressReporter.advance(
@@ -678,7 +701,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 let pending = try ledger.pendingCounts(hostname: hostname)
                 progressReporter.completePhase(.summarizing)
                 return ScanOutcome(summary: summary, finalize: finalize, pending: pending,
-                                   antigravityFailures: antigravityFailures,
+                                   antigravityWarning: antigravityWarnings.isEmpty
+                                    ? nil : "Antigravity：" + antigravityWarnings.joined(separator: "；"),
                                    recoveryPending: try Self.isRebuildCompletionPending(ledger: ledger))
             }
             let cancelled = Task.isCancelled
@@ -739,7 +763,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     /// 网络采集独立于本地扫描；串联上报同时等待两者完成。
     private func startNetworkCollection(hostname: String) {
-        guard networkTask == nil, let ledger, let settings = managedSettings else { return }
+        guard networkTask == nil, let ledger, let managementKey = managedSettings?.asterManagementKey else { return }
         let service = asterService
         let calendar = usageSummaryCalendar
         networkGeneration &+= 1
@@ -752,7 +776,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         networkTask = Task { [weak self] in
             do {
                 let eventCount = try await service.collect(
-                    managementKey: settings.asterManagementKey, ledger: ledger, hostname: hostname
+                    managementKey: managementKey, ledger: ledger, hostname: hostname
                 )
                 let committed = await Self.runOffMain(queue: Self.networkWorkerQueue) { gate in
                     try gate.throwIfCancelled()
@@ -852,9 +876,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 status.lastScanAt = completedAt
                 Self.clearScanProgress(&status)
                 status.scanError = nil
-                status.antigravityScanWarning = outcome.antigravityFailures > 0
-                    ? "Antigravity 有 \(outcome.antigravityFailures) 处读取失败，下轮重试"
-                    : nil
+                status.antigravityScanWarning = outcome.antigravityWarning
                 status.reportingEligible = outcome.finalize.reportingEligible
                 status.reportingBlockedReasons = outcome.finalize.blockedReasons
                 status.reportingWarnings = outcome.finalize.warnings
@@ -1184,8 +1206,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     func applyManagedSettings(_ settings: ManagedSettingsSnapshot?) {
         managedSettings = settings
         managedSettingsLoaded = true
-        if let settings {
-            let configuration = settings.reporting
+        if let configuration = settings?.reporting {
             reporter = TokenUsageReporter(configurationLoader: { _ in configuration })
         } else {
             reporter = TokenUsageReporter(configurationLoader: { _ in
@@ -1193,12 +1214,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             })
         }
         updateStatus {
-            $0.asterConfigured = settings != nil
-            $0.asterSourceCount = settings == nil ? 0 : 1
+            $0.asterConfigured = settings?.asterManagementKey != nil
+            $0.asterSourceCount = $0.asterConfigured ? 1 : 0
             $0.asterError = nil
         }
         refreshConfigurationAuthority()
-        guard settings != nil, isRunning, initializationTask == nil else { return }
+        guard let settings, !settings.canonicalHostname.isEmpty || settings.asterManagementKey != nil,
+              isRunning, initializationTask == nil else { return }
         if scanTask != nil {
             // 当前扫描可能已越过网络采集起点；完整完成后再以新配置启动增量扫描。
             rescanAfterManagedSettingsLoad = true
@@ -1217,7 +1239,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let summary: TokenUsageSummarySnapshot
         let finalize: UsageFinalizeResult
         let pending: (buckets: Int, sessions: Int)
-        let antigravityFailures: Int
+        let antigravityWarning: String?
         let recoveryPending: Bool
     }
 
@@ -1245,7 +1267,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         if let settings = managedSettings {
             let status = reporter.configurationStatus(for: configurationURL)
             return ConfigurationAuthority(
-                hostname: Self.normalize(settings.reporting.canonicalHostname),
+                hostname: settings.canonicalHostname,
                 status: status, errorText: Self.errorText(for: status)
             )
         }
@@ -1299,7 +1321,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             status.configurationError = authority.errorText
             status.canonicalHostname = effective.isEmpty ? nil : effective
             status.ingestBaseURL = baseURL
-            let canReport = !status.ingestBaseURL.isEmpty && !effective.isEmpty && authority.status == .ready
+            let canReport = !status.ingestBaseURL.isEmpty && !authority.hostname.isEmpty && authority.status == .ready
             if !canReport && status.reportingEnabled && (self.managedSettingsLoaded || self.legacyEnvURL != nil) {
                 status.reportingEnabled = false
                 self.defaults.set(false, forKey: DefaultsKey.reportingEnabled)

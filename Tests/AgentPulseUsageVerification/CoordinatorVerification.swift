@@ -43,7 +43,7 @@ enum CoordinatorVerification {
         try data.write(to: file)
         let ledger = try UsageLedgerStore(path: ":memory:")
         let source = UsageScanRoot(root: directory, source: "fixture")
-        let hostname = "scanner-verification"
+        let hostname = "Scanner's Mac"
         let manifest = try UsageScanManifest.discover(source: source)
         try require(manifest.files.count == 1 && manifest.files[0].size > oldHistoryBudget,
                     "discovery must retain oversized history files")
@@ -53,7 +53,7 @@ enum CoordinatorVerification {
         guard let fileID = present.first else { throw CoordinatorVerificationError.failed("scanner omitted history file") }
         try require(try ledger.checkpoint(fileID: fileID)?.offset == Int64(data.count),
                     "large history file did not reach its durable end")
-        _ = try ledger.finalizeDerived(hostname: hostname)
+        _ = try ledger.finalizeDerived(hostname: hostname, strategy: .fullRecompute)
         try require(try ledger.summary()?.counts.total == 5,
                     "large history file usage was not collected")
         _ = try UsageFileScanner.scan(manifest: manifest, ledger: ledger, hostname: hostname,
@@ -209,14 +209,14 @@ enum CoordinatorVerification {
         let apply = try functionBody(named: "applyManagedSettings", in: source)
         try require(apply.contains("managedSettings = settings")
                     && apply.contains("managedSettingsLoaded = true")
-                    && apply.contains("let configuration = settings.reporting")
+                    && apply.contains("if let configuration = settings?.reporting")
                     && apply.contains("TokenUsageReporter(configurationLoader: { _ in configuration })"),
                     "managed snapshot must supply the reporter protocol entirely in memory")
         try require(!apply.contains("defaults.set(") && !apply.contains("EnvFile"),
                     "managed credentials must not be persisted to defaults or env")
 
         let authority = try functionBody(named: "configurationAuthority", in: source)
-        try require(authority.contains("Self.normalize(settings.reporting.canonicalHostname)")
+        try require(authority.contains("hostname: settings.canonicalHostname")
                     && (try offset(of: "if let settings = managedSettings", in: authority))
                         < (try offset(of: "if let legacyEnvURL", in: authority)),
                     "managed hostname must take precedence over legacy fixtures")
@@ -231,13 +231,21 @@ enum CoordinatorVerification {
                         && !setter.contains("defaults.set(trimmed,"),
                         "legacy setting entry must not write production configuration: \(name)")
         }
+        let setLocalHostname = try functionBody(named: "setInitialLocalHostname", in: source)
+        try require(setLocalHostname.contains("defaults.set(hostname, forKey: DefaultsKey.canonicalHostname)")
+                    && setLocalHostname.contains("beginStartup()")
+                    && !setLocalHostname.contains("setReportingEnabled"),
+                    "the local hostname must be persisted and start collection without opting in to reporting")
+        let setReporting = try functionBody(named: "setReportingEnabled", in: source)
+        try require(setReporting.contains("!configurationAuthority().hostname.isEmpty"),
+                    "enabling reporting must require a managed hostname")
     }
 
     private static func verifyAsterCollectionUsesManagedKey(_ source: String) throws {
         let collection = try functionBody(named: "startNetworkCollection", in: source)
-        try require(collection.contains("let settings = managedSettings")
+        try require(collection.contains("let managementKey = managedSettings?.asterManagementKey")
                     && collection.contains("let service = asterService")
-                    && collection.contains("managementKey: settings.asterManagementKey, ledger: ledger, hostname: hostname"),
+                    && collection.contains("managementKey: managementKey, ledger: ledger, hostname: hostname"),
                     "Aster collection must use the managed key and the existing local ledger")
         try require(!collection.contains("reportingEnabled")
                     && !collection.contains("EnvFile")

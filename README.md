@@ -242,6 +242,8 @@ open dist/AgentPulse.app
 
 应用通过 `op` 读取 `DEV-CREDENTIALS` 保险库中的 `Agent Pulse` 条目。1Password 服务账号引导文件路径为 `~/.credentials/tokens/1password_service_account`，属主权限须为 `0600`。更新条目后，可在设置中点击「刷新配置」。
 
+表中的字段名可用作 1Password 自定义字段的 ID 或标签。同名 ID 优先，按标签匹配时标签须唯一。
+
 | 字段 | 用途 |
 |---|---|
 | `ASTER_MANAGEMENT_KEY` | Aster 管理事件接口接受的 Bearer 凭证 |
@@ -252,6 +254,8 @@ open dist/AgentPulse.app
 | `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY` | 可选的 R2 S3 访问凭证 |
 
 Aster 采集使用 `https://aster.taoai.site/api/admin/events`。每页事件和游标一起提交到 SQLite，可在下轮继续分页。账本按 `aster` 来源保存用量，并由现有上报流程发送。R2 配置齐全时，可按 `⌘⌥V` 上传剪贴板图片。
+
+Aster、R2 与用量上报分别读取各自所需的字段。首次启动时若没有设备标识，可在「设置 → Token 统计 → 设备标识」输入本机名称并保存，用于本地账本。用量上报使用 1Password 中的 `REPORT_CANONICAL_HOSTNAME`、`REPORT_BASE_URL` 和 `REPORTING_PROTOCOL`。
 
 ---
 
@@ -273,7 +277,7 @@ Aster 采集使用 `https://aster.taoai.site/api/admin/events`。每页事件和
 ~/Library/Application Support/AgentPulse/usage.sqlite3
 ```
 
-- schema v10、WAL 模式；分层保存原始 token/session 事件、skill/MCP 计数、已应用编辑行、派生的 30 分钟聚合 bucket 与 session、源文件 checkpoint 与按 hostname 隔离的同步状态。旧库通过增量列和新表无损迁移到 v10（parser version 仍为 v7）。
+- schema v11、WAL 模式；分层保存原始 token/session 事件、skill/MCP 计数、已应用编辑行、派生的 30 分钟聚合 bucket 与 session、源文件 checkpoint 与按 hostname 隔离的同步状态。Aster 和 Antigravity 的原始事件被压实时只额外保留事件身份哈希，避免切换 hostname 后重复计入。旧库通过增量列和新表迁移到 v11（parser version 仍为 v7）。
 - bucket 自然键为 `(hostname, source, model, project, bucket_start_ms)`；session 自然键为 `(hostname, source, session_hash)`。bucket 额外保存 skill 名称与次数、MCP server 次数、新增 / 删除 / 净行数；session 保存活跃秒数、消息数、小时直方图与 skill 名称。
 - hostname 下沉到原始事件层——每条原始 token/session/edit 事件都记录采集时的本机 hostname，便于设备改名时原地统一历史归属。派生（bucket/session）按各自 hostname 隔离保存，本地展示跨 hostname 聚合。
 - **设备标识改名**：在设置里改了 canonical hostname 后，下一轮比对发现与账本旧名不一致时会弹确认框，不静默自动改。选「确认改名」在一个事务内把 usage_buckets / usage_sessions 及原始三表（usage_events / usage_session_events / usage_edit_entries）中旧名的行全部原地 UPDATE 成新名，并更新 sync_state.canonical_hostname；改名后这些派生行按现有 dirty 机制（revision>synced_revision）重新变 dirty 重新上报。选「否」则新名从此生效、历史保留旧名（同机两名共存，各自按 hostname 上报），且新名即刻成为 canonical，不再重复弹窗。

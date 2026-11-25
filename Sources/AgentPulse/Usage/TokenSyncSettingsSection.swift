@@ -4,6 +4,7 @@ import AgentPulseCore
 /// 设置页的 Token 统计 / 用量上报两张深色卡片。
 struct TokenSyncSettingsSection: View {
     @ObservedObject var model: ApplicationModel
+    @State private var localHostname = ""
 
     init(model: ApplicationModel) {
         self.model = model
@@ -63,10 +64,26 @@ struct TokenSyncSettingsSection: View {
                 )
 
                 SettingsRow(title: "设备标识") {
-                    Text(model.tokenSyncStatus.canonicalHostname ?? "未配置")
-                        .font(.system(size: 11, design: .monospaced))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    if let hostname = model.tokenSyncStatus.canonicalHostname {
+                        Text(hostname)
+                            .font(.system(size: 11, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    } else {
+                        TextField("本机名称", text: $localHostname)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 180)
+                            .accessibilityLabel("本地设备标识")
+                            .onSubmit { model.setInitialTokenLocalHostname(localHostname) }
+                        SettingsPrimaryButton(
+                            title: "保存",
+                            systemImage: "checkmark",
+                            disabled: localHostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ) {
+                            model.setInitialTokenLocalHostname(localHostname)
+                        }
+                    }
                 }
 
                 // 上次扫描合成一行：标题 + ?（历史保留说明）+ 时间 + 立即扫描按钮。
@@ -235,7 +252,7 @@ struct TokenSyncSettingsSection: View {
     }
 
     private var scanDisabled: Bool {
-        !model.tokenSyncStatus.localCollectionEnabled || anySyncInProgress
+        !model.tokenSyncStatus.localCollectionEnabled || model.tokenSyncStatus.canonicalHostname == nil || anySyncInProgress
     }
 
     private var canEnableReporting: Bool {
@@ -323,7 +340,7 @@ struct TokenSyncSettingsSection: View {
 
     private var reportFooterText: String {
         if model.tokenSyncStatus.ingestBaseURL.isEmpty {
-            return "未配置 API 地址：仅本地统计，不会发起任何网络请求。"
+            return "未配置上报 API 地址，用量统计仅保存在本机。"
         }
         let interval = model.tokenSyncStatus.autoReportInterval.title
         return "启用后：应用启动时自动上报一次，之后每 \(interval)自动上报一次；也可点击「立即上报」手动触发。"

@@ -7,8 +7,9 @@ import Foundation
 
 struct ManagedSettingsSnapshot: Sendable {
     let reportingBaseURL: URL?
-    let reporting: TokenReportingConfiguration
-    let asterManagementKey: String
+    let canonicalHostname: String
+    let reporting: TokenReportingConfiguration?
+    let asterManagementKey: String?
     let r2: EnvironmentR2Configuration?
 }
 
@@ -20,12 +21,11 @@ enum ManagedSettingsLoader {
     private static let timeout: TimeInterval = 30
 
     enum Failure: LocalizedError {
-        case unavailable, incomplete
+        case unavailable
 
         var errorDescription: String? {
             switch self {
             case .unavailable: "无法读取 1Password 中的 Agent Pulse 配置"
-            case .incomplete: "1Password 中的 Agent Pulse 配置缺少 Aster 密钥或上报协议"
             }
         }
     }
@@ -33,6 +33,7 @@ enum ManagedSettingsLoader {
     private struct Item: Decodable {
         struct Field: Decodable {
             let id: String
+            let label: String?
             let value: String?
         }
         let fields: [Field]
@@ -49,34 +50,42 @@ enum ManagedSettingsLoader {
         let runner = SubprocessRunner(environmentOverrides: ["OP_SERVICE_ACCOUNT_TOKEN": token])
         let result = try runner.run(executable: cli,
             arguments: ["item", "get", item, "--vault", vault, "--format", "json"], timeout: timeout)
-        guard result.exitCode == 0,
-              let item = try? JSONDecoder().decode(Item.self, from: result.standardOutput) else {
-            throw Failure.unavailable
+        guard result.exitCode == 0 else { throw Failure.unavailable }
+        return try parseItem(result.standardOutput)
+    }
+
+    static func parseItem(_ data: Data) throws -> ManagedSettingsSnapshot {
+        guard let item = try? JSONDecoder().decode(Item.self, from: data) else { throw Failure.unavailable }
+
+        // Custom fields added in the app may have generated IDs. Accept unique labels, with IDs taking precedence.
+        var fields: [String: String] = [:]
+        for (label, matches) in Dictionary(grouping: item.fields, by: \.label) {
+            if let label, matches.count == 1 { fields[label] = matches[0].value }
         }
-        var values: [String: String] = [:]
         for field in item.fields {
-            values[field.id] = field.value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            fields[field.id] = field.value
         }
-        guard let key = values["ASTER_MANAGEMENT_KEY"], !key.isEmpty,
-              let protocolJSON = values["REPORTING_PROTOCOL"],
-              let rawHostname = values["REPORT_CANONICAL_HOSTNAME"],
-              var reporting = try? JSONDecoder().decode(TokenReportingConfiguration.self, from: Data(protocolJSON.utf8)) else {
-            throw Failure.incomplete
+        let values = fields.mapValues { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.value.isEmpty }
+        let hostname = CanonicalHostname.normalize(values["REPORT_CANONICAL_HOSTNAME"] ?? "")
+        let reporting = values["REPORTING_PROTOCOL"].flatMap { protocolJSON -> TokenReportingConfiguration? in
+            guard var configuration = try? JSONDecoder().decode(TokenReportingConfiguration.self,
+                                                                  from: Data(protocolJSON.utf8)) else { return nil }
+            configuration.canonicalHostname = hostname
+            return configuration.isReady && TokenUsageReporter.isValidPath(configuration.path) ? configuration : nil
         }
-        reporting.canonicalHostname = CanonicalHostname.normalize(rawHostname)
-        guard reporting.isReady, TokenUsageReporter.isValidPath(reporting.path) else { throw Failure.incomplete }
         let baseURL = values["REPORT_BASE_URL"].flatMap(URL.init(string:)).flatMap {
             TokenUsageReporter.isValidBaseURL($0) ? $0 : nil
         }
         let r2 = try? EnvironmentR2Configuration(environment: values)
-        return ManagedSettingsSnapshot(reportingBaseURL: baseURL, reporting: reporting,
-                                       asterManagementKey: key, r2: r2)
+        return ManagedSettingsSnapshot(reportingBaseURL: baseURL, canonicalHostname: hostname, reporting: reporting,
+                                       asterManagementKey: values["ASTER_MANAGEMENT_KEY"], r2: r2)
     }
 }
 
 @MainActor
 final class ManagedSettingsModel: ObservableObject {
-    @Published private(set) var isConfigured = false
+    @Published private(set) var hasLoadedItem = false
     @Published private(set) var isR2Configured = false
     @Published private(set) var errorText: String?
     private(set) var snapshot: ManagedSettingsSnapshot?
@@ -92,12 +101,12 @@ final class ManagedSettingsModel: ObservableObject {
             switch result {
             case let .success(snapshot):
                 self.snapshot = snapshot
-                isConfigured = true
+                hasLoadedItem = true
                 isR2Configured = snapshot.r2 != nil
-                errorText = snapshot.reportingBaseURL == nil ? "缺少上报地址" : nil
+                errorText = nil
             case let .failure(error):
                 snapshot = nil
-                isConfigured = false
+                hasLoadedItem = false
                 isR2Configured = false
                 errorText = (error as? ManagedSettingsLoader.Failure)?.errorDescription ?? "1Password 读取失败"
             }

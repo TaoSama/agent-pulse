@@ -157,7 +157,7 @@ public enum UsageIncrementalBaselineRecovery: Sendable, Equatable {
 /// - canonical hostname 变化时，从原始事件事务重建目标 hostname 派生聚合并清除旧 hostname。
 /// - 显式 rebuild 时事务性清空派生 + 原始 + checkpoint（仅显式 rebuild）。
 public final class UsageLedgerStore: @unchecked Sendable {
-    public static let schemaVersion: Int32 = 10
+    public static let schemaVersion: Int32 = 11
     public static let bucketMilliseconds: Int64 = 30 * 60 * 1_000
     public static let defaultMaxBucketsPerBatch = 500
     public static let defaultMaxSessionsPerBatch = 1_000
@@ -342,7 +342,9 @@ public final class UsageLedgerStore: @unchecked Sendable {
             status: "complete"
         )
         let frozen = try frozenBeforeMsUnlocked(hostname)
-        let keptEvents = frozen > 0 ? events.filter { millis($0.timestamp) >= frozen } : events
+        let unfrozenEvents = frozen > 0 ? events.filter { millis($0.timestamp) >= frozen } : events
+        let keptEvents = try eligibleNetworkEventsUnlocked(unfrozenEvents, source: source, hostname: hostname)
+        guard !keptEvents.isEmpty else { return }
         let previousBuckets = try networkPreviousBucketEventsUnlocked(keptEvents, source: source, hostname: hostname)
         try insertRawEvents(keptEvents, fileID: fileID, hostname: hostname)
         try writeCheckpoint(checkpoint)
@@ -1756,15 +1758,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
 
         // 持久化 logical 组 -> bucket 自然键映射，供增量 finalize 把旧 bucket 纳入作用域。
         // 必须在 temp_deduped_events 被 drop 之前执行。
-        let bms = Self.bucketMilliseconds
-        try exec("DELETE FROM usage_logical_bucket_map WHERE hostname='\(hostname)';")
-        try exec("""
-            INSERT OR REPLACE INTO usage_logical_bucket_map(
-                hostname,source,event_id,bucket_model,bucket_project,bucket_start)
-            SELECT '\(hostname)', source, event_id, model, project,
-                   (timestamp_ms/\(bms))*\(bms)
-            FROM temp_deduped_events;
-            """)
+        try updateLogicalBucketMapUnlocked(hostname: hostname, scoped: false)
 
         try? exec("DROP TABLE IF EXISTS temp_deduped_events;")
 
@@ -2773,20 +2767,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
         // 更新作用域内 logical 组的 bucket 映射：先删旧映射，再从 temp_deduped_events 写入新的。
         // 必须在 defer DROP temp_deduped_events 之前执行。
         finalizeDiagnostics.scopedLogicalEvents = Int(try scalar("SELECT COUNT(*) FROM temp_scope_events;"))
-        let bms = Self.bucketMilliseconds
-        try exec("""
-            DELETE FROM usage_logical_bucket_map
-            WHERE (hostname,source,event_id) IN (
-                SELECT '\(hostname)',source,event_id FROM temp_scope_events
-            );
-            """)
-        try exec("""
-            INSERT OR REPLACE INTO usage_logical_bucket_map(
-                hostname,source,event_id,bucket_model,bucket_project,bucket_start)
-            SELECT '\(hostname)', source, event_id, model, project,
-                   (timestamp_ms/\(bms))*\(bms)
-            FROM temp_deduped_events;
-            """)
+        try updateLogicalBucketMapUnlocked(hostname: hostname, scoped: true)
 
         return UsageFinalizeResult(
             reportingEligible: true,
@@ -2795,6 +2776,31 @@ public final class UsageLedgerStore: @unchecked Sendable {
             collapsedContentDuplicates: collapsedContentDuplicates,
             warnings: warnings
         )
+    }
+
+    private func updateLogicalBucketMapUnlocked(hostname: String, scoped: Bool) throws {
+        let deleteSQL = scoped ? """
+            DELETE FROM usage_logical_bucket_map
+            WHERE (hostname, source, event_id) IN (
+                SELECT ?, source, event_id FROM temp_scope_events
+            );
+            """ : "DELETE FROM usage_logical_bucket_map WHERE hostname = ?;"
+        let deletion = try prepare(deleteSQL)
+        defer { sqlite3_finalize(deletion) }
+        try bind(deletion, 1, hostname)
+        _ = try step(deletion)
+
+        let bucketMilliseconds = Self.bucketMilliseconds
+        let insertion = try prepare("""
+            INSERT OR REPLACE INTO usage_logical_bucket_map(
+                hostname, source, event_id, bucket_model, bucket_project, bucket_start)
+            SELECT ?, source, event_id, model, project,
+                   (timestamp_ms / \(bucketMilliseconds)) * \(bucketMilliseconds)
+            FROM temp_deduped_events;
+            """)
+        defer { sqlite3_finalize(insertion) }
+        try bind(insertion, 1, hostname)
+        _ = try step(insertion)
     }
 
     /// 读取作用域内带 skill/mcp 计数的原始事件（含 tier）。与全量的 skillEventSQL 同构，
@@ -2933,20 +2939,11 @@ public final class UsageLedgerStore: @unchecked Sendable {
     /// **跨所有 hostname 删除**：hostname 下沉在原始事件层只是「采集机痕迹」，派生已由 rebuildForHostname +
     /// recompute 统一归属到当前 canonical hostname（包含所有采集机的贡献）。冻结边界是全局时间概念，
     /// 若只删 canonical hostname 的行，旧机器名（改名前/多机同步）的历史原始行会成为永不可回收的死数据。
+    /// Aster / Antigravity 原始行仅在其归属 hostname 的 bucket 也冻结时删除，同批保存用于去重的事件 hash。
     /// 调用方负责在独立事务中提交每个批次；VACUUM 由调用方在事务外执行。
     func compactFrozenRawBatchUnlocked(hostname: String, frozen: Int64, limit: Int) throws -> Int64 {
         guard frozen > 0 else { return 0 }
-        let delEvents = try prepare("""
-            DELETE FROM usage_events
-            WHERE rowid IN (
-              SELECT rowid FROM usage_events INDEXED BY idx_usage_events_time
-              WHERE timestamp_ms < ?
-              LIMIT ?
-            );
-            """)
-        defer { sqlite3_finalize(delEvents) }
-        try bind(delEvents, 1, frozen); try bind(delEvents, 2, Int64(limit)); try done(delEvents)
-        let deletedEvents = Int64(sqlite3_changes(db))
+        let deletedEvents = try compactFrozenUsageEventsUnlocked(frozen: frozen, limit: limit)
         if deletedEvents > 0 { return deletedEvents }
 
         // 只删完全冻结 session 的 session_events：排除任何仍有 timestamp>=frozen 事件的 (source,session_hash)。
@@ -4667,6 +4664,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
                 try exec("DELETE FROM usage_session_events;")
                 try exec("DELETE FROM usage_edit_entries;")
                 try exec("DELETE FROM usage_edit_metric_sources;")
+                try exec("DELETE FROM usage_compacted_network_events;")
                 try exec("DELETE FROM usage_events;")
                 try exec("DELETE FROM usage_files;")
                 try resetParserPersistenceUnlocked()
@@ -4799,6 +4797,15 @@ public final class UsageLedgerStore: @unchecked Sendable {
             try transaction {
                 try migrateV9ToV10Unlocked()
                 try exec("PRAGMA user_version=10;")
+            }
+        }
+        let afterV10 = try scalar("PRAGMA user_version;")
+        if afterV10 == 10 {
+            try transaction {
+                // Older frozen rows no longer have event IDs. Track exact
+                // replays for new compaction batches without scanning raw data.
+                try exec(Self.compactedNetworkEventsSchema)
+                try exec("PRAGMA user_version=11;")
             }
         }
         // 版本无关的轻量元数据表/索引:每次 open 幂等补建。raw 大表性能索引只在后台派生前创建，
@@ -5213,7 +5220,7 @@ public final class UsageLedgerStore: @unchecked Sendable {
     func readIntUnlocked(key: String) throws -> Int64? { try readTextUnlocked(key: key).flatMap { Int64($0) } }
     func setIntUnlocked(key: String, value: Int64) throws { try setTextUnlocked(key: key, value: String(value)) }
 
-    private func deleteKeyUnlocked(_ key: String) throws {
+    func deleteKeyUnlocked(_ key: String) throws {
         let statement = try prepare("DELETE FROM sync_state WHERE key=?;"); defer { sqlite3_finalize(statement) }
         try bind(statement, 1, key); try done(statement)
     }

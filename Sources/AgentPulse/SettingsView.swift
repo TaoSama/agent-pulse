@@ -69,10 +69,10 @@ struct AgentPulseSettingsView: View {
     private var configurationCard: some View {
         SettingsCard(title: "1Password 配置", systemImage: "key.horizontal") {
             VStack(alignment: .leading, spacing: 10) {
-                SettingsRow(title: "配置状态") {
+                SettingsRow(title: "条目状态") {
                     SettingsStatusBadge(
-                        text: managedSettings.isConfigured ? "已就绪" : "未就绪",
-                        tone: managedSettings.isConfigured ? .positive : .warning
+                        text: managedSettings.hasLoadedItem ? "已读取" : "未读取",
+                        tone: managedSettings.hasLoadedItem ? .positive : .warning
                     )
                 }
                 if let error = managedSettings.errorText {

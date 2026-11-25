@@ -64,7 +64,8 @@ struct AsterUsageVerification {
         try await verifyShortPagesAndIdempotency()
         try await verifyFailedPassResumes()
         try await verifyFrozenHistoryBound()
-        print("AsterUsageVerification passed (6 checks)")
+        try await verifyHostnameReplays()
+        print("AsterUsageVerification passed (7 checks)")
     }
 
     private static func verifyTokenSemantics() async throws {
@@ -176,10 +177,71 @@ struct AsterUsageVerification {
     }
 
     private static func writeFrozen(path: String, milliseconds: Int64) throws {
-        var db: OpaquePointer?
-        guard sqlite3_open(path, &db) == SQLITE_OK else { throw VerificationFailure.failed("open fixture database") }
-        defer { sqlite3_close(db) }
         let sql = "INSERT INTO sync_state(key,value,updated_at_ms) VALUES('frozen_before_ms\u{1}\(hostname)','\(milliseconds)',0);"
-        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw VerificationFailure.failed("write frozen fixture") }
+        try executeSQL(sql, path: path)
+    }
+
+    private static func executeSQL(_ sql: String, path: String) throws {
+        var db: OpaquePointer?
+        let result = sqlite3_open(path, &db)
+        defer { sqlite3_close(db) }
+        guard result == SQLITE_OK else { throw VerificationFailure.failed("open fixture database") }
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw VerificationFailure.failed("write fixture database") }
+    }
+
+    private static func verifyHostnameReplays() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aster-replay-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        do {
+            let path = directory.appendingPathComponent("usage.sqlite3").path
+            let original = try UsageLedgerStore(path: path)
+            let recent = Date()
+            let historical = recent.addingTimeInterval(-45 * 24 * 60 * 60)
+            let firstPage = try data([
+                row("live", date: recent.ISO8601Format()),
+                row("compacted", date: historical.ISO8601Format()),
+            ])
+            _ = try await service(FixtureServer([firstPage, empty]))
+                .collect(managementKey: "test-secret", ledger: original, hostname: hostname)
+
+            try executeSQL("DROP TABLE usage_compacted_network_events; PRAGMA user_version=10;", path: path)
+            let ledger = try UsageLedgerStore(path: path)
+            try require(try ledger.eventCount() == 2, "v10 migration must retain existing Aster raw events")
+
+            let newHost = "adopted-host"
+            _ = try ledger.compactFrozenRaw(hostname: "unrelated-host")
+            try require(try ledger.eventCount() == 2, "compaction must preserve unfrozen network rows on another host")
+            let compacted = try ledger.compactFrozenRaw(hostname: hostname)
+            try require(compacted.deletedRows == 1 && (try ledger.eventCount()) == 1,
+                        "compaction must delete only the frozen raw Aster event")
+            try ledger.adoptHostname(newHost)
+
+            let reopened = try UsageLedgerStore(path: path)
+            let replayPage = try data([
+                row("live", date: recent.addingTimeInterval(7_200).ISO8601Format()),
+                row("compacted", date: recent.addingTimeInterval(3_600).ISO8601Format()),
+                row("new-history", date: historical.addingTimeInterval(-3_600).ISO8601Format()),
+            ])
+            let server = FixtureServer([replayPage, empty])
+            _ = try await service(server).collect(managementKey: "test-secret", ledger: reopened, hostname: newHost)
+            let oldBuckets = try reopened.buckets(hostname: hostname)
+            let newBuckets = try reopened.buckets(hostname: newHost)
+            try require(oldBuckets.reduce(0) { $0 + $1.counts.total } == 300
+                        && newBuckets.count == 1 && newBuckets.first?.counts.total == 150
+                        && (newBuckets.first?.bucketStart ?? .distantFuture) < historical
+                        && (try reopened.eventCount()) == 2,
+                        "only the unseen historical ID belongs to the adopted hostname")
+            let queries = await server.queries()
+            try require(queries.last?["after_event_id"] == "new-history", "filtered replays must advance pagination")
+
+            try reopened.resetForRebuild()
+            _ = try await service(FixtureServer([firstPage, empty]))
+                .collect(managementKey: "test-secret", ledger: reopened, hostname: newHost)
+            try require(try reopened.eventCount() == 2, "an explicit reset must clear compacted IDs")
+            try FileManager.default.removeItem(at: directory)
+        } catch {
+            try FileManager.default.removeItem(at: directory)
+            throw error
+        }
     }
 }

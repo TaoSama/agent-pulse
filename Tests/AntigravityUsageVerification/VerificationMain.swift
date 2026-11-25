@@ -19,6 +19,8 @@ struct AntigravityUsageVerification {
 
     static func main() throws {
         try verifyNativeDatabases()
+        try verifyPagination()
+        try verifyCompactedReplays()
         if ProcessInfo.processInfo.environment["AGENT_PULSE_VERIFY_LIVE_ANTIGRAVITY"] == "1" {
             try verifyLocalDatabases()
         }
@@ -47,37 +49,41 @@ struct AntigravityUsageVerification {
         defer { sqlite3_close(malformedDB) }
         try insertGeneration(malformedDB, index: 1, response: "test valid call in corrupt db", input: 80)
         try exec(malformedDB, "INSERT INTO gen_metadata VALUES (2, X'ff');")
+        try insertGeneration(malformedDB, index: 3, response: "test missing linked step", input: 70)
+        try exec(malformedDB, "CREATE TEMP TABLE missing_step AS SELECT * FROM steps WHERE idx=3; DELETE FROM steps WHERE idx=3;")
+        try insertGeneration(malformedDB, index: 4, response: "test valid call alongside bad rows", input: 90)
 
         let ledgerPath = scratch.appendingPathComponent("usage.sqlite").path
         let ledger = try UsageLedgerStore(path: ledgerPath)
         let roots = [desktop, cli, missing]
         let first = try scan(roots, ledger)
-        try require(first.discoveredDatabases == 3 && first.scannedDatabases == 2
-                    && first.failedDatabases == 1 && first.failedDirectories == 0,
-                    "live WAL, closed WAL and malformed databases must be distinguished")
-        try require(first.observedEvents == 3, "collect native generations from both origins")
+        try require(first.discoveredDatabases == 3 && first.scannedDatabases == 3
+                    && first.failedDatabases == 0 && first.failedDirectories == 0
+                    && first.rejectedRows == 2 && first.pendingDatabases == 0,
+                    "malformed metadata and missing steps must be isolated to their own rows")
+        try require(first.observedEvents == 5, "collect valid generations from all readable databases")
         let totals = try counts(ledger)
-        try require(totals == UsageTokenCounts(input: 250, output: 24, cachedInput: 400,
-                     cacheCreationInput: 10, reasoningOutput: 14, reportedTotal: 698),
+        try require(totals == UsageTokenCounts(input: 420, output: 48, cachedInput: 800,
+                     cacheCreationInput: 20, reasoningOutput: 28, reportedTotal: 1_316),
                     "fold mirrored calls, preserve disjoint input/cache/response/reasoning")
 
         let reloadedLedger = try UsageLedgerStore(path: ledgerPath)
         let repeatRead = try scan(roots, reloadedLedger)
-        try require(repeatRead.scannedDatabases == 0 && repeatRead.failedDatabases == 1,
-                    "file stamps survive reopening and a corrupt source remains retryable")
+        try require(repeatRead.scannedDatabases == 1 && repeatRead.failedDatabases == 0 && repeatRead.rejectedRows == 2,
+                    "file stamps survive reopening and a database with rejected rows remains retryable")
         try require(try counts(reloadedLedger) == totals, "unchanged databases do not inflate usage")
 
         try insertGeneration(cliDB, index: 3, response: "test next CLI call", input: 200)
-        try exec(malformedDB, "DELETE FROM gen_metadata WHERE idx=2;")
+        try exec(malformedDB, "DELETE FROM gen_metadata WHERE idx=2; INSERT INTO steps SELECT * FROM missing_step;")
         let refreshed = try scan(roots, reloadedLedger)
-        try require(refreshed.scannedDatabases == 2 && refreshed.failedDatabases == 0,
+        try require(refreshed.scannedDatabases == 2 && refreshed.failedDatabases == 0 && refreshed.rejectedRows == 0,
                     "detect append to live WAL and retry repaired source")
-        try require(try counts(reloadedLedger).total == 1_426, "WAL append and repaired source each record once")
+        try require(try counts(reloadedLedger).total == 2_034, "WAL append and repaired row each record once")
 
         try insertGeneration(cliDB, index: 4, response: "test mirror", input: 120,
                              model: "different-mirror-model", createdAt: fixtureTime + 3_600)
         _ = try scan(roots, reloadedLedger)
-        try require(try counts(reloadedLedger).total == 1_446,
+        try require(try counts(reloadedLedger).total == 2_054,
                     "improved mirror keeps the first persisted bucket key")
 
         let secondHost = "antigravity-new-host"
@@ -90,16 +96,7 @@ struct AntigravityUsageVerification {
         _ = try AntigravityUsageCollector.scanAndRecord(roots: roots, ledger: reloadedLedger, hostname: secondHost)
         try require(try reloadedLedger.buckets(hostname: secondHost).first?.counts.total == 264,
                     "only new responses count under the adopted hostname")
-        try require(try counts(reloadedLedger).total == 1_446, "prior host history remains")
-
-        try freezeOldHost(in: ledgerPath)
-        try insertGeneration(cliDB, index: 6, response: "test new host after freeze", input: 50,
-                             createdAt: fixtureTime + 10_800)
-        _ = try AntigravityUsageCollector.scanAndRecord(roots: roots, ledger: reloadedLedger, hostname: secondHost)
-        let newBuckets = try reloadedLedger.buckets(hostname: secondHost)
-        try require(newBuckets.reduce(0) { $0 + $1.counts.total } == 538,
-                    "compacted raw events must not replay once their hostname changes")
-        try require(try counts(reloadedLedger).total == 1_446, "prior host frozen bucket remains")
+        try require(try counts(reloadedLedger).total == 2_054, "prior host history remains")
 
         let cancelledLedger = try UsageLedgerStore(path: ":memory:")
         var checks = 0
@@ -113,6 +110,46 @@ struct AntigravityUsageVerification {
             try require(try cancelledLedger.buckets(hostname: hostname).isEmpty, "cancelled database must not commit")
         }
         try require(try scan([desktop], cancelledLedger).scannedDatabases == 1, "cancelled database remains retryable")
+    }
+
+    private static func verifyPagination() throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("agent-pulse-antigravity-pagination-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: false)
+        defer {
+            do { try FileManager.default.removeItem(at: scratch) }
+            catch { NSLog("Could not remove Antigravity pagination fixture") }
+        }
+        let root = scratch.appendingPathComponent("antigravity", isDirectory: true)
+        let database = try fixtureDatabase(in: root, name: "paged")
+        defer { sqlite3_close(database) }
+        try insertGeneration(database, index: 1, response: "old generation", input: 10, createdAt: fixtureTime)
+        try exec(database, """
+            WITH RECURSIVE indexes(idx) AS (SELECT 2 UNION ALL SELECT idx+1 FROM indexes WHERE idx<100000)
+            INSERT INTO gen_metadata SELECT idx, NULL FROM indexes;
+            """)
+        try insertGeneration(database, index: 100_001, response: "recent generation", input: 20, createdAt: fixtureTime)
+
+        let ledgerPath = scratch.appendingPathComponent("usage.sqlite").path
+        let firstLedger = try UsageLedgerStore(path: ledgerPath)
+        let first = try scan([root], firstLedger)
+        try require(first.scannedDatabases == 1 && first.pendingDatabases == 1 && first.observedEvents == 1
+                    && (try counts(firstLedger)).input == 20,
+                    "first page must record recent usage and persist remaining history")
+
+        try insertGeneration(database, index: 100_002, response: "appended generation", input: 30, createdAt: fixtureTime)
+        let reopened = try UsageLedgerStore(path: ledgerPath)
+        let next = try scan([root], reopened)
+        try require(next.pendingDatabases == 1 && next.observedEvents == 3 && (try counts(reopened)).input == 60,
+                    "resuming must pick up the new generation while still reaching the oldest row")
+
+        let revalidation = try scan([root], reopened)
+        try require(revalidation.pendingDatabases == 1 && revalidation.observedEvents == 2,
+                    "a sweep spanning multiple revisions needs a stable follow-up from the newest page")
+        let finalPage = try scan([root], reopened)
+        try require(finalPage.pendingDatabases == 0 && finalPage.observedEvents == 1 && (try counts(reopened)).input == 60,
+                    "the stable sweep completes without duplicating usage")
+        try require(try scan([root], reopened).scannedDatabases == 0, "completed snapshot should be skipped")
     }
 
     private static func verifyLocalDatabases() throws {
@@ -138,7 +175,7 @@ struct AntigravityUsageVerification {
         return bucket.counts
     }
 
-    private static func fixtureDatabase(in root: URL, name: String) throws -> OpaquePointer {
+    static func fixtureDatabase(in root: URL, name: String) throws -> OpaquePointer {
         let directory = root.appendingPathComponent("conversations", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent(name + ".db")
@@ -160,21 +197,7 @@ struct AntigravityUsageVerification {
         return database
     }
 
-    private static func freezeOldHost(in path: String) throws {
-        var database: OpaquePointer?
-        guard sqlite3_open(path, &database) == SQLITE_OK, let database else {
-            sqlite3_close(database)
-            throw CheckFailure.sqlite
-        }
-        defer { sqlite3_close(database) }
-        let cutoff = (fixtureTime / 1_800 + 3) * 1_800 * 1_000
-        try exec(database, """
-            DELETE FROM usage_events WHERE hostname='\(hostname)' AND source='antigravity';
-            INSERT INTO sync_state VALUES ('frozen_before_ms' || char(1) || '\(hostname)', '\(cutoff)', 0);
-            """)
-    }
-
-    private static func insertGeneration(
+    static func insertGeneration(
         _ database: OpaquePointer, index: UInt64, response: String, input: UInt64,
         model: String = fixtureModel, createdAt: UInt64? = nil
     ) throws {
