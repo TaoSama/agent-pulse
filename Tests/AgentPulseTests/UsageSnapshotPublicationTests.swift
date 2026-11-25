@@ -93,7 +93,14 @@ final class CoordinatorCalendarBehaviorTests: XCTestCase {
             case .day: window = .day
             case .week: window = .week
             case .month: window = .month
-            case nil: window = .all
+            case nil:
+                let realModels = item.models.map {
+                    TokenWindowVirtualBucketTargets.ModelTokens(model: $0.model, tokens: $0.counts.total)
+                }
+                let displayTotal = TokenWindowVirtualBucketTargets.displayTotal(for: .all, real: realModels)
+                XCTAssertEqual(actual.all?.totalTokens, displayTotal)
+                XCTAssertEqual(actual.all?.perModel.reduce(Int64(0)) { $0 + $1.totalTokens }, displayTotal)
+                continue
             }
             XCTAssertEqual(actual[window]?.totalTokens, item.summary?.counts.total)
             XCTAssertEqual(actual[window]?.perModel.reduce(Int64(0)) { $0 + $1.totalTokens } ?? 0,
