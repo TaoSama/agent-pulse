@@ -156,7 +156,7 @@ final class ApplicationModel: ObservableObject {
         let initialColorMode = TrendColorMode(rawValue: savedColorMode ?? "") ?? .risingGreen
         trendColorMode = initialColorMode
         uploadService = UploadService { [managedSettings] in managedSettings.snapshot?.r2 }
-        let tokenCoordinator = TokenSyncCoordinator()
+        let tokenCoordinator = TokenSyncCoordinator(waitsForManagedSettings: true)
         tokenCoordinator.hostnameRenamePrompt = { old, new, decide in
             // 决策回调在主线程弹出确认框；NSAlert 需在主线程运行。
             Task { @MainActor in

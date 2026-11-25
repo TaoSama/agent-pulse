@@ -64,6 +64,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     private var reporter: TokenUsageReporter
     private var managedSettings: ManagedSettingsSnapshot?
     private var managedSettingsLoaded = false
+    private let waitsForManagedSettings: Bool
+    private var awaitingManagedSettings: Bool { waitsForManagedSettings && !managedSettingsLoaded }
     private var rescanAfterManagedSettingsLoad = false
     private let asterService = AsterUsageService()
     private let usageSummaryCalendar: Calendar
@@ -133,6 +135,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         usageSummaryCalendar: Calendar = .autoupdatingCurrent,
         ledgerFactory: (@Sendable () throws -> UsageLedgerStore)? = nil,
         scanRoots: [UsageScanRoot]? = nil,
+        waitsForManagedSettings: Bool = false,
         autoLoopSleep: @escaping @Sendable (TimeInterval) async throws -> Void = { interval in
             try await Task.sleep(for: .seconds(interval))
         }
@@ -155,6 +158,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         self.localCollectionURL = TokenSyncCoordinator.defaultLocalCollectionURL()
         self.ledgerFactory = ledgerFactory
         self.injectedScanRoots = scanRoots
+        self.waitsForManagedSettings = waitsForManagedSettings
         self.autoLoopSleep = autoLoopSleep
         ledger = nil
 
@@ -446,7 +450,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     private func scanNow(chainedReport: Bool) {
         // 防重入；且不在上报进行时启动扫描，避免 rebuild 与在途上传竞争。
         guard scanTask == nil, reportTask == nil,
-              statusSubject.value.localCollectionEnabled else { return }
+              !awaitingManagedSettings, statusSubject.value.localCollectionEnabled else { return }
         guard let ledger else { retryLedgerInitializationIfNeeded(); return }
         refreshConfigurationAuthority()
 
@@ -574,7 +578,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 }
                 // Keep existing Antigravity transcript checkpoints and avoid importing a second copy.
                 let usesCustomAntigravity = localSources.contains { $0.source == AntigravityUsageCollector.source }
-                let antigravity: AntigravityUsageScanResult? = if injectedScanRoots == nil, !usesCustomAntigravity {
+                let hasCustomAntigravityHistory = if injectedScanRoots == nil, !usesCustomAntigravity {
+                    try ledger.hasAntigravityTranscriptHistory()
+                } else {
+                    false
+                }
+                let antigravity: AntigravityUsageScanResult? = if injectedScanRoots == nil,
+                    !usesCustomAntigravity, !hasCustomAntigravityHistory {
                     try AntigravityUsageCollector.scanAndRecord(
                         roots: AntigravityUsageCollector.defaultRoots(home: FileManager.default.homeDirectoryForCurrentUser),
                         ledger: ledger, hostname: hostname, checkCancellation: gate.throwIfCancelled
@@ -587,6 +597,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 let antigravityRejected = antigravity?.rejectedRows ?? 0
                 let antigravityComplete = antigravityFailures == 0 && antigravityPending == 0
                 var antigravityWarnings: [String] = []
+                if hasCustomAntigravityHistory {
+                    antigravityWarnings.append("账本含自定义来源历史，原生用量采集已暂停")
+                }
                 if antigravityFailures > 0 {
                     antigravityWarnings.append("\(antigravityFailures) 处读取失败，下轮重试")
                 }
@@ -936,7 +949,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     func reportNow() {
         // 防重入；且不在扫描进行时上报，避免与 rebuild 竞争。
-        guard reportTask == nil, scanTask == nil else { return }
+        guard reportTask == nil, scanTask == nil, !awaitingManagedSettings else { return }
         // rebuild pending 期间绝不发网络请求：必须先完整重扫全部来源并清除 pending。
         if networkTask != nil {
             reportAfterNetworkCollection = true
@@ -1087,6 +1100,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     }
 
     private func beginStartup() {
+        guard !awaitingManagedSettings else { return }
         // 启动即刷新配置权威，使 UI 一开始就反映真实能力。
         refreshConfigurationAuthority()
         // 崩溃安全恢复的最高优先级：存在 rebuild pending（上次已 reset 清库但未确认全部来源
@@ -1177,7 +1191,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         // rebuild pending 期间不启动自动上报循环（不发网络请求）。
         // 采集开启即可周期性扫描（不依赖上报开关）；上报另需其自身就绪，由循环体内分支决定。
         let status = statusSubject.value
-        guard autoLoopTask == nil, isRunning,
+        guard autoLoopTask == nil, isRunning, !awaitingManagedSettings,
               status.localCollectionEnabled || status.reportingEnabled else { return }
         let sleep = autoLoopSleep
         autoLoopTask = Task { [weak self] in
@@ -1204,6 +1218,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     /// 配置只在内存中驻留；生产 reporter 的 loader 不再访问本地配置文件。
     func applyManagedSettings(_ settings: ManagedSettingsSnapshot?) {
+        let resolvedInitialLookup = awaitingManagedSettings
         managedSettings = settings
         managedSettingsLoaded = true
         if let configuration = settings?.reporting {
@@ -1219,8 +1234,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             $0.asterError = nil
         }
         refreshConfigurationAuthority()
-        guard let settings, !settings.canonicalHostname.isEmpty || settings.asterManagementKey != nil,
-              isRunning, initializationTask == nil else { return }
+        let affectsCollection = settings.map { !$0.canonicalHostname.isEmpty || $0.asterManagementKey != nil } ?? false
+        guard isRunning, initializationTask == nil, resolvedInitialLookup || affectsCollection else { return }
         if scanTask != nil {
             // 当前扫描可能已越过网络采集起点；完整完成后再以新配置启动增量扫描。
             rescanAfterManagedSettingsLoad = true

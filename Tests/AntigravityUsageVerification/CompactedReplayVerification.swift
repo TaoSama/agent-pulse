@@ -24,6 +24,8 @@ extension AntigravityUsageVerification {
         let oldHost = "original-antigravity-host"
         let newHost = "adopted-antigravity-host"
         _ = try AntigravityUsageCollector.scanAndRecord(roots: [root], ledger: original, hostname: oldHost)
+        try requireReplay(try !original.hasAntigravityTranscriptHistory(),
+                          "a native checkpoint does not claim transcript history")
         let before = try original.buckets(hostname: oldHost)
         let compacted = try original.compactFrozenRaw(hostname: oldHost)
         try requireReplay(compacted.deletedRows == 1 && (try original.eventCount()) == 1,
@@ -40,6 +42,13 @@ extension AntigravityUsageVerification {
         try requireReplay(newBuckets.count == 1 && newBuckets.first?.counts.input == 30
                           && oldBuckets == before && (try reopened.eventCount()) == 2,
                           "only the unseen historical response should move totals after the hostname changes")
+        try reopened.record(events: [], checkpoint: UsageFileCheckpoint(
+            fileID: "legacy-transcript", source: AntigravityUsageCollector.source, pathHash: "fixture",
+            offset: 10, size: 10, modifiedAt: Date(), parserVersion: UsageJSONLParser.parserVersion,
+            status: "missing"
+        ), hostname: newHost)
+        try requireReplay(try reopened.hasAntigravityTranscriptHistory(),
+                          "a legacy transcript checkpoint claims history even when its file is missing")
     }
 
     private static func requireReplay(_ assertion: Bool, _ message: String) throws {

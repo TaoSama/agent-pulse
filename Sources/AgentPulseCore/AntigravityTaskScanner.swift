@@ -34,11 +34,30 @@ struct AntigravityTaskScanner {
         let wal: Stamp?
     }
 
+    private enum Profile: String, CaseIterable {
+        case desktop = "antigravity"
+        case cli = "antigravity-cli"
+        case ide = "antigravity-ide"
+
+        init?(databaseURL: URL) {
+            self.init(rawValue: databaseURL.deletingLastPathComponent().lastPathComponent)
+        }
+
+        func ownsProcess(executablePath: String) -> Bool {
+            switch self {
+            case .desktop: executablePath.hasSuffix(".app/Contents/MacOS/Antigravity")
+            case .cli: executablePath.split(separator: "/").last == "agy"
+                && !executablePath.contains(".app/Contents/")
+            case .ide: executablePath.hasSuffix(".app/Contents/MacOS/Antigravity IDE")
+            }
+        }
+    }
+
     private struct Conversation {
         let id: String
         let lastActivity: Date?
         let busy: Bool
-        let cli: Bool
+        let profile: Profile
         let native: Bool
 
         func supersedes(_ previous: Self) -> Bool {
@@ -56,9 +75,6 @@ struct AntigravityTaskScanner {
 
     private enum ReadFailure: Error { case metadata, incompleteWAL, replaced, sqlite }
 
-    private static let desktopDirectory = "antigravity"
-    private static let cliDirectory = "antigravity-cli"
-    private static let ideDirectory = "antigravity-ide"
     private static let cliSource = "CORTEX_TRAJECTORY_SOURCE_CLI"
     private static let busySQL = "not_fully_idle != 0 OR status IN ('CASCADE_RUN_STATUS_RUNNING', 'CASCADE_RUN_STATUS_BUSY')"
     private static let unixEpochJulianDay = 2_440_587.5
@@ -72,24 +88,12 @@ struct AntigravityTaskScanner {
     }
 
     mutating func scan(databases: [URL], processes: [RunningProcess], now: Date) -> RuntimeTaskCategoryMetric {
-        let desktopRunning = processes.contains {
-            $0.executablePath.hasSuffix(".app/Contents/MacOS/Antigravity")
-        }
-        let ideRunning = processes.contains {
-            $0.executablePath.hasSuffix(".app/Contents/MacOS/Antigravity IDE")
-        }
-        let cliRunning = processes.contains {
-            $0.executablePath.split(separator: "/").last == "agy"
-                && !$0.executablePath.contains(".app/Contents/")
-        }
-        guard !databases.isEmpty, desktopRunning || ideRunning || cliRunning else {
+        let runningProfiles = Set(Profile.allCases.filter { profile in
+            processes.contains { profile.ownsProcess(executablePath: $0.executablePath) }
+        })
+        guard !databases.isEmpty, !runningProfiles.isEmpty else {
             return RuntimeTaskCategoryMetric(totalTasks: 0, activeTasks: 0, present: false, quality: .complete)
         }
-
-        var runningDirectories: Set<String> = []
-        if desktopRunning { runningDirectories.insert(Self.desktopDirectory) }
-        if cliRunning { runningDirectories.insert(Self.cliDirectory) }
-        if ideRunning { runningDirectories.insert(Self.ideDirectory) }
 
         var unique: [String: Conversation] = [:]
         var readable = false
@@ -97,7 +101,7 @@ struct AntigravityTaskScanner {
         for url in databases {
             do {
                 guard let rows = try readRows(at: url) else {
-                    if runningDirectories.contains(url.deletingLastPathComponent().lastPathComponent) {
+                    if let profile = Profile(databaseURL: url), runningProfiles.contains(profile) {
                         partial = true
                     }
                     continue
@@ -117,7 +121,7 @@ struct AntigravityTaskScanner {
         }
 
         var active = 0
-        for row in unique.values where row.busy && (row.cli ? cliRunning : desktopRunning || ideRunning) {
+        for row in unique.values where row.busy && runningProfiles.contains(row.profile) {
             guard let date = row.lastActivity else {
                 partial = true
                 continue
@@ -183,7 +187,7 @@ struct AntigravityTaskScanner {
         guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK else {
             throw ReadFailure.sqlite
         }
-        let cliStore = url.deletingLastPathComponent().lastPathComponent == cliDirectory
+        let storeProfile = Profile(databaseURL: url) ?? .desktop
         var rows: [Conversation] = []
         while true {
             switch sqlite3_step(statement) {
@@ -194,10 +198,10 @@ struct AntigravityTaskScanner {
                 let seconds = (julianDay - unixEpochJulianDay) * secondsPerDay
                 let date = sqlite3_column_type(statement, 1) == SQLITE_NULL ? nil
                     : Date(timeIntervalSince1970: (seconds * 1_000).rounded() / 1_000)
-                let cli = cliStore || sqlite3_column_int(statement, 3) != 0
+                let profile: Profile = sqlite3_column_int(statement, 3) != 0 ? .cli : storeProfile
                 rows.append(Conversation(id: String(cString: id), lastActivity: date,
                                          busy: sqlite3_column_int(statement, 2) != 0,
-                                         cli: cli, native: cliStore == cli))
+                                         profile: profile, native: profile == storeProfile))
             default: throw ReadFailure.sqlite
             }
         }

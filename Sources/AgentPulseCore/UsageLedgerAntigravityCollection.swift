@@ -2,6 +2,17 @@ import Foundation
 import SQLite3
 
 extension UsageLedgerStore {
+    public func hasAntigravityTranscriptHistory() throws -> Bool {
+        let source = AntigravityUsageCollector.source
+        return try queue.sync {
+            let statement = try prepare("SELECT 1 FROM usage_files WHERE source=? AND file_id<>? LIMIT 1;")
+            defer { sqlite3_finalize(statement) }
+            try bind(statement, 1, source)
+            try bind(statement, 2, "network\u{1}\(source)")
+            return try step(statement) == SQLITE_ROW
+        }
+    }
+
     private func antigravityRevisionKey(_ databaseID: String) -> String {
         "antigravity_database_v1\u{1}\(databaseID)"
     }

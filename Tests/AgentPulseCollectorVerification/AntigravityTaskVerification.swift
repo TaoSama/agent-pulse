@@ -45,7 +45,6 @@ enum AntigravityTaskVerification {
                 );
                 """
         try exec(desktop, schema)
-        try seedClosedProfile(at: stores[2], schema: schema)
         try exec(desktop, """
             INSERT INTO conversation_summaries VALUES
               ('mirror', '2026-11-25 12:00:00.001+00:00', 0, 1, 'CASCADE_RUN_STATUS_RUNNING', 'CORTEX_TRAJECTORY_SOURCE_CLI', 0, '', 2),
@@ -61,9 +60,16 @@ enum AntigravityTaskVerification {
               ('placeholder', '0001-01-01 00:00:00+00:00', 0, 0, '', '', 0, '', 0);
             """
         try seedClosedProfile(at: stores[1], schema: schema + "\n" + cliRows)
+        let ideRows = """
+            INSERT INTO conversation_summaries VALUES
+              ('ide', '2026-11-25 12:00:00.001+00:00', 0, 1, 'CASCADE_RUN_STATUS_RUNNING', '', 0, '', 2),
+              ('mirror', '2026-11-25 12:00:00.001+00:00', 0, 1, 'CASCADE_RUN_STATUS_RUNNING', 'CORTEX_TRAJECTORY_SOURCE_CLI', 0, '', 2);
+            """
+        try seedClosedProfile(at: stores[2], schema: schema + "\n" + ideRows)
         let scanner = Scanner()
         let desktopProcess = RunningProcess(pid: 101, executablePath: "/Applications/Renamed.app/Contents/MacOS/Antigravity")
         let cliProcess = RunningProcess(pid: 102, executablePath: "agy")
+        let ideProcess = RunningProcess(pid: 103, executablePath: "/Applications/Antigravity IDE.app/Contents/MacOS/Antigravity IDE")
         scanner.replace(with: [desktopProcess, cliProcess])
         let codexSessions = root.appendingPathComponent("codex-sessions", isDirectory: true)
         try FileManager.default.createDirectory(at: codexSessions, withIntermediateDirectories: false)
@@ -79,28 +85,34 @@ enum AntigravityTaskVerification {
         let collector = try CodexRuntimeMetricsCollector(configuration: configuration, processScanner: scanner)
         let first = try await collector.scan(at: now)
         let metric = first.taskBreakdown.antigravity
-        try require(metric.totalTasks == 5 && metric.activeTasks == 2,
+        try require(metric.totalTasks == 6 && metric.activeTasks == 2,
                     "top-level task count mismatch: \(metric)")
         try require(first.taskBreakdown.antigravity.quality == .complete, "closed WAL profile should remain readable")
         try require(!FileManager.default.fileExists(atPath: stores[2].path + "-shm"),
                     "read-only scan created a sidecar for the closed profile")
-        try require(first.totalTasks == 5 && first.activeTasks == 2, "combined task counters omit Antigravity")
+        try require(first.totalTasks == 6 && first.activeTasks == 2, "combined task counters omit Antigravity")
         try verifyLegacySnapshot(first.taskBreakdown)
 
+        scanner.replace(with: [ideProcess])
+        let ideOnly = try await collector.scan(at: now.addingTimeInterval(1))
+        try require(ideOnly.taskBreakdown.antigravity.totalTasks == 6 && ideOnly.taskBreakdown.antigravity.activeTasks == 1,
+                    "a running IDE must count its own task without reviving busy Desktop or mirrored CLI tasks")
+
         try exec(desktop, "UPDATE conversation_summaries SET status='CASCADE_RUN_STATUS_IDLE' WHERE conversation_id='desktop'")
-        let changed = try await collector.scan(at: now.addingTimeInterval(1))
-        try require(changed.taskBreakdown.antigravity.activeTasks == 1, "WAL-only idle update did not invalidate the cache")
+        scanner.replace(with: [desktopProcess, cliProcess, ideProcess])
+        let changed = try await collector.scan(at: now.addingTimeInterval(2))
+        try require(changed.taskBreakdown.antigravity.activeTasks == 2, "WAL-only idle update did not invalidate the cache")
         scanner.replace(with: [desktopProcess])
-        let cliExited = try await collector.scan(at: now.addingTimeInterval(2))
-        try require(cliExited.taskBreakdown.antigravity.activeTasks == 0, "exited CLI still contributes active tasks")
+        let desktopOnly = try await collector.scan(at: now.addingTimeInterval(3))
+        try require(desktopOnly.taskBreakdown.antigravity.activeTasks == 0, "exited CLI or IDE still contributes active tasks")
 
         try FileManager.default.removeItem(at: stores[2])
-        let withoutIDE = try await collector.scan(at: now.addingTimeInterval(3))
+        let withoutIDE = try await collector.scan(at: now.addingTimeInterval(4))
         try require(withoutIDE.taskBreakdown.antigravity.quality == .complete,
                     "a missing inactive IDE profile must not degrade quality")
 
         try Data("not SQLite".utf8).write(to: stores[2])
-        let partial = try await collector.scan(at: now.addingTimeInterval(4))
+        let partial = try await collector.scan(at: now.addingTimeInterval(5))
         try require(partial.taskBreakdown.antigravity.totalTasks == 5 && partial.taskBreakdown.antigravity.quality == .partial,
                     "an unreadable Antigravity store must preserve the other stores and degrade quality")
         try require(partial.activeCountsArePartial && !partial.taskBreakdown.desktopActiveIsPartial
@@ -110,13 +122,13 @@ enum AntigravityTaskVerification {
         try FileManager.default.removeItem(at: stores[2])
         try FileManager.default.removeItem(at: stores[1])
         scanner.replace(with: [desktopProcess, cliProcess])
-        let missingCLI = try await collector.scan(at: now.addingTimeInterval(5))
+        let missingCLI = try await collector.scan(at: now.addingTimeInterval(6))
         try require(missingCLI.taskBreakdown.antigravity.totalTasks == 4
                     && missingCLI.taskBreakdown.antigravity.quality == .partial,
                     "a missing running CLI profile must preserve readable counts and degrade quality")
 
         scanner.replace(with: [])
-        let closed = try await collector.scan(at: now.addingTimeInterval(6))
+        let closed = try await collector.scan(at: now.addingTimeInterval(7))
         try require(!closed.taskBreakdown.antigravity.present && closed.taskBreakdown.antigravity.totalTasks == 0,
                     "closed Antigravity still contributes historical tasks")
     }
