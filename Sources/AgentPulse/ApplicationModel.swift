@@ -140,11 +140,10 @@ final class ApplicationModel: ObservableObject {
     let orbViewModel: OrbViewModel
     let menuBarLabelViewModel = MenuBarLabelViewModel()
 
-    /// 合并 env 的双源字段状态与写回（R2 / cliproxy / 上报简单值同源）。
-    let envSettings = EnvSettingsModel()
+    let managedSettings = ManagedSettingsModel()
     let metricsStore = MetricsStore()
     let uploadService: UploadService
-    private let tokenSyncCoordinator: TokenSyncCoordinating
+    private let tokenSyncCoordinator: TokenSyncCoordinator
     var showDashboard: (@MainActor () -> Void)?
     var showOrb: ((Bool) -> Void)?
     var showToast: ((ToastState) -> Void)?
@@ -153,13 +152,10 @@ final class ApplicationModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
 
     private init() {
-        // 合并 env 路径：R2 / cliproxy / 上报简单值统一收敛到一个 0600 文件；
-        // 历史遗留路径键平滑迁移到规范键（见 MergedEnvPreferences）。
-        let path = MergedEnvPreferences.resolvePath()
         let savedColorMode = UserDefaults.standard.string(forKey: "trendColorMode")
         let initialColorMode = TrendColorMode(rawValue: savedColorMode ?? "") ?? .risingGreen
         trendColorMode = initialColorMode
-        uploadService = UploadService(configPath: path)
+        uploadService = UploadService { [managedSettings] in managedSettings.snapshot?.r2 }
         let tokenCoordinator = TokenSyncCoordinator()
         tokenCoordinator.hostnameRenamePrompt = { old, new, decide in
             // 决策回调在主线程弹出确认框；NSAlert 需在主线程运行。
@@ -232,22 +228,9 @@ final class ApplicationModel: ObservableObject {
         metricsStore.$dashboardModelTPSHistory.sink { [weak self] in
             self?.publish($0, to: \.dashboardModelTPSHistory)
         }.store(in: &cancellables)
-        // 合并 env 路径变化：仅同步给 UploadService（路径字符串），凭证不落盘。
-        envSettings.$path
-            .dropFirst()
-            .removeDuplicates()
-            .sink { [weak self] path in
-                self?.uploadService.configPath = path
-            }
-            .store(in: &cancellables)
-        // REPORT_* 简单值由 TokenSyncCoordinator 统一写回 env 并刷新上报状态（单一写者），
-        // EnvSettingsModel 只负责回显；此处把这两个键的写回委托给 coordinator。
-        envSettings.setExternalWriter({ [weak self] value in
-            self?.setTokenIngestBaseURL(value)
-        }, for: MergedEnvKeys.reportBaseURL)
-        envSettings.setExternalWriter({ [weak self] value in
-            self?.setTokenCanonicalHostname(value)
-        }, for: MergedEnvKeys.reportCanonicalHostname)
+        managedSettings.onChange = { [weak tokenCoordinator] snapshot in
+            tokenCoordinator?.applyManagedSettings(snapshot)
+        }
         $trendColorMode
             .dropFirst()
             .removeDuplicates()
@@ -292,6 +275,7 @@ final class ApplicationModel: ObservableObject {
     func start() {
         metricsStore.start()
         tokenSyncCoordinator.start()
+        managedSettings.reload()
     }
     func stop() {
         metricsStore.stop()
@@ -341,8 +325,6 @@ final class ApplicationModel: ObservableObject {
     func setTokenCompaction(_ enabled: Bool) { tokenSyncCoordinator.setCompactionEnabled(enabled) }
     func setTokenReporting(_ enabled: Bool) { tokenSyncCoordinator.setReportingEnabled(enabled) }
     func setTokenAutoReportInterval(_ interval: TokenReportInterval) { tokenSyncCoordinator.setAutoReportInterval(interval) }
-    func setTokenCanonicalHostname(_ hostname: String) { tokenSyncCoordinator.setCanonicalHostname(hostname) }
-    func setTokenIngestBaseURL(_ url: String) { tokenSyncCoordinator.setIngestBaseURL(url) }
     func scanTokenUsageNow() { tokenSyncCoordinator.scanNow() }
     func reportTokenUsageNow() { tokenSyncCoordinator.reportNow() }
 

@@ -4,11 +4,9 @@ import AgentPulseCore
 /// 设置页的 Token 统计 / 用量上报两张深色卡片。
 struct TokenSyncSettingsSection: View {
     @ObservedObject var model: ApplicationModel
-    @ObservedObject var envSettings: EnvSettingsModel
 
     init(model: ApplicationModel) {
         self.model = model
-        self.envSettings = model.envSettings
     }
 
     var body: some View {
@@ -64,15 +62,12 @@ struct TokenSyncSettingsSection: View {
                     disabled: !model.tokenSyncStatus.localCollectionEnabled
                 )
 
-                // hostname 权威来自合并 env 的 REPORT_CANONICAL_HOSTNAME：双源可读可填，
-                // 手填经 coordinator 写回 env 并刷新上报状态（非密钥，明文回显）。
-                // 单行「标题 · ? · 值 · 编辑」，值不折行；说明进 ? 悬浮。
-                dualSourceField(
-                    "设备标识",
-                    key: MergedEnvKeys.reportCanonicalHostname,
-                    singleLine: true,
-                    help: "canonical hostname，存于合并 env，作为上报身份；改名会触发历史归属确认。"
-                )
+                SettingsRow(title: "设备标识") {
+                    Text(model.tokenSyncStatus.canonicalHostname ?? "未配置")
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
 
                 // 上次扫描合成一行：标题 + ?（历史保留说明）+ 时间 + 立即扫描按钮。
                 HStack(alignment: .center, spacing: 8) {
@@ -127,10 +122,6 @@ struct TokenSyncSettingsSection: View {
                 if !canEnableReporting {
                     SettingsFootnote(reportingDisabledReason, tone: .negative)
                 }
-
-                // API 地址权威来自合并 env 的 REPORT_BASE_URL：双源可读可填（非密钥明文），
-                // 手填经 coordinator 写回 env；填好但不自动开启上报。单行显示不折行，与其它输入框一致。
-                dualSourceField("API 地址（留空则仅本地）", key: MergedEnvKeys.reportBaseURL, singleLine: true)
 
                 HStack(spacing: 6) {
                     Image(systemName: "point.3.connected.trianglepath.dotted")
@@ -202,20 +193,6 @@ struct TokenSyncSettingsSection: View {
         }
     }
 
-    /// 构造双源字段（REPORT_* 简单值，非密钥明文；手填经 coordinator 写回 env）。
-    private func dualSourceField(_ title: String, key: String, singleLine: Bool = false, stacked: Bool = false, help: String? = nil) -> some View {
-        SettingsDualSourceField(
-            title: title,
-            isSecret: envSettings.isSecret(key),
-            source: envSettings.sourceBinding(for: key),
-            rawValue: envSettings.valueBinding(for: key),
-            displayValue: envSettings.displayValue(for: key),
-            singleLine: singleLine,
-            help: help,
-            stacked: stacked
-        )
-    }
-
     // MARK: Bindings
 
     private var localCollectionBinding: Binding<Bool> {
@@ -266,13 +243,13 @@ struct TokenSyncSettingsSection: View {
 
     private var reportingDisabledReason: String {
         if model.tokenSyncStatus.ingestBaseURL.isEmpty {
-            return "请先配置 API 地址"
+            return "1Password 中缺少上报 API 地址"
         }
         if model.tokenSyncStatus.canonicalHostname == nil {
-            return "请先配置 hostname"
+            return "1Password 中缺少设备标识"
         }
         if model.tokenSyncStatus.configurationStatus != .ready {
-            return "本地凭证配置未就绪"
+            return "1Password 配置未就绪"
         }
         return ""
     }

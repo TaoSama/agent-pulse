@@ -1,5 +1,4 @@
 import Combine
-import CryptoKit
 import Foundation
 import AgentPulseCore
 import AgentPulseReporting
@@ -29,18 +28,17 @@ private struct ScanProgressUpdate: Sendable {
 /// 扫描（record 原始 token + session 事件）→ 按需 rebuild → finalizeDerived → summary →
 /// 上报资格门禁 → 可选普通上报。
 ///
-/// canonical hostname 以 0600 reporting.json 配置为“上报权威”，每次刷新时读取；
+/// canonical hostname 以 1Password 加载的内存配置为上报权威；
 /// 配置缺失仍允许纯本地采集（用用户保存的本地 hostname），但绝不 fallback 到
 /// Host.current / local。配置就绪时，本地 hostname 必须与配置权威对齐，否则重建或明确阻止。
 ///
-/// 未开启上报、未配置 API 地址，或本地 reporting.json 缺失时，不会创建网络
+/// 未开启上报、未配置 API 地址，或托管配置尚未加载时，不会创建上报网络
 /// 请求，也不会启动取 token 的外部进程。
 @MainActor
 final class TokenSyncCoordinator: TokenSyncCoordinating {
     private enum DefaultsKey {
         static let localCollectionEnabled = "tokenSync.localCollectionEnabled"
         static let reportingEnabled = "tokenSync.reportingEnabled"
-        static let ingestBaseURL = "tokenSync.ingestBaseURL"
         static let canonicalHostname = "tokenSync.canonicalHostname"
         static let autoReportInterval = "tokenSync.autoReportIntervalSeconds"
         static let lastScanAt = "tokenSync.lastScanAt"
@@ -61,11 +59,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     private var networkGeneration: UInt64 = 0
     private var reportAfterNetworkCollection = false
     private let configurationURL: URL
-    /// 合并 env 文件（凭证 + 上报简单值 REPORT_BASE_URL / REPORT_CANONICAL_HOSTNAME 的单一来源）。
-    private let mergedEnvURL: URL
-    private let reporter: TokenUsageReporter
-    /// cliproxyapi 主动拉取采集服务；配置缺失/失败时跳过，不影响本地文件采集。
-    private let cliProxyService: CliProxyUsageService
+    /// 仅供显式注入的离线验证兼容旧 fixture；生产启动不读取 env。
+    private let legacyEnvURL: URL?
+    private var reporter: TokenUsageReporter
+    private var managedSettings: ManagedSettingsSnapshot?
+    private var managedSettingsLoaded = false
+    private var rescanAfterManagedSettingsLoad = false
+    private let asterService = AsterUsageService()
     private let usageSummaryCalendar: Calendar
     /// 可选本地采集来源配置文件（owner-only 0600），独立于 reporting.json。
     /// 缺失/非法不影响内建来源采集。
@@ -130,7 +130,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         defaults: UserDefaults = .standard,
         configurationURL: URL = TokenSyncCoordinator.defaultConfigurationURL(),
         reporter: TokenUsageReporter? = nil,
-        cliProxyService: CliProxyUsageService = CliProxyUsageService(),
         usageSummaryCalendar: Calendar = .autoupdatingCurrent,
         ledgerFactory: (@Sendable () throws -> UsageLedgerStore)? = nil,
         scanRoots: [UsageScanRoot]? = nil,
@@ -140,14 +139,18 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
     ) {
         self.defaults = defaults
         self.configurationURL = configurationURL
-        // 合并 env 路径：上报的 hostname / base URL 等简单值收敛到此文件（凭证同源）。
-        let mergedEnvPath = MergedEnvKeys.resolvePath(saved: defaults.string(forKey: MergedEnvPreferences.pathDefaultsKey))
-        self.mergedEnvURL = URL(fileURLWithPath: (mergedEnvPath as NSString).expandingTildeInPath)
-        // reporter 默认注入「合成 loader」：解码 reporting.json 纯协议结构后，把 canonicalHostname
-        // 覆盖为合并 env 的值——reporting.json 只留协议结构，hostname 权威来自 env。测试可显式注入 reporter。
-        let effectiveReporter = reporter ?? TokenSyncCoordinator.makeEnvBackedReporter(envURL: self.mergedEnvURL)
+        let legacyEnvURL: URL?
+        if reporter != nil || ledgerFactory != nil {
+            let path = MergedEnvKeys.resolvePath(saved: defaults.string(forKey: MergedEnvPreferences.pathDefaultsKey))
+            legacyEnvURL = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        } else {
+            legacyEnvURL = nil
+        }
+        self.legacyEnvURL = legacyEnvURL
+        let effectiveReporter = reporter ?? TokenUsageReporter(configurationLoader: { _ in
+            throw TokenUsageReporterError.configurationMissing
+        })
         self.reporter = effectiveReporter
-        self.cliProxyService = cliProxyService
         self.usageSummaryCalendar = usageSummaryCalendar
         self.localCollectionURL = TokenSyncCoordinator.defaultLocalCollectionURL()
         self.ledgerFactory = ledgerFactory
@@ -167,12 +170,13 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let persistedLastReportAt = defaults.object(forKey: DefaultsKey.lastReportAt) as? Date
         let persistedLastReportSucceeded = defaults.object(forKey: DefaultsKey.lastReportSucceeded) as? Bool
         self.autoReportInterval = reportInterval
-        // base URL 权威改为合并 env 的 REPORT_BASE_URL；env 缺失时回落到旧 UserDefaults 值（平滑迁移）。
-        let baseURL = Self.envBaseURL(url: self.mergedEnvURL) ?? (defaults.string(forKey: DefaultsKey.ingestBaseURL) ?? "")
+        let baseURL = legacyEnvURL.flatMap(Self.envBaseURL) ?? ""
         let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
 
-        // 配置权威：hostname 以合并 env 的 REPORT_CANONICAL_HOSTNAME 为准；配置未就绪时为空。
-        let authority = Self.configurationAuthority(reporter: effectiveReporter, url: configurationURL, envURL: self.mergedEnvURL)
+        // 生产启动先保留本地身份，待 1Password 配置加载后刷新权威。
+        let authority = legacyEnvURL.map {
+            Self.legacyConfigurationAuthority(reporter: effectiveReporter, url: configurationURL, envURL: $0)
+        } ?? ConfigurationAuthority(hostname: "", status: .missing, errorText: "正在从 1Password 加载配置")
         // 上报所用 hostname 权威优先；否则回落到用户保存的本地 hostname（仅用于本地采集）。
         let effectiveHostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
 
@@ -180,8 +184,8 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         summarySubject = CurrentValueSubject(.empty)
 
         let canReport = !baseURL.isEmpty && !effectiveHostname.isEmpty && authority.status == .ready
-        let reporting = canReport ? storedReporting : false
-        if storedReporting && !canReport {
+        let reporting = legacyEnvURL == nil ? storedReporting : canReport && storedReporting
+        if legacyEnvURL != nil && storedReporting && !canReport {
             // 配置已失效时持久化关闭，避免配置日后恢复后自动“复活”上报。
             defaults.set(false, forKey: DefaultsKey.reportingEnabled)
         }
@@ -359,11 +363,16 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         startAutoLoopIfNeeded()
     }
 
-    /// 保存上报 base URL：权威落在合并 env 的 REPORT_BASE_URL（0600 写回），不写 UserDefaults。
+    /// 兼容注入验证的旧设置接口；生产配置只能从 1Password 刷新。
     func setIngestBaseURL(_ url: String) {
+        guard let legacyEnvURL else { return }
         let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 写回合并 env（空串表示清除该键）；写回失败仅记状态，不阻断 UI。
-        try? EnvFile.writeBack([MergedEnvKeys.reportBaseURL: trimmed], to: mergedEnvURL)
+        do {
+            try EnvFile.writeBack([MergedEnvKeys.reportBaseURL: trimmed], to: legacyEnvURL)
+        } catch {
+            updateStatus { $0.configurationError = "配置保存失败" }
+            return
+        }
         var stopAutoLoop = false
         updateStatus { status in
             status.ingestBaseURL = trimmed
@@ -379,13 +388,18 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
     }
 
-    /// 保存上报 canonical hostname：权威落在合并 env 的 REPORT_CANONICAL_HOSTNAME（0600 写回），
-    /// 不写 UserDefaults。写回后以 env 权威刷新状态。
+    /// 兼容注入验证的旧设置接口；生产配置只能从 1Password 刷新。
     func setCanonicalHostname(_ hostname: String) {
+        guard let legacyEnvURL else { return }
         let trimmed = Self.normalize(hostname)
-        try? EnvFile.writeBack([MergedEnvKeys.reportCanonicalHostname: trimmed], to: mergedEnvURL)
+        do {
+            try EnvFile.writeBack([MergedEnvKeys.reportCanonicalHostname: trimmed], to: legacyEnvURL)
+        } catch {
+            updateStatus { $0.configurationError = "配置保存失败" }
+            return
+        }
         refreshConfigurationAuthority()
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL, envURL: mergedEnvURL)
+        let authority = configurationAuthority()
         // env 权威优先；env 缺失时采用刚写入的值（trim 归一化后一致）。
         let effective = authority.hostname.isEmpty ? trimmed : authority.hostname
         var stopAutoLoop = false
@@ -413,7 +427,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         guard ledger == nil, initializationTask == nil else { return }
         initializeLedger(
             storedHostname: Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? ""),
-            authorityHostname: Self.envCanonicalHostname(url: mergedEnvURL)
+            authorityHostname: configurationAuthority().hostname
         )
     }
 
@@ -427,7 +441,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         refreshConfigurationAuthority()
 
         // 解析有效 hostname：配置权威优先，否则用户保存的本地 hostname。绝不 fallback Host.current。
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL, envURL: mergedEnvURL)
+        let authority = configurationAuthority()
         let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
         let hostname = authority.hostname.isEmpty ? storedHostname : authority.hostname
         guard !hostname.isEmpty else {
@@ -712,73 +726,37 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
     }
 
-    /// Network collection has its own lifetime: local discovery, parsing and publication can
-    /// finish while a CPA is slow. Reporting waits for both operations when explicitly chained.
+    /// 网络采集独立于本地扫描；串联上报同时等待两者完成。
     private func startNetworkCollection(hostname: String) {
-        guard networkTask == nil, let ledger else { return }
-        let service = cliProxyService
-        let configPath = Self.cliProxyConfigPath(defaults: defaults)
+        guard networkTask == nil, let ledger, let settings = managedSettings else { return }
+        let service = asterService
         let calendar = usageSummaryCalendar
         networkGeneration &+= 1
         let generation = networkGeneration
+        updateStatus {
+            $0.asterConfigured = true
+            $0.asterSourceCount = 1
+            $0.asterError = nil
+        }
         networkTask = Task { [weak self] in
             do {
-                let prepared = await Self.runOffMain(queue: Self.networkWorkerQueue) { gate in
-                    try gate.throwIfCancelled()
-                    let identities = CliProxyUsageService.configuredSourceIdentities(atPath: configPath)
-                    return try ledger.cliProxyCollectionStates(identities: identities, hostname: hostname)
-                }
-                let states = try prepared.get()
-                try Task.checkCancellation()
-                if states.isEmpty {
-                    guard let self, generation == self.networkGeneration else { return }
-                    self.updateStatus {
-                        $0.cliProxyConfigured = false
-                        $0.cliProxySourceCount = 0
-                        $0.cliProxyError = nil
-                    }
-                    self.finishNetworkCollection(generation: generation)
-                    return
-                }
-                guard let self, generation == self.networkGeneration else { return }
-                self.updateStatus {
-                    $0.cliProxyConfigured = true
-                    $0.cliProxySourceCount = states.count
-                    $0.cliProxyError = nil
-                }
-                let collected = try await service.collectUsage(atPath: configPath, statesByIdentity: states)
+                let eventCount = try await service.collect(
+                    managementKey: settings.asterManagementKey, ledger: ledger, hostname: hostname
+                )
                 let committed = await Self.runOffMain(queue: Self.networkWorkerQueue) { gate in
-                    var committedStates = states
-                    for collection in collected.collections {
-                        try gate.throwIfCancelled()
-                        committedStates[collection.identity] = try ledger.commitCliProxyCollection(
-                            collection, hostname: hostname, checkCancellation: gate.throwIfCancelled
-                        )
-                        try collection.removeStaging()
-                    }
                     try gate.throwIfCancelled()
-                    let finalStates = Array(committedStates.values)
-                    guard collected.collections.contains(where: { $0.eventCount > 0 }),
+                    guard eventCount > 0,
                           try !Self.isRebuildCompletionPending(ledger: ledger) else {
-                        return NetworkCollectionOutcome(states: finalStates, snapshot: nil)
+                        return Optional<NetworkSnapshot>.none
                     }
-                    let snapshot = NetworkSnapshot(
+                    return NetworkSnapshot(
                         summary: try Self.summaries(from: ledger, containing: Date(), calendar: calendar),
                         pending: try ledger.pendingCounts(hostname: hostname)
                     )
-                    return NetworkCollectionOutcome(states: finalStates, snapshot: snapshot)
                 }
-                let outcome = try committed.get()
-                guard generation == self.networkGeneration, !Task.isCancelled else { return }
-                self.updateStatus {
-                    $0.cliProxyConfigured = collected.sourceCount > 0
-                    $0.cliProxySourceCount = collected.sourceCount
-                    $0.cliProxyError = CliProxyCollectionPresentation.diagnostic(
-                        states: outcome.states, failedSourceCount: collected.failedSourceCount,
-                        sourceCount: collected.sourceCount
-                    )
-                }
-                if let snapshot = outcome.snapshot, self.publish(snapshot.summary) {
+                let snapshot = try committed.get()
+                guard let self, generation == self.networkGeneration, !Task.isCancelled else { return }
+                if let snapshot, self.publish(snapshot.summary) {
                     self.updateStatus {
                         $0.pendingBuckets = snapshot.pending.buckets
                         $0.pendingSessions = snapshot.pending.sessions
@@ -789,7 +767,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 // Cancellation only ends this collection; existing durable usage is retained.
             } catch {
                 guard let self, generation == self.networkGeneration else { return }
-                self.updateStatus { $0.cliProxyError = "CPA 采集失败，下轮自动重试" }
+                self.updateStatus { $0.asterError = "Aster 采集失败，下轮自动重试" }
             }
             self?.finishNetworkCollection(generation: generation)
         }
@@ -803,7 +781,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         if shouldReport, status.reportingEnabled {
             if scanTask != nil { reportAfterCurrentScan = true }
             else { reportNow() }
-        } else if status.reportingInProgress, status.scanPhase == .cliproxy, reportTask == nil {
+        } else if status.reportingInProgress, status.scanPhase == .aster, reportTask == nil {
             updateStatus { status in
                 status.reportingInProgress = false
                 Self.clearScanProgress(&status)
@@ -871,6 +849,11 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     status.pendingSessions = outcome.pending.sessions
                 }
             }
+            if rescanAfterManagedSettingsLoad {
+                rescanAfterManagedSettingsLoad = false
+                scanNow(chainedReport: chainedReport || reportAfterCurrentScan)
+                return
+            }
             // rebuild pending 恢复路径：本次扫描已完整跑完全部来源（无致命失败），
             // 且 off-main 已在 finalize 后清除 pending。此处确认已清除后再恢复正常启动链路
             // （恢复上报）。若因某种原因仍未清除，则保持 pending、绝不发网络请求。
@@ -936,7 +919,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
             return
         }
         // 上报 hostname 以配置权威为准。
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL, envURL: mergedEnvURL)
+        let authority = configurationAuthority()
         guard !authority.hostname.isEmpty else {
             updateStatus { $0.reportingError = "hostname 未配置，禁止上报" }
             return
@@ -997,19 +980,19 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         }
     }
 
-    /// 本地文件扫描完成后，如果 CPA 网络采集仍在收尾，上报会等待它。
+    /// 本地文件扫描完成后，如果 Aster 网络采集仍在收尾，上报会等待它。
     /// 继续复用现有 scan progress 字段，避免菜单栏看起来已经空闲或卡住。
     private func publishDeferredNetworkReportProgress() {
         updateStatus { status in
             status.reportingInProgress = true
             status.reportingError = nil
-            status.scanPhase = .cliproxy
+            status.scanPhase = .aster
             status.scanDone = 0
-            status.scanTotal = max(0, status.cliProxySourceCount)
+            status.scanTotal = max(0, status.asterSourceCount)
             status.scanProgress = max(status.scanProgress ?? 0, 0.95)
-            status.scanDetailText = status.cliProxySourceCount > 0
-                ? "等待 CPA 采集完成（\(status.cliProxySourceCount) 个来源）"
-                : "等待 CPA 采集完成"
+            status.scanDetailText = status.asterSourceCount > 0
+                ? "等待 Aster 采集完成（\(status.asterSourceCount) 个来源）"
+                : "等待 Aster 采集完成"
         }
     }
 
@@ -1118,6 +1101,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         autoLoopTask?.cancel()
         autoLoopTask = nil
         reportAfterCurrentScan = false
+        rescanAfterManagedSettingsLoad = false
         networkTask?.cancel()
         networkTask = nil
         networkGeneration &+= 1
@@ -1182,6 +1166,33 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     // MARK: - Configuration authority
 
+    /// 配置只在内存中驻留；生产 reporter 的 loader 不再访问本地配置文件。
+    func applyManagedSettings(_ settings: ManagedSettingsSnapshot?) {
+        managedSettings = settings
+        managedSettingsLoaded = true
+        if let settings {
+            let configuration = settings.reporting
+            reporter = TokenUsageReporter(configurationLoader: { _ in configuration })
+        } else {
+            reporter = TokenUsageReporter(configurationLoader: { _ in
+                throw TokenUsageReporterError.configurationMissing
+            })
+        }
+        updateStatus {
+            $0.asterConfigured = settings != nil
+            $0.asterSourceCount = settings == nil ? 0 : 1
+            $0.asterError = nil
+        }
+        refreshConfigurationAuthority()
+        guard settings != nil, isRunning, initializationTask == nil else { return }
+        if scanTask != nil {
+            // 当前扫描可能已越过网络采集起点；完整完成后再以新配置启动增量扫描。
+            rescanAfterManagedSettingsLoad = true
+        } else {
+            beginStartup()
+        }
+    }
+
     private struct ConfigurationAuthority {
         let hostname: String
         let status: TokenReportingConfigurationStatus
@@ -1210,20 +1221,28 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let pending: (buckets: Int, sessions: Int)
     }
 
-    private struct NetworkCollectionOutcome: Sendable {
-        let states: [CliProxyCollectionState]
-        let snapshot: NetworkSnapshot?
-    }
-
     private struct DaySeriesSnapshot: Sendable {
         let revision: Int64
         let series: DashboardDaySeries
     }
 
-    /// 读取上报权威：hostname 来自合并 env 的 REPORT_CANONICAL_HOSTNAME；配置就绪状态走注入了
-    /// env-hostname 的 reporter.configurationStatus（reporting.json 只提供纯协议结构）。
-    /// 配置缺失 / env-hostname 空时 hostname 为空，但仍允许纯本地采集。
-    private static func configurationAuthority(
+    private func configurationAuthority() -> ConfigurationAuthority {
+        if let settings = managedSettings {
+            let status = reporter.configurationStatus(for: configurationURL)
+            return ConfigurationAuthority(
+                hostname: Self.normalize(settings.reporting.canonicalHostname),
+                status: status, errorText: Self.errorText(for: status)
+            )
+        }
+        if let legacyEnvURL {
+            return Self.legacyConfigurationAuthority(reporter: reporter, url: configurationURL, envURL: legacyEnvURL)
+        }
+        return ConfigurationAuthority(hostname: "", status: .missing,
+            errorText: managedSettingsLoaded ? "1Password 配置未就绪" : "正在从 1Password 加载配置")
+    }
+
+    /// 仅保留显式依赖注入时的旧验证入口。
+    private static func legacyConfigurationAuthority(
         reporter: TokenUsageReporter,
         url: URL,
         envURL: URL
@@ -1231,17 +1250,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let status = reporter.configurationStatus(for: url)
         let hostname = envCanonicalHostname(url: envURL)
         return ConfigurationAuthority(hostname: hostname, status: status, errorText: errorText(for: status))
-    }
-
-    /// 构造 env 支撑的 reporter：注入 configurationLoader，把 reporting.json 解码为纯协议结构后，
-    /// 用合并 env 的 REPORT_CANONICAL_HOSTNAME 覆盖 canonicalHostname，使 reporter 内部围栏/就绪判定
-    /// 均以 env hostname 为准，reporting.json 无需再携带 hostname 权威。
-    private static func makeEnvBackedReporter(envURL: URL) -> TokenUsageReporter {
-        TokenUsageReporter(configurationLoader: { configURL in
-            var configuration = try TokenUsageReporter.loadConfiguration(from: configURL)
-            configuration.canonicalHostname = envCanonicalHostname(url: envURL)
-            return configuration
-        })
     }
 
     /// 从合并 env 读取并归一化 REPORT_CANONICAL_HOSTNAME；文件缺失/非法/键缺失时返回空串。
@@ -1261,19 +1269,23 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     /// 刷新配置状态与权威 hostname / base URL 到 UI；配置就绪但 baseURL/hostname 缺失时禁用上报。
     private func refreshConfigurationAuthority() {
-        let authority = Self.configurationAuthority(reporter: reporter, url: configurationURL, envURL: mergedEnvURL)
+        let authority = configurationAuthority()
         let storedHostname = Self.normalize(defaults.string(forKey: DefaultsKey.canonicalHostname) ?? "")
         let effective = authority.hostname.isEmpty ? storedHostname : authority.hostname
-        // base URL 权威同为合并 env；env 缺失时保留当前 status（可能来自旧 UserDefaults 迁移值）。
-        let envBaseURL = Self.envBaseURL(url: mergedEnvURL)
+        let baseURL: String
+        if let settings = managedSettings {
+            baseURL = settings.reportingBaseURL?.absoluteString ?? ""
+        } else {
+            baseURL = legacyEnvURL.flatMap(Self.envBaseURL) ?? ""
+        }
         var stopAutoLoop = false
         updateStatus { status in
             status.configurationStatus = Self.presentationStatus(authority.status)
             status.configurationError = authority.errorText
             status.canonicalHostname = effective.isEmpty ? nil : effective
-            if let envBaseURL { status.ingestBaseURL = envBaseURL }
+            status.ingestBaseURL = baseURL
             let canReport = !status.ingestBaseURL.isEmpty && !effective.isEmpty && authority.status == .ready
-            if !canReport && status.reportingEnabled {
+            if !canReport && status.reportingEnabled && (self.managedSettingsLoaded || self.legacyEnvURL != nil) {
                 status.reportingEnabled = false
                 self.defaults.set(false, forKey: DefaultsKey.reportingEnabled)
                 stopAutoLoop = true
@@ -1309,13 +1321,6 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
 
     private static func normalize(_ value: String) -> String {
         CanonicalHostname.normalize(value)
-    }
-
-    /// 解析 cliproxy 配置路径：UserDefaults 只存路径（不含凭证），为空回退默认。
-    private static func cliProxyConfigPath(defaults: UserDefaults) -> String {
-        CliProxyUsageService.resolveConfigPath(
-            saved: defaults.string(forKey: CliProxyUsageService.configPathDefaultsKey)
-        )
     }
 
     nonisolated private static var codexSessionsRoot: URL {

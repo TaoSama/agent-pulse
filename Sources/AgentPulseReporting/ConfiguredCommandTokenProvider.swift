@@ -76,7 +76,13 @@ public struct ProcessResult: Sendable, Equatable {
 /// diagnostics may echo token material.
 public struct SubprocessRunner: ProcessRunning {
     private static let defaultSystemPath = "/usr/bin:/bin:/usr/sbin:/sbin"
-    public init() {}
+    private let environmentOverrides: [String: String]
+
+    public init() { self.init(environmentOverrides: [:]) }
+
+    public init(environmentOverrides: [String: String]) {
+        self.environmentOverrides = environmentOverrides
+    }
 
     public static func helperEnvironment(executable: String, inherited: [String: String]) -> [String: String] {
         var environment = inherited
@@ -93,7 +99,8 @@ public struct SubprocessRunner: ProcessRunning {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        process.environment = Self.helperEnvironment(executable: executable, inherited: ProcessInfo.processInfo.environment)
+        let environment = ProcessInfo.processInfo.environment.merging(environmentOverrides) { _, override in override }
+        process.environment = Self.helperEnvironment(executable: executable, inherited: environment)
 
         let stdoutPipe = Pipe()
         process.standardOutput = stdoutPipe

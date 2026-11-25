@@ -193,6 +193,47 @@ final class CoordinatorRecoveryTests: XCTestCase {
         XCTAssertFalse(coordinator.status.reportingEnabled)
     }
 
+    func testManagedConfigurationOverridesLegacyEnvironmentWithoutReadingProtocolFile() throws {
+        let fixture = try makeFixture()
+        let coordinator = makeCoordinator(fixture, clock: CoordinatorTestClock())
+        defer { coordinator.stop() }
+        let configuration = try CoordinatorTestConfiguration(hostname: Self.hostname).load()
+        let baseURL = try XCTUnwrap(URL(string: "https://managed.invalid"))
+
+        coordinator.applyManagedSettings(ManagedSettingsSnapshot(
+            reportingBaseURL: baseURL, reporting: configuration,
+            asterManagementKey: "fixture-management-key", r2: nil
+        ))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("reporting.json").path))
+        XCTAssertEqual(coordinator.status.configurationStatus, .ready)
+        XCTAssertEqual(coordinator.status.ingestBaseURL, baseURL.absoluteString)
+        XCTAssertEqual(coordinator.status.canonicalHostname, Self.hostname)
+        XCTAssertTrue(coordinator.status.asterConfigured)
+        XCTAssertEqual(coordinator.status.asterSourceCount, 1)
+        XCTAssertFalse(coordinator.status.reportingEnabled, "loading valid credentials must not opt in to reporting")
+    }
+
+    func testManagedConfigurationWithoutReportingURLKeepsCollectionConfigured() throws {
+        let fixture = try makeFixture()
+        let coordinator = makeCoordinator(fixture, clock: CoordinatorTestClock())
+        defer { coordinator.stop() }
+        let configuration = try CoordinatorTestConfiguration(hostname: Self.hostname).load()
+
+        coordinator.applyManagedSettings(ManagedSettingsSnapshot(
+            reportingBaseURL: nil, reporting: configuration,
+            asterManagementKey: "fixture-management-key", r2: nil
+        ))
+        coordinator.setReportingEnabled(true)
+
+        XCTAssertTrue(coordinator.status.asterConfigured)
+        XCTAssertEqual(coordinator.status.canonicalHostname, Self.hostname)
+        XCTAssertEqual(coordinator.status.ingestBaseURL, "")
+        XCTAssertFalse(coordinator.status.reportingEnabled)
+        XCTAssertEqual(coordinator.status.reportingError, "配置未就绪，无法启用上报")
+        XCTAssertTrue(coordinator.status.localCollectionEnabled)
+    }
+
     func testChangingIntervalDoesNotWaitForBusyLedgerQueueOnMainActor() async throws {
         let fixture = try makeFixture()
         try FileManager.default.createDirectory(at: fixture.sourceRoot, withIntermediateDirectories: false)
