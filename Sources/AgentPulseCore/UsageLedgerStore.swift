@@ -320,6 +320,16 @@ public final class UsageLedgerStore: @unchecked Sendable {
     public func recordNetworkEvents(_ events: [UsageEvent], source: String, hostname: String) throws {
         guard !events.isEmpty else { return }
         guard events.allSatisfy({ $0.source == source }) else { throw UsageLedgerError.invalidCheckpoint }
+        try queue.sync {
+            try transaction {
+                try recordNetworkEventsUnlocked(events, source: source, hostname: hostname)
+            }
+        }
+    }
+
+    func recordNetworkEventsUnlocked(_ events: [UsageEvent], source: String, hostname: String) throws {
+        guard !events.isEmpty else { return }
+        guard events.allSatisfy({ $0.source == source }) else { throw UsageLedgerError.invalidCheckpoint }
         let fileID = "network\u{1}\(source)"
         let checkpoint = UsageFileCheckpoint(
             fileID: fileID,
@@ -331,18 +341,14 @@ public final class UsageLedgerStore: @unchecked Sendable {
             parserVersion: Int(Self.networkParserVersion),
             status: "complete"
         )
-        try queue.sync {
-            try transaction {
-                let frozen = try frozenBeforeMsUnlocked(hostname)
-                let keptEvents = frozen > 0 ? events.filter { millis($0.timestamp) >= frozen } : events
-                let previousBuckets = try networkPreviousBucketEventsUnlocked(keptEvents, source: source, hostname: hostname)
-                try insertRawEvents(keptEvents, fileID: fileID, hostname: hostname)
-                try writeCheckpoint(checkpoint)
-                try recomputeNetworkBucketsUnlocked(events: keptEvents + previousBuckets, source: source, hostname: hostname)
-                if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
-                    try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
-                }
-            }
+        let frozen = try frozenBeforeMsUnlocked(hostname)
+        let keptEvents = frozen > 0 ? events.filter { millis($0.timestamp) >= frozen } : events
+        let previousBuckets = try networkPreviousBucketEventsUnlocked(keptEvents, source: source, hostname: hostname)
+        try insertRawEvents(keptEvents, fileID: fileID, hostname: hostname)
+        try writeCheckpoint(checkpoint)
+        try recomputeNetworkBucketsUnlocked(events: keptEvents + previousBuckets, source: source, hostname: hostname)
+        if try readTextUnlocked(key: Self.canonicalHostnameKey) == nil {
+            try setTextUnlocked(key: Self.canonicalHostnameKey, value: hostname)
         }
     }
 
@@ -5156,7 +5162,8 @@ public final class UsageLedgerStore: @unchecked Sendable {
     private func reportingEligibleKey(_ hostname: String) -> String { "reporting_eligible\u{1}\(hostname)" }
     /// 冻结水位线（per-hostname）：早于该毫秒边界（对齐 30 分钟 bucket）的 bucket/session 视为已固化。
     /// 单调不减、永不回退；其原始行可被 compact 删除以省磁盘，派生行保留供本地看总数。
-    private func frozenBeforeKey(_ hostname: String) -> String { "frozen_before_ms\u{1}\(hostname)" }
+    static let frozenBeforeKeyPrefix = "frozen_before_ms\u{1}"
+    private func frozenBeforeKey(_ hostname: String) -> String { Self.frozenBeforeKeyPrefix + hostname }
 
     /// 读取某 hostname 的冻结水位线（毫秒）；未设置返回 0（无冻结）。
     func frozenBeforeMsUnlocked(_ hostname: String) throws -> Int64 {

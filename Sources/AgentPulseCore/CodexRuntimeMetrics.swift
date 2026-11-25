@@ -26,6 +26,7 @@ public enum RuntimeTaskCategory: String, Codable, Sendable, Equatable, CaseItera
     case codexCLI
     case claudeCLI
     case claudeDesktop
+    case antigravity
 }
 
 /// 单类运行时 task 的当前计数。`present` 表示该类当前是否有已打开的 task，
@@ -61,17 +62,31 @@ public struct RuntimeTaskBreakdown: Codable, Sendable, Equatable {
     public let codexCLI: RuntimeTaskCategoryMetric
     public let claudeCLI: RuntimeTaskCategoryMetric
     public let claudeDesktop: RuntimeTaskCategoryMetric
+    public let antigravity: RuntimeTaskCategoryMetric
 
     public init(
         codexDesktop: RuntimeTaskCategoryMetric,
         codexCLI: RuntimeTaskCategoryMetric,
         claudeCLI: RuntimeTaskCategoryMetric,
-        claudeDesktop: RuntimeTaskCategoryMetric
+        claudeDesktop: RuntimeTaskCategoryMetric,
+        antigravity: RuntimeTaskCategoryMetric = .unavailable
     ) {
         self.codexDesktop = codexDesktop
         self.codexCLI = codexCLI
         self.claudeCLI = claudeCLI
         self.claudeDesktop = claudeDesktop
+        self.antigravity = antigravity
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            codexDesktop: try values.decode(RuntimeTaskCategoryMetric.self, forKey: .codexDesktop),
+            codexCLI: try values.decode(RuntimeTaskCategoryMetric.self, forKey: .codexCLI),
+            claudeCLI: try values.decode(RuntimeTaskCategoryMetric.self, forKey: .claudeCLI),
+            claudeDesktop: try values.decode(RuntimeTaskCategoryMetric.self, forKey: .claudeDesktop),
+            antigravity: try values.decodeIfPresent(RuntimeTaskCategoryMetric.self, forKey: .antigravity) ?? .unavailable
+        )
     }
 
     public static let unavailable = RuntimeTaskBreakdown(
@@ -152,6 +167,7 @@ public struct CodexRuntimeMetricsConfiguration: Sendable, Equatable {
     public let automationRoots: [String]
     public let claudeSessionsDirectory: URL
     public let claudeProjectsDirectory: URL
+    public let antigravitySummaryDatabases: [URL]
     public let databaseURL: URL
 
     public init(
@@ -163,13 +179,15 @@ public struct CodexRuntimeMetricsConfiguration: Sendable, Equatable {
             .resolvingSymlinksInPath(),
         claudeProjectsDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/projects", isDirectory: true)
-            .resolvingSymlinksInPath()
+            .resolvingSymlinksInPath(),
+        antigravitySummaryDatabases: [URL] = []
     ) {
         self.sessionsDirectories = sessionsDirectories
         self.automationRoots = automationRoots
         self.databaseURL = databaseURL
         self.claudeSessionsDirectory = claudeSessionsDirectory.resolvingSymlinksInPath().standardizedFileURL
         self.claudeProjectsDirectory = claudeProjectsDirectory.resolvingSymlinksInPath().standardizedFileURL
+        self.antigravitySummaryDatabases = antigravitySummaryDatabases
     }
 
     public static func live(fileManager: FileManager = .default) throws -> CodexRuntimeMetricsConfiguration {
@@ -186,8 +204,13 @@ public struct CodexRuntimeMetricsConfiguration: Sendable, Equatable {
                 .resolvingSymlinksInPath(),
             claudeProjectsDirectory: fileManager.homeDirectoryForCurrentUser
                 .appendingPathComponent(".claude/projects", isDirectory: true)
-                .resolvingSymlinksInPath()
+                .resolvingSymlinksInPath(),
+            antigravitySummaryDatabases: defaultAntigravitySummaryDatabases(home: fileManager.homeDirectoryForCurrentUser)
         )
+    }
+
+    public static func defaultAntigravitySummaryDatabases(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> [URL] {
+        AntigravityTaskScanner.databaseURLs(home: home)
     }
 
     public static func defaultDatabaseURL(fileManager: FileManager = .default) throws -> URL {
@@ -486,6 +509,7 @@ public actor CodexRuntimeMetricsCollector {
     private var cachedCodexEnumerationFailed = false
     private var cachedTokenEnumerationFailed = false
     private var claudeDesktopFiles: [URL] = []
+    private var antigravityTasks = AntigravityTaskScanner()
     private var claudeDesktopFileCache: [String: ClaudeDesktopFileCacheEntry] = [:]
     private var claudeDesktopBytesRead = 0
     private var runtimeJSONRecordsDecoded = 0
@@ -594,6 +618,7 @@ public actor CodexRuntimeMetricsCollector {
         let codexCLIMetric: RuntimeTaskCategoryMetric
         let claudeCLIMetric: RuntimeTaskCategoryMetric
         let claudeDesktopMetric: RuntimeTaskCategoryMetric
+        let antigravityMetric: RuntimeTaskCategoryMetric
         let processScanFailed: Bool
         let desktopTotal = accumulator.desktopTasks.count
         let desktopActive = activeSessionCount(in: accumulator.desktopTasks, now: sampledAt)
@@ -648,30 +673,40 @@ public actor CodexRuntimeMetricsCollector {
                 desktopRunning: claudeDesktopRunning,
                 now: sampledAt
             )
+            antigravityMetric = antigravityTasks.scan(
+                databases: configuration.antigravitySummaryDatabases,
+                processes: processes,
+                now: sampledAt
+            )
             processScanFailed = false
         } catch {
             codexCLIMetric = .unavailable
             claudeCLIMetric = .unavailable
             claudeDesktopMetric = .unavailable
+            antigravityMetric = .unavailable
             processScanFailed = true
         }
         let breakdown = RuntimeTaskBreakdown(
             codexDesktop: desktopMetric,
             codexCLI: codexCLIMetric,
             claudeCLI: claudeCLIMetric,
-            claudeDesktop: claudeDesktopMetric
+            claudeDesktop: claudeDesktopMetric,
+            antigravity: antigravityMetric
         )
         let totalTasks = sumAvailable([
             desktopMetric.totalTasks,
             codexCLIMetric.totalTasks,
             claudeCLIMetric.totalTasks,
             claudeDesktopMetric.totalTasks,
+            // An unreadable optional Antigravity store makes this a lower bound.
+            antigravityMetric.totalTasks ?? 0,
         ])
         let activeTasks = sumAvailable([
             desktopMetric.activeTasks,
             codexCLIMetric.activeTasks,
             claudeCLIMetric.activeTasks,
             claudeDesktopMetric.activeTasks,
+            antigravityMetric.activeTasks ?? 0,
         ])
         let terminalActive = sumAvailable([
             codexCLIMetric.activeTasks,
@@ -702,7 +737,7 @@ public actor CodexRuntimeMetricsCollector {
             desktopActive: desktopMetric.activeTasks,
             terminalActive: terminalActive,
             activeCountsArePartial: processScanFailed
-                || [desktopMetric, codexCLIMetric, claudeCLIMetric, claudeDesktopMetric]
+                || [desktopMetric, codexCLIMetric, claudeCLIMetric, claudeDesktopMetric, antigravityMetric]
                 .contains(where: { $0.quality != .complete }),
             completed: CompletedTaskMetric(
                 value: accumulator.completedIdentities.count,

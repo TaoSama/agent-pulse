@@ -17,13 +17,13 @@
 
 ## ✨ 功能亮点
 
-- **四类 task 分类统计**：Codex Desktop、Codex CLI、Claude CLI、Claude Desktop 的 total / active 分别统计，界面同时展示汇总结果。
+- **任务分类统计**：Codex Desktop、Codex CLI、Claude CLI、Claude Desktop 与 Antigravity 的 total / active 分别统计，界面同时展示汇总结果。
 - **实时 TPS 曲线**：每秒采样一次，180 秒滑窗 output-token 速率；看板保留总曲线并叠加真实分模型曲线，最新模型 TPS 在竖向图例中一位小数展示。
 - **趋势着色**：基于最近 15 分钟序列做线性回归，下降超阈值才判定为下降，其余视为稳定/上升，可在设置中互换涨跌配色。
 - **可拖动悬浮球**：跟随鼠标拖动到任意屏幕位置；单击弹出 task 概览，双击弹出 TPS 看板，点击外部自动收起。
 - **剪贴板图片上传 R2**：全局快捷键把剪贴板图片上传到 Cloudflare R2，返回可复制的公开 URL。
 - **冷启动缓存**：SQLite 保存最近一次聚合快照，重启后立即显示缓存值，后台重建 baseline 完成后切换为实时值。
-- **长期 Token 统计**：本地 SQLite 追加保存 Codex / Claude token 用量，支持日 / 月 / 年 / 全部四个统计窗口；删除历史 session 文件不影响已入库统计。
+- **长期 Token 统计**：本地 SQLite 保存 Codex、Claude、Antigravity 和 Aster 用量，支持按窗口汇总。删除历史会话文件后仍保留已入库统计。
 - **工具与编辑指标**：按 30 分钟 bucket 统计 skill 调用、MCP 调用与已应用编辑的增删行，只保存名称和计数，不保存参数或补丁内容。
 
 ---
@@ -32,7 +32,7 @@
 
 | 载体 | 交互 | 展示内容 |
 |---|---|---|
-| 菜单栏 | 点击图标展开菜单 | 2×2 来源区（Codex Desktop / Codex CLI / Claude CLI / Claude Desktop）+ TPS + 四窗口 Token 卡 + 设置入口 |
+| 菜单栏 | 点击图标展开菜单 | 任务来源、TPS、Token 卡与设置入口 |
 | 悬浮球 | 拖动 | 跟随鼠标移动到任意屏幕位置并记忆坐标 |
 | 悬浮球 | 单击 | 任务概览气泡：`All tasks` 置顶，只列出 active > 0 的来源，按 active/total 排序 |
 | 悬浮球 | 双击 | TPS 看板：在悬浮球所在屏幕居中打开，展示带坐标轴的实时曲线与涨跌着色 |
@@ -106,6 +106,7 @@ flowchart TB
 | **Codex CLI** | 当前独立 `codex` 进程数（排除 `.app/Contents` helper） | 有存活进程且在当前 sessions 找到顶层 `codex_exec` 的最近 `task_started` rollout（不超过 total） |
 | **Claude CLI** | 存活且 basename 为 `claude` 的 PID，`kind=interactive`、`entrypoint=cli` 的匹配 registry | 仅 `status=busy` 计入；`idle` 与陈旧 registry 不计 |
 | **Claude Desktop** | Claude.app 运行时，`~/.claude/projects/**/*.jsonl` 中顶层 `entrypoint=claude-desktop-3p` 的 distinct session | 最近 5 分钟仍有活动，且尾部处于等待模型或仍在生成的会话 |
+| **Antigravity** | `~/.gemini/antigravity{,-cli,-ide}/conversation_summaries.db` 中有实际步骤的顶层会话，跨客户端按会话去重 | 相应客户端仍在运行且会话近期仍忙 |
 
 - Codex 的 `archived_sessions` 与 `automations` 目录记录完全不参与 task 或 Completed 统计。
 - 进程退出后，CLI 的 total/active 会在下一次采样归零；未打开的 CLI 不统计。
@@ -147,6 +148,7 @@ open dist/AgentPulse.app
 ## 🪙 Token 统计与可选上报
 
 - 本地扫描 `~/.codex/sessions/**/*.jsonl` 与 `~/.claude/projects/**/*.jsonl`，事件追加写入独立 SQLite，并聚合为 30 分钟 bucket。
+- Antigravity 从上述目录的 `conversations/*.db` 读取原生生成元数据，按模型调用去重并分别记录可见输出、推理和缓存 Token。常规扫描会把结果合并进本地账本，开启上报后随账本同步。当前版本的实时 TPS 仍来自 Codex 和 Claude。
 - 菜单 Token 卡支持日 / 月 / 年 / 全部四个窗口；每个窗口展示总 Tokens、估算费用、缓存 / 新增、缓存命中率，卡片底部展示实时 TPS；无数据时不以 0 冒充。
 - Token 卡、分模型明细与 1 天 TPS 曲线会聚合账本中所有 hostname；canonical hostname 只约束本机新扫描数据的归属与上报身份，不过滤本地展示。
 - 只保存统计维度、token 计数、工具名称与调用次数、编辑增删行和 hash 后的 session/source-file 标识，不保存正文、标题、完整 cwd、工具参数、补丁内容或凭证。
@@ -287,6 +289,7 @@ Aster 采集使用 `https://aster.taoai.site/api/admin/events`。每页事件和
 swift run AgentPulseCoreVerification   # 核心采集 / TPS / 曲线逻辑
 swift run AgentPulseCollectorVerification   # 采集器发现 / 缓存复用 / 排除与不可读兜底
 swift run AsterUsageVerification      # Aster 分页、计数和持久化
+swift run AntigravityUsageVerification # 原生用量、去重和账本写入
 swift run AgentPulseR2Verification     # R2 签名 / Key / URL
 swift run AgentPulseReportingVerification # 通用上报传输层
 swift run AgentPulseUsageVerification     # 账本到上报 payload 的离线组装

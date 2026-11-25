@@ -448,39 +448,39 @@ private struct CompactMetric: View {
     }
 }
 
-/// 菜单栏中的四来源 2×2 网格；每行两个来源。
+/// 菜单栏来源网格，每行最多两个来源。
 private struct RuntimeSourceGrid: View {
     let breakdown: RuntimeTaskBreakdown
 
     var body: some View {
         VStack(spacing: 6) {
-            RuntimeSourcePairRow(
+            RuntimeSourceRow(
                 leftTitle: "Codex Desktop",
                 leftMetric: breakdown.codexDesktop,
-                rightTitle: "Codex CLI",
-                rightMetric: breakdown.codexCLI
+                right: ("Codex CLI", breakdown.codexCLI)
             )
-            RuntimeSourcePairRow(
+            RuntimeSourceRow(
                 leftTitle: "Claude CLI",
                 leftMetric: breakdown.claudeCLI,
-                rightTitle: "Claude Desktop",
-                rightMetric: breakdown.claudeDesktop
+                right: ("Claude Desktop", breakdown.claudeDesktop)
             )
+            RuntimeSourceRow(leftTitle: "Antigravity", leftMetric: breakdown.antigravity)
         }
     }
 }
 
-private struct RuntimeSourcePairRow: View {
+private struct RuntimeSourceRow: View {
     let leftTitle: String
     let leftMetric: RuntimeTaskCategoryMetric
-    let rightTitle: String
-    let rightMetric: RuntimeTaskCategoryMetric
+    var right: (title: String, metric: RuntimeTaskCategoryMetric)?
 
     var body: some View {
         HStack(spacing: 10) {
             AgentCategoryCell(title: leftTitle, metric: leftMetric)
-            Rectangle().fill(Color.white).frame(width: 1, height: 20)
-            AgentCategoryCell(title: rightTitle, metric: rightMetric)
+            if let right {
+                Rectangle().fill(Color.white).frame(width: 1, height: 20)
+                AgentCategoryCell(title: right.title, metric: right.metric)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)

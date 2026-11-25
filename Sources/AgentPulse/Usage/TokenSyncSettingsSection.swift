@@ -92,6 +92,9 @@ struct TokenSyncSettingsSection: View {
                 if let error = model.tokenSyncStatus.scanError {
                     SettingsFootnote(error, tone: .negative)
                 }
+                if let warning = model.tokenSyncStatus.antigravityScanWarning {
+                    SettingsFootnote(warning, tone: .warning)
+                }
             }
         }
     }

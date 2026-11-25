@@ -15,6 +15,7 @@ struct AgentPulseCollectorVerification {
         try await withFixture(named: "exclusions", verifyStaleAndEmptyFilesExcluded)
         try await withFixture(named: "unreadable", verifyUnreadableFilesDoNotFailScan)
         try await RuntimeIncrementalVerification.run()
+        try await AntigravityTaskVerification.run()
         print("AgentPulseCollector verification passed")
     }
 

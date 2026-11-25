@@ -223,7 +223,8 @@ final class OrbWindowController {
             ("Codex Desktop", breakdown.codexDesktop, 0),
             ("Codex CLI", breakdown.codexCLI, 1),
             ("Claude CLI", breakdown.claudeCLI, 2),
-            ("Claude Desktop", breakdown.claudeDesktop, 3)
+            ("Claude Desktop", breakdown.claudeDesktop, 3),
+            ("Antigravity", breakdown.antigravity, 4)
         ]
         let items = candidates
             .filter { $0.1.present && ($0.1.activeTasks ?? 0) > 0 }

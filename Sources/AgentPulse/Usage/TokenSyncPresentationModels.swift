@@ -328,6 +328,7 @@ struct TokenSyncStatus: Sendable, Equatable {
     var asterError: String? = nil
     /// Local collection failures do not change reporting configuration or disable retries.
     var scanError: String? = nil
+    var antigravityScanWarning: String? = nil
 
     /// 当前扫描阶段；scanningInProgress == false 时为 nil。仅用于进度展示。
     var scanPhase: TokenScanPhase? = nil

@@ -562,6 +562,15 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     try gate.throwIfCancelled()
                     try ledger.markFilesMissing(source: source, presentFileIDs: present, hostname: hostname)
                 }
+                let antigravity: AntigravityUsageScanResult? = if injectedScanRoots == nil {
+                    try AntigravityUsageCollector.scanAndRecord(
+                        roots: AntigravityUsageCollector.defaultRoots(home: FileManager.default.homeDirectoryForCurrentUser),
+                        ledger: ledger, hostname: hostname, checkCancellation: gate.throwIfCancelled
+                    )
+                } else {
+                    nil
+                }
+                let antigravityFailures = antigravity.map { $0.failedDatabases + $0.failedDirectories } ?? 0
                 progressReporter.completePhase(.scanning)
                 // 全部来源扫描后统一 finalizeDerived：全局去重 + 聚合 + 上报资格门禁。
                 // 无变化轮（raw 派生 dirty 位未置 且 无 rebuild 待完成）跳过 O(全库) 重算：
@@ -628,13 +637,12 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 }
                 let postFinalizeDetail = try Self.pendingProgressDetail(from: ledger, hostname: hostname)
                 progressReporter.completePhase(.finalizing, detail: postFinalizeDetail)
-                // 只有在所有来源都完整扫描（无致命失败：任一来源枚举失败 / 单文件 I/O 失败都会
-                // 在上面抛出并终止本次扫描，不会到达此处）后，才显式清除 rebuild pending。
-                // record/finalize 不会推断重扫已完成，清除是此处唯一入口。
-                if try ledger.requiresRebuildCompletion() {
+                // Optional databases may be temporarily unavailable. Keep any explicit rebuild
+                // pending until the Antigravity scan also succeeds.
+                if antigravityFailures == 0, try ledger.requiresRebuildCompletion() {
                     try ledger.markRebuildCompleted()
                 }
-                if compactionEnabled {
+                if compactionEnabled, antigravityFailures == 0 {
                     progressReporter.enterPhase(.compacting, total: UsageCompactionStep.total, detail: "准备冻结压实")
                     let compaction = try ledger.compactFrozenRaw(hostname: hostname) { update in
                         progressReporter.advance(
@@ -668,6 +676,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 let pending = try ledger.pendingCounts(hostname: hostname)
                 progressReporter.completePhase(.summarizing)
                 return ScanOutcome(summary: summary, finalize: finalize, pending: pending,
+                                   antigravityFailures: antigravityFailures,
                                    recoveryPending: try Self.isRebuildCompletionPending(ledger: ledger))
             }
             let cancelled = Task.isCancelled
@@ -841,6 +850,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                 status.lastScanAt = completedAt
                 Self.clearScanProgress(&status)
                 status.scanError = nil
+                status.antigravityScanWarning = outcome.antigravityFailures > 0
+                    ? "Antigravity 有 \(outcome.antigravityFailures) 处读取失败，下轮重试"
+                    : nil
                 status.reportingEligible = outcome.finalize.reportingEligible
                 status.reportingBlockedReasons = outcome.finalize.blockedReasons
                 status.reportingWarnings = outcome.finalize.warnings
@@ -1203,6 +1215,7 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
         let summary: TokenUsageSummarySnapshot
         let finalize: UsageFinalizeResult
         let pending: (buckets: Int, sessions: Int)
+        let antigravityFailures: Int
         let recoveryPending: Bool
     }
 

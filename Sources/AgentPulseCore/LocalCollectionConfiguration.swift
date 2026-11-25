@@ -44,7 +44,9 @@ public enum LocalCollectionConfigurationError: Error, Equatable, Sendable {
 
 public enum LocalCollectionConfigurationLoader {
     /// 内建来源标识：用户配置的来源不得覆盖这些，否则会污染内建扫描的去重/聚合口径。
-    public static let reservedSources: Set<String> = [UsageJSONLParser.codexSource, "claude-code"]
+    public static let reservedSources: Set<String> = [
+        UsageJSONLParser.codexSource, "claude-code", AntigravityUsageCollector.source,
+    ]
 
     /// 归一化来源名的最大长度。
     public static let maxSourceLength = 30

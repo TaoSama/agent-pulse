@@ -14,6 +14,7 @@ TARGETS = (
     "SecureConfigVerification", "LedgerRebuildVerification",
     "ScanProgressSmootherVerification", "DerivedFinalizeEquivalence",
     "DerivedFinalizeBenchmark", "IncrementalParserVerification", "ParserMemoryVerification", "CliProxyPipelineVerification",
+    "AsterUsageVerification", "AntigravityUsageVerification",
 )
 
 
@@ -26,6 +27,7 @@ def main():
     # ReconcileParityVerification's live path reads local config and credentials;
     # it is intentionally not an offline gate. Pure reconcile checks live in tests.
     environment.pop("AGENT_PULSE_RECONCILE_REQUIRE_LIVE", None)
+    environment.pop("AGENT_PULSE_VERIFY_LIVE_ANTIGRAVITY", None)
     environment.pop("BENCH_REQUIRE_RATIO", None)
     # The offline gate always asserts the bounded default parser-memory fixture.
     environment.update(PARSER_MEMORY_SCALE="1", PARSER_MEMORY_OBSERVE="0")
