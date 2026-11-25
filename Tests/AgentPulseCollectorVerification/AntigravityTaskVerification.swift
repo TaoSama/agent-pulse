@@ -36,8 +36,6 @@ enum AntigravityTaskVerification {
         }
         let desktop = try open(stores[0])
         defer { sqlite3_close(desktop) }
-        let cli = try open(stores[1])
-        defer { sqlite3_close(cli) }
         let schema = """
                 PRAGMA journal_mode = WAL;
                 CREATE TABLE conversation_summaries (
@@ -46,7 +44,7 @@ enum AntigravityTaskVerification {
                     nesting_depth INTEGER, parent_conversation_id TEXT, step_count INTEGER
                 );
                 """
-        for db in [desktop, cli] { try exec(db, schema) }
+        try exec(desktop, schema)
         try seedClosedProfile(at: stores[2], schema: schema)
         try exec(desktop, """
             INSERT INTO conversation_summaries VALUES
@@ -56,12 +54,13 @@ enum AntigravityTaskVerification {
               ('killed', '2026-11-25 12:00:00.001+00:00', 1, 1, 'CASCADE_RUN_STATUS_RUNNING', '', 0, '', 2),
               ('child', '2026-11-25 12:00:00.001+00:00', 0, 1, 'CASCADE_RUN_STATUS_RUNNING', '', 1, 'desktop', 2);
             """)
-        try exec(cli, """
+        let cliRows = """
             INSERT INTO conversation_summaries VALUES
               ('mirror', '2026-11-25 12:00:00.001+00:00', 0, 0, 'CASCADE_RUN_STATUS_IDLE', '', 0, '', 2),
               ('cli', '2026-11-25 12:00:00.001+00:00', 0, 1, '', '', 0, '', 0),
               ('placeholder', '0001-01-01 00:00:00+00:00', 0, 0, '', '', 0, '', 0);
-            """)
+            """
+        try seedClosedProfile(at: stores[1], schema: schema + "\n" + cliRows)
         let scanner = Scanner()
         let desktopProcess = RunningProcess(pid: 101, executablePath: "/Applications/Renamed.app/Contents/MacOS/Antigravity")
         let cliProcess = RunningProcess(pid: 102, executablePath: "agy")
@@ -95,12 +94,29 @@ enum AntigravityTaskVerification {
         let cliExited = try await collector.scan(at: now.addingTimeInterval(2))
         try require(cliExited.taskBreakdown.antigravity.activeTasks == 0, "exited CLI still contributes active tasks")
 
+        try FileManager.default.removeItem(at: stores[2])
+        let withoutIDE = try await collector.scan(at: now.addingTimeInterval(3))
+        try require(withoutIDE.taskBreakdown.antigravity.quality == .complete,
+                    "a missing inactive IDE profile must not degrade quality")
+
         try Data("not SQLite".utf8).write(to: stores[2])
-        let partial = try await collector.scan(at: now.addingTimeInterval(3))
+        let partial = try await collector.scan(at: now.addingTimeInterval(4))
         try require(partial.taskBreakdown.antigravity.totalTasks == 5 && partial.taskBreakdown.antigravity.quality == .partial,
                     "an unreadable Antigravity store must preserve the other stores and degrade quality")
+        try require(partial.activeCountsArePartial && !partial.taskBreakdown.desktopActiveIsPartial
+                    && !partial.taskBreakdown.terminalActiveIsPartial,
+                    "Antigravity quality must affect combined counts alone")
+
+        try FileManager.default.removeItem(at: stores[2])
+        try FileManager.default.removeItem(at: stores[1])
+        scanner.replace(with: [desktopProcess, cliProcess])
+        let missingCLI = try await collector.scan(at: now.addingTimeInterval(5))
+        try require(missingCLI.taskBreakdown.antigravity.totalTasks == 4
+                    && missingCLI.taskBreakdown.antigravity.quality == .partial,
+                    "a missing running CLI profile must preserve readable counts and degrade quality")
+
         scanner.replace(with: [])
-        let closed = try await collector.scan(at: now.addingTimeInterval(4))
+        let closed = try await collector.scan(at: now.addingTimeInterval(6))
         try require(!closed.taskBreakdown.antigravity.present && closed.taskBreakdown.antigravity.totalTasks == 0,
                     "closed Antigravity still contributes historical tasks")
     }
@@ -115,6 +131,8 @@ enum AntigravityTaskVerification {
         let restored = try JSONDecoder().decode(RuntimeTaskBreakdown.self, from: legacy)
         try require(restored.antigravity == .unavailable && restored.codexDesktop == breakdown.codexDesktop,
                     "legacy cached snapshot must decode without Antigravity data")
+        try require(!restored.desktopActiveIsPartial && !restored.terminalActiveIsPartial,
+                    "legacy cached subtotals must keep the quality of their own sources")
     }
 
     private static func seedClosedProfile(at url: URL, schema: String) throws {

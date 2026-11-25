@@ -56,7 +56,9 @@ struct AntigravityTaskScanner {
 
     private enum ReadFailure: Error { case metadata, incompleteWAL, replaced, sqlite }
 
+    private static let desktopDirectory = "antigravity"
     private static let cliDirectory = "antigravity-cli"
+    private static let ideDirectory = "antigravity-ide"
     private static let cliSource = "CORTEX_TRAJECTORY_SOURCE_CLI"
     private static let busySQL = "not_fully_idle != 0 OR status IN ('CASCADE_RUN_STATUS_RUNNING', 'CASCADE_RUN_STATUS_BUSY')"
     private static let unixEpochJulianDay = 2_440_587.5
@@ -72,22 +74,34 @@ struct AntigravityTaskScanner {
     mutating func scan(databases: [URL], processes: [RunningProcess], now: Date) -> RuntimeTaskCategoryMetric {
         let desktopRunning = processes.contains {
             $0.executablePath.hasSuffix(".app/Contents/MacOS/Antigravity")
-                || $0.executablePath.hasSuffix(".app/Contents/MacOS/Antigravity IDE")
+        }
+        let ideRunning = processes.contains {
+            $0.executablePath.hasSuffix(".app/Contents/MacOS/Antigravity IDE")
         }
         let cliRunning = processes.contains {
             $0.executablePath.split(separator: "/").last == "agy"
                 && !$0.executablePath.contains(".app/Contents/")
         }
-        guard !databases.isEmpty, desktopRunning || cliRunning else {
+        guard !databases.isEmpty, desktopRunning || ideRunning || cliRunning else {
             return RuntimeTaskCategoryMetric(totalTasks: 0, activeTasks: 0, present: false, quality: .complete)
         }
+
+        var runningDirectories: Set<String> = []
+        if desktopRunning { runningDirectories.insert(Self.desktopDirectory) }
+        if cliRunning { runningDirectories.insert(Self.cliDirectory) }
+        if ideRunning { runningDirectories.insert(Self.ideDirectory) }
 
         var unique: [String: Conversation] = [:]
         var readable = false
         var partial = false
         for url in databases {
             do {
-                guard let rows = try readRows(at: url) else { continue }
+                guard let rows = try readRows(at: url) else {
+                    if runningDirectories.contains(url.deletingLastPathComponent().lastPathComponent) {
+                        partial = true
+                    }
+                    continue
+                }
                 readable = true
                 for row in rows {
                     if let existing = unique[row.id], !row.supersedes(existing) { continue }
@@ -103,7 +117,7 @@ struct AntigravityTaskScanner {
         }
 
         var active = 0
-        for row in unique.values where row.busy && (row.cli ? cliRunning : desktopRunning) {
+        for row in unique.values where row.busy && (row.cli ? cliRunning : desktopRunning || ideRunning) {
             guard let date = row.lastActivity else {
                 partial = true
                 continue

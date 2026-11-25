@@ -189,8 +189,8 @@ public final class MetricsStore: ObservableObject {
             publish(metric(result.totalTasks, partial: result.activeCountsArePartial), to: \.totalTasks)
             publish(metric(result.activeTasks, partial: result.activeCountsArePartial), to: \.activeTasks)
             publish(result.taskBreakdown, to: \.taskBreakdown)
-            publish(metric(result.desktopActive, partial: result.activeCountsArePartial), to: \.desktopActive)
-            publish(metric(result.terminalActive, partial: result.activeCountsArePartial), to: \.terminalActive)
+            publish(metric(result.desktopActive, partial: result.taskBreakdown.desktopActiveIsPartial), to: \.desktopActive)
+            publish(metric(result.terminalActive, partial: result.taskBreakdown.terminalActiveIsPartial), to: \.terminalActive)
             if let completed = result.completed.value {
                 publish(.partial(completed), to: \.completedTotal)
             } else {
@@ -303,8 +303,8 @@ public final class MetricsStore: ObservableObject {
         totalTasks = metric(snapshot.totalTasks, partial: snapshot.activeCountsArePartial)
         activeTasks = metric(snapshot.activeTasks, partial: snapshot.activeCountsArePartial)
         taskBreakdown = snapshot.taskBreakdown
-        desktopActive = metric(snapshot.desktopActive, partial: snapshot.activeCountsArePartial)
-        terminalActive = metric(snapshot.terminalActive, partial: snapshot.activeCountsArePartial)
+        desktopActive = metric(snapshot.desktopActive, partial: snapshot.taskBreakdown.desktopActiveIsPartial)
+        terminalActive = metric(snapshot.terminalActive, partial: snapshot.taskBreakdown.terminalActiveIsPartial)
         if let completed = snapshot.completed.value {
             completedTotal = .partial(completed)
         }

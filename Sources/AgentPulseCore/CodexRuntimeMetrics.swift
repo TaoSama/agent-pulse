@@ -64,6 +64,12 @@ public struct RuntimeTaskBreakdown: Codable, Sendable, Equatable {
     public let claudeDesktop: RuntimeTaskCategoryMetric
     public let antigravity: RuntimeTaskCategoryMetric
 
+    public var desktopActiveIsPartial: Bool { codexDesktop.quality != .complete }
+
+    public var terminalActiveIsPartial: Bool {
+        codexCLI.quality != .complete || claudeCLI.quality != .complete
+    }
+
     public init(
         codexDesktop: RuntimeTaskCategoryMetric,
         codexCLI: RuntimeTaskCategoryMetric,
