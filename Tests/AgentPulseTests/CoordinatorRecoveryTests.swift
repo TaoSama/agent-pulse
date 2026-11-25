@@ -193,6 +193,80 @@ final class CoordinatorRecoveryTests: XCTestCase {
         XCTAssertFalse(coordinator.status.reportingEnabled)
     }
 
+    func testManagedConfigurationOverridesLegacyEnvironmentWithoutReadingProtocolFile() throws {
+        let fixture = try makeFixture()
+        let coordinator = makeCoordinator(fixture, clock: CoordinatorTestClock())
+        defer { coordinator.stop() }
+        let configuration = try CoordinatorTestConfiguration(hostname: Self.hostname).load()
+        let baseURL = try XCTUnwrap(URL(string: "https://managed.invalid"))
+
+        coordinator.applyManagedSettings(ManagedSettingsSnapshot(
+            reportingBaseURL: baseURL, canonicalHostname: Self.hostname, reporting: configuration,
+            asterManagementKey: nil, r2: nil
+        ))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("reporting.json").path))
+        XCTAssertEqual(coordinator.status.configurationStatus, .ready)
+        XCTAssertEqual(coordinator.status.ingestBaseURL, baseURL.absoluteString)
+        XCTAssertEqual(coordinator.status.canonicalHostname, Self.hostname)
+        XCTAssertFalse(coordinator.status.asterConfigured)
+        XCTAssertEqual(coordinator.status.asterSourceCount, 0)
+        XCTAssertFalse(coordinator.status.reportingEnabled, "loading valid credentials must not opt in to reporting")
+    }
+
+    func testManagedConfigurationWithoutReportingURLKeepsCollectionConfigured() throws {
+        let fixture = try makeFixture()
+        let coordinator = makeCoordinator(fixture, clock: CoordinatorTestClock())
+        defer { coordinator.stop() }
+        let configuration = try CoordinatorTestConfiguration(hostname: Self.hostname).load()
+
+        coordinator.applyManagedSettings(ManagedSettingsSnapshot(
+            reportingBaseURL: nil, canonicalHostname: Self.hostname, reporting: configuration,
+            asterManagementKey: "fixture-management-key", r2: nil
+        ))
+        coordinator.setReportingEnabled(true)
+
+        XCTAssertTrue(coordinator.status.asterConfigured)
+        XCTAssertEqual(coordinator.status.canonicalHostname, Self.hostname)
+        XCTAssertEqual(coordinator.status.ingestBaseURL, "")
+        XCTAssertFalse(coordinator.status.reportingEnabled)
+        XCTAssertEqual(coordinator.status.reportingError, "配置未就绪，无法启用上报")
+        XCTAssertTrue(coordinator.status.localCollectionEnabled)
+    }
+
+    func testFirstLocalHostnameEnablesCollectionWithoutEnablingReporting() async throws {
+        let fixture = try makeFixture(hostname: nil)
+        try FileManager.default.createDirectory(at: fixture.sourceRoot, withIntermediateDirectories: false)
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let transcript = """
+            {"type":"assistant","timestamp":"\(timestamp)","sessionId":"local-only","message":{"id":"usage-1","model":"fixture-model","usage":{"input_tokens":10,"output_tokens":7}}}
+
+            """
+        try Data(transcript.utf8).write(to: fixture.sourceRoot.appendingPathComponent("local.jsonl"))
+        let coordinator = makeCoordinator(fixture, clock: CoordinatorTestClock())
+        defer { coordinator.stop() }
+        let reportingURL = try XCTUnwrap(URL(string: "https://managed.invalid"))
+        coordinator.applyManagedSettings(ManagedSettingsSnapshot(
+            reportingBaseURL: reportingURL, canonicalHostname: "", reporting: nil,
+            asterManagementKey: nil, r2: nil
+        ))
+        coordinator.start()
+        XCTAssertNil(coordinator.status.canonicalHostname)
+
+        let hostname = "Studio's Mac"
+        coordinator.setInitialLocalHostname("  \(hostname)  ")
+        try await eventually("saving a hostname should start the first local scan") {
+            coordinator.status.lastScanAt != nil && !coordinator.status.scanningInProgress
+        }
+        XCTAssertEqual(coordinator.status.canonicalHostname, hostname)
+        XCTAssertEqual(fixture.defaults.string(forKey: "tokenSync.canonicalHostname"), hostname)
+        XCTAssertEqual(try fixture.ledger.buckets(hostname: hostname).map(\.counts.total), [17])
+
+        coordinator.setReportingEnabled(true)
+        XCTAssertFalse(coordinator.status.reportingEnabled)
+        XCTAssertEqual(coordinator.status.reportingError, "配置未就绪，无法启用上报")
+    }
+
     func testChangingIntervalDoesNotWaitForBusyLedgerQueueOnMainActor() async throws {
         let fixture = try makeFixture()
         try FileManager.default.createDirectory(at: fixture.sourceRoot, withIntermediateDirectories: false)
@@ -250,7 +324,7 @@ final class CoordinatorRecoveryTests: XCTestCase {
         )
     }
 
-    private func makeFixture() throws -> CoordinatorFixture {
+    private func makeFixture(hostname: String? = CoordinatorRecoveryTests.hostname) throws -> CoordinatorFixture {
         let suite = "CoordinatorRecoveryTests.\(UUID().uuidString)"
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -260,16 +334,18 @@ final class CoordinatorRecoveryTests: XCTestCase {
         }
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         let envURL = directory.appendingPathComponent("fixture.env")
-        try EnvFile.writeBack([
-            MergedEnvKeys.reportCanonicalHostname: Self.hostname,
-            MergedEnvKeys.reportBaseURL: "https://reporting.invalid"
-        ], to: envURL)
         defaults.set(envURL.path, forKey: MergedEnvPreferences.pathDefaultsKey)
-        defaults.set(Self.hostname, forKey: "tokenSync.canonicalHostname")
         defaults.set(true, forKey: "tokenSync.localCollectionEnabled")
         defaults.set(false, forKey: "tokenSync.reportingEnabled")
         let ledger = try UsageLedgerStore(path: ":memory:")
-        try ledger.adoptHostname(Self.hostname)
+        if let hostname {
+            try EnvFile.writeBack([
+                MergedEnvKeys.reportCanonicalHostname: hostname,
+                MergedEnvKeys.reportBaseURL: "https://reporting.invalid"
+            ], to: envURL)
+            defaults.set(hostname, forKey: "tokenSync.canonicalHostname")
+            try ledger.adoptHostname(hostname)
+        }
         return CoordinatorFixture(
             directory: directory, sourceRoot: directory.appendingPathComponent("source"),
             defaults: defaults, ledger: ledger

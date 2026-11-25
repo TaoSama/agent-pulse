@@ -160,11 +160,11 @@ enum CliProxyCollectionPresentation {
 }
 
 /// 一轮「扫描 → 上报」链路的阶段。用于把整体进度分解为带权重的顺序阶段，
-/// 使进度条能跨越 cliproxy 采集、逐文件扫描、派生重算、摘要与可选上报，而不是
+/// 使进度条能跨越 Aster 采集、逐文件扫描、派生重算、摘要与可选上报，而不是
 /// 卡在某一档跳变。权重之和为 1；scan 是唯一能报出真实细粒度（逐文件）的阶段。
 enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
-    /// cliproxy 主动拉取（网络来源）。
-    case cliproxy
+    /// Aster 主动拉取（网络来源）。
+    case aster
     /// 逐文件扫描全部来源（占大头，能报 已扫描/总数）。
     case scanning
     /// finalizeDerived 派生重算（全局去重 + 聚合 + 门禁）。
@@ -180,7 +180,7 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
     /// 因此这两档占大头，避免进度在某一档长时间停滞。
     var weight: Double {
         switch self {
-        case .cliproxy: return 0.05
+        case .aster: return 0.05
         case .scanning: return 0.57
         case .finalizing: return 0.23
         case .compacting: return 0.05
@@ -201,7 +201,7 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
 
     var displayLabel: String {
         switch self {
-        case .cliproxy: return "采集 CPA"
+        case .aster: return "采集 Aster"
         case .scanning: return "扫描文件"
         case .finalizing: return "整理统计"
         case .compacting: return "冻结压实"
@@ -213,7 +213,7 @@ enum TokenScanPhase: String, Sendable, Equatable, CaseIterable {
     /// 该阶段计数的单位量词，用于底部详细进度行的「已扫描/总数 单位」。
     var unit: String {
         switch self {
-        case .cliproxy: return "事件"
+        case .aster: return "事件"
         case .scanning: return "文件"
         case .finalizing: return "步"
         case .compacting: return "步"
@@ -321,13 +321,14 @@ struct TokenSyncStatus: Sendable, Equatable {
     var lastReportSucceeded: Bool?
 
     /// cliproxyapi 采集是否已配置（0600 配置文件 + 字段齐全）。
-    var cliProxyConfigured: Bool = false
+    var asterConfigured: Bool = false
     /// 已完整配置的 CPA 来源数量。
-    var cliProxySourceCount: Int = 0
+    var asterSourceCount: Int = 0
     /// cliproxyapi 采集错误（脱敏）；nil 表示无错误或未配置。
-    var cliProxyError: String? = nil
+    var asterError: String? = nil
     /// Local collection failures do not change reporting configuration or disable retries.
     var scanError: String? = nil
+    var antigravityScanWarning: String? = nil
 
     /// 当前扫描阶段；scanningInProgress == false 时为 nil。仅用于进度展示。
     var scanPhase: TokenScanPhase? = nil

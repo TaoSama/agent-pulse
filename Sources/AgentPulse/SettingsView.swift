@@ -2,23 +2,22 @@ import SwiftUI
 import AgentPulseCore
 
 /// 设置视图：嵌入 menubar 面板内的深色卡片式设置，与主面板、悬浮球共用黑底白字语言。
-/// 包含趋势配色、合并 env 凭证（R2 / cliproxy 双源）、以及 Token 统计/上报/全量同步状态。
+/// 展示趋势配色、用量采集与上报，以及 1Password 配置状态。
 struct AgentPulseSettingsView: View {
     @ObservedObject var model: ApplicationModel
-    @ObservedObject var envSettings: EnvSettingsModel
+    @ObservedObject var managedSettings: ManagedSettingsModel
 
     init(model: ApplicationModel) {
         self.model = model
-        self.envSettings = model.envSettings
+        self.managedSettings = model.managedSettings
     }
 
     var body: some View {
         VStack(spacing: 12) {
             trendCard
             TokenSyncSettingsSection(model: model)
-            cliProxyCard
-            envPathCard
-            r2Card
+            asterCard
+            configurationCard
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 16)
@@ -45,60 +44,54 @@ struct AgentPulseSettingsView: View {
         }
     }
 
-    /// 合并 env 文件路径卡片：R2 / cliproxy / 上报简单值统一存放，只保存路径，凭证不写入 App 设置。
-    private var envPathCard: some View {
-        SettingsCard(title: "凭证文件（合并 env）", systemImage: "key.horizontal") {
-            EnvPathRow(
-                path: $envSettings.path,
-                help: "只保存文件路径；密钥仅在内存与该 0600 文件中，不写入 App 设置。留空「编辑 → 完成」即恢复默认路径。"
-            )
-        }
-    }
-
-    private var r2Card: some View {
-        SettingsCard(title: "R2 图片上传", systemImage: "photo.on.rectangle.angled") {
+    private var asterCard: some View {
+        SettingsCard(title: "Aster 用量采集", systemImage: "antenna.radiowaves.left.and.right") {
             VStack(alignment: .leading, spacing: 12) {
-                dualSourceField("Account ID", key: MergedEnvKeys.r2AccountID, singleLine: true)
-                dualSourceField("Bucket", key: MergedEnvKeys.r2Bucket)
-                dualSourceField("Public Base URL", key: MergedEnvKeys.r2PublicBaseURL)
-                dualSourceField("Access Key ID", key: MergedEnvKeys.r2AccessKeyID)
-                dualSourceField("Secret Access Key", key: MergedEnvKeys.r2SecretAccessKey)
-            }
-        }
-    }
-
-    private var cliProxyCard: some View {
-        SettingsCard(title: "cliproxyapi 用量采集", systemImage: "antenna.radiowaves.left.and.right") {
-            VStack(alignment: .leading, spacing: 12) {
-                dualSourceField("Base URL", key: MergedEnvKeys.cliProxyBaseURL)
-                dualSourceField("Management Key", key: MergedEnvKeys.cliProxyManagementKey)
-                dualSourceField("Target API Key", key: MergedEnvKeys.cliProxyTargetAPIKey)
-                SettingsFootnote("额外来源通过凭证文件中的 CLIPROXY_<SOURCE>_* 三元组配置。")
+                SettingsRow(title: "服务") {
+                    Text("aster.taoai.site")
+                        .font(.system(size: 11, design: .monospaced))
+                }
                 SettingsRow(title: "采集状态") {
                     SettingsStatusBadge(
-                        text: model.tokenSyncStatus.cliProxyConfigured
-                            ? "已配置 \(model.tokenSyncStatus.cliProxySourceCount) 个来源"
+                        text: model.tokenSyncStatus.asterConfigured
+                            ? "已配置"
                             : "未配置",
-                        tone: model.tokenSyncStatus.cliProxyConfigured ? .positive : .neutral
+                        tone: model.tokenSyncStatus.asterConfigured ? .positive : .neutral
                     )
                 }
-                if let error = model.tokenSyncStatus.cliProxyError {
+                if let error = model.tokenSyncStatus.asterError {
                     SettingsFootnote(error, tone: .warning)
                 }
             }
         }
     }
 
-    /// 构造一个双源字段：env 读取 / 手动填写；密钥掩码，非密钥明文。
-    private func dualSourceField(_ title: String, key: String, singleLine: Bool = false) -> some View {
-        SettingsDualSourceField(
-            title: title,
-            isSecret: envSettings.isSecret(key),
-            source: envSettings.sourceBinding(for: key),
-            rawValue: envSettings.valueBinding(for: key),
-            displayValue: envSettings.displayValue(for: key),
-            singleLine: singleLine
-        )
+    private var configurationCard: some View {
+        SettingsCard(title: "1Password 配置", systemImage: "key.horizontal") {
+            VStack(alignment: .leading, spacing: 10) {
+                SettingsRow(title: "条目状态") {
+                    SettingsStatusBadge(
+                        text: managedSettings.hasLoadedItem ? "已读取" : "未读取",
+                        tone: managedSettings.hasLoadedItem ? .positive : .warning
+                    )
+                }
+                if let error = managedSettings.errorText {
+                    SettingsFootnote(error, tone: .negative)
+                }
+                SettingsRow(title: "R2 图片上传") {
+                    SettingsStatusBadge(
+                        text: managedSettings.isR2Configured ? "已配置" : "未配置",
+                        tone: managedSettings.isR2Configured ? .positive : .warning
+                    )
+                }
+                HStack {
+                    Spacer()
+                    SettingsPrimaryButton(title: "刷新配置", systemImage: "arrow.clockwise") {
+                        managedSettings.reload()
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -168,211 +161,6 @@ struct SettingsRow<Content: View>: View {
     }
 }
 
-/// 深色输入框：小标题在上，等宽字体路径输入。
-struct SettingsField: View {
-    let title: String
-    @Binding var text: String
-    var accessibilityLabel: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(Color.white)
-            TextField(
-                "",
-                text: $text,
-                prompt: Text("未设置").foregroundColor(Color.white.opacity(0.4))
-            )
-            .textFieldStyle(.plain)
-            .font(.system(size: 12, design: .monospaced))
-            .foregroundStyle(Color.white)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.white.opacity(0.08))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
-            )
-            .accessibilityLabel(accessibilityLabel ?? title)
-        }
-    }
-}
-
-/// 凭证字段：单行「标题 · 值回显 · 编辑」。默认只读回显合并 env 读到的值
-/// （密钥中间星号掩码，非密钥明文）；点「编辑」展开明文输入，「完成」或回车即写回 0600 env。
-/// 写回时自动把该键来源置为 manual，保留手填→写回能力，无需显式来源切换。
-struct SettingsDualSourceField: View {
-    let title: String
-    let isSecret: Bool
-    @Binding var source: EnvFieldSource
-    /// 原始值绑定（set 只在 manual 源生效，会写回 env）。
-    @Binding var rawValue: String
-    /// UI 展示值（密钥已掩码、非密钥明文）；只读回显与未展开时用。
-    let displayValue: String
-    /// 值单行显示、不折行（长值中间省略）；默认允许换行以完整展示长路径。
-    var singleLine: Bool = false
-    /// 非空时在标题右侧加一个「?」图标，悬浮展示该说明文字（替代下方常驻小字）。
-    var help: String? = nil
-    /// 两行布局：标题（+?）单独一行，值框与编辑按钮在下一行占满整宽。
-    /// 用于设备标识这类需要完整展示值的字段；默认单行「标题 · 值 · 编辑」。
-    var stacked: Bool = false
-
-    @State private var isEditing = false
-    @State private var draft = ""
-
-    var body: some View {
-        if stacked {
-            VStack(alignment: .leading, spacing: 6) {
-                labelRow
-                HStack(alignment: .center, spacing: 8) { valueAndEdit }
-            }
-        } else {
-            HStack(alignment: .center, spacing: 8) {
-                labelRow.frame(width: 132, alignment: .leading)
-                valueAndEdit
-            }
-        }
-    }
-
-    private var labelRow: some View {
-        HStack(spacing: 4) {
-            Text(title)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(Color.white)
-                .fixedSize(horizontal: false, vertical: true)
-            if let help {
-                HelpBadge(text: help)
-            }
-            Spacer(minLength: 0)
-        }
-    }
-
-    @ViewBuilder
-    private var valueAndEdit: some View {
-        if isEditing {
-            editableBox
-            SettingsGhostButton("完成") { commitDraft() }
-        } else {
-            readOnlyBox(displayValue.isEmpty ? "未设置" : displayValue, placeholder: displayValue.isEmpty)
-            SettingsGhostButton("编辑") {
-                draft = rawValue
-                isEditing = true
-            }
-        }
-    }
-
-    private func commitDraft() {
-        // 手填即切到 manual 源再写回，让值绑定的写回逻辑生效。
-        if source != .manual { source = .manual }
-        rawValue = draft
-        isEditing = false
-    }
-
-    private func readOnlyBox(_ text: String, placeholder: Bool) -> some View {
-        Text(text)
-            .font(.system(size: 12, design: .monospaced))
-            .foregroundStyle(placeholder ? Color.white.opacity(0.3) : Color.white)
-            .lineLimit(singleLine ? 1 : nil)
-            .truncationMode(.middle)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.white.opacity(0.05))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(Color.white.opacity(0.1), lineWidth: 1)
-            )
-            .accessibilityLabel("\(title)（只读）")
-    }
-
-    private var editableBox: some View {
-        TextField(
-            "",
-            text: $draft,
-            prompt: Text("输入后点完成").foregroundColor(Color.white.opacity(0.3))
-        )
-        .textFieldStyle(.plain)
-        .font(.system(size: 12, design: .monospaced))
-        .foregroundStyle(Color.white)
-        .onSubmit { commitDraft() }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .fill(Color.white.opacity(0.08))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .stroke(Color.white.opacity(0.14), lineWidth: 1)
-        )
-        .accessibilityLabel(title)
-    }
-}
-
-/// 合并 env 路径行：单行「.env 路径 · ? · 值 · 编辑」，与凭证字段同一视觉。
-/// 值单行不折行；点「编辑」展开输入，「完成」/回车写回；留空提交即恢复默认路径。
-struct EnvPathRow: View {
-    @Binding var path: String
-    let help: String
-
-    @State private var isEditing = false
-    @State private var draft = ""
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 8) {
-            HStack(spacing: 4) {
-                Text(".env 路径")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(Color.white)
-                HelpBadge(text: help)
-                Spacer(minLength: 0)
-            }
-            .frame(width: 132, alignment: .leading)
-            if isEditing {
-                TextField("", text: $draft, prompt: Text("留空恢复默认").foregroundColor(Color.white.opacity(0.3)))
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(Color.white)
-                    .onSubmit { commit() }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
-                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.white.opacity(0.08)))
-                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.white.opacity(0.14), lineWidth: 1))
-                    .accessibilityLabel("合并 env 配置文件路径")
-                SettingsGhostButton("完成") { commit() }
-            } else {
-                Text(path.isEmpty ? MergedEnvKeys.defaultPath : path)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(Color.white)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
-                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.white.opacity(0.05)))
-                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.white.opacity(0.1), lineWidth: 1))
-                    .accessibilityLabel(".env 路径（只读）")
-                SettingsGhostButton("编辑") {
-                    draft = path
-                    isEditing = true
-                }
-            }
-        }
-    }
-
-    private func commit() {
-        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        path = trimmed.isEmpty ? MergedEnvKeys.defaultPath : trimmed
-        isEditing = false
-    }
-}
 
 /// 开关行：左标题（可带副标题），右侧显眼开关（放大轨道 + 滑块 + 开/关文字）。
 struct SettingsToggleRow: View {

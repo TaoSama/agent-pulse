@@ -56,6 +56,7 @@ public final class MetricsStore: ObservableObject {
         public var automationDirectories: [URL]
         public var claudeSessionsDirectory: URL
         public var claudeProjectsDirectory: URL
+        public var antigravitySummaryDatabases: [URL]
         public var scanInterval: TimeInterval
         public var databaseURL: URL?
 
@@ -72,7 +73,8 @@ public final class MetricsStore: ObservableObject {
             claudeProjectsDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".claude/projects", isDirectory: true)
                 .resolvingSymlinksInPath(),
-            databaseURL: URL? = nil
+            databaseURL: URL? = nil,
+            antigravitySummaryDatabases: [URL] = CodexRuntimeMetricsConfiguration.defaultAntigravitySummaryDatabases()
         ) {
             self.sessionsDirectory = sessionsDirectory
             self.automationDirectories = automationDirectories
@@ -81,6 +83,7 @@ public final class MetricsStore: ObservableObject {
             // 运行时必须每秒产生一个持久化样本。
             self.scanInterval = 1
             self.databaseURL = databaseURL
+            self.antigravitySummaryDatabases = antigravitySummaryDatabases
         }
     }
 
@@ -136,7 +139,8 @@ public final class MetricsStore: ObservableObject {
                 automationRoots: configuration.automationDirectories.map(\.path),
                 databaseURL: databaseURL,
                 claudeSessionsDirectory: configuration.claudeSessionsDirectory,
-                claudeProjectsDirectory: configuration.claudeProjectsDirectory
+                claudeProjectsDirectory: configuration.claudeProjectsDirectory,
+                antigravitySummaryDatabases: configuration.antigravitySummaryDatabases
             ))
             initializationError = nil
         } catch {
@@ -185,8 +189,8 @@ public final class MetricsStore: ObservableObject {
             publish(metric(result.totalTasks, partial: result.activeCountsArePartial), to: \.totalTasks)
             publish(metric(result.activeTasks, partial: result.activeCountsArePartial), to: \.activeTasks)
             publish(result.taskBreakdown, to: \.taskBreakdown)
-            publish(metric(result.desktopActive, partial: result.activeCountsArePartial), to: \.desktopActive)
-            publish(metric(result.terminalActive, partial: result.activeCountsArePartial), to: \.terminalActive)
+            publish(metric(result.desktopActive, partial: result.taskBreakdown.desktopActiveIsPartial), to: \.desktopActive)
+            publish(metric(result.terminalActive, partial: result.taskBreakdown.terminalActiveIsPartial), to: \.terminalActive)
             if let completed = result.completed.value {
                 publish(.partial(completed), to: \.completedTotal)
             } else {
@@ -299,8 +303,8 @@ public final class MetricsStore: ObservableObject {
         totalTasks = metric(snapshot.totalTasks, partial: snapshot.activeCountsArePartial)
         activeTasks = metric(snapshot.activeTasks, partial: snapshot.activeCountsArePartial)
         taskBreakdown = snapshot.taskBreakdown
-        desktopActive = metric(snapshot.desktopActive, partial: snapshot.activeCountsArePartial)
-        terminalActive = metric(snapshot.terminalActive, partial: snapshot.activeCountsArePartial)
+        desktopActive = metric(snapshot.desktopActive, partial: snapshot.taskBreakdown.desktopActiveIsPartial)
+        terminalActive = metric(snapshot.terminalActive, partial: snapshot.taskBreakdown.terminalActiveIsPartial)
         if let completed = snapshot.completed.value {
             completedTotal = .partial(completed)
         }

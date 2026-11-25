@@ -175,6 +175,16 @@ let package = Package(
             dependencies: ["AgentPulseCore", "AgentPulseReporting"],
             path: "Tests/CliProxyPipelineVerification"
         ),
+        .executableTarget(
+            name: "AsterUsageVerification",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/AsterUsageVerification"
+        ),
+        .executableTarget(
+            name: "AntigravityUsageVerification",
+            dependencies: ["AgentPulseCore"],
+            path: "Tests/AntigravityUsageVerification"
+        ),
     ],
     swiftLanguageModes: [.v6]
 )
