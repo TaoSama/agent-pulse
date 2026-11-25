@@ -434,6 +434,8 @@ enum AgentPulseUsageVerification {
         // 内建来源不可被覆盖。
         try require(LocalCollectionConfigurationLoader.sanitize([raw("codex", "/a")]).isEmpty, "reserved source 'codex' must be rejected")
         try require(LocalCollectionConfigurationLoader.sanitize([raw("Claude-Code", "/a")]).isEmpty, "reserved source 'claude-code' must be rejected (case-insensitive)")
+        let legacyAntigravity = LocalCollectionConfigurationLoader.sanitize([raw("Antigravity", "/a")])
+        try require(legacyAntigravity.first?.source == "antigravity", "legacy Antigravity sources keep their existing identity")
 
         // format 非 claude 跳过。
         try require(LocalCollectionConfigurationLoader.sanitize([raw("x", "/a", "jsonl")]).isEmpty, "non-claude format must be skipped")

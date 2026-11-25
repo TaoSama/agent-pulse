@@ -177,6 +177,8 @@ open dist/AgentPulse.app
 
 `source` 会归一化为最长 30 字符的 `[a-z0-9._-]` 标识，不能覆盖内建来源；`root` 必须是绝对路径，重复或嵌套目录会被拒绝。文件必须为 `0600`，配置缺失或无有效条目时仍只扫描内建来源。该文件只声明本机只读采集目录，不包含上报地址或凭证。
 
+已有名为 `antigravity` 的自定义来源时，保留该来源及其扫描进度，原生 Antigravity Token 采集会暂停，以免对同一批历史重复计数。Antigravity 任务统计仍使用原生来源。
+
 ### 上报协议要点
 
 - **传输安全**：生产地址只接受 `https`；`http` 仅在 loopback（`localhost` / `127.0.0.1` / `::1`）时放行。base URL 不得携带用户名、密码、query 或 fragment。

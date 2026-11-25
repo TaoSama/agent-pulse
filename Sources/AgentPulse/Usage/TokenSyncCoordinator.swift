@@ -562,7 +562,9 @@ final class TokenSyncCoordinator: TokenSyncCoordinating {
                     try gate.throwIfCancelled()
                     try ledger.markFilesMissing(source: source, presentFileIDs: present, hostname: hostname)
                 }
-                let antigravity: AntigravityUsageScanResult? = if injectedScanRoots == nil {
+                // Keep existing Antigravity transcript checkpoints and avoid importing a second copy.
+                let usesCustomAntigravity = localSources.contains { $0.source == AntigravityUsageCollector.source }
+                let antigravity: AntigravityUsageScanResult? = if injectedScanRoots == nil, !usesCustomAntigravity {
                     try AntigravityUsageCollector.scanAndRecord(
                         roots: AntigravityUsageCollector.defaultRoots(home: FileManager.default.homeDirectoryForCurrentUser),
                         ledger: ledger, hostname: hostname, checkCancellation: gate.throwIfCancelled
